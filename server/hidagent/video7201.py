@@ -118,7 +118,6 @@ class H264Decoder:
         self._expect: int | None = None
         self._cur: bytearray | None = None
         self._config = b""
-        self.last_ts: int | None = None
         self.reset()
 
     def reset(self) -> None:
@@ -142,8 +141,6 @@ class H264Decoder:
         self._expect = (seq + 1) & 0xFFFF
         payload = chunk[3:]
         if flags & START:
-            if len(payload) >= 4:
-                self.last_ts = struct.unpack_from("<I", payload)[0]
             self._cur = bytearray(payload[4:] if len(payload) >= 4 else b"")
         elif self._cur is not None:
             self._cur += payload
@@ -198,14 +195,18 @@ def frame_to_jpeg(frame, quality: int = 75) -> bytes:
     return buf.getvalue()
 
 
+def hello_line(token: str) -> bytes:
+    """每次重连都是新解码器，只发普通 hello。板子会从 CONFIG/IDR 重新给，不走 `at <ts>` 续传。"""
+    return f"hello {token}\n".encode("ascii")
+
+
 def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
             quality: int = 75, max_fps: int = 8, connect_timeout: float = 5,
-            on_ready=None, on_stall=None, sockets: list | None = None,
-            resume_ts: int | None = None, on_timestamp=None) -> None:
+            on_ready=None, on_stall=None, sockets: list | None = None) -> None:
     """阻塞读取一路 7201，直到 stop 或对端断开。on_jpeg(jpeg_bytes) 在解码线程里调用。
 
-    静屏时板子可能不再推新帧，但 hello/ka 的零长度应答还在。只有帧和应答都停了约 12 秒
-    才调用 on_stall。有上一帧时间戳时，hello 带上 `at <ts>`，让板子按固件的 resume 语义续上。
+    每次连接都新建解码器。静屏时板子可能不再推新帧，但 hello/ka 的零长度应答还在。
+    只有帧和应答都停了约 12 秒才调用 on_stall。序号断了就发 resync，让板子从 IDR 重来。
     """
     sock = socket.create_connection((host, int(port)), timeout=connect_timeout)
     if sockets is not None:
@@ -213,11 +214,7 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.settimeout(0.5)
-        if resume_ts is None:
-            hello = f"hello {token}\n"
-        else:
-            hello = f"hello {token} at {int(resume_ts)}\n"
-        sock.sendall(hello.encode("ascii"))
+        sock.sendall(hello_line(token))
         decoder = H264Decoder()
         records = RecordBuffer()
         gate = LatestFrameGate(max_fps)
@@ -263,8 +260,6 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
                     except OSError:
                         raise
                     continue
-                if decoder.last_ts is not None and on_timestamp:
-                    on_timestamp(decoder.last_ts)
                 if not frames:
                     continue
                 last_frame = time.monotonic()

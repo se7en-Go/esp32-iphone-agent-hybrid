@@ -102,7 +102,7 @@ Kz 的 `Device.send()` 原来要求回复恰好是 `ok`。适配层剥掉 `<id> 
 
 来源：`wifi_video_tcp.cpp`、`wifi_video.h`、`src/video/gop.c` 的 `vchunk_next`。
 
-- 客户端先发一行 `hello <vtok>\n`。token 不对，板子直接断开。也可以 `hello <vtok> at <ts>` 表示解码器已经跟上那个时间戳；我们从 IDR 重新开始，不发 `at`。
+- 客户端先发一行 `hello <vtok>\n`。token 不对，板子直接断开。固件还认 `hello <vtok> at <ts>`（解码器已经跟上那个时间戳，板子只补后面的 P 帧）。我们每次重连都换一个新的解码器，所以只发普通 hello，等板子重发 CONFIG 和 IDR。序号断了再发 `resync`。画面停住时仍提示重新选一次屏幕镜像。
 - 之后每秒一行 `ka`。板子在 `RECV_TIMEOUT_MS`（5 秒）内收不到就拆会话。我们按 1 秒发。
 - 板子下发的记录是 `[u16 LE 长度][chunk]`。长度为 0 的记录是 hello/ka 的应答，不是视频。
 - chunk 是 `[seq u16 LE][flags u8][payload]`。flags：bit0 START、bit1 END、bit2 IDR、bit3 CONFIG、bit4 BENCH、bit5 SNAP、bit6 RESUME、bit7（`WV_AUDIO`）音频。

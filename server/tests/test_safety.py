@@ -108,6 +108,132 @@ def test_web_reset_clears_trip_but_keeps_sends(tmp_path):
         assert _real_guard_bytes() == before
 
 
+class _OkLink:
+    def __init__(self):
+        self.written: list[bytes] = []
+        self.replies: asyncio.Queue[bytes] = asyncio.Queue()
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.written.append(data)
+        req = data.decode().strip().split()[0]
+        self.replies.put_nowait(f"{req} ok\n".encode())
+
+    async def readline(self) -> bytes:
+        return await self.replies.get()
+
+    def close(self) -> None:
+        self.closed = True
+        self.replies.put_nowait(b"")
+
+    def is_open(self) -> bool:
+        return not self.closed
+
+
+class _HoldFirstType(_OkLink):
+    def __init__(self):
+        super().__init__()
+        self.first = asyncio.Event()
+        self._held = False
+
+    def write(self, data: bytes) -> None:
+        self.written.append(data)
+        if b" type " in data and not self._held:
+            self._held = True
+            self.first.set()
+            return
+        req = data.decode().strip().split()[0]
+        self.replies.put_nowait(f"{req} ok\n".encode())
+
+
+def test_prepare_then_enter_reaches_serial_once(tmp_path):
+    noon = datetime(2023, 11, 14, 12, 0).timestamp()
+    previous = module.guard
+    module.guard = Guard(clock=lambda: noon, path=tmp_path / "guard.json")
+    link = _OkLink()
+    module.device.attach(link)
+    try:
+        async def scenario():
+            transport = httpx.ASGITransport(app=module.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+                prepared = await client.post("/api/skill/prepare-send", json={"skill": ""})
+                assert prepared.status_code == 200 and prepared.json()["allowed"] is True
+                first = await client.post("/api/key", json={"text": "enter"})
+                assert first.status_code == 200, first.text
+                second = await client.post("/api/key", json={"text": "enter"})
+                assert second.status_code == 409
+
+        asyncio.run(scenario())
+        assert len([line for line in link.written if b"key enter" in line]) == 1
+        assert len(module.guard.sends) == 1
+    finally:
+        module.device.close()
+        module.guard = previous
+
+
+def test_stopped_type_returns_409_not_500():
+    link = _HoldFirstType()
+    module.device.attach(link)
+    try:
+        async def scenario():
+            transport = httpx.ASGITransport(app=module.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+                typing = asyncio.create_task(client.post("/api/type", json={"text": "x" * 1000}))
+                await asyncio.wait_for(link.first.wait(), 1)
+                stopped = await client.post("/api/agent/stop", json={})
+                assert stopped.status_code == 200
+                result = await typing
+                assert result.status_code == 409
+                assert "紧急停止" in result.json()["detail"]
+
+        asyncio.run(scenario())
+        assert len([line for line in link.written if b" type " in line]) == 1
+    finally:
+        module.device.close()
+
+
+def test_stop_during_calibration_does_not_keep_moving():
+    class HoldSettled:
+        live = True
+        frame = b"frame"
+        updated = 0.0
+
+        def __init__(self):
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def settled(self, **_kwargs):
+            self.entered.set()
+            await self.release.wait()
+
+        async def fresh(self, *_args, **_kwargs):
+            return None
+
+    screen = HoldSettled()
+    saved = module.phone.screen
+    module.phone.screen = screen
+    link = _OkLink()
+    module.device.attach(link)
+    try:
+        async def scenario():
+            transport = httpx.ASGITransport(app=module.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+                job = asyncio.create_task(client.post("/api/calibrate/start", json={}))
+                await asyncio.wait_for(screen.entered.wait(), 1)
+                stopped = await client.post("/api/agent/stop", json={})
+                assert stopped.status_code == 200
+                screen.release.set()
+                result = await job
+                assert result.status_code == 409
+
+        asyncio.run(scenario())
+        text = b"".join(link.written).decode()
+        assert "move 12" not in text and "move -12" not in text and "move 200 200" not in text
+    finally:
+        module.phone.screen = saved
+        module.device.close()
+
+
 def _not_unsupported(call):
     try:
         return call()

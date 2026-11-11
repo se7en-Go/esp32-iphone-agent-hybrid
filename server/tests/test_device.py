@@ -11,6 +11,7 @@ from hidagent.device import (
     SerialLink,
     open_serial,
     port_is_ch343,
+    supervise_maintain,
     wait_for_ping,
 )
 from hidagent.messages import NO_PORT
@@ -255,6 +256,65 @@ def test_stop_aborts_remaining_type_chunks_when_tripped_mid_ack(tmp_path):
         with pytest.raises(DeviceError):
             await device.send("type more")
         assert len(link.written) == before
+
+    asyncio.run(scenario())
+
+
+class _NetinfoLink:
+    def __init__(self):
+        self.written: list[bytes] = []
+        self.replies: asyncio.Queue[bytes] = asyncio.Queue()
+        self.first = asyncio.Event()
+        self.second = asyncio.Event()
+        self.netinfos = 0
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.written.append(data)
+        text = data.decode()
+        req = text.split()[0]
+        if "netinfo" in text:
+            self.netinfos += 1
+            if self.netinfos == 1:
+                self.first.set()
+                return
+            self.second.set()
+            body = '{"ip":"10.0.0.2","vtok":"abcd"}'
+            self.replies.put_nowait(f"{req} {body}\n".encode())
+            return
+        self.replies.put_nowait(f"{req} ok\n".encode())
+
+    async def readline(self) -> bytes:
+        return await self.replies.get()
+
+    def close(self) -> None:
+        self.closed = True
+        self.replies.put_nowait(b"")
+
+    def is_open(self) -> bool:
+        return not self.closed
+
+
+def test_stop_during_netinfo_leaves_maintain_alive_and_it_reconnects():
+    async def scenario():
+        device = Device()
+        link = _NetinfoLink()
+        device.attach(link)
+        supervisor = asyncio.create_task(supervise_maintain(device))
+        await asyncio.wait_for(link.first.wait(), 1)
+        device.request_abort()
+        await asyncio.sleep(0)
+        await device.send("release")
+        await device.send("home")
+        device.clear_abort()
+        assert device.maintain_task is not None and not device.maintain_task.done()
+        await asyncio.wait_for(link.second.wait(), 1)
+        assert not device.maintain_task.done()
+        assert not supervisor.done()
+        device._closing = True
+        supervisor.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await supervisor
 
     asyncio.run(scenario())
 

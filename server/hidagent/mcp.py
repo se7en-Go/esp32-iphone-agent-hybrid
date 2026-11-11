@@ -183,7 +183,8 @@ def create_server(url: str | None = None):
     def skill_prepare_send(skill: str = "") -> dict:
         """Call BEFORE the send key or send button. Enforces quiet hours and the rate limit.
 
-        allowed=false means do not send. This does not count a send.
+        allowed=false means do not send. A reservation counts once; the following Enter
+        uses it and does not count a second time. It expires if Enter is not pressed soon.
         """
         with IPhoneClient(url) as client:
             return client.skill_prepare(skill)

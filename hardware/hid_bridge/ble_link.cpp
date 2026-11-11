@@ -17,6 +17,7 @@
 #include "cli_link.h"
 #include "src/cli/cli_proto.h"
 #include "src/ble/pair_window.h"
+#include "src/ble/ingress.h"
 #include "logbuf.h"
 
 static_assert(MYNEWT_VAL(MSYS_1_BLOCK_COUNT) == 64 && MYNEWT_VAL(MSYS_1_BLOCK_SIZE) == 320,
@@ -199,12 +200,15 @@ class CharCb : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &ci) override {
     const NimBLEAttValue &raw = c->getValue();
     if (c == cliIn || c == cliInNR) {
-      if (!ci.isEncrypted()) return;  // an unpaired client must not reach command dispatch
+      // Upstream Handsy CLI seals PAIR/HELLO/DATA itself and does not make an OS bond.
+      // cli_on_frame ignores anything that does not open that session, so this is not
+      // an unauthenticated command path. HID and net writes stay below.
+      if (!ble_write_reaches_handler(1, ci.isEncrypted() ? 1 : 0)) return;
       cli_on_frame(slotFor(ci.getConnHandle()), raw.data(), raw.length());
       return;
     }
     String v(raw.c_str(), raw.length());
-    if (!ci.isEncrypted()) return;
+    if (!ble_write_reaches_handler(0, ci.isEncrypted() ? 1 : 0)) return;
     if (c == netChar) { net_request(v); return; }
     v.trim();
     if (appWorks(v)) appSeenMs = millis() | 1;

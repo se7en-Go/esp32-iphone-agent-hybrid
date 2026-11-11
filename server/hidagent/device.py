@@ -142,7 +142,9 @@ class Device:
         self.last_error = ""
         self._abort = False
         self._abort_epoch = 0
-        self._inflight: asyncio.Task | None = None
+        self._closing = False
+        self._exchanges: set[asyncio.Task] = set()
+        self.maintain_task: asyncio.Task | None = None
 
     @property
     def connected(self) -> bool:
@@ -209,12 +211,12 @@ class Device:
         return self._abort_epoch
 
     def request_abort(self) -> None:
-        """紧急停止。正在等应答的那一条会被取消，锁马上让出来，后面的 HID 不再写。"""
+        """紧急停止。只打断正在等应答的那一次交换，不取消维护任务本身。"""
         self._abort = True
         self._abort_epoch += 1
-        task = self._inflight
-        if task is not None and task is not asyncio.current_task() and not task.done():
-            task.cancel()
+        for task in list(self._exchanges):
+            if task is not asyncio.current_task() and not task.done():
+                task.cancel()
 
     def clear_abort(self) -> None:
         self._abort = False
@@ -225,35 +227,30 @@ class Device:
         timeout = self._timeout(command)
         name = command.split(" ", 1)[0]
         async with self._lock:
-            self._inflight = asyncio.current_task()
+            # 停止和熔断都在写串口之前、锁里面再查一次。查完到 write 之间没有 await。
+            if self._abort and name not in {"release", "home"}:
+                raise DeviceError("已紧急停止，后面的内容没有发出。")
+            gate = getattr(self, "gate", None)
+            if gate is not None:
+                gate(command)
+            link = self._link
+            if link is None or not link.is_open():
+                raise DeviceError(messages.BOARD_NOT_CONNECTED)
+            req_id = self._request_id(command)
             try:
-                # 停止和熔断都在写串口之前、锁里面再查一次。查完到 write 之间没有 await。
-                if self._abort and name not in {"release", "home"}:
-                    raise DeviceError("已紧急停止，后面的内容没有发出。")
-                gate = getattr(self, "gate", None)
-                if gate is not None:
-                    gate(command)
-                link = self._link
-                if link is None or not link.is_open():
-                    raise DeviceError(messages.BOARD_NOT_CONNECTED)
-                req_id = self._request_id(command)
-                try:
-                    link.write(f"{req_id} {command}\n".encode())
-                    reply = await self._read_reply(link, req_id, timeout)
-                except asyncio.CancelledError:
-                    if not self._abort:
-                        link.close()
-                        if self._link is link:
-                            self._link = None
-                    raise
-                except (OSError, asyncio.TimeoutError) as exc:
+                link.write(f"{req_id} {command}\n".encode())
+                reply = await self._read_reply(link, req_id, timeout)
+            except asyncio.CancelledError:
+                if not self._abort:
                     link.close()
                     if self._link is link:
                         self._link = None
-                    raise DeviceError(messages.link_lost(command)) from exc
-            finally:
-                if self._inflight is asyncio.current_task():
-                    self._inflight = None
+                raise
+            except (OSError, asyncio.TimeoutError) as exc:
+                link.close()
+                if self._link is link:
+                    self._link = None
+                raise DeviceError(messages.link_lost(command)) from exc
         self._beat = time.time()
         if command.split(" ", 1)[0] in HID_COMMANDS:
             self._last = self._beat
@@ -262,11 +259,26 @@ class Device:
             log.debug("%s -> %s", name, reply[:80])
         return reply
 
+    async def _await_exchange(self, command: str) -> str:
+        """在子任务里等应答。紧急停止只取消这次交换，调用方（包括维护循环）还在。"""
+        task = asyncio.create_task(self.exchange(command), name=f"exchange-{command.split(' ', 1)[0]}")
+        self._exchanges.add(task)
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        finally:
+            self._exchanges.discard(task)
+        if task.cancelled():
+            raise DeviceError("已紧急停止，后面的内容没有发出。")
+        return task.result()
+
     async def query(self, command: str) -> str:
-        return await self.exchange(command)
+        return await self._await_exchange(command)
 
     async def send(self, command: str) -> None:
-        reply = await self.exchange(command)
+        reply = await self._await_exchange(command)
         if reply != "ok":
             raise DeviceError(messages.explain_reply(command, reply))
 
@@ -322,20 +334,42 @@ class Device:
         log.info("board serial ready on %s", name)
 
     async def maintain(self) -> None:
-        """掉线就重连，连上就刷新 IP 和 vtok。密码不留下。"""
-        while True:
+        """掉线就重连，连上就刷新 IP 和 vtok。密码不留下。紧急停止不会结束这个循环。"""
+        while not self._closing:
             try:
+                if self._abort:
+                    await asyncio.sleep(0.05)
+                    continue
                 if not self.connected:
                     await self.connect()
                 await self.refresh_netinfo()
                 self.last_error = ""
+            except asyncio.CancelledError:
+                raise
             except DeviceError as exc:
                 self.last_error = str(exc)
                 log.info("%s", exc)
             except Exception as exc:
                 self.last_error = messages.BOARD_NOT_CONNECTED
                 log.warning("board maintain: %s", type(exc).__name__)
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.05 if self._abort else 2)
+
+
+async def supervise_maintain(device: Device) -> None:
+    """维护任务如果自己退出，再拉起来。关机时 _closing 为真，不再重启。"""
+    while not device._closing:
+        task = asyncio.create_task(device.maintain())
+        device.maintain_task = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            if device._closing:
+                raise
+        except Exception:
+            log.warning("maintain exited", exc_info=True)
+        if device._closing:
+            return
+        await asyncio.sleep(0.05)
 
     async def wait_connected(self, timeout: float) -> bool:
         deadline = time.time() + timeout

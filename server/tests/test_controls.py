@@ -10,7 +10,7 @@ from PIL import Image
 
 from hidagent.app import ControlAction
 from hidagent.control import Controls
-from hidagent.phone import Phone
+from hidagent.phone import TYPE_LIMIT, Phone
 
 
 def jpeg(color="white"):
@@ -43,7 +43,7 @@ def test_long_ascii_is_split_under_the_firmware_line_limit(tmp_path):
     sent = []
 
     async def send(command):
-        assert len(command) <= 480 + len("type ")
+        assert len(command) <= TYPE_LIMIT + len("type ")
         sent.append(command)
 
     phone = Phone(SimpleNamespace(send=send), tmp_path / "calibration.json", None)
@@ -68,6 +68,23 @@ def test_chunk_preserves_space_that_firmware_trim_would_drop(tmp_path):
 
     assert "".join(firmware_typed(command) for command in sent) == text
     assert all(not firmware_typed(command).endswith(" ") for command in sent)
+
+
+def test_all_space_run_is_typed_exactly(tmp_path):
+    text = "x" + " " * 480 + "y"
+    sent = []
+
+    async def send(command):
+        sent.append(command)
+
+    phone = Phone(SimpleNamespace(send=send), tmp_path / "calibration.json", None)
+    asyncio.run(phone.type(text))
+
+    def firmware_typed(command: str) -> str:
+        line = f"7 {command}".strip()
+        return line.split(" ", 2)[2] if line.count(" ") >= 2 else ""
+
+    assert "".join(firmware_typed(command) for command in sent) == text
 
 
 def test_pixel_coordinates_return_evidence_and_single_use_token():

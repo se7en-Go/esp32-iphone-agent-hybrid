@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from .agent import Agent
 from .control import Controls
 from .debug import Trace
-from .device import Device, DeviceError
+from .device import Device, DeviceError, supervise_maintain
 from .guard import Guard, limits_for, skill_file
 from .layouts import list_layouts, resolve_point
 from .llm import LLM
@@ -54,7 +54,8 @@ guard = Guard(path=DATA_DIR / "guard.json")
 @asynccontextmanager
 async def lifespan(_):
     # 测试会把 device / screen 换成假对象。缺方法时就跳过，避免导入即连串口。
-    maintain = asyncio.create_task(device.maintain()) if hasattr(device, "maintain") else None
+    device._closing = False
+    maintain = asyncio.create_task(supervise_maintain(device)) if hasattr(device, "maintain") else None
     if hasattr(screen, "bind"):
         screen.bind(device)
     if hasattr(screen, "start"):
@@ -63,6 +64,7 @@ async def lifespan(_):
     try:
         yield
     finally:
+        device._closing = True
         if awake:
             awake.cancel()
         if maintain:
@@ -104,7 +106,7 @@ def _hid_gate(command: str) -> None:
             f"熔断还在（{guard.reason or '风险提示'}）。这一条 HID 没有发出。"
         )
     if is_enter_key(command):
-        decision = guard.prepare_send("")
+        decision = guard.consume_reservation("")
         if not decision["allowed"]:
             raise DeviceError(decision["reason"])
 
@@ -237,6 +239,8 @@ async def act(action):
         async with manual_lock:
             controls.invalidate()
             await action()
+    except asyncio.CancelledError as e:
+        raise HTTPException(409, "已紧急停止，这一次没有做完。") from e
     except (DeviceError, RuntimeError) as e:
         raise HTTPException(409, for_user(str(e))) from e
     return {"ok": True}
@@ -470,6 +474,8 @@ async def calibrate_start():
         async with manual_lock:
             controls.invalidate()
             return {"ok": True, "auto": await phone.start_calibration(), "span": phone.span}
+    except asyncio.CancelledError as e:
+        raise HTTPException(409, "已紧急停止，校准没有继续。") from e
     except (DeviceError, RuntimeError) as e:
         raise HTTPException(409, for_user(str(e))) from e
 

@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import struct
 import threading
 from fractions import Fraction
 
@@ -11,9 +12,11 @@ from PIL import Image
 
 from hidagent.video7201 import (
     CONFIG,
+    START,
     H264Decoder,
     LatestFrameGate,
     RecordBuffer,
+    hello_line,
     keepalive,
     pack_access_unit,
     run_tcp,
@@ -250,7 +253,11 @@ def test_keepalive_ack_is_not_a_frozen_screen():
     assert stream_is_dead(12.5, last_frame=0, last_ack=0) is True
 
 
-def test_reconnect_hello_can_carry_the_firmware_timestamp():
+def test_reconnect_uses_plain_hello_and_a_fresh_decoder():
+    """断线后不发 hello … at。新连接用新解码器，等板子重发 CONFIG/IDR。"""
+    assert hello_line(TOKEN) == f"hello {TOKEN}\n".encode()
+    assert b" at " not in hello_line(TOKEN)
+
     async def scenario():
         seen: dict[str, bytes] = {}
 
@@ -273,11 +280,38 @@ def test_reconnect_hello_can_carry_the_firmware_timestamp():
 
         try:
             await asyncio.wait_for(asyncio.to_thread(
-                run_tcp, "127.0.0.1", port, TOKEN, lambda _blob: None, stop,
-                resume_ts=1234, on_ready=on_ready), 10)
+                run_tcp, "127.0.0.1", port, TOKEN, lambda _blob: None, stop, on_ready=on_ready), 10)
         finally:
             server.close()
             await server.wait_closed()
-        assert seen["hello"] == f"hello {TOKEN} at 1234\n".encode()
+        assert seen["hello"] == f"hello {TOKEN}\n".encode()
 
     asyncio.run(scenario())
+
+
+def test_partial_access_unit_does_not_publish_a_resume_timestamp():
+    decoder = H264Decoder()
+    chunk = struct.pack("<HBI", 1, START, 2000) + b"\x00\x00\x00\x01\x09"
+    assert decoder.push_chunk(chunk) == []
+    assert getattr(decoder, "last_ts", None) is None
+
+
+def test_screen_reconnect_after_a_timestamp_stays_on_plain_hello(monkeypatch):
+    from hidagent.screen import Screen
+
+    screen = Screen("10.0.0.8", TOKEN)
+    seen: list[dict] = []
+
+    def fake(_host, _port, _token, _on_jpeg, stop, **kwargs):
+        seen.append(kwargs)
+        hook = getattr(screen, "_on_timestamp", None)
+        if hook:
+            hook(2000)
+        stop.set()
+        if len(seen) >= 2:
+            screen._stopping = True
+
+    monkeypatch.setattr("hidagent.screen.video7201.run_tcp", fake)
+    screen._supervise()
+    assert len(seen) >= 2
+    assert all(call.get("resume_ts") in (None,) for call in seen)

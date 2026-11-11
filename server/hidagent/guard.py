@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import secrets
 import threading
 import time
 from datetime import datetime
@@ -20,6 +21,7 @@ from .paths import skill_roots
 STOP_PHRASES = ("操作频繁", "风控", "验证码")
 FLOOR_INTERVAL = 3.0
 CEILING_PER_HOUR = 30
+RESERVATION_TTL = 30.0
 
 
 def _frontmatter(text: str) -> dict[str, str]:
@@ -98,6 +100,7 @@ class Guard:
         self.reason = ""
         self.sends: list[float] = []
         self._pending = 0
+        self._reservation: tuple[str, float] | None = None
         self._lock = threading.Lock()
         self._load()
 
@@ -212,13 +215,61 @@ class Guard:
             }
         return None
 
+    def _drop_expired_reservation(self) -> None:
+        if self._reservation is None:
+            return
+        _token, stamp = self._reservation
+        if self._clock() - stamp > RESERVATION_TTL:
+            self._reservation = None
+
     def prepare_send(self, skill: str = "") -> dict:
-        """发送动作之前占一个名额。两个请求同时进来也只能过一个。"""
+        """占一个一次性名额。紧接着的 Enter 用掉它，不再记第二次。"""
         with self._lock:
+            self._drop_expired_reservation()
+            if self._reservation is not None:
+                return {
+                    "stop": False, "counted": False, "allowed": False,
+                    "reason": "这一次已经占过名额，直接按发送键。",
+                }
             blocked = self._rate_block(skill)
             if blocked:
                 return blocked
-            self.sends.append(self._clock())
+            now = self._clock()
+            token = secrets.token_hex(8)
+            self.sends.append(now)
+            self._reservation = (token, now)
+            self._pending += 1
+            self._save()
+            return {
+                "stop": False, "counted": False, "allowed": True,
+                "reason": "", "reservation": token,
+            }
+
+    def consume_reservation(self, skill: str = "") -> dict:
+        """Enter：有未过期的 prepare 就用掉，没有就自己占一个名额。一次发送只计一次。"""
+        with self._lock:
+            if self.tripped:
+                return {
+                    "stop": True, "counted": False, "allowed": False,
+                    "reason": f"熔断还在（{self.reason}）。不要重试。",
+                }
+            limits = limits_for(skill)
+            now = self._clock()
+            if limits["quiet"] and in_quiet(
+                datetime.fromtimestamp(now), limits["quiet_start"], limits["quiet_end"]
+            ):
+                return {
+                    "stop": False, "counted": False, "allowed": False,
+                    "reason": "现在是静默时段，这一次不发送。",
+                }
+            self._drop_expired_reservation()
+            if self._reservation is not None:
+                self._reservation = None
+                return {"stop": False, "counted": False, "allowed": True, "reason": ""}
+            blocked = self._rate_block(skill)
+            if blocked:
+                return blocked
+            self.sends.append(now)
             self._pending += 1
             self._save()
             return {"stop": False, "counted": False, "allowed": True, "reason": ""}
