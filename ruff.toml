@@ -1,0 +1,12 @@
+# 仓库根目录的检查范围和 server/pyproject.toml 一致。
+# 固件 C/C++ 不在这里。scripts 里为了先改 sys.path 再导入，保留 E402 的 noqa。
+line-length = 120
+target-version = "py310"
+extend-exclude = ["hardware/hid_bridge", "hardware/build", "hardware/dist", "server/.venv"]
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E701", "UP036"]
+
+[lint.per-file-ignores]
+"hardware/tests/**" = ["E501", "E702"]

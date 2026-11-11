@@ -115,10 +115,10 @@ def test_direct_action_and_agent_start_cannot_interleave(api, monkeypatch):
             pending = asyncio.create_task(client.post("/api/tap", json={"x": .5, "y": .4}))
             await entered.wait()
             for path, body in [("/api/key", {"text": "enter"}), ("/api/agent", {"text": "Open Clock"}),
-                               ("/api/calibrate/start", None), ("/api/calibrate/finish", {"x": .5, "y": .4})]:
+                               ("/api/calibrate/start", {}), ("/api/calibrate/finish", {"x": .5, "y": .4})]:
                 assert (await client.post(path, json=body)).status_code == 409
             assert not calls
-            assert (await client.post("/api/agent/stop")).status_code == 200
+            assert (await client.post("/api/agent/stop", json={})).status_code == 200
             release.set()
             assert (await pending).status_code == 200
             assert (await client.post("/api/agent", json={"text": "Open Clock"})).status_code == 200

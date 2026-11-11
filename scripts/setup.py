@@ -18,7 +18,10 @@ def create_venv() -> Path:
         return python
     VENV.parent.mkdir(parents=True, exist_ok=True)
     if shutil.which("uv"):
-        result = subprocess.call(["uv", "venv", "--python", "3.12", str(VENV)])
+        # --seed 装上 pip。没有 pip 的 uv venv 会让后面的 pip 回退失败。
+        result = subprocess.call(["uv", "venv", "--seed", "--python", "3.12", str(VENV)])
+        if result != 0:
+            result = subprocess.call(["uv", "venv", "--python", "3.12", str(VENV)])
         if result == 0 and venv_python().is_file():
             return venv_python()
         print("uv 没能建好环境，改用当前的 Python。")
@@ -40,7 +43,12 @@ def install(python: Path, dev: bool) -> None:
         command = ["uv", "pip", "install", "--python", str(python), "-e", extras]
         if subprocess.call(command, cwd=SERVER) == 0:
             return
-        print("uv pip 失败了，改用这个环境里的 pip。")
+        print("uv pip 失败了。如果这个环境里没有 pip，就改用标准 venv。")
+    probe = subprocess.call([str(python), "-m", "pip", "--version"])
+    if probe != 0:
+        shutil.rmtree(VENV, ignore_errors=True)
+        subprocess.check_call([sys.executable, "-m", "venv", str(VENV)])
+        python = venv_python()
     subprocess.check_call([str(python), "-m", "pip", "install", "-U", "pip"])
     subprocess.check_call([str(python), "-m", "pip", "install", "-e", extras], cwd=SERVER)
 
@@ -54,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     print("Python 环境好了。")
     print("下一步：把 CI 产物 esp32s3-n16r8-merged.bin 放到 hardware/dist/ ，COM 口接电脑，然后刷机。")
     if sys.platform == "win32":
-        print("刷机：powershell -File hardware\\flash.ps1")
+        print("刷机：powershell -ExecutionPolicy Bypass -File hardware\\flash.ps1")
     else:
         print("刷机：./hardware/flash.sh")
     return 0

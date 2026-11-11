@@ -10,7 +10,7 @@
 
 // GOP since the latest IDR. A still screen gets an IDR only every few minutes (iOS 26: maybe once per mirroring
 // session), so room for ~27 min of AUs at 5 fps (P-frames of a still screen are tiny). When it fills, it freezes
-// (gop.h): a stream that is in step goes on from the tail below, everyone else needs the next IDR (status fz).
+// (gop.h): a stream goes on from the tail below. A new decoder can replay both while the tail is complete.
 #ifndef GOP_CAP_KB
 #define GOP_CAP_KB 4096  // flash.sh --small-gop: 256, to test a frozen GOP within minutes
 #endif
@@ -169,16 +169,24 @@ static void unfollow(Sink &s, char why) {
   s.resumed = false;
 }
 
-// Snapshot of the GOP state: generation, AU count, SPS/PPS. A frozen GOP counts as none (it may end minutes
-// ago), except for a stream that goes on from the tail.
-static bool snapshot(uint32_t *gen, int *n, uint8_t *cfg, size_t *cfg_len, uint32_t *cfg_ts, const Sink *following) {
+// Snapshot of the GOP state: generation, AU count, SPS/PPS. A new decoder may replay a frozen GOP only
+// while its entire tail is still present. Join the tail under the same lock so trimming during replay
+// marks the sink out of step instead of silently skipping reference frames.
+static bool snapshot(uint32_t *gen, int *n, uint8_t *cfg, size_t *cfg_len, uint32_t *cfg_ts, Sink *following) {
   xSemaphoreTake(lock, portMAX_DELAY);
   *gen = gop.gen;
-  if (gop.frozen && !(following && tailLive && following->onTail && following->followGen == gop.gen)) {
-    *n = 0;
-    *cfg_len = 0;
-    xSemaphoreGive(lock);
-    return false;
+  if (gop.frozen) {
+    bool inStep = following && following->onTail && following->followGen == gop.gen;
+    if (!(following && tailLive && (inStep || !tailTrimmed))) {
+      *n = 0;
+      *cfg_len = 0;
+      xSemaphoreGive(lock);
+      return false;
+    }
+    if (!inStep) {
+      following->onTail = true;
+      following->tailNext = 0;
+    }
   }
   *n = gop.wait_idr ? 0 : gop.n;
   *cfg_len = gop.cfg_len;
@@ -358,6 +366,13 @@ void video_on_au(const uint8_t *au, size_t len, bool idr) {
   }
   xSemaphoreTake(lock, portMAX_DELAY);
   bool wasFrozen = gop.frozen, wasLive = tailLive;
+  if (idr) {
+    // The tail belongs to the previous GOP; never append its P frames after a new IDR.
+    gop_clear(&tail);
+    tailLive = tailTrimmed = false;
+    sink.onTail = false;
+    sink.tailNext = 0;
+  }
   gop_push(&gop, au, len, idr, now);
   bool froze = gop.frozen && !wasFrozen;
   if (froze) {  // the tail runs for everyone: an app that reconnects goes on from it (resume)

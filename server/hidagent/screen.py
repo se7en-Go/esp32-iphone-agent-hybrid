@@ -82,7 +82,7 @@ class Screen:
                 video7201.run_tcp(
                     host, self.port, token, self._on_jpeg, self._stop,
                     quality=self.quality, max_fps=max(1, self.fps),
-                    on_ready=self._on_ready, sockets=self._sockets,
+                    on_ready=self._on_ready, on_stall=self._on_stall, sockets=self._sockets,
                 )
                 self.last_error = "7201 连接结束了，正在重连。"
             except Exception as exc:
@@ -96,9 +96,14 @@ class Screen:
         self._session_ok = True
         self.last_error = ""
 
+    def _on_stall(self) -> None:
+        self.last_error = "画面停住了。请在控制中心重新选一次「屏幕镜像 → ESP32 Agent」。板子可能还留着旧缓冲。"
+
     def _on_jpeg(self, jpeg: bytes) -> None:
         self.frame = jpeg
         self.updated = time.time()
+        if self.last_error.startswith("画面停住了"):
+            self.last_error = ""
 
     @property
     def live(self) -> bool:

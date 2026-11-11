@@ -29,6 +29,8 @@ int ble_peers();         // connected centrals
 
 // For cli_link.cpp (slot = the peer's connection slot).
 bool ble_pair_window_open();
+void ble_allow_pairing(uint32_t window_ms);  // serial only; default boot state is closed
+void ble_deny_pairing();
 uint16_t ble_cli_mtu(int slot);
 bool ble_cli_subscribed(int slot);
 bool ble_cli_notify(int slot, const uint8_t *p, size_t n, bool video, uint32_t timeout_ms);

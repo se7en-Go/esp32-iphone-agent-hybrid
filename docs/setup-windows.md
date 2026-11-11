@@ -13,11 +13,11 @@
 
 在仓库根目录打开 PowerShell：
 
-1. `powershell -File scripts\setup.ps1`
-2. 从 GitHub Actions 的 Firmware 作业下载 `esp32s3-n16r8-merged.bin`，放到 `hardware\dist\`。COM 口接好后运行 `powershell -File hardware\flash.ps1`。第一次会写完整的 16MB 镜像，请等到脚本自己说刷好了。
-3. `powershell -File scripts\wifi.ps1 --ssid "你家的2.4GHz"`，按提示输入密码。
-4. USB 口接 iPhone。控制中心 → 屏幕镜像 → **ESP32 Agent**。`powershell -File scripts\run-server.ps1`，浏览器打开 `http://127.0.0.1:8890`。三个灯都绿再校准。
-5. `powershell -File scripts\mcp-config.ps1`，把片段放进 Agent。
+1. `powershell -ExecutionPolicy Bypass -File scripts\setup.ps1`
+2. 从 GitHub Actions 的 Firmware 作业下载 `esp32s3-n16r8-merged.bin`，放到 `hardware\dist\`。COM 口接好后运行 `powershell -ExecutionPolicy Bypass -File hardware\flash.ps1`。第一次会写完整的 16MB 镜像，请等到脚本自己说刷好了。
+3. `powershell -ExecutionPolicy Bypass -File scripts\wifi.ps1 --ssid "你家的2.4GHz"`，按提示输入密码。
+4. USB 口接 iPhone。控制中心 → 屏幕镜像 → **ESP32 Agent**。`powershell -ExecutionPolicy Bypass -File scripts\run-server.ps1`，浏览器打开 `http://127.0.0.1:8890`。先等 device 和 screen 两盏灯变绿，再点校准。
+5. `powershell -ExecutionPolicy Bypass -File scripts\mcp-config.ps1`，把片段放进 Agent。
 
 服务只监听本机 8890，一般不用为它开入站防火墙。若 Windows 询问 Python 能否访问网络，允许专用网络的出站即可，那是电脑去连板子的 7201。
 

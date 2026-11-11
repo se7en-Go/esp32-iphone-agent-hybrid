@@ -20,7 +20,7 @@ import time
 
 import av
 
-START, END, AUDIO = 1, 2, 0x80
+START, END, IDR, CONFIG, AUDIO = 1, 2, 4, 8, 0x80
 PAYLOAD = 1380
 
 
@@ -78,6 +78,34 @@ def pack_access_unit(au: bytes, seq: int, timestamp: int, *, idr: bool = False,
     return bytes(out), seq
 
 
+def _parameter_sets_only(au: bytes) -> bool:
+    """只有 SPS/PPS/SEI/AUD，没有 VCL 图像。"""
+    saw_vcl = False
+    index = 0
+    while index < len(au):
+        four = au.find(b"\x00\x00\x00\x01", index)
+        three = au.find(b"\x00\x00\x01", index)
+        if four < 0 and three < 0:
+            break
+        if three >= 0 and (four < 0 or three < four):
+            start, mark = three, 3
+        else:
+            start, mark = four, 4
+        header_at = start + mark
+        if header_at >= len(au):
+            break
+        nal_type = au[header_at] & 0x1F
+        if nal_type in (1, 5):
+            saw_vcl = True
+        index = header_at + 1
+    return not saw_vcl and bool(au)
+
+
+def stream_is_dead(now: float, last_frame: float, last_ack: float, limit: float = 12.0) -> bool:
+    """静屏可以很久没有新帧，只要 keepalive 的应答还在，就不是断流。"""
+    return now - last_frame > limit and now - last_ack > limit
+
+
 def keepalive() -> bytes:
     return b"\x00\x00"
 
@@ -89,12 +117,15 @@ class H264Decoder:
         self._codec = None
         self._expect: int | None = None
         self._cur: bytearray | None = None
+        self._config = b""
         self.reset()
 
     def reset(self) -> None:
+        config = self._config
         self._codec = av.CodecContext.create("h264", "r")
         self._expect = None
         self._cur = None
+        self._config = config
 
     def push_chunk(self, chunk: bytes) -> list:
         if len(chunk) < 3:
@@ -119,14 +150,42 @@ class H264Decoder:
             return []
         au = bytes(self._cur)
         self._cur = None
-        frames = []
+        # 固件把 SPS/PPS 单独打成 CONFIG，不是一张图。解失败也不能 reset，否则后面的 IDR 没有参数集。
+        if flags & CONFIG or _parameter_sets_only(au):
+            if au:
+                self._config = au
+            return []
+        if (flags & IDR) and self._config:
+            au = self._config + au
         try:
-            for packet in self._codec.parse(au):
-                frames.extend(self._codec.decode(packet))
-        except av.AVError:
+            # 完整访问单元直接当一个 packet。parse() 会扣住最后一帧，静止画面就一直不出来。
+            return list(self._codec.decode(av.Packet(au)))
+        except av.error.FFmpegError:
             self.reset()
             return []
-        return frames
+
+
+class LatestFrameGate:
+    """帧率上限留最新的一帧，不把还没发出去的新帧丢掉。"""
+
+    def __init__(self, max_fps: int):
+        self.gap = 1 / max_fps if max_fps else 0
+        self.last = None
+        self.pending = None
+
+    def push(self, frame, now: float):
+        self.pending = frame
+        return self.flush(now)
+
+    def flush(self, now: float):
+        if self.pending is None:
+            return None
+        if self.gap and self.last is not None and now - self.last < self.gap:
+            return None
+        ready = self.pending
+        self.pending = None
+        self.last = now
+        return ready
 
 
 def frame_to_jpeg(frame, quality: int = 75) -> bytes:
@@ -136,36 +195,62 @@ def frame_to_jpeg(frame, quality: int = 75) -> bytes:
     return buf.getvalue()
 
 
+def hello_line(token: str) -> bytes:
+    """每次重连都是新解码器，只发普通 hello。板子会从 CONFIG/IDR 重新给，不走 `at <ts>` 续传。"""
+    return f"hello {token}\n".encode("ascii")
+
+
 def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
             quality: int = 75, max_fps: int = 8, connect_timeout: float = 5,
-            on_ready=None, sockets: list | None = None) -> None:
-    """阻塞读取一路 7201，直到 stop 或对端断开。on_jpeg(jpeg_bytes) 在解码线程里调用。"""
+            on_ready=None, on_stall=None, sockets: list | None = None) -> None:
+    """阻塞读取一路 7201，直到 stop 或对端断开。on_jpeg(jpeg_bytes) 在解码线程里调用。
+
+    每次连接都新建解码器。静屏时板子可能不再推新帧，但 hello/ka 的零长度应答还在。
+    只有帧和应答都停了约 12 秒才调用 on_stall。序号断了就发 resync，让板子从 IDR 重来。
+    """
     sock = socket.create_connection((host, int(port)), timeout=connect_timeout)
     if sockets is not None:
         sockets.append(sock)
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.settimeout(0.5)
-        sock.sendall(f"hello {token}\n".encode("ascii"))
+        sock.sendall(hello_line(token))
         decoder = H264Decoder()
         records = RecordBuffer()
+        gate = LatestFrameGate(max_fps)
         authed = False
+        stalled = False
         last_ka = time.monotonic()
-        last_jpeg = 0.0
-        gap = 1 / max_fps if max_fps else 0
-        while not stop.is_set():
-            now = time.monotonic()
+        last_frame = time.monotonic()
+        last_ack = time.monotonic()
+
+        def send_keepalive(now: float) -> None:
+            nonlocal last_ka
             if authed and now - last_ka >= 1:
                 sock.sendall(b"ka\n")
                 last_ka = now
+
+        while not stop.is_set():
+            now = time.monotonic()
+            send_keepalive(now)
+            if authed and not stalled and stream_is_dead(now, last_frame, last_ack) and on_stall:
+                stalled = True
+                on_stall()
             try:
                 data = sock.recv(65536)
             except TimeoutError:
+                ready = gate.flush(time.monotonic())
+                if ready is not None:
+                    on_jpeg(frame_to_jpeg(ready, quality))
                 continue
             if not data:
                 raise ConnectionError("7201 closed")
             for record in records.feed(data):
+                # 一个 recv 可能包含整个长 GOP；解码期间也必须保持一秒一次的心跳。
+                send_keepalive(time.monotonic())
                 if record is None:
+                    last_ack = time.monotonic()
+                    stalled = False
                     if not authed:
                         authed = True
                         if on_ready:
@@ -184,11 +269,12 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
                     continue
                 if not frames:
                     continue
-                now = time.monotonic()
-                if gap and now - last_jpeg < gap:
-                    continue
-                on_jpeg(frame_to_jpeg(frames[-1], quality))
-                last_jpeg = now
+                last_frame = time.monotonic()
+                stalled = False
+                # 只保留最新的解码帧，真正输出时才做昂贵的 JPEG 转换。
+                ready = gate.push(frames[-1], last_frame)
+                if ready is not None:
+                    on_jpeg(frame_to_jpeg(ready, quality))
     finally:
         try:
             sock.close()

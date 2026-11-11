@@ -180,11 +180,25 @@ def create_server(url: str | None = None):
             return client.skill_check(observed_text, skill)
 
     @mcp.tool()
-    def skill_confirm_send(bubble_visible: bool, observed_text: str = "", skill: str = "") -> dict:
-        """Count a send only when bubble_visible is true because the new bubble is fully on screen.
+    def skill_prepare_send(skill: str = "") -> dict:
+        """Call BEFORE the send key or send button. Enforces quiet hours and the rate limit.
 
-        An empty input or a device ack is not success. This is a technical check, not a draft
-        and not a request for human approval. Rate limits and quiet hours apply here.
+        allowed=false means do not send. Enter or a named send button consumes the reservation
+        within 30 seconds, rechecks rate and quiet hours, and records the actual send time.
+        It counts once; expired reservations still conservatively use the hourly quota.
+        """
+        with IPhoneClient(url) as client:
+            return client.skill_prepare(skill)
+
+    @mcp.tool()
+    def skill_confirm_send(bubble_visible: bool, observed_text: str = "", skill: str = "") -> dict:
+        """Record a send only when the caller sets bubble_visible after seeing the new bubble.
+
+        The server cannot see the bubble. bubble_visible is the caller's claim, not proof.
+        An empty input or a device ack is not success. Confirmation does not charge quota again
+        for a send already consumed by Enter or a named send button. For a send made directly
+        on the phone, confirmation checks rate and quiet hours and consumes a slot.
+        Observed risk text still trips the guard. This is not a draft or a human approval step.
         """
         with IPhoneClient(url) as client:
             return client.skill_confirm(bubble_visible, observed_text, skill)

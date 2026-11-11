@@ -92,6 +92,8 @@ STA 的限制也写清楚：路由器要有 2.4GHz；不能开 AP 隔离或访�
 
 串口速率 115200，只传命令。视频不能走这根线。
 
+蓝牙配对默认关闭。固件不再在每次上电后的 3 分钟里接受没有密码的 Just Works 配对，否则旁边的设备可以读到 Wi-Fi 密码、vtok，并发 HID 或用 vtok 做 OTA。需要实验 BLE / 7202 时，在 COM 口发送 `0 ble pair on`，窗口 60 秒，`0 ble pair off` 可以提前关掉。已经绑定过的设备仍可重连。日常控制不需要这一步。
+
 Kz 的 `Device.send()` 原来要求回复恰好是 `ok`。适配层剥掉 `<id> ` 前缀后再做同样的判断，所以 `phone.py` 不用改命令字符串。`netinfo` 和 `status` 的正文是 JSON，不是 `ok`，走单独的 `query()`，不会被当成 HID 失败。
 
 `0 netinfo` / `0 status` / `0 net ` 在固件里是按整行匹配的快捷分支，所以这三条的 id 固定用 `0`。其它命令用递增 id，避免和启动时的杂散字节对上。
@@ -100,7 +102,7 @@ Kz 的 `Device.send()` 原来要求回复恰好是 `ok`。适配层剥掉 `<id> 
 
 来源：`wifi_video_tcp.cpp`、`wifi_video.h`、`src/video/gop.c` 的 `vchunk_next`。
 
-- 客户端先发一行 `hello <vtok>\n`。token 不对，板子直接断开。也可以 `hello <vtok> at <ts>` 表示解码器已经跟上那个时间戳；我们从 IDR 重新开始，不发 `at`。
+- 客户端先发一行 `hello <vtok>\n`。token 不对，板子直接断开。固件还认 `hello <vtok> at <ts>`（解码器已经跟上那个时间戳，板子只补后面的 P 帧）。我们每次重连都换一个新的解码器，所以只发普通 hello，等板子重发 CONFIG 和 IDR。序号断了再发 `resync`。画面停住时仍提示重新选一次屏幕镜像。
 - 之后每秒一行 `ka`。板子在 `RECV_TIMEOUT_MS`（5 秒）内收不到就拆会话。我们按 1 秒发。
 - 板子下发的记录是 `[u16 LE 长度][chunk]`。长度为 0 的记录是 hello/ka 的应答，不是视频。
 - chunk 是 `[seq u16 LE][flags u8][payload]`。flags：bit0 START、bit1 END、bit2 IDR、bit3 CONFIG、bit4 BENCH、bit5 SNAP、bit6 RESUME、bit7（`WV_AUDIO`）音频。
@@ -134,10 +136,11 @@ Windows 10/11 上的运行时是：官方 Python 3.10+、PowerShell、pip wheel�
 
 核心服务不知道“微信发送键”在业务上是什么，只提供点、滑、打字、拼音、截图。群回复的语气、话题、禁词、时段写在 `skills/wechat-group-reply/SKILL.md`，这是内容约束的唯一地方。
 
-系统熔断在 `hidagent/guard.py`，是协作的：只有 Agent 调用 `skill_check` 或 `skill_confirm_send` 时才生效，点、滑、打字这些底层工具不会自己拦截。微信 skill 不能把它关掉：
+系统熔断在 `hidagent/guard.py`：风险文字仍需 Agent 调用 `skill_check` 或 `skill_confirm_send` 报告；一旦熔断，底层 HID gate 会自动拦截点、滑、打字等操作。紧急 stop 所需的 `release` / `home` 命令保留豁免，用于松开按键和归位指针。微信 skill 不能把它关掉：
 
-- 观察到的文字里出现「操作频繁」「风控」「验证码」：立刻跳闸，之后的发送检查直接拒绝，不自动重试。跳闸写在数据目录的 `guard.json`，重启服务不会清掉；确认手机上的提示已经处理之后，删掉这个文件再启动（这是显式解除，不是给 Agent 的绕过工具）。
+- 观察到的文字里出现「操作频繁」「风控」「验证码」：立刻跳闸，之后的发送检查直接拒绝，不自动重试。跳闸写在数据目录的 `guard.json`，重启服务不会清掉；人工确认手机上的提示已经处理之后，从本机网页显式重置，保留这一小时的发送次数（没有给 Agent 的解除工具）。
 - 频率：默认两次发送至少间隔 8 秒、每小时最多 20 次、23:00–07:00 不发。skill 只能把间隔加大、次数减少，不能低于 3 秒、不能超过每小时 30 次。
+- `prepare` 先占一次性名额；Enter 和命名 `send` 按钮在实际 HID 发送前统一消费并更新发送时间，气泡确认不重复计数。
 - `skill_confirm_send` 只有在 `bubble_visible=true` 时才把这次计为发送成功。输入框清空、收到 `ok`，都不算。服务端看不到气泡的语义，这一位由看着截图的 Agent 填写；工具说明写明不许在没看见完整新气泡时填 true。这是技术校验，不是“停下来等用户批准”。
 
 没有草稿接口，没有确认弹窗。风险写在 README 和 skill 里：用专用运营号，不要用主号；腾讯的条款不允许自动化操作，行为特征（秒回、全天、高频、模板化）仍可能被限制。
@@ -149,7 +152,7 @@ Windows 10/11 上的运行时是：官方 Python 3.10+、PowerShell、pip wheel�
 1. 安装 Python 3.10+（Windows 用 python.org 的安装包，勾选 PATH），运行 `setup`。
 2. COM 口插电脑，运行 `flash`（esptool 写入 CI 打好的 merged.bin）。
 3. 运行 `wifi`，把家里的 2.4GHz 名称和密码经串口写进 NVS。
-4. USB 口经数据线（Lightning 手机要用相机转换器）接 iPhone，打开辅助触控，屏幕镜像选 “ESP32 Agent”。运行 `run-server`，打开 `http://127.0.0.1:8890`，三个灯都绿再校准。
+4. USB 口经数据线（Lightning 手机要用相机转换器）接 iPhone，打开辅助触控，屏幕镜像选 “ESP32 Agent”。运行 `run-server`，打开 `http://127.0.0.1:8890`，先等 device 和 screen 变绿，再校准，第三盏灯随后才绿。
 5. 运行 `mcp-config`，把片段贴进 Agent，让它把指针移到屏幕中央并停住，不要只看 ACK。
 
 每一步失败都走中文错误，带下一步，不把 traceback 甩给用户。网页上 `device` / `screen` / `calibrated` 三个灯常亮，缺一个就显示缺什么、怎么修。

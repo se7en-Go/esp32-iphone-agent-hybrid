@@ -95,3 +95,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "flash help failed" }
           python scripts/wifi_config.py --help
           if ($LASTEXITCODE -ne 0) { throw "wifi help failed" }
+      - name: Windows PowerShell 5.1 runs a script via ExecutionPolicy Bypass
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ge 6) { throw "this step must be Windows PowerShell 5.1, not pwsh" }
+          $bypass = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','scripts\policy-probe.ps1' -Wait -PassThru -NoNewWindow
+          if ($bypass.ExitCode -ne 0) { throw "ExecutionPolicy Bypass could not run scripts\policy-probe.ps1" }
+          $restricted = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Restricted','-File','scripts\policy-probe.ps1' -Wait -PassThru -NoNewWindow
+          if ($restricted.ExitCode -eq 0) {
+            Write-Output "this image ignores ExecutionPolicy Restricted; Bypass itself succeeded"
+          } else {
+            Write-Output "Restricted blocked -File, Bypass allowed it"
+          }

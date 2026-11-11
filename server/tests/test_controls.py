@@ -10,7 +10,7 @@ from PIL import Image
 
 from hidagent.app import ControlAction
 from hidagent.control import Controls
-from hidagent.phone import Phone
+from hidagent.phone import TYPE_LIMIT, Phone
 
 
 def jpeg(color="white"):
@@ -37,6 +37,54 @@ class FakePhone:
     async def tap_verified(self, x, y): self.calls.append(("tap", x, y))
     async def type(self, text): self.calls.append(("type", text))
     async def key(self, text): self.calls.append(("key", text))
+
+
+def test_long_ascii_is_split_under_the_firmware_line_limit(tmp_path):
+    sent = []
+
+    async def send(command):
+        assert len(command) <= TYPE_LIMIT + len("type ")
+        sent.append(command)
+
+    phone = Phone(SimpleNamespace(send=send), tmp_path / "calibration.json", None)
+    asyncio.run(phone.type("x" * 1000))
+    assert len(sent) == 3
+    assert "".join(part.removeprefix("type ") for part in sent) == "x" * 1000
+
+
+def test_chunk_preserves_space_that_firmware_trim_would_drop(tmp_path):
+    text = "x" * 479 + " " + "y" * 21
+    sent = []
+
+    async def send(command):
+        sent.append(command)
+
+    phone = Phone(SimpleNamespace(send=send), tmp_path / "calibration.json", None)
+    asyncio.run(phone.type(text))
+
+    def firmware_typed(command: str) -> str:
+        line = f"7 {command}".strip()
+        return line.split(" ", 2)[2]
+
+    assert "".join(firmware_typed(command) for command in sent) == text
+    assert all(not firmware_typed(command).endswith(" ") for command in sent)
+
+
+def test_all_space_run_is_typed_exactly(tmp_path):
+    text = "x" + " " * 480 + "y"
+    sent = []
+
+    async def send(command):
+        sent.append(command)
+
+    phone = Phone(SimpleNamespace(send=send), tmp_path / "calibration.json", None)
+    asyncio.run(phone.type(text))
+
+    def firmware_typed(command: str) -> str:
+        line = f"7 {command}".strip()
+        return line.split(" ", 2)[2] if line.count(" ") >= 2 else ""
+
+    assert "".join(firmware_typed(command) for command in sent) == text
 
 
 def test_pixel_coordinates_return_evidence_and_single_use_token():
@@ -260,7 +308,7 @@ def test_emergency_stop_cancels_new_action_without_ticket_or_waiting_for_lock(mo
                 "action": "tap", "x": .5, "y": .5, "screen_id": observation["screen_id"]}))
             await entered.wait()
             assert (await client.get("/api/control/observe")).status_code == 409
-            result = await asyncio.wait_for(client.post("/api/agent/stop"), 1)
+            result = await asyncio.wait_for(client.post("/api/agent/stop", json={}), 1)
             assert result.status_code == 200
             assert (await pending).status_code == 409
             assert control.ticket is None

@@ -8,6 +8,10 @@
 from __future__ import annotations
 
 import json
+import math
+import os
+import secrets
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +21,7 @@ from .paths import skill_roots
 STOP_PHRASES = ("操作频繁", "风控", "验证码")
 FLOOR_INTERVAL = 3.0
 CEILING_PER_HOUR = 30
+RESERVATION_TTL = 30.0
 
 
 def _frontmatter(text: str) -> dict[str, str]:
@@ -91,68 +96,118 @@ class Guard:
     def __init__(self, clock=time.time, path: Path | None = None):
         self._clock = clock
         self._path = path
-        self.tripped = False
-        self.reason = ""
-        self.sends: list[float] = []
-        self._load()
+        # 同步路由/串口线程和 asyncio 共用；临界区内绝不能 await。
+        # observe/confirm/save 及最终 HID 写入会嵌套进入，所以必须可重入。
+        self._lock = threading.RLock()
+        with self._lock:
+            self.tripped = False
+            self.reason = ""
+            self.sends: list[float] = []
+            self._pending = 0
+            self._reservation: tuple[str, float] | None = None
+            self._load()
+
+    def _fail_closed(self, reason: str) -> None:
+        self.tripped = True
+        self.reason = reason
+        self.sends = []
 
     def _load(self) -> None:
-        if self._path is None or not self._path.is_file():
-            return
-        try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
-        if not isinstance(data, dict):
-            return
-        self.tripped = bool(data.get("tripped"))
-        self.reason = str(data.get("reason") or "")
+        with self._lock:
+            if self._path is None or not self._path.is_file():
+                return
+            try:
+                data = json.loads(self._path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeError):
+                self._fail_closed("guard.json 读不出来，按已熔断处理。")
+                return
+            sends = data.get("sends", []) if isinstance(data, dict) else None
+            tripped = data.get("tripped") if isinstance(data, dict) else None
+            if (
+                not isinstance(data, dict)
+                or "tripped" not in data
+                or type(tripped) is not bool
+                or not isinstance(sends, list)
+            ):
+                self._fail_closed("guard.json 内容无法核对，按已熔断处理。")
+                return
+            parsed: list[float] = []
+            for item in sends:
+                if isinstance(item, bool) or not isinstance(item, (int, float)):
+                    self._fail_closed("guard.json 的发送时间损坏，按已熔断处理。")
+                    return
+                value = float(item)
+                if not math.isfinite(value):
+                    self._fail_closed("guard.json 的发送时间损坏，按已熔断处理。")
+                    return
+                parsed.append(value)
+            self.sends = parsed
+            # 重新加载也不能撤销内存中的熔断；只有 reset 能解除。
+            if tripped:
+                self.tripped = True
+                self.reason = str(data.get("reason") or "")
 
     def _save(self) -> None:
-        if self._path is None:
-            return
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"tripped": self.tripped, "reason": self.reason}
-        self._path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        with self._lock:
+            if self._path is None:
+                return
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(
+                {"tripped": self.tripped, "reason": self.reason, "sends": self.sends},
+                ensure_ascii=False,
+            )
+            temporary = self._path.with_suffix(".json.tmp")
+            temporary.write_text(payload, encoding="utf-8")
+            os.replace(temporary, self._path)
 
     def reset(self) -> None:
-        """显式解除。重启服务不会调用这里。"""
-        self.tripped = False
-        self.reason = ""
-        if self._path is not None and self._path.is_file():
-            self._path.unlink()
-        elif self._path is not None:
-            self._save()
+        """只解除熔断。这一小时已经发出去的次数还在，重启服务也不会清掉。"""
+        with self._lock:
+            previous = self.tripped, self.reason
+            self.tripped = False
+            self.reason = ""
+            try:
+                self._save()
+            except OSError:
+                # 磁盘仍可能处于熔断状态；保存失败不能在内存里放行。
+                self.tripped, self.reason = previous
+                raise
 
     def phrases(self, skill: str) -> tuple[str, ...]:
         extra = limits_for(skill)["extra_stop"]
         return STOP_PHRASES + tuple(extra)
 
     def observe(self, text: str, skill: str = "") -> dict:
-        for phrase in self.phrases(skill):
-            if phrase and phrase in (text or ""):
-                self.tripped = True
-                self.reason = phrase
-                self._save()
+        with self._lock:
+            for phrase in self.phrases(skill):
+                if phrase and phrase in (text or ""):
+                    self.tripped = True
+                    self.reason = phrase
+                    self._save()
+                    return {
+                        "stop": True,
+                        "counted": False,
+                        "allowed": False,
+                        "reason": f"看到「{phrase}」，已熔断。不要重试，不要换一种说法再发。",
+                    }
+            if self.tripped:
                 return {
                     "stop": True,
                     "counted": False,
                     "allowed": False,
-                    "reason": f"看到「{phrase}」，已熔断。不要重试，不要换一种说法再发。",
+                    "reason": f"熔断还在（{self.reason}）。不要重试。"
+                              "重启服务也不会让这次风险提示消失，请先人工看手机。",
                 }
+            return {"stop": False, "counted": False, "allowed": False,
+                    "reason": "这只是观察，还不是发送许可。发送前要先做频率和静默检查。"}
+
+    def _rate_block(self, skill: str, *, consuming: bool = False) -> dict | None:
+        """调用方持有 _lock。频率和静默不计入发送次数；None 表示这一刻可以发。"""
         if self.tripped:
             return {
-                "stop": True,
-                "counted": False,
-                "allowed": False,
-                "reason": f"熔断还在（{self.reason}）。不要重试。重启服务也不会让这次风险提示消失，请先人工看手机。",
+                "stop": True, "counted": False, "allowed": False,
+                "reason": f"熔断还在（{self.reason}）。不要重试。",
             }
-        return {"stop": False, "counted": False, "allowed": True, "reason": ""}
-
-    def confirm_send(self, *, bubble_visible: bool, observed_text: str, skill: str = "") -> dict:
-        seen = self.observe(observed_text, skill)
-        if seen["stop"]:
-            return seen
         limits = limits_for(skill)
         now = self._clock()
         moment = datetime.fromtimestamp(now)
@@ -163,6 +218,9 @@ class Guard:
             }
         window = [stamp for stamp in self.sends if now - stamp < 3600]
         self.sends = window
+        if consuming and self._reservation is not None:
+            # prepare 的名额始终是最后一条；消费时不把自己的预留当作上一次发送。
+            window = window[:-1]
         interval = limits["min_interval"]
         if window and now - window[-1] < interval:
             return {
@@ -174,13 +232,76 @@ class Guard:
                 "stop": False, "counted": False, "allowed": False,
                 "reason": f"这一小时已经发送 {limits['max_per_hour']} 次。",
             }
-        if not bubble_visible:
+        return None
+
+    def _drop_expired_reservation(self) -> None:
+        """调用方持有 _lock；过期名额仍保守留在 sends 中。"""
+        if self._reservation is None:
+            return
+        _token, stamp = self._reservation
+        if self._clock() - stamp > RESERVATION_TTL:
+            self._reservation = None
+
+    def prepare_send(self, skill: str = "") -> dict:
+        """保守占一个一次性名额。Enter 或命名发送按钮消费时更新为实际发送时间。"""
+        with self._lock:
+            self._drop_expired_reservation()
+            if self._reservation is not None:
+                return {
+                    "stop": False, "counted": False, "allowed": False,
+                    "reason": "这一次已经占过名额，直接按发送键。",
+                }
+            blocked = self._rate_block(skill)
+            if blocked:
+                return blocked
+            now = self._clock()
+            token = secrets.token_hex(8)
+            self.sends.append(now)
+            self._reservation = (token, now)
+            self._save()
             return {
-                "stop": False, "counted": False, "allowed": False,
-                "reason": "屏幕上还没有完整的新消息气泡。输入框清空和收到 ok 都不算发送成功。",
+                "stop": False, "counted": False, "allowed": True,
+                "reason": "", "reservation": token,
             }
-        self.sends.append(now)
-        return {"stop": False, "counted": True, "allowed": True, "reason": ""}
+
+    def consume_reservation(self, skill: str = "") -> dict:
+        """真正发送前原子结算：复用未过期的预留，或直接占用并消费一个名额。"""
+        with self._lock:
+            return self._consume_reservation(skill)
+
+    def _consume_reservation(self, skill: str) -> dict:
+        """调用方持有 _lock；检查、更新时间和销毁预留不能被另一发送插入。"""
+        self._drop_expired_reservation()
+        blocked = self._rate_block(skill, consuming=True)
+        if blocked:
+            return blocked
+        now = self._clock()
+        if self._reservation is not None:
+            self.sends[-1] = now
+            self._reservation = None
+        else:
+            self.sends.append(now)
+        self._pending += 1
+        self._save()
+        return {"stop": False, "counted": False, "allowed": True, "reason": ""}
+
+    def confirm_send(self, *, bubble_visible: bool, observed_text: str, skill: str = "") -> dict:
+        with self._lock:
+            seen = self.observe(observed_text, skill)
+            if seen["stop"]:
+                return seen
+            if not bubble_visible:
+                return {
+                    "stop": False, "counted": False, "allowed": False,
+                    "reason": "屏幕上还没有完整的新消息气泡。输入框清空和收到 ok 都不算发送成功。",
+                }
+            if not self._pending:
+                # 兼容用户直接在手机上发送后确认；也消费之前的 prepare，不能再次复用。
+                decision = self._consume_reservation(skill)
+                if not decision["allowed"]:
+                    return decision
+            self._pending -= 1
+            return {"stop": False, "counted": True, "allowed": True, "reason": ""}
 
 
 def skill_file(skill: str) -> Path | None:

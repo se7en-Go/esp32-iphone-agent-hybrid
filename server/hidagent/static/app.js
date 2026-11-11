@@ -238,6 +238,10 @@ $("clear").addEventListener("click", async () => {
   if (await post("/api/agent/clear")) { $("task").value = ""; say(null); }
 });
 $("estop").addEventListener("click", () => post("/api/agent/stop"));
+$("guard-reset").addEventListener("click", () => {
+  if (!window.confirm(t("guardResetAsk"))) return;
+  post("/api/guard/reset", { confirm: true });
+});
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("zoom").open) post("/api/agent/stop"); });
 
 // ---- polling -------------------------------------------------------------------------

@@ -3,12 +3,21 @@
 # ///
 """Drives the simulated board (cli_sim) as a CLI would, with an independent client (Python's cryptography):
 pairing, the pairing window, sessions, replays, commands, status and video. uv run test_cli_sim.py"""
-import hashlib, hmac, json, os, struct, subprocess, sys, tempfile, time
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+import hashlib
+import hmac
+import json
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 fails = 0
@@ -113,7 +122,7 @@ nvs = os.path.join(tmp, "nvs")
 b = Board(nvs, CLI_SIM_WINDOW="0")
 c = Client()
 f = c.pair(b)
-check(f and f[0] == 0xE0 and b"pairing window closed" in f, "pairing outside the window is refused")
+check(f and f[0] == 0xE0 and b"closed: 0 ble pair on, 60s" in f, "pairing outside the window is refused")
 f = c.hello(b)
 check(f and f[0] == 0xE0 and f[1:] == b"not paired", "an unpaired client gets 'not paired'")
 b.close()
@@ -146,8 +155,9 @@ for p in video:
     h264 += payload
 check(len(video) > 10 and h264.startswith(b"\x00\x00\x00\x01"), f"video chunks arrive ({len(video)}, {len(h264)} bytes)")
 png = subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "h264", "-i", "pipe:0", "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
-                     input=h264, capture_output=True).stdout
-open(os.path.join(tmp, "got.h264"), "wb").write(h264)
+                     input=h264, capture_output=True, check=False).stdout
+with open(os.path.join(tmp, "got.h264"), "wb") as saved:
+    saved.write(h264)
 check(png[:8] == b"\x89PNG\r\n\x1a\n", f"the streamed H.264 decodes to a PNG ({tmp}/got.h264)")
 
 # Replay: the board drops the session.
