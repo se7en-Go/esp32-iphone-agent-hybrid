@@ -44,6 +44,19 @@ def test_skill_cannot_loosen_the_floor(tmp_path, monkeypatch):
     assert tripped["stop"]
 
 
+def test_trip_is_still_there_after_a_new_guard(tmp_path):
+    path = tmp_path / "guard.json"
+    first = Guard(path=path)
+    assert first.observe("系统：操作频繁", "")["stop"]
+    second = Guard(path=path)
+    assert second.tripped and second.reason == "操作频繁"
+    assert second.observe("普通的一句", "")["stop"]
+    second.reset()
+    third = Guard(path=path)
+    assert not third.tripped
+    assert third.observe("普通的一句", "")["stop"] is False
+
+
 def test_quiet_hours_wrap_midnight():
     assert in_quiet(datetime(2023, 11, 14, 23, 30), (23, 0), (7, 0))
     assert in_quiet(datetime(2023, 11, 14, 6, 0), (23, 0), (7, 0))

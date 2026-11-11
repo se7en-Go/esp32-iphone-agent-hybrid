@@ -1,8 +1,18 @@
 import asyncio
+import threading
+import time
 
 import pytest
 
-from hidagent.device import Device, DeviceError
+from hidagent.device import (
+    WCH_VID,
+    Device,
+    DeviceError,
+    SerialLink,
+    open_serial,
+    port_is_ch343,
+    wait_for_ping,
+)
 from hidagent.messages import NO_PORT
 
 
@@ -178,6 +188,84 @@ def test_cancelled_command_closes_the_link_before_the_next_command():
             await asyncio.wait_for(queued, 0.5)
 
     asyncio.run(scenario())
+
+
+class FakeSerial:
+    """打开时吐一行启动日志，前几次 ping 不答，模拟克隆板一开串口就复位。"""
+
+    def __init__(self, replies_after: int = 3):
+        self.port = ""
+        self.baudrate = 115200
+        self.timeout = 0.2
+        self.dtr = True
+        self.rts = True
+        self.is_open = False
+        self.opens = 0
+        self.pings = 0
+        self.replies_after = replies_after
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+
+    def open(self) -> None:
+        self.opens += 1
+        self.is_open = True
+        with self._lock:
+            self._buf.extend(b"rst:0x1 (POWERON_RESET),boot:0x13\r\n")
+
+    def close(self) -> None:
+        self.is_open = False
+
+    def write(self, data: bytes) -> None:
+        if b"0 ping" in data:
+            self.pings += 1
+            if self.pings >= self.replies_after:
+                with self._lock:
+                    self._buf.extend(b"0 ok\n")
+
+    def flush(self) -> None:
+        return None
+
+    def read(self, size: int) -> bytes:
+        time.sleep(0.01)
+        with self._lock:
+            if not self._buf:
+                return b""
+            chunk = bytes(self._buf[:size])
+            del self._buf[:len(chunk)]
+            return chunk
+
+
+def test_ping_stays_on_one_handle_and_skips_the_boot_log():
+    fake = FakeSerial(replies_after=3)
+
+    async def scenario():
+        opened = open_serial("COM9", impl=fake)
+        assert fake.opens == 1
+        assert fake.dtr is False and fake.rts is False
+        link = SerialLink("COM9", opened=opened)
+        try:
+            assert await wait_for_ping(link, timeout=2)
+        finally:
+            link.close()
+
+    asyncio.run(scenario())
+    assert fake.opens == 1
+    assert fake.pings >= 3
+
+
+def test_ch343_needs_wch_vid_and_a_known_pid():
+    class Port:
+        def __init__(self, **fields):
+            self.device = fields.pop("device")
+            self.vid = fields.get("vid")
+            self.pid = fields.get("pid")
+            self.manufacturer = fields.get("manufacturer", "")
+
+    assert port_is_ch343(Port(device="COM5", vid=WCH_VID, pid=0x55D3, manufacturer="QinHeng"))
+    assert port_is_ch343(Port(device="COM6", vid=WCH_VID, pid=0x55D4, manufacturer=""))
+    assert not port_is_ch343(Port(device="COM7", vid=WCH_VID, pid=0x9999, manufacturer="Qinheng"))
+    assert not port_is_ch343(Port(device="/dev/ttyS0", vid=None, pid=None, manufacturer="qinheng"))
+    assert not port_is_ch343(Port(device="COM8", vid=0x1234, pid=0x55D3, manufacturer="wch"))
 
 
 def test_discover_without_a_wch_port_explains_the_next_step(monkeypatch):

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime
 from pathlib import Path
@@ -87,11 +88,41 @@ def in_quiet(moment: datetime, start: tuple[int, int], end: tuple[int, int]) -> 
 
 
 class Guard:
-    def __init__(self, clock=time.time):
+    def __init__(self, clock=time.time, path: Path | None = None):
         self._clock = clock
+        self._path = path
         self.tripped = False
         self.reason = ""
         self.sends: list[float] = []
+        self._load()
+
+    def _load(self) -> None:
+        if self._path is None or not self._path.is_file():
+            return
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        self.tripped = bool(data.get("tripped"))
+        self.reason = str(data.get("reason") or "")
+
+    def _save(self) -> None:
+        if self._path is None:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"tripped": self.tripped, "reason": self.reason}
+        self._path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def reset(self) -> None:
+        """显式解除。重启服务不会调用这里。"""
+        self.tripped = False
+        self.reason = ""
+        if self._path is not None and self._path.is_file():
+            self._path.unlink()
+        elif self._path is not None:
+            self._save()
 
     def phrases(self, skill: str) -> tuple[str, ...]:
         extra = limits_for(skill)["extra_stop"]
@@ -102,6 +133,7 @@ class Guard:
             if phrase and phrase in (text or ""):
                 self.tripped = True
                 self.reason = phrase
+                self._save()
                 return {
                     "stop": True,
                     "counted": False,

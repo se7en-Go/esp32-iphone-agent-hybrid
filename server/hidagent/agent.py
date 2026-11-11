@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
 import time
 
@@ -162,7 +163,11 @@ class Agent:
             self.shots[len(self.steps)] = shot
         self.steps.append({"t": time.time(), "shot": bool(shot), **step})
         self.trace.write(kind="step", **step)
-        log.info("agent: %s", step)
+        # 委托模式的逐步正文可能含屏幕上的字。平常只记动作名；HIDAGENT_DEBUG=1 才记整步。
+        if os.environ.get("HIDAGENT_DEBUG") == "1":
+            log.info("agent: %s", step)
+        else:
+            log.info("agent: %s", step.get("action", "step"))
 
     async def _ask(self, role: str, llm: LLM, system: str, prompt: str,
                    temperature: float = 0) -> tuple[str, float, bytes | None]:

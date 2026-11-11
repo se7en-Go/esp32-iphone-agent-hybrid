@@ -24,6 +24,9 @@ log = logging.getLogger(__name__)
 WCH_VID = 0x1A86
 # CH343 是 0x55D3。克隆板有时报成 CH340 / CH9102，所以同一厂家的这几个 PID 都接受。
 WCH_PIDS = {0x55D3, 0x55D4, 0x7523, 0x5523}
+# 打开串口后有的克隆板会复位，setup() 要几秒。同一句柄上每隔 300ms 再问一次，不要反复开关口。
+PING_EVERY = 0.3
+PING_WINDOW = 8.0
 HID_COMMANDS = {"home", "move", "press", "release", "click", "scroll", "type", "key", "homescreen"}
 FIXED_ID = {"netinfo", "status", "net"}
 
@@ -32,11 +35,26 @@ class DeviceError(RuntimeError):
     pass
 
 
+def open_serial(port: str, baud: int = 115200, impl=None):
+    """DTR/RTS 保持不复位。先赋值再 open，避免 pyserial 默认把线拉下去触发 EN。"""
+    ser = impl if impl is not None else serial.Serial()
+    ser.port = port
+    ser.baudrate = baud
+    ser.timeout = 0.2
+    ser.dtr = False
+    ser.rts = False
+    if not getattr(ser, "is_open", False):
+        ser.open()
+    ser.dtr = False
+    ser.rts = False
+    return ser
+
+
 class SerialLink:
     """阻塞的 pyserial 收成一行一行的异步队列。"""
 
-    def __init__(self, port: str, baud: int = 115200):
-        self._ser = serial.Serial(port, baud, timeout=0.2)
+    def __init__(self, port: str, baud: int = 115200, opened=None):
+        self._ser = opened if opened is not None else open_serial(port, baud)
         self._loop = asyncio.get_running_loop()
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._buf = bytearray()
@@ -59,8 +77,14 @@ class SerialLink:
                     break
                 line = bytes(self._buf[:nl + 1])
                 del self._buf[:nl + 1]
-                self._loop.call_soon_threadsafe(self._queue.put_nowait, line)
-        self._loop.call_soon_threadsafe(self._queue.put_nowait, b"")
+                self._post(line)
+        self._post(b"")
+
+    def _post(self, line: bytes) -> None:
+        try:
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, line)
+        except RuntimeError:
+            return
 
     def write(self, data: bytes) -> None:
         if self._closed:
@@ -79,21 +103,26 @@ class SerialLink:
             self._ser.close()
         except Exception:
             pass
+        thread = getattr(self, "_thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
 
     def is_open(self) -> bool:
         return not self._closed and bool(getattr(self._ser, "is_open", False))
 
 
+def port_is_ch343(port) -> bool:
+    """必须同时是 VID 0x1A86 和已知 PID（含 CH343 的 0x55D3）。
+
+    厂家名大小写不敏感，正确拼写是 qinheng。只出现这个名字、没有这对 VID/PID，不能放行。
+    厂家名按小写比较，正确拼写是 qinheng。只有这个名字、没有 VID/PID，不放行。
+    """
+    return getattr(port, "vid", None) == WCH_VID and getattr(port, "pid", None) in WCH_PIDS
+
+
 def candidate_ports() -> list[str]:
     """只列出沁恒 USB 串口。不要去打开 /dev/ttyS0 这种本机串口。"""
-    found: list[str] = []
-    for port in list_ports.comports():
-        text = f"{port.description or ''} {port.manufacturer or ''}".lower()
-        vid_ok = port.vid == WCH_VID and (port.pid in WCH_PIDS or port.pid is None)
-        name_ok = any(key in text for key in ("ch343", "ch340", "ch910", "wch", "qinhen", "1a86"))
-        if vid_ok or (port.vid == WCH_VID) or name_ok:
-            found.append(port.device)
-    return found
+    return [port.device for port in list_ports.comports() if port_is_ch343(port)]
 
 
 class Device:
@@ -246,14 +275,14 @@ class Device:
             raise DeviceError(self.last_error) from exc
         self.attach(link, name)
         try:
-            reply = await self.exchange("ping")
-        except DeviceError as exc:
-            self.last_error = str(exc)
+            ready = await wait_for_ping(link, PING_WINDOW)
+        except OSError as exc:
             self.close()
-            raise
-        if reply != "ok":
+            self.last_error = messages.link_lost("ping")
+            raise DeviceError(self.last_error) from exc
+        if not ready:
             self.close()
-            self.last_error = messages.explain_reply("ping", reply)
+            self.last_error = messages.PORT_SILENT
             raise DeviceError(self.last_error)
         self.last_error = ""
         log.info("board serial ready on %s", name)
@@ -304,25 +333,40 @@ def _is_int(text: str) -> bool:
     return True
 
 
-async def probe_port(name: str, timeout: float = 1.2) -> bool:
+async def wait_for_ping(link, timeout: float = PING_WINDOW) -> bool:
+    """同一句柄上反复发 `0 ping`。启动日志不是应答，丢掉，直到看到 `0 ok`。"""
+    deadline = time.monotonic() + timeout
+    next_ping = 0.0
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        if now >= next_ping:
+            link.write(b"0 ping\n")
+            next_ping = now + PING_EVERY
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            raw = await asyncio.wait_for(link.readline(), min(PING_EVERY, remaining))
+        except asyncio.TimeoutError:
+            continue
+        if not raw:
+            return False
+        if raw.decode("utf-8", "replace").strip() == "0 ok":
+            return True
+    return False
+
+
+async def probe_port(name: str, timeout: float = PING_WINDOW) -> bool:
     try:
         link = SerialLink(name)
     except serial.SerialException:
         return False
     try:
-        link.write(b"0 ping\n")
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            raw = await asyncio.wait_for(link.readline(), max(0.05, deadline - time.monotonic()))
-            if not raw:
-                return False
-            if raw.decode("utf-8", "replace").strip() == "0 ok":
-                return True
-    except (OSError, asyncio.TimeoutError):
+        return await wait_for_ping(link, timeout)
+    except OSError:
         return False
     finally:
         link.close()
-    return False
 
 
 async def discover_port() -> str:

@@ -47,7 +47,7 @@ phone = Phone(device, DATA_DIR / "calibration.json", screen)
 controls = Controls(phone, screen)
 agent = Agent(phone, screen, LLM.from_env("ACTOR"), LLM.from_env("PLANNER"),
               Trace(DATA_DIR / "traces" if DEBUG else None))
-guard = Guard()
+guard = Guard(path=DATA_DIR / "guard.json")
 
 
 @asynccontextmanager
