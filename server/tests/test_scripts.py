@@ -1,5 +1,6 @@
 """入口脚本能打印帮助，并且文档没有叫人去装 Linux 子系统。"""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -10,7 +11,11 @@ BANNED = ("请先装 WSL", "请先安装 WSL", "install WSL", "先装 WSL2", "Wi
 
 def test_help_exits_cleanly():
     for script in ("scripts/setup.py", "scripts/flash.py", "scripts/wifi_config.py", "scripts/mcp_config.py"):
-        result = subprocess.run([sys.executable, str(ROOT / script), "--help"], capture_output=True, text=True)
+        env = os.environ.copy()
+        env["PYTHONUTF8"] = "1"
+        result = subprocess.run(
+            [sys.executable, str(ROOT / script), "--help"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
         assert result.returncode == 0, result.stderr
 
 
