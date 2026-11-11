@@ -13,6 +13,7 @@ import logging
 import os
 import threading
 import time
+from contextlib import nullcontext
 
 import serial
 from serial.tools import list_ports
@@ -227,18 +228,19 @@ class Device:
         timeout = self._timeout(command)
         name = command.split(" ", 1)[0]
         async with self._lock:
-            # 停止和熔断都在写串口之前、锁里面再查一次。查完到 write 之间没有 await。
+            # asyncio 锁只串行化交换；熔断还需要 gate 提供的跨线程写入锁。
             if self._abort and name not in {"release", "home"}:
                 raise DeviceError("已紧急停止，后面的内容没有发出。")
             gate = getattr(self, "gate", None)
-            if gate is not None:
-                gate(command)
+            write_guard = gate(command) if gate is not None else None
             link = self._link
             if link is None or not link.is_open():
                 raise DeviceError(messages.BOARD_NOT_CONNECTED)
             req_id = self._request_id(command)
             try:
-                link.write(f"{req_id} {command}\n".encode())
+                # 在 guard 的同一把锁内复查并写入；先释放它，再 await 应答。
+                with write_guard if write_guard is not None else nullcontext():
+                    link.write(f"{req_id} {command}\n".encode())
                 reply = await self._read_reply(link, req_id, timeout)
             except asyncio.CancelledError:
                 if not self._abort:

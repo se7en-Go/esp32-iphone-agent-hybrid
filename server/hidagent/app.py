@@ -2,7 +2,7 @@
 
 import asyncio
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Literal
@@ -100,20 +100,36 @@ def is_enter_key(command: str) -> bool:
 _named_send: ContextVar[bool] = ContextVar("named_send", default=False)
 
 
-def _hid_gate(command: str) -> None:
+def _check_hid_trip(current: Guard, name: str) -> None:
+    """调用方持有 current._lock；release/home 保留紧急停止的清理语义。"""
+    if current.tripped and name not in {"release", "home"}:
+        raise DeviceError(
+            f"熔断还在（{current.reason or '风险提示'}）。这一条 HID 没有发出。"
+        )
+
+
+@contextmanager
+def _hid_write_guard(current: Guard, name: str):
+    # 与 observe/trip 同锁，复查到实际串口写入之间不能有线程插入，也不能 await。
+    with current._lock:
+        _check_hid_trip(current, name)
+        yield
+
+
+def _hid_gate(command: str):
     name = command.split(" ", 1)[0].strip().lower()
     if name not in {"home", "move", "press", "release", "click", "scroll", "type", "key", "homescreen"}:
-        return
-    if guard.tripped and name not in {"release", "home"}:
-        raise DeviceError(
-            f"熔断还在（{guard.reason or '风险提示'}）。这一条 HID 没有发出。"
-        )
-    if is_enter_key(command) or (name == "click" and _named_send.get()):
-        decision = guard.consume_reservation("")
-        if not decision["allowed"]:
-            if _named_send.get():
-                raise HTTPException(409, decision["reason"])
-            raise DeviceError(decision["reason"])
+        return None
+    current = guard
+    with current._lock:
+        _check_hid_trip(current, name)
+        if is_enter_key(command) or (name == "click" and _named_send.get()):
+            decision = current.consume_reservation("")
+            if not decision["allowed"]:
+                if _named_send.get():
+                    raise HTTPException(409, decision["reason"])
+                raise DeviceError(decision["reason"])
+    return _hid_write_guard(current, name)
 
 
 device.gate = _hid_gate

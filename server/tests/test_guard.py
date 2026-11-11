@@ -2,6 +2,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from threading import Barrier
 
+import pytest
+
 from hidagent.guard import FLOOR_INTERVAL, Guard, in_quiet, limits_for
 
 
@@ -142,3 +144,46 @@ def test_concurrent_consumers_share_only_one_reservation():
         results = list(workers.map(lambda _: consume(), range(2)))
     assert sum(results) == 1
     assert guard.sends == [now[0]]
+
+
+def test_failed_reset_keeps_trip_and_quota(tmp_path, monkeypatch):
+    path = tmp_path / "guard.json"
+    noon = datetime(2023, 11, 14, 12).timestamp()
+    guard = Guard(clock=lambda: noon, path=path)
+    assert guard.consume_reservation()["allowed"]
+    assert guard.observe("验证码")["stop"]
+
+    def failed_replace(*_args):
+        raise OSError("disk unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("hidagent.guard.os.replace", failed_replace)
+        with pytest.raises(OSError, match="disk unavailable"):
+            guard.reset()
+    assert guard.tripped and guard.reason == "验证码"
+    assert guard.sends == [noon]
+    assert Guard(path=path).tripped and Guard(path=path).sends == [noon]
+    guard._save()
+    assert Guard(path=path).tripped
+    guard.reset()
+    assert not Guard(path=path).tripped
+    assert Guard(path=path).sends == [noon]
+
+
+def test_reload_cannot_clear_an_unpersisted_trip(tmp_path, monkeypatch):
+    path = tmp_path / "guard.json"
+    guard = Guard(path=path)
+    guard._save()
+
+    def failed_replace(*_args):
+        raise OSError("disk unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("hidagent.guard.os.replace", failed_replace)
+        with pytest.raises(OSError, match="disk unavailable"):
+            guard.observe("风控")
+    assert guard.tripped
+    guard._load()
+    assert guard.tripped and guard.reason == "风控"
+    guard._save()
+    assert Guard(path=path).tripped
