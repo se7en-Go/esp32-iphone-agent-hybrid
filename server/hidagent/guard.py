@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -95,6 +97,8 @@ class Guard:
         self.tripped = False
         self.reason = ""
         self.sends: list[float] = []
+        self._pending = 0
+        self._lock = threading.Lock()
         self._load()
 
     def _fail_closed(self, reason: str) -> None:
@@ -110,15 +114,28 @@ class Guard:
         except (OSError, json.JSONDecodeError, UnicodeError):
             self._fail_closed("guard.json 读不出来，按已熔断处理。")
             return
-        if not isinstance(data, dict) or "tripped" not in data or not isinstance(data.get("sends", []), list):
+        sends = data.get("sends", []) if isinstance(data, dict) else None
+        tripped = data.get("tripped") if isinstance(data, dict) else None
+        if (
+            not isinstance(data, dict)
+            or "tripped" not in data
+            or type(tripped) is not bool
+            or not isinstance(sends, list)
+        ):
             self._fail_closed("guard.json 内容无法核对，按已熔断处理。")
             return
-        try:
-            self.sends = [float(item) for item in data.get("sends", [])]
-        except (TypeError, ValueError):
-            self._fail_closed("guard.json 的发送时间损坏，按已熔断处理。")
-            return
-        self.tripped = bool(data.get("tripped"))
+        parsed: list[float] = []
+        for item in sends:
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                self._fail_closed("guard.json 的发送时间损坏，按已熔断处理。")
+                return
+            value = float(item)
+            if not math.isfinite(value):
+                self._fail_closed("guard.json 的发送时间损坏，按已熔断处理。")
+                return
+            parsed.append(value)
+        self.sends = parsed
+        self.tripped = tripped
         self.reason = str(data.get("reason") or "")
 
     def _save(self) -> None:
@@ -134,10 +151,9 @@ class Guard:
         os.replace(temporary, self._path)
 
     def reset(self) -> None:
-        """显式解除。重启服务不会调用这里。"""
+        """只解除熔断。这一小时已经发出去的次数还在，重启服务也不会清掉。"""
         self.tripped = False
         self.reason = ""
-        self.sends = []
         self._save()
 
     def phrases(self, skill: str) -> tuple[str, ...]:
@@ -197,27 +213,35 @@ class Guard:
         return None
 
     def prepare_send(self, skill: str = "") -> dict:
-        """发送动作之前调用。不过频率或静默就不许发，也不计入次数。"""
-        blocked = self._rate_block(skill)
-        if blocked:
-            return blocked
-        return {"stop": False, "counted": False, "allowed": True, "reason": ""}
+        """发送动作之前占一个名额。两个请求同时进来也只能过一个。"""
+        with self._lock:
+            blocked = self._rate_block(skill)
+            if blocked:
+                return blocked
+            self.sends.append(self._clock())
+            self._pending += 1
+            self._save()
+            return {"stop": False, "counted": False, "allowed": True, "reason": ""}
 
     def confirm_send(self, *, bubble_visible: bool, observed_text: str, skill: str = "") -> dict:
         seen = self.observe(observed_text, skill)
         if seen["stop"]:
             return seen
-        blocked = self._rate_block(skill)
-        if blocked:
-            return blocked
         if not bubble_visible:
             return {
                 "stop": False, "counted": False, "allowed": False,
                 "reason": "屏幕上还没有完整的新消息气泡。输入框清空和收到 ok 都不算发送成功。",
             }
-        self.sends.append(self._clock())
-        self._save()
-        return {"stop": False, "counted": True, "allowed": True, "reason": ""}
+        with self._lock:
+            if self._pending:
+                self._pending -= 1
+                return {"stop": False, "counted": True, "allowed": True, "reason": ""}
+            blocked = self._rate_block(skill)
+            if blocked:
+                return blocked
+            self.sends.append(self._clock())
+            self._save()
+            return {"stop": False, "counted": True, "allowed": True, "reason": ""}
 
 
 def skill_file(skill: str) -> Path | None:

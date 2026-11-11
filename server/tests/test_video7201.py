@@ -9,20 +9,29 @@ import av
 import pytest
 from PIL import Image
 
-from hidagent.video7201 import H264Decoder, LatestFrameGate, RecordBuffer, keepalive, pack_access_unit, run_tcp
+from hidagent.video7201 import (
+    CONFIG,
+    H264Decoder,
+    LatestFrameGate,
+    RecordBuffer,
+    keepalive,
+    pack_access_unit,
+    run_tcp,
+    stream_is_dead,
+)
 
 SIZE = 160
 TOKEN = "0123456789abcdef"
 
 
-def annexb_access_units(count: int = 4) -> list[bytes]:
+def annexb_access_units(count: int = 4, gop: str = "1") -> list[bytes]:
     codec = av.CodecContext.create("libx264", "w")
     codec.width = SIZE
     codec.height = SIZE
     codec.pix_fmt = "yuv420p"
     codec.time_base = Fraction(1, 10)
     codec.framerate = 10
-    codec.options = {"preset": "ultrafast", "tune": "zerolatency", "profile": "baseline", "g": "1"}
+    codec.options = {"preset": "ultrafast", "tune": "zerolatency", "profile": "baseline", "g": gop}
     codec.open()
     packets: list[bytes] = []
     for index in range(count):
@@ -163,5 +172,112 @@ def test_wrong_token_does_not_decode():
             await asyncio.to_thread(run_tcp, "127.0.0.1", port, "nope", lambda _blob: None, stop)
         server.close()
         await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def _nals(data: bytes) -> list[bytes]:
+    starts = []
+    index = 0
+    while True:
+        four = data.find(b"\x00\x00\x00\x01", index)
+        three = data.find(b"\x00\x00\x01", index)
+        if four < 0 and three < 0:
+            break
+        if three >= 0 and (four < 0 or three < four):
+            starts.append(three)
+            index = three + 3
+        else:
+            starts.append(four)
+            index = four + 4
+    starts.append(len(data))
+    return [data[a:b] for a, b in zip(starts, starts[1:], strict=False) if b > a]
+
+
+def _nal_type(nal: bytes) -> int:
+    header = nal[4] if nal.startswith(b"\x00\x00\x00\x01") else nal[3]
+    return header & 0x1F
+
+
+def test_separate_config_au_then_idr_and_p_frames_decode():
+    """固件把 SPS/PPS 单独打成 CONFIG，后面才是 IDR、P、P。CONFIG 不能被当成坏帧清掉解码器。"""
+    units = annexb_access_units(4, gop="30")
+    config = bytearray()
+    pictures: list[bytes] = []
+    for unit in units:
+        pieces = _nals(unit)
+        if not pictures:
+            kept = bytearray()
+            for nal in pieces:
+                if _nal_type(nal) in (1, 5):
+                    kept += nal
+                else:
+                    config += nal
+            if kept:
+                pictures.append(bytes(kept))
+        else:
+            pictures.append(unit)
+    assert config and len(pictures) >= 3
+    assert _nal_type(_nals(pictures[0])[-1]) == 5
+    seq = 0
+    blob = bytearray()
+    chunk, seq = pack_access_unit(bytes(config), seq, 1000, config=True)
+    blob += chunk
+    chunk, seq = pack_access_unit(pictures[0], seq, 1001, idr=True)
+    blob += chunk
+    for index, picture in enumerate(pictures[1:], start=2):
+        chunk, seq = pack_access_unit(picture, seq, 1000 + index)
+        blob += chunk
+    decoder = H264Decoder()
+    frames = []
+    saw_config = False
+    for record in RecordBuffer().feed(bytes(blob)):
+        if record is None:
+            continue
+        flags = record[2]
+        got = decoder.push_chunk(record)
+        if flags & CONFIG:
+            saw_config = True
+            assert got == []
+            assert decoder._config
+        frames.extend(got)
+    assert saw_config
+    assert len(frames) == len(pictures)
+
+
+def test_keepalive_ack_is_not_a_frozen_screen():
+    assert stream_is_dead(12.5, last_frame=0, last_ack=12.0) is False
+    assert stream_is_dead(12.5, last_frame=0, last_ack=0) is True
+
+
+def test_reconnect_hello_can_carry_the_firmware_timestamp():
+    async def scenario():
+        seen: dict[str, bytes] = {}
+
+        async def handle(reader, writer):
+            seen["hello"] = await reader.readline()
+            writer.write(keepalive())
+            await writer.drain()
+            try:
+                await asyncio.wait_for(reader.read(64), 2)
+            except (asyncio.TimeoutError, ConnectionError):
+                pass
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        stop = threading.Event()
+
+        def on_ready():
+            stop.set()
+
+        try:
+            await asyncio.wait_for(asyncio.to_thread(
+                run_tcp, "127.0.0.1", port, TOKEN, lambda _blob: None, stop,
+                resume_ts=1234, on_ready=on_ready), 10)
+        finally:
+            server.close()
+            await server.wait_closed()
+        assert seen["hello"] == f"hello {TOKEN} at 1234\n".encode()
 
     asyncio.run(scenario())

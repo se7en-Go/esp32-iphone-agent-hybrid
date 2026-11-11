@@ -14,6 +14,7 @@ from hidagent.device import (
     wait_for_ping,
 )
 from hidagent.messages import NO_PORT
+from hidagent.phone import Phone
 
 
 class MemoryLink:
@@ -186,6 +187,74 @@ def test_cancelled_command_closes_the_link_before_the_next_command():
         assert not device.connected
         with pytest.raises(DeviceError, match="没连上"):
             await asyncio.wait_for(queued, 0.5)
+
+    asyncio.run(scenario())
+
+
+class _HoldFirst:
+    def __init__(self):
+        self.written: list[bytes] = []
+        self.replies: asyncio.Queue[bytes] = asyncio.Queue()
+        self.closed = False
+        self.first_written = asyncio.Event()
+        self.release = asyncio.Event()
+        self._count = 0
+
+    def write(self, data: bytes) -> None:
+        self.written.append(data)
+        req = data.decode().strip().split()[0]
+        self._count += 1
+        if self._count == 1:
+            self.first_written.set()
+
+            async def later(req_id: str = req) -> None:
+                await self.release.wait()
+                await self.replies.put(f"{req_id} ok\n".encode())
+
+            asyncio.get_running_loop().create_task(later())
+        else:
+            self.replies.put_nowait(f"{req} ok\n".encode())
+
+    async def readline(self) -> bytes:
+        return await self.replies.get()
+
+    def close(self) -> None:
+        self.closed = True
+        self.replies.put_nowait(b"")
+
+    def is_open(self) -> bool:
+        return not self.closed
+
+
+def test_stop_aborts_remaining_type_chunks_when_tripped_mid_ack(tmp_path):
+    async def scenario():
+        device = Device()
+        link = _HoldFirst()
+        device.attach(link)
+        tripped = {"on": False}
+
+        def gate(command: str) -> None:
+            name = command.split(" ", 1)[0]
+            if tripped["on"] and name not in {"release", "home"}:
+                raise DeviceError("熔断")
+
+        device.gate = gate
+        phone = Phone(device, tmp_path / "calibration.json", None)
+        job = asyncio.create_task(phone.type("x" * 1000))
+        await asyncio.wait_for(link.first_written.wait(), 1)
+        tripped["on"] = True
+        device.request_abort()
+        link.release.set()
+        with pytest.raises((DeviceError, asyncio.CancelledError)):
+            await job
+        typed = [line for line in link.written if b" type " in line]
+        assert len(typed) == 1
+        await device.send("release")
+        assert any(b" release" in line for line in link.written)
+        before = len(link.written)
+        with pytest.raises(DeviceError):
+            await device.send("type more")
+        assert len(link.written) == before
 
     asyncio.run(scenario())
 

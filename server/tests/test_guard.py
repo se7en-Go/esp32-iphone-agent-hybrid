@@ -85,3 +85,41 @@ def test_quiet_hours_wrap_midnight():
     assert in_quiet(datetime(2023, 11, 14, 23, 30), (23, 0), (7, 0))
     assert in_quiet(datetime(2023, 11, 14, 6, 0), (23, 0), (7, 0))
     assert not in_quiet(datetime(2023, 11, 14, 12, 0), (23, 0), (7, 0))
+
+
+def test_prepare_send_reserves_quota_before_the_next_enter():
+    noon = datetime(2023, 11, 14, 12, 0).timestamp()
+    guard = Guard(clock=lambda: noon)
+    first = guard.prepare_send("")
+    assert first["allowed"] is True and guard.sends == [noon]
+    assert guard.prepare_send("")["allowed"] is False
+    assert guard.prepare_send("")["allowed"] is False
+    assert guard.sends == [noon]
+
+
+def test_guard_json_null_tripped_and_nan_fail_closed(tmp_path):
+    path = tmp_path / "guard.json"
+    path.write_text('{"tripped": null, "sends": []}', encoding="utf-8")
+    assert Guard(path=path).tripped
+    path.write_text('{"tripped": false, "sends": [NaN]}', encoding="utf-8")
+    assert Guard(path=path).tripped
+    path.write_text('{"tripped": false, "sends": [1e309]}', encoding="utf-8")
+    assert Guard(path=path).tripped
+    path.write_text('{"tripped": false, "sends": [1000.0]}', encoding="utf-8")
+    healthy = Guard(path=path)
+    assert healthy.tripped is False and healthy.sends == [1000.0]
+
+
+def test_reset_clears_the_trip_and_keeps_hourly_sends(tmp_path):
+    noon = datetime(2023, 11, 14, 12, 0).timestamp()
+    path = tmp_path / "guard.json"
+    guard = Guard(clock=lambda: noon, path=path)
+    assert guard.prepare_send("")["allowed"] is True
+    guard.tripped = True
+    guard.reason = "验证码"
+    guard._save()
+    guard.reset()
+    assert guard.tripped is False and guard.sends == [noon]
+    again = Guard(clock=lambda: noon, path=path)
+    assert again.tripped is False and again.sends == [noon]
+    assert again.prepare_send("")["allowed"] is False

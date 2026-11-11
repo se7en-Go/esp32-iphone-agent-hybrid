@@ -226,15 +226,6 @@ def create_server(url: str | None = None):
             return client.task_status()
 
     @mcp.tool()
-    def guard_reset() -> dict:
-        """Clear a latched circuit breaker after a person has looked at the phone.
-
-        Restarting the server does not clear it. Do not call this to bypass a risk prompt.
-        """
-        with IPhoneClient(url) as client:
-            return client.guard_reset()
-
-    @mcp.tool()
     def stop_task() -> dict:
         """Emergency cancel and release/re-home pointer. No observation token required."""
         with IPhoneClient(url) as client:

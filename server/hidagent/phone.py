@@ -14,9 +14,30 @@ from collections import deque
 from pathlib import Path
 
 from . import vision
-from .device import Device
+from .device import Device, DeviceError
 
 log = logging.getLogger(__name__)
+
+
+def type_chunks(text: str, limit: int = 480) -> list[str]:
+    """按固件一行的上限切开。空格放到下一段的开头，不要留在这一段的行尾。"""
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    index = 0
+    while index < len(text):
+        end = min(index + limit, len(text))
+        if end < len(text):
+            while end > index and text[end - 1].isspace():
+                end -= 1
+            if end == index:
+                end = min(index + limit, len(text))
+        part = text[index:end]
+        if not part:
+            break
+        parts.append(part)
+        index = end
+    return parts
 
 CALIBRATION_MOVE = 200  # mouse units moved diagonally for a manual (one point) calibration; stays on screen
 CALIBRATION_STOPS = (150, 350)  # automatic calibration finds the pointer at these distances from the corner
@@ -246,12 +267,12 @@ class Phone:
 
     async def type(self, text: str) -> None:
         # 固件串口一行最多 512 字节，含 "<id> type "。超长就切开，每段都要等到 ok。
-        limit = 480
-        if len(text) <= limit:
-            await self.device.send(f"type {text}")
-            return
-        for start in range(0, len(text), limit):
-            await self.device.send("type " + text[start:start + limit])
+        # 固件对整行 trim，空格不能留在一段的末尾，否则会被吃掉。
+        epoch = getattr(self.device, "abort_epoch", 0)
+        for part in type_chunks(text):
+            if getattr(self.device, "abort_epoch", 0) != epoch:
+                raise DeviceError("已紧急停止，后面的内容没有发出。")
+            await self.device.send(f"type {part}")
 
     async def key(self, combo: str) -> None:
         await self.device.send(f"key {combo}")

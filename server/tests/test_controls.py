@@ -52,6 +52,24 @@ def test_long_ascii_is_split_under_the_firmware_line_limit(tmp_path):
     assert "".join(part.removeprefix("type ") for part in sent) == "x" * 1000
 
 
+def test_chunk_preserves_space_that_firmware_trim_would_drop(tmp_path):
+    text = "x" * 479 + " " + "y" * 21
+    sent = []
+
+    async def send(command):
+        sent.append(command)
+
+    phone = Phone(SimpleNamespace(send=send), tmp_path / "calibration.json", None)
+    asyncio.run(phone.type(text))
+
+    def firmware_typed(command: str) -> str:
+        line = f"7 {command}".strip()
+        return line.split(" ", 2)[2]
+
+    assert "".join(firmware_typed(command) for command in sent) == text
+    assert all(not firmware_typed(command).endswith(" ") for command in sent)
+
+
 def test_pixel_coordinates_return_evidence_and_single_use_token():
     phone, screen = FakePhone(), Screen()
     control = Controls(phone, screen)

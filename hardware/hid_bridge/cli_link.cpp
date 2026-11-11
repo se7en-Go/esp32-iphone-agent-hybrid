@@ -1,5 +1,6 @@
 // CLI link, see cli_link.h.
 #include "cli_link.h"
+#include "src/cli/plain_bound.h"
 #include <Preferences.h>
 #include <esp_heap_caps.h>
 #include <esp_mac.h>
@@ -93,8 +94,9 @@ static int findClient(const uint8_t *id) {
 
 static void plain(int slot, uint8_t type, const uint8_t *p, size_t n) {
   uint8_t out[80];
+  n = plain_payload_fit(sizeof out, n);  // one byte is the type; never write past out[]
   out[0] = type;
-  memcpy(out + 1, p, n);
+  if (n && p) memcpy(out + 1, p, n);
   notify(slot, out, n + 1, false, 1000);
 }
 
@@ -103,8 +105,12 @@ static void error(int slot, const char *why) { plain(slot, CLI_ERROR, (const uin
 static void pair(int slot, const uint8_t *p, size_t n) {
   if (n != 32 + CLI_ID_LEN) return error(slot, "bad pair request");
   if (slot == CLI_TCP_SLOT) return error(slot, "pair over Bluetooth");  // the pairing window is for whoever is near
-  if (!ble_pair_window_open())
-    return error(slot, "pairing window closed: serial command '0 ble pair on', then pair within 60 seconds");
+  if (!ble_pair_window_open()) {
+    // Must stay inside plain()'s 79-byte payload. sizeof includes the trailing NUL.
+    static const char closed[] = "closed: 0 ble pair on, 60s";
+    static_assert(sizeof(closed) <= 80, "CLI error text must fit in plain()");
+    return error(slot, closed);
+  }
   uint8_t priv[32], pub[32], key[CLI_KEY_LEN];
   esp_fill_random(priv, sizeof priv);
   bool ok = cli_pair(priv, p, pub, key);

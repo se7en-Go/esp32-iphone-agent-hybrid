@@ -20,7 +20,7 @@ import time
 
 import av
 
-START, END, AUDIO = 1, 2, 0x80
+START, END, IDR, CONFIG, AUDIO = 1, 2, 4, 8, 0x80
 PAYLOAD = 1380
 
 
@@ -78,6 +78,34 @@ def pack_access_unit(au: bytes, seq: int, timestamp: int, *, idr: bool = False,
     return bytes(out), seq
 
 
+def _parameter_sets_only(au: bytes) -> bool:
+    """只有 SPS/PPS/SEI/AUD，没有 VCL 图像。"""
+    saw_vcl = False
+    index = 0
+    while index < len(au):
+        four = au.find(b"\x00\x00\x00\x01", index)
+        three = au.find(b"\x00\x00\x01", index)
+        if four < 0 and three < 0:
+            break
+        if three >= 0 and (four < 0 or three < four):
+            start, mark = three, 3
+        else:
+            start, mark = four, 4
+        header_at = start + mark
+        if header_at >= len(au):
+            break
+        nal_type = au[header_at] & 0x1F
+        if nal_type in (1, 5):
+            saw_vcl = True
+        index = header_at + 1
+    return not saw_vcl and bool(au)
+
+
+def stream_is_dead(now: float, last_frame: float, last_ack: float, limit: float = 12.0) -> bool:
+    """静屏可以很久没有新帧，只要 keepalive 的应答还在，就不是断流。"""
+    return now - last_frame > limit and now - last_ack > limit
+
+
 def keepalive() -> bytes:
     return b"\x00\x00"
 
@@ -89,12 +117,16 @@ class H264Decoder:
         self._codec = None
         self._expect: int | None = None
         self._cur: bytearray | None = None
+        self._config = b""
+        self.last_ts: int | None = None
         self.reset()
 
     def reset(self) -> None:
+        config = self._config
         self._codec = av.CodecContext.create("h264", "r")
         self._expect = None
         self._cur = None
+        self._config = config
 
     def push_chunk(self, chunk: bytes) -> list:
         if len(chunk) < 3:
@@ -110,6 +142,8 @@ class H264Decoder:
         self._expect = (seq + 1) & 0xFFFF
         payload = chunk[3:]
         if flags & START:
+            if len(payload) >= 4:
+                self.last_ts = struct.unpack_from("<I", payload)[0]
             self._cur = bytearray(payload[4:] if len(payload) >= 4 else b"")
         elif self._cur is not None:
             self._cur += payload
@@ -119,6 +153,13 @@ class H264Decoder:
             return []
         au = bytes(self._cur)
         self._cur = None
+        # 固件把 SPS/PPS 单独打成 CONFIG，不是一张图。解失败也不能 reset，否则后面的 IDR 没有参数集。
+        if flags & CONFIG or _parameter_sets_only(au):
+            if au:
+                self._config = au
+            return []
+        if (flags & IDR) and self._config:
+            au = self._config + au
         try:
             # 完整访问单元直接当一个 packet。parse() 会扣住最后一帧，静止画面就一直不出来。
             return list(self._codec.decode(av.Packet(au)))
@@ -159,11 +200,12 @@ def frame_to_jpeg(frame, quality: int = 75) -> bytes:
 
 def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
             quality: int = 75, max_fps: int = 8, connect_timeout: float = 5,
-            on_ready=None, on_stall=None, sockets: list | None = None) -> None:
+            on_ready=None, on_stall=None, sockets: list | None = None,
+            resume_ts: int | None = None, on_timestamp=None) -> None:
     """阻塞读取一路 7201，直到 stop 或对端断开。on_jpeg(jpeg_bytes) 在解码线程里调用。
 
-    板子在画面冻住时可能不再推新帧，解码器这边也没有更新。超过约 12 秒没有新帧就调用
-    on_stall，让界面提示重新选一次屏幕镜像。
+    静屏时板子可能不再推新帧，但 hello/ka 的零长度应答还在。只有帧和应答都停了约 12 秒
+    才调用 on_stall。有上一帧时间戳时，hello 带上 `at <ts>`，让板子按固件的 resume 语义续上。
     """
     sock = socket.create_connection((host, int(port)), timeout=connect_timeout)
     if sockets is not None:
@@ -171,7 +213,11 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.settimeout(0.5)
-        sock.sendall(f"hello {token}\n".encode("ascii"))
+        if resume_ts is None:
+            hello = f"hello {token}\n"
+        else:
+            hello = f"hello {token} at {int(resume_ts)}\n"
+        sock.sendall(hello.encode("ascii"))
         decoder = H264Decoder()
         records = RecordBuffer()
         gate = LatestFrameGate(max_fps)
@@ -179,12 +225,13 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
         stalled = False
         last_ka = time.monotonic()
         last_frame = time.monotonic()
+        last_ack = time.monotonic()
         while not stop.is_set():
             now = time.monotonic()
             if authed and now - last_ka >= 1:
                 sock.sendall(b"ka\n")
                 last_ka = now
-            if authed and not stalled and now - last_frame > 12 and on_stall:
+            if authed and not stalled and stream_is_dead(now, last_frame, last_ack) and on_stall:
                 stalled = True
                 on_stall()
             try:
@@ -198,6 +245,8 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
                 raise ConnectionError("7201 closed")
             for record in records.feed(data):
                 if record is None:
+                    last_ack = time.monotonic()
+                    stalled = False
                     if not authed:
                         authed = True
                         if on_ready:
@@ -214,6 +263,8 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
                     except OSError:
                         raise
                     continue
+                if decoder.last_ts is not None and on_timestamp:
+                    on_timestamp(decoder.last_ts)
                 if not frames:
                     continue
                 last_frame = time.monotonic()

@@ -59,6 +59,7 @@ def test_real_stdio_uses_host_vision_and_returns_action_images_without_model_key
             assert {"iphone_observe", "iphone_tap", "iphone_compose_chinese",
                     "task_status", "stop_task"} <= tools.keys()
             assert "delegate_task" not in tools
+            assert "guard_reset" not in tools
             assert {"iphone_batch", "iphone_layouts", "skill_check", "skill_confirm_send"} <= tools.keys()
             assert "screen_id" in tools["iphone_tap"].inputSchema["required"]
             assert "bubble" in tools["skill_confirm_send"].description
@@ -97,7 +98,7 @@ def test_real_stdio_uses_host_vision_and_returns_action_images_without_model_key
                         ("/api/skill/check", {"observed_text": "操作频繁", "skill": "wechat-group-reply"}),
                         ("/api/control/batch", {"screen_id": "batch-1", "steps": [
                             {"action": "type", "text": "hi"}]}),
-                        ("/api/agent/stop", None)]
+                        ("/api/agent/stop", {})]
 
 
 def test_delegate_tool_requires_explicit_opt_in(monkeypatch):
@@ -105,3 +106,9 @@ def test_delegate_tool_requires_explicit_opt_in(monkeypatch):
     monkeypatch.setenv("IPHONE_MCP_ENABLE_DELEGATE", "1")
     tools = asyncio.run(create_server().list_tools())
     assert "delegate_task" in {tool.name for tool in tools}
+
+
+def test_mcp_has_no_guard_reset():
+    from hidagent.mcp import create_server
+    tools = asyncio.run(create_server().list_tools())
+    assert "guard_reset" not in {tool.name for tool in tools}

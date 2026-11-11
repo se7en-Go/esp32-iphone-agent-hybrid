@@ -62,9 +62,6 @@ class IPhoneClient:
     def skill_prepare(self, skill: str = "") -> dict:
         return self.request("POST", "/api/skill/prepare-send", {"skill": skill}).json()
 
-    def guard_reset(self) -> dict:
-        return self.request("POST", "/api/guard/reset", {}).json()
-
     def skill_check(self, observed_text: str = "", skill: str = "") -> dict:
         return self.request("POST", "/api/skill/check",
                             {"observed_text": observed_text, "skill": skill}).json()
@@ -77,11 +74,11 @@ class IPhoneClient:
     def action(self, name: str, **arguments) -> dict:
         if name not in ("tap", "swipe", "scroll", "type", "key", "home", "back"):
             raise ValueError("unknown control action")
-        return self.request("POST", f"/api/{name}", arguments or None).json()
+        return self.request("POST", f"/api/{name}", arguments or {}).json()
 
     def calibrate(self, x: float | None = None, y: float | None = None) -> dict:
         if x is None and y is None:
-            return self.request("POST", "/api/calibrate/start").json()
+            return self.request("POST", "/api/calibrate/start", {}).json()
         if x is None or y is None:
             raise ValueError("provide both pointer coordinates")
         return self.request("POST", "/api/calibrate/finish", {"x": x, "y": y}).json()
@@ -93,4 +90,4 @@ class IPhoneClient:
         return self.status()["agent"]
 
     def stop(self) -> dict:
-        return self.request("POST", "/api/agent/stop").json()
+        return self.request("POST", "/api/agent/stop", {}).json()

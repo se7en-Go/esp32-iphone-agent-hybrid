@@ -86,20 +86,27 @@ def refuse_if_tripped() -> None:
         )
 
 
+def is_enter_key(command: str) -> bool:
+    """enter、Enter、enter+shift、shift+enter、带空格的 enter 都是发送键。"""
+    name, _, arg = command.strip().partition(" ")
+    if name.lower() != "key":
+        return False
+    parts = [piece.strip().lower() for piece in arg.replace("+", " ").split() if piece.strip()]
+    return "enter" in parts
+
+
 def _hid_gate(command: str) -> None:
-    name = command.split(" ", 1)[0]
+    name = command.split(" ", 1)[0].strip().lower()
     if name not in {"home", "move", "press", "release", "click", "scroll", "type", "key", "homescreen"}:
         return
-    if guard.tripped:
+    if guard.tripped and name not in {"release", "home"}:
         raise DeviceError(
             f"熔断还在（{guard.reason or '风险提示'}）。这一条 HID 没有发出。"
         )
-    if name == "key":
-        arg = command.split(" ", 1)[1].lower() if " " in command else ""
-        if arg == "enter" or arg.endswith("+enter"):
-            decision = guard.prepare_send("")
-            if not decision["allowed"]:
-                raise DeviceError(decision["reason"])
+    if is_enter_key(command):
+        decision = guard.prepare_send("")
+        if not decision["allowed"]:
+            raise DeviceError(decision["reason"])
 
 
 device.gate = _hid_gate
@@ -114,7 +121,14 @@ async def reject_cross_site_posts(request: Request, call_next):
             host = (urlparse(header).hostname or "").lower()
             if host not in LOCAL_HOSTS:
                 return JSONResponse({"detail": "拒绝来自其他网站的请求。请只从本机网页操作。"}, status_code=403)
-        if "application/json" not in request.headers.get("content-type", "").lower():
+        ctype = request.headers.get("content-type", "")
+        length = request.headers.get("content-length")
+        has_body = bool(request.headers.get("transfer-encoding")) or (
+            length is not None and length not in ("", "0")
+        )
+        if ctype and "application/json" not in ctype.lower():
+            return JSONResponse({"detail": "只接受 application/json，不接受表单提交。"}, status_code=415)
+        if not ctype and has_body:
             return JSONResponse({"detail": "只接受 application/json，不接受表单提交。"}, status_code=415)
     return await call_next(request)
 
@@ -372,11 +386,27 @@ def skill_confirm(body: SkillBody):
                               skill=body.skill)
 
 
+class GuardReset(BaseModel):
+    confirm: bool = False
+
+
 @app.post("/api/guard/reset")
-def guard_reset():
-    """人工看过手机之后才调用。Agent 不应该用它绕过风险提示。"""
+def guard_reset(body: GuardReset, request: Request):
+    """只有本机网页、并且人明确确认过，才能解除熔断。发送次数保留。"""
+    origin = request.headers.get("origin") or ""
+    referer = request.headers.get("referer") or ""
+    if not origin and not referer:
+        raise HTTPException(403, "只能从本机网页解除熔断。")
+    for header in (origin, referer):
+        if not header:
+            continue
+        host = (urlparse(header).hostname or "").lower()
+        if host not in LOCAL_HOSTS:
+            raise HTTPException(403, "只能从本机网页解除熔断。")
+    if body.confirm is not True:
+        raise HTTPException(400, "需要在网页上确认已经看过手机。这一小时的发送次数不会清掉。")
     guard.reset()
-    return {"ok": True, "tripped": guard.tripped}
+    return {"ok": True, "tripped": guard.tripped, "sends": len(guard.sends)}
 
 
 @app.get("/api/steps/{index}.jpg")
@@ -478,18 +508,18 @@ async def agent_stop():
     if job and job is not asyncio.current_task():
         job.cancel()
     agent.stop()
-    await asyncio.sleep(0.1)  # let a gesture in flight finish its own release
-    # Emergency stop must stay available even while a direct action holds the lock.
+    if hasattr(device, "request_abort"):
+        device.request_abort()
+    await asyncio.sleep(0)  # 让被取消的那一条先放开串口锁
     try:
         if getattr(device, "connected", False):
-            bypass = getattr(device, "unguarded", None)
-            if bypass:
-                with device.unguarded():
-                    await phone.reset()
-            else:
-                await phone.reset()
+            await phone.reset()
     except (DeviceError, RuntimeError) as e:
         raise HTTPException(409, for_user(str(e))) from e
+    finally:
+        await asyncio.sleep(0)
+        if hasattr(device, "clear_abort"):
+            device.clear_abort()
     return {"ok": True}
 
 

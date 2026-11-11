@@ -33,6 +33,7 @@ class Screen:
         self._started = False
         self._stopping = False
         self._session_ok = False
+        self._resume_ts: int | None = None
         self._stop = threading.Event()
         self._sockets: list = []
 
@@ -83,6 +84,7 @@ class Screen:
                     host, self.port, token, self._on_jpeg, self._stop,
                     quality=self.quality, max_fps=max(1, self.fps),
                     on_ready=self._on_ready, on_stall=self._on_stall, sockets=self._sockets,
+                    resume_ts=self._resume_ts, on_timestamp=self._on_timestamp,
                 )
                 self.last_error = "7201 连接结束了，正在重连。"
             except Exception as exc:
@@ -95,6 +97,9 @@ class Screen:
     def _on_ready(self) -> None:
         self._session_ok = True
         self.last_error = ""
+
+    def _on_timestamp(self, ts: int) -> None:
+        self._resume_ts = int(ts)
 
     def _on_stall(self) -> None:
         self.last_error = "画面停住了。请在控制中心重新选一次「屏幕镜像 → ESP32 Agent」。板子可能还留着旧缓冲。"

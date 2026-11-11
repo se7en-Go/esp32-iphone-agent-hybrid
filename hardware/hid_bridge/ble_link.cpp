@@ -16,6 +16,7 @@
 #include "netcfg.h"
 #include "cli_link.h"
 #include "src/cli/cli_proto.h"
+#include "src/ble/pair_window.h"
 #include "logbuf.h"
 
 static_assert(MYNEWT_VAL(MSYS_1_BLOCK_COUNT) == 64 && MYNEWT_VAL(MSYS_1_BLOCK_SIZE) == 320,
@@ -197,7 +198,11 @@ class ServerCb : public NimBLEServerCallbacks {
 class CharCb : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &ci) override {
     const NimBLEAttValue &raw = c->getValue();
-    if (c == cliIn || c == cliInNR) { cli_on_frame(slotFor(ci.getConnHandle()), raw.data(), raw.length()); return; }
+    if (c == cliIn || c == cliInNR) {
+      if (!ci.isEncrypted()) return;  // an unpaired client must not reach command dispatch
+      cli_on_frame(slotFor(ci.getConnHandle()), raw.data(), raw.length());
+      return;
+    }
     String v(raw.c_str(), raw.length());
     if (!ci.isEncrypted()) return;
     if (c == netChar) { net_request(v); return; }
@@ -562,7 +567,12 @@ void ble_unpair() {
 }
 
 // Hooks for cli_link.cpp.
-bool ble_pair_window_open() { return pairArmed && (int32_t)(pairUntil - millis()) > 0; }
+bool ble_pair_window_open() {
+  int still = 0;
+  int open = pair_window_still_open(pairArmed ? 1 : 0, pairUntil, millis(), &still);
+  pairArmed = still != 0;
+  return open != 0;
+}
 
 void ble_allow_pairing(uint32_t window_ms) {
   if (window_ms < 5000) window_ms = 5000;

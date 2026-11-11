@@ -3,6 +3,8 @@ const I18N = {
   en: {
     waiting: "Waiting for the phone screen…", liveCaption: "Live screen · click to tap, drag to swipe",
     estop: "■ Emergency stop (Esc)", motionOn: "Motion: on", motionOff: "Motion: off", estopHint: "Stops the AI and lets go of the screen",
+    guardReset: "Clear the circuit breaker",
+    guardResetAsk: "Have you looked at the phone and confirmed the warning is gone? Sends already made this hour stay counted.",
     clear: "Clear history",
     manual: "Manual controls", home: "Home", back: "Back", calibrate: "Calibrate", type: "Type", press: "Press",
     typePh: "Type text", keyPh: "Key: enter, cmd+a…", log: "Live log",
@@ -22,6 +24,8 @@ const I18N = {
   zh: {
     waiting: "等待手机画面…", liveCaption: "实时画面 · 点击 = 点按，拖动 = 滑动",
     estop: "■ 紧急停止（Esc）", motionOn: "动效：开", motionOff: "动效：关", estopHint: "立即停止 AI，并松开屏幕",
+    guardReset: "看过手机后解除熔断",
+    guardResetAsk: "看过手机、确认风险提示已经消失？这一小时已经发出去的次数不会清掉。",
     clear: "清空记录",
     manual: "手动操控", home: "主屏幕", back: "返回", calibrate: "校准", type: "输入", press: "按键",
     typePh: "输入文字", keyPh: "按键：enter、cmd+a…", log: "实时日志",

@@ -140,6 +140,9 @@ class Device:
         self.ssid = ""
         self.vtok = ""
         self.last_error = ""
+        self._abort = False
+        self._abort_epoch = 0
+        self._inflight: asyncio.Task | None = None
 
     @property
     def connected(self) -> bool:
@@ -201,31 +204,56 @@ class Device:
     def unguarded(self):
         return _Unguarded(self)
 
+    @property
+    def abort_epoch(self) -> int:
+        return self._abort_epoch
+
+    def request_abort(self) -> None:
+        """紧急停止。正在等应答的那一条会被取消，锁马上让出来，后面的 HID 不再写。"""
+        self._abort = True
+        self._abort_epoch += 1
+        task = self._inflight
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+
+    def clear_abort(self) -> None:
+        self._abort = False
+
     async def exchange(self, command: str) -> str:
-        gate = getattr(self, "gate", None)
-        if gate is not None and not getattr(self, "_hid_bypass", 0):
-            gate(command)
         if not self.connected:
             raise DeviceError(messages.BOARD_NOT_CONNECTED)
         timeout = self._timeout(command)
+        name = command.split(" ", 1)[0]
         async with self._lock:
-            link = self._link
-            if link is None or not link.is_open():
-                raise DeviceError(messages.BOARD_NOT_CONNECTED)
-            req_id = self._request_id(command)
+            self._inflight = asyncio.current_task()
             try:
-                link.write(f"{req_id} {command}\n".encode())
-                reply = await self._read_reply(link, req_id, timeout)
-            except asyncio.CancelledError:
-                link.close()
-                if self._link is link:
-                    self._link = None
-                raise
-            except (OSError, asyncio.TimeoutError) as exc:
-                link.close()
-                if self._link is link:
-                    self._link = None
-                raise DeviceError(messages.link_lost(command)) from exc
+                # 停止和熔断都在写串口之前、锁里面再查一次。查完到 write 之间没有 await。
+                if self._abort and name not in {"release", "home"}:
+                    raise DeviceError("已紧急停止，后面的内容没有发出。")
+                gate = getattr(self, "gate", None)
+                if gate is not None:
+                    gate(command)
+                link = self._link
+                if link is None or not link.is_open():
+                    raise DeviceError(messages.BOARD_NOT_CONNECTED)
+                req_id = self._request_id(command)
+                try:
+                    link.write(f"{req_id} {command}\n".encode())
+                    reply = await self._read_reply(link, req_id, timeout)
+                except asyncio.CancelledError:
+                    if not self._abort:
+                        link.close()
+                        if self._link is link:
+                            self._link = None
+                    raise
+                except (OSError, asyncio.TimeoutError) as exc:
+                    link.close()
+                    if self._link is link:
+                        self._link = None
+                    raise DeviceError(messages.link_lost(command)) from exc
+            finally:
+                if self._inflight is asyncio.current_task():
+                    self._inflight = None
         self._beat = time.time()
         if command.split(" ", 1)[0] in HID_COMMANDS:
             self._last = self._beat
