@@ -55,19 +55,29 @@ def test_real_content_change_restarts_quiet_window():
 def test_animation_still_obeys_maximum_wait():
     async def scenario():
         screen = Screen()
-        white, black = frame("white"), frame("black")
-        screen.frame = white
+        screen.frame = frame("white")
 
         async def animate():
+            # A black/white toggle can land back on the frame last sampled.
+            # Windows sleeps in ~15.6ms ticks, so the 40ms flip and the 50ms
+            # poll often take an even number of flips between samples. settled
+            # then treats the screen as quiet and returns at quiet (0.15s).
+            # The 0.172s failure is that path, not a 0.2s maximum measured
+            # short: the same monotonic clock cannot take the max path before
+            # most. A new, obviously different image each step is still a
+            # change no matter how many steps fall between samples.
+            n = 0
             while True:
-                screen.frame = black if screen.frame == white else white
+                n += 1
+                screen.frame = frame(((n * 97) % 256, (n * 57) % 256, 255 - (n * 23) % 256))
                 screen.updated = time.time()
-                await asyncio.sleep(.04)
+                await asyncio.sleep(.02)
 
         task = asyncio.create_task(animate())
         try:
             started = time.monotonic()
             await screen.settled(quiet=.15, least=.01, most=.2)
+            # Stay above the quiet window. 0.19 - 0.05 would accept the 0.172s return.
             assert .19 <= time.monotonic() - started < .4
         finally:
             task.cancel()
