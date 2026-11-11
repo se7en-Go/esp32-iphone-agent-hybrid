@@ -81,6 +81,42 @@ def test_send_without_board_fails_fast():
         asyncio.run(Device().send("ping"))
 
 
+@pytest.mark.parametrize("method", ["wait_connected", "keep_awake"])
+def test_device_exposes_connection_lifecycle_methods(method):
+    assert callable(getattr(Device(), method, None)), f"Device.{method} is missing"
+
+
+def test_keep_awake_nudges_an_idle_connected_phone(monkeypatch):
+    from hidagent import device as module
+
+    async def scenario():
+        device = Device()
+        link = MemoryLink()
+        device.attach(link)
+        now = device._last + 30
+        monkeypatch.setattr(module.time, "time", lambda: now)
+        beats = 0
+
+        async def heartbeat(_delay):
+            nonlocal beats
+            beats += 1
+            if beats > 1:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(module.asyncio, "sleep", heartbeat)
+        firmware = asyncio.create_task(run_firmware(link))
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await device.keep_awake()
+            assert link.written == [b"1 move 1 0\n", b"2 move -1 0\n"]
+        finally:
+            firmware.cancel()
+            await asyncio.gather(firmware, return_exceptions=True)
+            device.close()
+
+    asyncio.run(scenario())
+
+
 def test_round_trip_strips_id_and_never_keeps_the_wifi_password():
     async def scenario():
         device = Device()

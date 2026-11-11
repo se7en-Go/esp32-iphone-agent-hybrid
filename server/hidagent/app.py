@@ -3,6 +3,7 @@
 import asyncio
 import os
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -53,20 +54,19 @@ guard = Guard(path=DATA_DIR / "guard.json")
 
 @asynccontextmanager
 async def lifespan(_):
-    # 测试会把 device / screen 换成假对象。缺方法时就跳过，避免导入即连串口。
+    # 测试可替换 device / screen；启动时必须具备设备保活接口。
     device._closing = False
     maintain = asyncio.create_task(supervise_maintain(device)) if hasattr(device, "maintain") else None
     if hasattr(screen, "bind"):
         screen.bind(device)
     if hasattr(screen, "start"):
         screen.start()
-    awake = asyncio.create_task(device.keep_awake(screen=screen)) if hasattr(device, "keep_awake") else None
+    awake = asyncio.create_task(device.keep_awake(screen=screen))
     try:
         yield
     finally:
         device._closing = True
-        if awake:
-            awake.cancel()
+        awake.cancel()
         if maintain:
             maintain.cancel()
         if hasattr(screen, "stop"):
@@ -97,6 +97,9 @@ def is_enter_key(command: str) -> bool:
     return "enter" in parts
 
 
+_named_send: ContextVar[bool] = ContextVar("named_send", default=False)
+
+
 def _hid_gate(command: str) -> None:
     name = command.split(" ", 1)[0].strip().lower()
     if name not in {"home", "move", "press", "release", "click", "scroll", "type", "key", "homescreen"}:
@@ -105,9 +108,11 @@ def _hid_gate(command: str) -> None:
         raise DeviceError(
             f"熔断还在（{guard.reason or '风险提示'}）。这一条 HID 没有发出。"
         )
-    if is_enter_key(command):
+    if is_enter_key(command) or (name == "click" and _named_send.get()):
         decision = guard.consume_reservation("")
         if not decision["allowed"]:
+            if _named_send.get():
+                raise HTTPException(409, decision["reason"])
             raise DeviceError(decision["reason"])
 
 
@@ -332,10 +337,6 @@ def layouts():
 async def layout_tap(body: LayoutTap):
     refuse_if_tripped()
     check_manual()
-    if body.point == "send":
-        decision = guard.prepare_send("")
-        if not decision["allowed"]:
-            raise HTTPException(409, decision["reason"])
     try:
         x, y = resolve_point(body.layout, body.point)
     except ValueError as e:
@@ -343,11 +344,14 @@ async def layout_tap(body: LayoutTap):
     request = ControlAction(action="tap", screen_id=body.screen_id, x=x, y=y)
     async with manual_lock:
         controls.job = asyncio.current_task()
+        # exchange 子任务继承上下文；定位完成后，在实际 click 的串口 gate 里结算。
+        send_token = _named_send.set(body.point == "send")
         try:
             result = await controls.perform(request)
         except ValueError as e:
             raise HTTPException(409, str(e)) from e
         finally:
+            _named_send.reset(send_token)
             controls.job = None
     result["layout"] = body.layout
     result["point"] = body.point
@@ -379,13 +383,13 @@ def skill_check(body: SkillBody):
 
 @app.post("/api/skill/prepare-send")
 def skill_prepare(body: SkillBody):
-    """发送键按下之前。频率和静默不过就不许发，也不计入次数。"""
+    """发送前检查并预留一个名额，发送时消费且更新实际发送时间。"""
     return guard.prepare_send(body.skill)
 
 
 @app.post("/api/skill/confirm-send")
 def skill_confirm(body: SkillBody):
-    """气泡位是调用方的声明，不是服务端看见了气泡。频率和静默在计数之前再查一次。"""
+    """气泡位是调用方的声明。确认已消费的发送不重复计数，也不产生新的预留。"""
     return guard.confirm_send(bubble_visible=body.bubble_visible, observed_text=body.observed_text,
                               skill=body.skill)
 

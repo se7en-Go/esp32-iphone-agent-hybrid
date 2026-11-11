@@ -185,7 +185,7 @@ class Guard:
         return {"stop": False, "counted": False, "allowed": False,
                 "reason": "这只是观察，还不是发送许可。发送前要先做频率和静默检查。"}
 
-    def _rate_block(self, skill: str) -> dict | None:
+    def _rate_block(self, skill: str, *, consuming: bool = False) -> dict | None:
         """频率和静默。不计入发送次数。返回 None 表示这一刻可以发。"""
         if self.tripped:
             return {
@@ -202,6 +202,9 @@ class Guard:
             }
         window = [stamp for stamp in self.sends if now - stamp < 3600]
         self.sends = window
+        if consuming and self._reservation is not None:
+            # prepare 的名额始终是最后一条；消费时不把自己的预留当作上一次发送。
+            window = window[:-1]
         interval = limits["min_interval"]
         if window and now - window[-1] < interval:
             return {
@@ -223,7 +226,7 @@ class Guard:
             self._reservation = None
 
     def prepare_send(self, skill: str = "") -> dict:
-        """占一个一次性名额。紧接着的 Enter 用掉它，不再记第二次。"""
+        """保守占一个一次性名额。Enter 或命名发送按钮消费时更新为实际发送时间。"""
         with self._lock:
             self._drop_expired_reservation()
             if self._reservation is not None:
@@ -238,7 +241,6 @@ class Guard:
             token = secrets.token_hex(8)
             self.sends.append(now)
             self._reservation = (token, now)
-            self._pending += 1
             self._save()
             return {
                 "stop": False, "counted": False, "allowed": True,
@@ -246,33 +248,25 @@ class Guard:
             }
 
     def consume_reservation(self, skill: str = "") -> dict:
-        """Enter：有未过期的 prepare 就用掉，没有就自己占一个名额。一次发送只计一次。"""
+        """真正发送前原子结算：复用未过期的预留，或直接占用并消费一个名额。"""
         with self._lock:
-            if self.tripped:
-                return {
-                    "stop": True, "counted": False, "allowed": False,
-                    "reason": f"熔断还在（{self.reason}）。不要重试。",
-                }
-            limits = limits_for(skill)
-            now = self._clock()
-            if limits["quiet"] and in_quiet(
-                datetime.fromtimestamp(now), limits["quiet_start"], limits["quiet_end"]
-            ):
-                return {
-                    "stop": False, "counted": False, "allowed": False,
-                    "reason": "现在是静默时段，这一次不发送。",
-                }
-            self._drop_expired_reservation()
-            if self._reservation is not None:
-                self._reservation = None
-                return {"stop": False, "counted": False, "allowed": True, "reason": ""}
-            blocked = self._rate_block(skill)
-            if blocked:
-                return blocked
+            return self._consume_reservation(skill)
+
+    def _consume_reservation(self, skill: str) -> dict:
+        """调用方持有 _lock；检查、更新时间和销毁预留不能被另一发送插入。"""
+        self._drop_expired_reservation()
+        blocked = self._rate_block(skill, consuming=True)
+        if blocked:
+            return blocked
+        now = self._clock()
+        if self._reservation is not None:
+            self.sends[-1] = now
+            self._reservation = None
+        else:
             self.sends.append(now)
-            self._pending += 1
-            self._save()
-            return {"stop": False, "counted": False, "allowed": True, "reason": ""}
+        self._pending += 1
+        self._save()
+        return {"stop": False, "counted": False, "allowed": True, "reason": ""}
 
     def confirm_send(self, *, bubble_visible: bool, observed_text: str, skill: str = "") -> dict:
         seen = self.observe(observed_text, skill)
@@ -284,14 +278,12 @@ class Guard:
                 "reason": "屏幕上还没有完整的新消息气泡。输入框清空和收到 ok 都不算发送成功。",
             }
         with self._lock:
-            if self._pending:
-                self._pending -= 1
-                return {"stop": False, "counted": True, "allowed": True, "reason": ""}
-            blocked = self._rate_block(skill)
-            if blocked:
-                return blocked
-            self.sends.append(self._clock())
-            self._save()
+            if not self._pending:
+                # 兼容用户直接在手机上发送后确认；也消费之前的 prepare，不能再次复用。
+                decision = self._consume_reservation(skill)
+                if not decision["allowed"]:
+                    return decision
+            self._pending -= 1
             return {"stop": False, "counted": True, "allowed": True, "reason": ""}
 
 

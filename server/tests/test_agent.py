@@ -92,3 +92,71 @@ def test_repeating_a_move_that_keeps_changing_the_screen_is_not_stuck():
 def test_precise_tap_flag():
     assert parse_command("tap 120 640 precise") == {"action": "tap", "x": 120, "y": 640, "precise": True}
     assert "precise" not in parse_command("tap 120 640")
+
+
+def test_agent_resumes_real_key_command_after_device_reconnects(tmp_path, monkeypatch):
+    import asyncio
+
+    from hidagent import device as device_module
+    from hidagent.agent import Agent
+    from hidagent.debug import Trace
+    from hidagent.device import Device
+    from hidagent.phone import Phone
+
+    class Screen:
+        live, frame, aspect = True, b"jpeg", 0.46
+
+        async def settled(self):
+            pass
+
+    class Model:
+        model = "fake"
+
+        def __init__(self, replies):
+            self.replies = iter(replies)
+
+        async def chat(self, *_args, **_kwargs):
+            return next(self.replies)
+
+    class Link:
+        def __init__(self):
+            self.written = []
+            self.replies = asyncio.Queue()
+
+        def write(self, data):
+            self.written.append(data)
+            self.replies.put_nowait(data.split(b" ", 1)[0] + b" ok\n")
+
+        async def readline(self):
+            return await self.replies.get()
+
+        def is_open(self):
+            return True
+
+        def close(self):
+            pass
+
+    async def scenario():
+        device, link = Device(), Link()
+        reconnect_waits = []
+
+        async def reconnect(delay):
+            reconnect_waits.append(delay)
+            device.attach(link)
+
+        monkeypatch.setattr(device_module.asyncio, "sleep", reconnect)
+        monkeypatch.setattr("hidagent.agent.vision.changed", lambda *_args, **_kwargs: True)
+        screen = Screen()
+        actor = Model(["DO: key a", "DO: key a", "DO: done recovered"])
+        planner = Model(["1. Press a", "1. Retry after reconnect"])
+        agent = Agent(Phone(device, tmp_path / "calibration.json", screen), screen,
+                      actor, planner, Trace(None), max_failures=1)
+        agent.start("Press a")
+        await agent._job
+        actions = [step["action"] for step in agent.steps]
+        assert actions == ["plan", "hiccup", "replan (stuck)", "key", "done"], agent.steps
+        assert reconnect_waits == [0.2]
+        assert link.written == [b"1 key a\n"]
+        device.close()
+
+    asyncio.run(scenario())

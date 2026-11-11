@@ -1,6 +1,7 @@
 """熔断挡住 HID，以及网页接口不接受跨站表单。"""
 
 import asyncio
+import io
 import os
 import socket
 import sys
@@ -14,6 +15,7 @@ import pytest
 import uvicorn
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from PIL import Image
 
 from hidagent import app as module
 from hidagent.client import IPhoneClient
@@ -169,6 +171,161 @@ def test_prepare_then_enter_reaches_serial_once(tmp_path):
     finally:
         module.device.close()
         module.guard = previous
+
+
+@pytest.fixture
+def send_routes(tmp_path, monkeypatch):
+    from hidagent.control import Controls
+    from hidagent.device import Device
+    from hidagent.phone import Phone
+
+    image = io.BytesIO()
+    Image.new("RGB", (100, 200), "white").save(image, format="JPEG")
+
+    class Screen:
+        live, frame, updated = True, image.getvalue(), 0.0
+
+        async def fresh(self, *_args):
+            return self.frame
+
+        async def settled(self, **_kwargs):
+            pass
+
+    clock = [datetime(2023, 11, 14, 12, 0).timestamp()]
+    guard = Guard(clock=lambda: clock[0], path=tmp_path / "guard.json")
+    device, link, screen = Device(), _OkLink(), Screen()
+    device.attach(link)
+    device.gate = module._hid_gate
+    phone = Phone(device, tmp_path / "calibration.json", screen)
+    controls = Controls(phone, screen)
+
+    async def positioned(x, y):
+        return x, y
+
+    monkeypatch.setattr(phone, "point_verified", positioned)
+    monkeypatch.setattr("hidagent.phone.TAP_GAP", 0)
+    monkeypatch.setattr(module, "guard", guard)
+    monkeypatch.setattr(module, "device", device)
+    monkeypatch.setattr(module, "phone", phone)
+    monkeypatch.setattr(module, "controls", controls)
+    monkeypatch.setattr(module, "resolve_point", lambda *_args: (0.9, 0.9))
+    yield clock, guard, link, phone
+    device.close()
+
+
+@pytest.mark.parametrize("confirm_first", [False, True])
+def test_late_enter_records_send_time_and_blocks_second(send_routes, confirm_first):
+    clock, guard, link, _phone = send_routes
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+            prepared = await client.post("/api/skill/prepare-send", json={})
+            assert prepared.json()["allowed"]
+            clock[0] += 9
+            first = await client.post("/api/key", json={"text": "enter"})
+            assert first.status_code == 200
+            if confirm_first:
+                confirmed = await client.post("/api/skill/confirm-send", json={"bubble_visible": True})
+                assert confirmed.json()["counted"]
+                again = await client.post("/api/skill/prepare-send", json={})
+                assert not again.json()["allowed"]
+            second = await client.post("/api/key", json={"text": "enter"})
+            assert second.status_code == 409
+
+    asyncio.run(scenario())
+    assert guard.sends == [clock[0]]
+    assert len([line for line in link.written if b"key enter" in line]) == 1
+
+
+@pytest.mark.parametrize("prepare_first", [False, True])
+@pytest.mark.parametrize("previous_sends", [0, 19])
+def test_send_button_consumes_reservation_before_confirm_and_enter(send_routes, prepare_first, previous_sends):
+    clock, guard, link, _phone = send_routes
+    guard.sends = [clock[0] - 100 - 9 * index for index in reversed(range(previous_sends))]
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+            if prepare_first:
+                prepared = await client.post("/api/skill/prepare-send", json={})
+                assert prepared.json()["allowed"]
+            observed = await client.get("/api/control/observe")
+            sent = await client.post("/api/control/layout-tap", json={
+                "layout": "demo", "point": "send", "screen_id": observed.json()["screen_id"],
+            })
+            assert sent.status_code == 200, sent.text
+            assert sent.json()["command_acknowledged"]
+            confirmed = await client.post("/api/skill/confirm-send", json={"bubble_visible": True})
+            assert confirmed.json()["counted"]
+            clock[0] += 1
+            second = await client.post("/api/key", json={"text": "enter"})
+            assert second.status_code == 409
+
+    asyncio.run(scenario())
+    assert len(guard.sends) == previous_sends + 1
+    assert len([line for line in link.written if b" click" in line]) == 1
+    assert not any(b"key enter" in line for line in link.written)
+
+
+def test_send_button_records_time_after_pointer_positioning(send_routes, monkeypatch):
+    clock, guard, _link, phone = send_routes
+
+    async def delayed_position(x, y):
+        clock[0] += 9
+        return x, y
+
+    monkeypatch.setattr(phone, "point_verified", delayed_position)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+            observed = await client.get("/api/control/observe")
+            sent = await client.post("/api/control/layout-tap", json={
+                "layout": "demo", "point": "send", "screen_id": observed.json()["screen_id"],
+            })
+            assert sent.status_code == 200 and sent.json()["command_acknowledged"]
+
+    asyncio.run(scenario())
+    assert guard.sends == [clock[0]]
+
+
+def test_invalid_send_button_observation_does_not_reserve_quota(send_routes):
+    _clock, guard, link, _phone = send_routes
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+            sent = await client.post("/api/control/layout-tap", json={
+                "layout": "demo", "point": "send", "screen_id": "invalid",
+            })
+            assert sent.status_code == 409
+
+    asyncio.run(scenario())
+    assert guard.sends == []
+    assert link.written == []
+
+
+def test_send_button_rate_limit_returns_409_without_second_click(send_routes):
+    _clock, guard, link, _phone = send_routes
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+            observed = await client.get("/api/control/observe")
+            first = await client.post("/api/control/layout-tap", json={
+                "layout": "demo", "point": "send", "screen_id": observed.json()["screen_id"],
+            })
+            assert first.status_code == 200 and first.json()["command_acknowledged"]
+            second = await client.post("/api/control/layout-tap", json={
+                "layout": "demo", "point": "send", "screen_id": first.json()["screen_id"],
+            })
+            assert second.status_code == 409
+            assert "8 秒" in second.json()["detail"]
+
+    asyncio.run(scenario())
+    assert len(guard.sends) == 1
+    assert len([line for line in link.written if b" click" in line]) == 1
 
 
 def test_stopped_type_returns_409_not_500():

@@ -315,3 +315,87 @@ def test_screen_reconnect_after_a_timestamp_stays_on_plain_hello(monkeypatch):
     screen._supervise()
     assert len(seen) >= 2
     assert all(call.get("resume_ts") in (None,) for call in seen)
+
+
+def _large_replay(monkeypatch, decode_cost):
+    """3171 个 AU 落在一次 recv 内；用假成本量出转换工作量，不依赖 CI 机器速度。"""
+    from hidagent import video7201
+
+    count = 3171
+    clock = [0.0]
+    encoded, emitted, ka_times = [], [], []
+    stop = threading.Event()
+    blob = bytearray(keepalive())
+    seq = 0
+    for index in range(count):
+        record, seq = pack_access_unit(b"\x00\x00\x01\x61x", seq, index)
+        blob += record
+    assert len(blob) <= 65536
+
+    class Decoder:
+        def __init__(self):
+            self.index = 0
+
+        def push_chunk(self, record):
+            clock[0] += decode_cost
+            frame = self.index
+            self.index += 1
+            return [frame]
+
+    class Socket:
+        batch_elapsed = None
+        received = False
+        closed = False
+
+        def setsockopt(self, *_args):
+            pass
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, data):
+            if data == b"ka\n":
+                ka_times.append(clock[0])
+            else:
+                assert data == hello_line(TOKEN)
+
+        def recv(self, _size):
+            if not self.received:
+                self.received = True
+                return bytes(blob)
+            self.batch_elapsed = clock[0]
+            clock[0] += 0.5
+            stop.set()
+            raise TimeoutError
+
+        def close(self):
+            self.closed = True
+
+    def encode(frame, quality):
+        assert quality == 75
+        encoded.append(frame)
+        clock[0] += 0.0035
+        return str(frame).encode()
+
+    sock = Socket()
+    monkeypatch.setattr(video7201.socket, "create_connection", lambda *_args, **_kw: sock)
+    monkeypatch.setattr(video7201.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(video7201, "H264Decoder", Decoder)
+    monkeypatch.setattr(video7201, "frame_to_jpeg", encode)
+    run_tcp("fake-board", 7201, TOKEN, emitted.append, stop)
+    assert sock.closed
+    assert emitted[-1] == str(count - 1).encode(), "flush must output the newest held frame"
+    return sock.batch_elapsed, encoded, emitted, ka_times
+
+
+def test_large_replay_encodes_only_rate_limited_frames(monkeypatch):
+    elapsed, encoded, emitted, _ka_times = _large_replay(monkeypatch, decode_cost=0.0001)
+    assert elapsed < 0.5, f"3171-AU batch took {elapsed:.4f}s of simulated work"
+    assert len(encoded) == len(emitted) <= 4
+
+
+def test_large_replay_sends_keepalive_during_decode(monkeypatch):
+    elapsed, _encoded, _emitted, ka_times = _large_replay(monkeypatch, decode_cost=0.001)
+    assert len(ka_times) >= 3, "keepalive must run while the receive batch is decoding"
+    points = [0.0, *ka_times, elapsed]
+    assert max(b - a for a, b in zip(points, points[1:], strict=False)) < 1.01

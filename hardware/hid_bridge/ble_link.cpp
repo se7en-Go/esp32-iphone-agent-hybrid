@@ -18,6 +18,7 @@
 #include "src/cli/cli_proto.h"
 #include "src/ble/pair_window.h"
 #include "src/ble/ingress.h"
+#include "src/hid/command_line.h"
 #include "logbuf.h"
 
 static_assert(MYNEWT_VAL(MSYS_1_BLOCK_COUNT) == 64 && MYNEWT_VAL(MSYS_1_BLOCK_SIZE) == 320,
@@ -210,7 +211,7 @@ class CharCb : public NimBLECharacteristicCallbacks {
     String v(raw.c_str(), raw.length());
     if (!ble_write_reaches_handler(0, ci.isEncrypted() ? 1 : 0)) return;
     if (c == netChar) { net_request(v); return; }
-    v.trim();
+    v.remove(hid_line_length(v.c_str(), v.length()));
     if (appWorks(v)) appSeenMs = millis() | 1;
     ble_push_cmd(FROM_APP, v.c_str(), v.length());
   }

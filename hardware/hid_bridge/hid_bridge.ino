@@ -32,6 +32,7 @@
 #include "src/airplay/airplay.h"
 #include "src/hid/arbiter.h"
 #include "src/hid/pace.h"
+#include "src/hid/command_line.h"
 #include "src/heard/heard.h"
 #include "src/cli/cli_proto.h"
 #include "logbuf.h"
@@ -461,7 +462,7 @@ void loop() {
   if (serialDone) {
     line = serialLine;
     serialLine = "";
-    line.trim();
+    line.remove(hid_line_length(line.c_str(), line.length()));
     if (line == "0 ble pair on") { ble_allow_pairing(60000); Serial.println("0 ok"); return; }
     if (line == "0 ble pair off") { ble_deny_pairing(); Serial.println("0 ok"); return; }
     if (line.startsWith("0 net ")) { net_request(line.substring(6)); Serial.println("0 ok"); return; }
@@ -477,7 +478,7 @@ void loop() {
   int sp = line.indexOf(' ');
   String id = sp < 0 ? line : line.substring(0, sp);
   String rest = sp < 0 ? "" : line.substring(sp + 1);
-  rest.trim();
+  rest.remove(hid_line_length(rest.c_str(), rest.length()));
 #if DEBUG_SERIAL
   unsigned long started = millis();
 #endif

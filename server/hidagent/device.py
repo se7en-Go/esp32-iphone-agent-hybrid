@@ -361,23 +361,6 @@ class Device:
                 log.warning("board maintain: %s", type(exc).__name__)
             await asyncio.sleep(0.05 if self._abort else 2)
 
-
-async def supervise_maintain(device: Device) -> None:
-    """维护任务如果自己退出，再拉起来。关机时 _closing 为真，不再重启。"""
-    while not device._closing:
-        task = asyncio.create_task(device.maintain())
-        device.maintain_task = task
-        try:
-            await task
-        except asyncio.CancelledError:
-            if device._closing:
-                raise
-        except Exception:
-            log.warning("maintain exited", exc_info=True)
-        if device._closing:
-            return
-        await asyncio.sleep(0.05)
-
     async def wait_connected(self, timeout: float) -> bool:
         deadline = time.time() + timeout
         while not self.connected and time.time() < deadline:
@@ -398,6 +381,23 @@ async def supervise_maintain(device: Device) -> None:
                     await self.send("ping")
             except DeviceError as exc:
                 log.info("board gone: %s", exc)
+
+
+async def supervise_maintain(device: Device) -> None:
+    """维护任务如果自己退出，再拉起来。关机时 _closing 为真，不再重启。"""
+    while not device._closing:
+        task = asyncio.create_task(device.maintain())
+        device.maintain_task = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            if device._closing:
+                raise
+        except Exception:
+            log.warning("maintain exited", exc_info=True)
+        if device._closing:
+            return
+        await asyncio.sleep(0.05)
 
 
 class _Unguarded:

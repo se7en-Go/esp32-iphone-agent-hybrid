@@ -223,11 +223,16 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
         last_ka = time.monotonic()
         last_frame = time.monotonic()
         last_ack = time.monotonic()
-        while not stop.is_set():
-            now = time.monotonic()
+
+        def send_keepalive(now: float) -> None:
+            nonlocal last_ka
             if authed and now - last_ka >= 1:
                 sock.sendall(b"ka\n")
                 last_ka = now
+
+        while not stop.is_set():
+            now = time.monotonic()
+            send_keepalive(now)
             if authed and not stalled and stream_is_dead(now, last_frame, last_ack) and on_stall:
                 stalled = True
                 on_stall()
@@ -236,11 +241,13 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
             except TimeoutError:
                 ready = gate.flush(time.monotonic())
                 if ready is not None:
-                    on_jpeg(ready)
+                    on_jpeg(frame_to_jpeg(ready, quality))
                 continue
             if not data:
                 raise ConnectionError("7201 closed")
             for record in records.feed(data):
+                # 一个 recv 可能包含整个长 GOP；解码期间也必须保持一秒一次的心跳。
+                send_keepalive(time.monotonic())
                 if record is None:
                     last_ack = time.monotonic()
                     stalled = False
@@ -264,9 +271,10 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
                     continue
                 last_frame = time.monotonic()
                 stalled = False
-                ready = gate.push(frame_to_jpeg(frames[-1], quality), last_frame)
+                # 只保留最新的解码帧，真正输出时才做昂贵的 JPEG 转换。
+                ready = gate.push(frames[-1], last_frame)
                 if ready is not None:
-                    on_jpeg(ready)
+                    on_jpeg(frame_to_jpeg(ready, quality))
     finally:
         try:
             sock.close()

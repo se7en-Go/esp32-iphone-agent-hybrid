@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from threading import Barrier
 
 from hidagent.guard import FLOOR_INTERVAL, Guard, in_quiet, limits_for
 
@@ -123,3 +125,20 @@ def test_reset_clears_the_trip_and_keeps_hourly_sends(tmp_path):
     again = Guard(clock=lambda: noon, path=path)
     assert again.tripped is False and again.sends == [noon]
     assert again.prepare_send("")["allowed"] is False
+
+
+def test_concurrent_consumers_share_only_one_reservation():
+    now = [datetime(2023, 11, 14, 12, 0).timestamp()]
+    guard = Guard(clock=lambda: now[0])
+    assert guard.prepare_send()["allowed"]
+    now[0] += 9
+    ready = Barrier(2)
+
+    def consume():
+        ready.wait(timeout=5)
+        return guard.consume_reservation()["allowed"]
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        results = list(workers.map(lambda _: consume(), range(2)))
+    assert sum(results) == 1
+    assert guard.sends == [now[0]]

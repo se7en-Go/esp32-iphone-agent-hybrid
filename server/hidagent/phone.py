@@ -26,7 +26,7 @@ TYPE_LIMIT = SERIAL_LINE_MAX - TYPE_PREFIX_MAX
 
 
 def type_chunks(text: str, limit: int = TYPE_LIMIT) -> list[str]:
-    """切开时让空格留在一行中间或非空格前面。固件 line.trim() 会吃掉行尾空格。"""
+    """按串口行长上限分块，尽量不在一段空格中间切开；固件保留每块的完整内容。"""
     if len(text) <= limit:
         return [text]
     parts: list[str] = []
@@ -317,7 +317,6 @@ class Phone:
 
     async def type(self, text: str) -> None:
         # 固件串口一行最多 512 字节，含 "<id> type "。超长就切开，每段都要等到 ok。
-        # 固件对整行 trim，空格不能留在一段的末尾，否则会被吃掉。
         epoch = getattr(self.device, "abort_epoch", 0)
         for part in type_chunks(text):
             if getattr(self.device, "abort_epoch", 0) != epoch:
