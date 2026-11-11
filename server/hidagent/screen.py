@@ -1,0 +1,163 @@
+"""手机画面。默认从板子 TCP 7201 收 H.264，用 PyAV 解成 JPEG。
+
+对外仍是原来的 Screen：start/stop、live、frame、updated、aspect、settled、fresh。
+上面的手势和网页不用知道传输换过。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import socket
+import threading
+import time
+
+from . import video7201, vision
+
+log = logging.getLogger(__name__)
+
+
+class Screen:
+    def __init__(self, host: str = "", token: str = "", port: int = 7201,
+                 fps: int | None = None, quality: int = 75):
+        self._fixed_host = host
+        self._fixed_token = token
+        self.port = port
+        self.quality = quality
+        self.fps = fps if fps is not None else int(os.environ.get("VIDEO_FPS", "8"))
+        self.frame: bytes | None = None
+        self.updated = 0.0
+        self.last_error = ""
+        self._device = None
+        self._started = False
+        self._stopping = False
+        self._session_ok = False
+        self._stop = threading.Event()
+        self._sockets: list = []
+
+    def bind(self, device) -> None:
+        self._device = device
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._stopping = False
+        self._stop.clear()
+        threading.Thread(target=self._supervise, name="screen-7201", daemon=True).start()
+
+    def stop(self) -> None:
+        self._stopping = True
+        self._stop.set()
+        self._session_ok = False
+        for sock in list(self._sockets):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def _endpoint(self) -> tuple[str, str]:
+        host = self._fixed_host or os.environ.get("BOARD_HOST", "").strip()
+        token = self._fixed_token or os.environ.get("BOARD_VTOK", "").strip()
+        device = self._device
+        if not host and device is not None:
+            host = getattr(device, "ip", "") or ""
+        if not token and device is not None:
+            token = getattr(device, "vtok", "") or ""
+        if host in ("0.0.0.0", "0.0.0.0/0"):
+            host = ""
+        return host, token
+
+    def _supervise(self) -> None:
+        while not self._stopping:
+            host, token = self._endpoint()
+            if not host or not token:
+                self._session_ok = False
+                self.last_error = "还没有板子的 IP 或 vtok。COM 口连上之后，服务会从 0 netinfo 里读。"
+                time.sleep(1)
+                continue
+            self._stop.clear()
+            try:
+                video7201.run_tcp(
+                    host, self.port, token, self._on_jpeg, self._stop,
+                    quality=self.quality, max_fps=max(1, self.fps),
+                    on_ready=self._on_ready, sockets=self._sockets,
+                )
+                self.last_error = "7201 连接结束了，正在重连。"
+            except Exception as exc:
+                self.last_error = _friendly_video_error(exc)
+                log.info("screen: %s", self.last_error)
+            self._session_ok = False
+            if not self._stopping:
+                time.sleep(1)
+
+    def _on_ready(self) -> None:
+        self._session_ok = True
+        self.last_error = ""
+
+    def _on_jpeg(self, jpeg: bytes) -> None:
+        self.frame = jpeg
+        self.updated = time.time()
+
+    @property
+    def live(self) -> bool:
+        if self.frame is None:
+            return False
+        # 测试直接塞 frame、没有启动线程时，当作画面可用。
+        if not self._started:
+            return True
+        # 静止画面时 AirPlay 不推新帧。会话还在、最近 90 秒内有过帧，就算活着。
+        return self._session_ok and (time.time() - self.updated < 90)
+
+    @property
+    def aspect(self) -> float:
+        """Frame width / height, read from the JPEG header (portrait iPhone as a fallback)."""
+        blob = self.frame or b""
+        i = blob.find(b"\xff\xc0")
+        if i < 0 or len(blob) < i + 9:
+            return 9 / 19.5
+        return int.from_bytes(blob[i + 7:i + 9], "big") / int.from_bytes(blob[i + 5:i + 7], "big")
+
+    async def settled(self, quiet: float = 0.35, least: float = 0.25, most: float = 4,
+                      transport: bool = False) -> None:
+        """Wait for quiet image content, not quiet transport: AirPlay may repeat identical frames."""
+        if transport:
+            started = time.monotonic()
+            await asyncio.sleep(least)
+            while time.time() - self.updated < quiet and time.monotonic() - started < most:
+                await asyncio.sleep(.1)
+            return
+        started = last_change = time.monotonic()
+        previous = self.frame
+        while True:
+            now, current = time.monotonic(), self.frame
+            if current != previous:
+                if vision.changed(previous, current):
+                    last_change = now
+                previous = current
+            if now - started >= most or (now - started >= least and now - last_change >= quiet):
+                return
+            await asyncio.sleep(min(0.05, max(0, most - (now - started))))
+
+    async def fresh(self, since: float, timeout: float = 0.8) -> bytes | None:
+        """The first frame received after `since`, or None if none arrives in time."""
+        deadline = time.time() + timeout
+        while self.updated <= since:
+            if time.time() > deadline:
+                return None
+            await asyncio.sleep(0.02)
+        return self.frame
+
+
+def _friendly_video_error(exc: Exception) -> str:
+    text = str(exc)
+    if isinstance(exc, UnicodeEncodeError) or "ascii" in text.lower():
+        return "vtok 里有非 ASCII 字符，hello 发不出去。请重新读一次 netinfo。"
+    if "timed out" in text or "Timeout" in text:
+        return "连不上板子的 7201 端口。确认电脑和板子在同一个局域网，并且手机已经开始屏幕镜像。"
+    if "refused" in text or "10061" in text:
+        return "板子拒绝了 7201。它可能还没连上 Wi-Fi，或镜像接收器没起来。看串口 0 status 里的 ap 字段。"
+    if "closed" in text:
+        return "7201 被关掉了。vtok 每次重启都会变，服务会重新读串口；若一直这样，请重新选一次屏幕镜像。"
+    return "画面连接失败。请重新选一次屏幕镜像；若 iOS 16/17 的列表里没有 ESP32 Agent，看 docs/troubleshooting.md。"

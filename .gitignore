@@ -25,6 +25,7 @@ traces/
 # 固件编译产物。预编译 bin 由 CI 上传，不进 git。
 hardware/build/
 hardware/dist/
+hardware/tests/test
 hardware/hid_bridge/build/
 .arduino/
 .tools/
