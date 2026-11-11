@@ -39,6 +39,6 @@ def require_venv() -> Path:
     if python.is_file():
         return python
     if sys.platform == "win32":
-        fail("还没有 Python 环境。请先在仓库根目录运行：powershell -File scripts\\setup.ps1")
+        fail("还没有 Python 环境。请先在仓库根目录运行：powershell -ExecutionPolicy Bypass -File scripts\\setup.ps1")
     fail("还没有 Python 环境。请先在仓库根目录运行：./scripts/setup.sh")
     return python

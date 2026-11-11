@@ -180,11 +180,21 @@ def create_server(url: str | None = None):
             return client.skill_check(observed_text, skill)
 
     @mcp.tool()
-    def skill_confirm_send(bubble_visible: bool, observed_text: str = "", skill: str = "") -> dict:
-        """Count a send only when bubble_visible is true because the new bubble is fully on screen.
+    def skill_prepare_send(skill: str = "") -> dict:
+        """Call BEFORE the send key or send button. Enforces quiet hours and the rate limit.
 
-        An empty input or a device ack is not success. This is a technical check, not a draft
-        and not a request for human approval. Rate limits and quiet hours apply here.
+        allowed=false means do not send. This does not count a send.
+        """
+        with IPhoneClient(url) as client:
+            return client.skill_prepare(skill)
+
+    @mcp.tool()
+    def skill_confirm_send(bubble_visible: bool, observed_text: str = "", skill: str = "") -> dict:
+        """Record a send only when the caller sets bubble_visible after seeing the new bubble.
+
+        The server cannot see the bubble. bubble_visible is the caller's claim, not proof.
+        An empty input or a device ack is not success. Rate and quiet hours are checked again
+        before the send is counted. This is not a draft and not a human approval step.
         """
         with IPhoneClient(url) as client:
             return client.skill_confirm(bubble_visible, observed_text, skill)
@@ -214,6 +224,15 @@ def create_server(url: str | None = None):
         """Read the one current delegated task. This is not a job history."""
         with IPhoneClient(url) as client:
             return client.task_status()
+
+    @mcp.tool()
+    def guard_reset() -> dict:
+        """Clear a latched circuit breaker after a person has looked at the phone.
+
+        Restarting the server does not clear it. Do not call this to bypass a risk prompt.
+        """
+        with IPhoneClient(url) as client:
+            return client.guard_reset()
 
     @mcp.tool()
     def stop_task() -> dict:

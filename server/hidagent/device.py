@@ -198,7 +198,13 @@ class Device:
             if text.startswith(prefix):
                 return text[len(prefix):]
 
+    def unguarded(self):
+        return _Unguarded(self)
+
     async def exchange(self, command: str) -> str:
+        gate = getattr(self, "gate", None)
+        if gate is not None and not getattr(self, "_hid_bypass", 0):
+            gate(command)
         if not self.connected:
             raise DeviceError(messages.BOARD_NOT_CONNECTED)
         timeout = self._timeout(command)
@@ -323,6 +329,19 @@ class Device:
                     await self.send("ping")
             except DeviceError as exc:
                 log.info("board gone: %s", exc)
+
+
+class _Unguarded:
+    def __init__(self, device: Device):
+        self._device = device
+
+    def __enter__(self):
+        self._device._hid_bypass = getattr(self._device, "_hid_bypass", 0) + 1
+        return self._device
+
+    def __exit__(self, *_args):
+        self._device._hid_bypass -= 1
+        return False
 
 
 def _is_int(text: str) -> bool:

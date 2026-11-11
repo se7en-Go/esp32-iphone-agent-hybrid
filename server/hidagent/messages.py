@@ -25,7 +25,10 @@ NO_SCREEN = (
     "请看 docs/troubleshooting.md。"
 )
 
-NOT_CALIBRATED = "指针还没校准。打开 http://127.0.0.1:8890 ，点「校准」，再在画面里点一下圆形指针。"
+NOT_CALIBRATED = (
+    "指针还没校准。device 和 screen 两盏灯亮了之后，打开 http://127.0.0.1:8890 点「校准」，"
+    "再在画面里点一下圆点。第三盏灯这时才会绿。"
+)
 
 UXPLAY_WINDOWS = (
     "SCREEN_BACKEND=uxplay 在 Windows 上不可用（UxPlay 依赖 GStreamer，而且 pass_fds 不存在）。"
@@ -85,10 +88,17 @@ def hints(device: bool, screen: bool, calibrated: bool, last_error: str = "",
     else:
         screen_zh = screen_error or NO_SCREEN
         screen_en = screen_error or "No mirror yet. Control Center → Screen Mirroring → ESP32 Agent."
-    cal_zh = NOT_CALIBRATED if device and screen else "先让 device 和 screen 两盏灯亮，再校准。"
-    cal_en = "Calibrate after device and screen are both on."
+    if screen and screen_error:
+        screen_zh, screen_en = screen_error, screen_error
+    cal_zh = NOT_CALIBRATED if device and screen else (
+        "先让 device 和 screen 两盏灯亮，再点校准。校准成功后第三盏灯才变绿。"
+    )
+    cal_en = "Turn device and screen on, then calibrate. The third light turns green after that."
     return {
         "device": {"zh": "" if device else device_zh, "en": "" if device else device_en},
-        "screen": {"zh": "" if screen else screen_zh, "en": "" if screen else screen_en},
+        "screen": {
+            "zh": "" if screen and not screen_error else screen_zh,
+            "en": "" if screen and not screen_error else screen_en,
+        },
         "calibrated": {"zh": "" if calibrated else cal_zh, "en": "" if calibrated else cal_en},
     }

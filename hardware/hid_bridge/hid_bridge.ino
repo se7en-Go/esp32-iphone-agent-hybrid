@@ -462,6 +462,8 @@ void loop() {
     line = serialLine;
     serialLine = "";
     line.trim();
+    if (line == "0 ble pair on") { ble_allow_pairing(60000); Serial.println("0 ok"); return; }
+    if (line == "0 ble pair off") { ble_deny_pairing(); Serial.println("0 ok"); return; }
     if (line.startsWith("0 net ")) { net_request(line.substring(6)); Serial.println("0 ok"); return; }
     if (line == "0 netinfo") { Serial.println("0 " + net_json(true)); return; }  // what the app reads over BLE (incl. vtok)
     if (line == "0 status") { Serial.println("0 " + statusJson(true, FROM_APP)); return; }

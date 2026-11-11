@@ -57,6 +57,30 @@ def test_trip_is_still_there_after_a_new_guard(tmp_path):
     assert third.observe("普通的一句", "")["stop"] is False
 
 
+def test_prepare_send_enforces_quiet_hours_before_counting():
+    night = datetime(2023, 11, 14, 23, 30).timestamp()
+    guard = Guard(clock=lambda: night)
+    decision = guard.prepare_send("")
+    assert decision["allowed"] is False and guard.sends == []
+
+
+def test_corrupt_guard_file_fails_closed_and_sends_survive_restart(tmp_path):
+    path = tmp_path / "guard.json"
+    path.write_text("{", encoding="utf-8")
+    broken = Guard(path=path)
+    assert broken.tripped and broken.prepare_send("")["allowed"] is False
+    path.write_text("[]", encoding="utf-8")
+    assert Guard(path=path).tripped
+    noon = datetime(2023, 11, 14, 12, 0).timestamp()
+    fresh = tmp_path / "ok.json"
+    first = Guard(clock=lambda: noon, path=fresh)
+    assert first.prepare_send("")["allowed"] is True
+    assert first.confirm_send(bubble_visible=True, observed_text="", skill="")["counted"] is True
+    second = Guard(clock=lambda: noon, path=fresh)
+    assert second.sends == [noon]
+    assert second.prepare_send("")["allowed"] is False
+
+
 def test_quiet_hours_wrap_midnight():
     assert in_quiet(datetime(2023, 11, 14, 23, 30), (23, 0), (7, 0))
     assert in_quiet(datetime(2023, 11, 14, 6, 0), (23, 0), (7, 0))

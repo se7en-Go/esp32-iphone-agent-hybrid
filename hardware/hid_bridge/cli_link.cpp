@@ -104,7 +104,7 @@ static void pair(int slot, const uint8_t *p, size_t n) {
   if (n != 32 + CLI_ID_LEN) return error(slot, "bad pair request");
   if (slot == CLI_TCP_SLOT) return error(slot, "pair over Bluetooth");  // the pairing window is for whoever is near
   if (!ble_pair_window_open())
-    return error(slot, "pairing window closed: unplug and replug the board, then pair within 3 minutes");
+    return error(slot, "pairing window closed: serial command '0 ble pair on', then pair within 60 seconds");
   uint8_t priv[32], pub[32], key[CLI_KEY_LEN];
   esp_fill_random(priv, sizeof priv);
   bool ok = cli_pair(priv, p, pub, key);

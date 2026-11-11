@@ -119,14 +119,35 @@ class H264Decoder:
             return []
         au = bytes(self._cur)
         self._cur = None
-        frames = []
         try:
-            for packet in self._codec.parse(au):
-                frames.extend(self._codec.decode(packet))
-        except av.AVError:
+            # 完整访问单元直接当一个 packet。parse() 会扣住最后一帧，静止画面就一直不出来。
+            return list(self._codec.decode(av.Packet(au)))
+        except av.error.FFmpegError:
             self.reset()
             return []
-        return frames
+
+
+class LatestFrameGate:
+    """帧率上限留最新的一帧，不把还没发出去的新帧丢掉。"""
+
+    def __init__(self, max_fps: int):
+        self.gap = 1 / max_fps if max_fps else 0
+        self.last = None
+        self.pending = None
+
+    def push(self, frame, now: float):
+        self.pending = frame
+        return self.flush(now)
+
+    def flush(self, now: float):
+        if self.pending is None:
+            return None
+        if self.gap and self.last is not None and now - self.last < self.gap:
+            return None
+        ready = self.pending
+        self.pending = None
+        self.last = now
+        return ready
 
 
 def frame_to_jpeg(frame, quality: int = 75) -> bytes:
@@ -138,8 +159,12 @@ def frame_to_jpeg(frame, quality: int = 75) -> bytes:
 
 def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
             quality: int = 75, max_fps: int = 8, connect_timeout: float = 5,
-            on_ready=None, sockets: list | None = None) -> None:
-    """阻塞读取一路 7201，直到 stop 或对端断开。on_jpeg(jpeg_bytes) 在解码线程里调用。"""
+            on_ready=None, on_stall=None, sockets: list | None = None) -> None:
+    """阻塞读取一路 7201，直到 stop 或对端断开。on_jpeg(jpeg_bytes) 在解码线程里调用。
+
+    板子在画面冻住时可能不再推新帧，解码器这边也没有更新。超过约 12 秒没有新帧就调用
+    on_stall，让界面提示重新选一次屏幕镜像。
+    """
     sock = socket.create_connection((host, int(port)), timeout=connect_timeout)
     if sockets is not None:
         sockets.append(sock)
@@ -149,18 +174,25 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
         sock.sendall(f"hello {token}\n".encode("ascii"))
         decoder = H264Decoder()
         records = RecordBuffer()
+        gate = LatestFrameGate(max_fps)
         authed = False
+        stalled = False
         last_ka = time.monotonic()
-        last_jpeg = 0.0
-        gap = 1 / max_fps if max_fps else 0
+        last_frame = time.monotonic()
         while not stop.is_set():
             now = time.monotonic()
             if authed and now - last_ka >= 1:
                 sock.sendall(b"ka\n")
                 last_ka = now
+            if authed and not stalled and now - last_frame > 12 and on_stall:
+                stalled = True
+                on_stall()
             try:
                 data = sock.recv(65536)
             except TimeoutError:
+                ready = gate.flush(time.monotonic())
+                if ready is not None:
+                    on_jpeg(ready)
                 continue
             if not data:
                 raise ConnectionError("7201 closed")
@@ -184,11 +216,11 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
                     continue
                 if not frames:
                     continue
-                now = time.monotonic()
-                if gap and now - last_jpeg < gap:
-                    continue
-                on_jpeg(frame_to_jpeg(frames[-1], quality))
-                last_jpeg = now
+                last_frame = time.monotonic()
+                stalled = False
+                ready = gate.push(frame_to_jpeg(frames[-1], quality), last_frame)
+                if ready is not None:
+                    on_jpeg(ready)
     finally:
         try:
             sock.close()

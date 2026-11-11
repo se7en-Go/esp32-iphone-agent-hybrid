@@ -9,7 +9,7 @@ import av
 import pytest
 from PIL import Image
 
-from hidagent.video7201 import H264Decoder, RecordBuffer, keepalive, pack_access_unit, run_tcp
+from hidagent.video7201 import H264Decoder, LatestFrameGate, RecordBuffer, keepalive, pack_access_unit, run_tcp
 
 SIZE = 160
 TOKEN = "0123456789abcdef"
@@ -75,6 +75,26 @@ def framed_stream(units: list[bytes]) -> bytes:
         if index == 1:
             out += keepalive()
     return bytes(out)
+
+
+def test_last_access_unit_is_not_held_back():
+    units = annexb_access_units(3)
+    decoder = H264Decoder()
+    frames = []
+    for record in RecordBuffer().feed(framed_stream(units)):
+        if record is None:
+            continue
+        frames.extend(decoder.push_chunk(record))
+    assert len(frames) == len(units)
+    assert frames[-1].width == SIZE and frames[-1].height == SIZE
+
+
+def test_frame_gate_emits_the_newest_held_frame():
+    gate = LatestFrameGate(1)
+    assert gate.push(b"a", 0) == b"a"
+    assert gate.push(b"b", 0.1) is None
+    assert gate.push(b"c", 0.2) is None
+    assert gate.flush(1.2) == b"c"
 
 
 def test_record_buffer_and_decoder_round_trip():

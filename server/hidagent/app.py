@@ -5,9 +5,10 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -73,6 +74,51 @@ async def lifespan(_):
 
 
 app = FastAPI(lifespan=lifespan)
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def refuse_if_tripped() -> None:
+    if guard.tripped:
+        raise HTTPException(
+            409,
+            f"熔断还在（{guard.reason or '风险提示'}）。点、滑、打字都已停下。"
+            "看过手机、确认提示消失之后，再调用重置。重启服务不会自动解除。",
+        )
+
+
+def _hid_gate(command: str) -> None:
+    name = command.split(" ", 1)[0]
+    if name not in {"home", "move", "press", "release", "click", "scroll", "type", "key", "homescreen"}:
+        return
+    if guard.tripped:
+        raise DeviceError(
+            f"熔断还在（{guard.reason or '风险提示'}）。这一条 HID 没有发出。"
+        )
+    if name == "key":
+        arg = command.split(" ", 1)[1].lower() if " " in command else ""
+        if arg == "enter" or arg.endswith("+enter"):
+            decision = guard.prepare_send("")
+            if not decision["allowed"]:
+                raise DeviceError(decision["reason"])
+
+
+device.gate = _hid_gate
+
+
+@app.middleware("http")
+async def reject_cross_site_posts(request: Request, call_next):
+    if request.method == "POST" and request.url.path.startswith("/api/"):
+        for header in (request.headers.get("origin"), request.headers.get("referer")):
+            if not header:
+                continue
+            host = (urlparse(header).hostname or "").lower()
+            if host not in LOCAL_HOSTS:
+                return JSONResponse({"detail": "拒绝来自其他网站的请求。请只从本机网页操作。"}, status_code=403)
+        if "application/json" not in request.headers.get("content-type", "").lower():
+            return JSONResponse({"detail": "只接受 application/json，不接受表单提交。"}, status_code=415)
+    return await call_next(request)
+
+
 class Static(StaticFiles):
     """Static files that browsers re-check on every load, so a new version shows up on refresh."""
 
@@ -171,6 +217,7 @@ def check_manual():
 
 
 async def act(action):
+    refuse_if_tripped()
     check_manual()
     try:
         async with manual_lock:
@@ -196,7 +243,7 @@ def status():
             "debug": DEBUG, "trace": str(agent.trace.dir or ""), "aspect": round(screen.aspect, 4),
             "hints": hints(dev, live, calibrated,
                            "" if dev else last_error,
-                           "" if live else str(getattr(screen, "last_error", "") or "")),
+                           str(getattr(screen, "last_error", "") or "")),
             "link": {"port": getattr(device, "port_name", ""), "mode": getattr(device, "mode", ""),
                      "ip": getattr(device, "ip", ""), "receiver": "ESP32 Agent"},
             "models": {"planner": agent.planner.model, "actor": agent.actor.model},
@@ -223,6 +270,7 @@ async def control_observe():
 
 @app.post("/api/control/action")
 async def control_action(request: ControlAction):
+    refuse_if_tripped()
     check_manual()
     async with manual_lock:
         controls.job = asyncio.current_task()
@@ -243,6 +291,7 @@ def _steps(screen_id: str, steps: list[ActionStep]) -> list[ControlAction]:
 @app.post("/api/control/batch")
 async def control_batch(request: BatchBody):
     """一次观察、连续多步，最后只回一张图。"""
+    refuse_if_tripped()
     check_manual()
     async with manual_lock:
         controls.job = asyncio.current_task()
@@ -263,7 +312,12 @@ def layouts():
 
 @app.post("/api/control/layout-tap")
 async def layout_tap(body: LayoutTap):
+    refuse_if_tripped()
     check_manual()
+    if body.point == "send":
+        decision = guard.prepare_send("")
+        if not decision["allowed"]:
+            raise HTTPException(409, decision["reason"])
     try:
         x, y = resolve_point(body.layout, body.point)
     except ValueError as e:
@@ -305,11 +359,24 @@ def skill_check(body: SkillBody):
     return guard.observe(body.observed_text, body.skill)
 
 
+@app.post("/api/skill/prepare-send")
+def skill_prepare(body: SkillBody):
+    """发送键按下之前。频率和静默不过就不许发，也不计入次数。"""
+    return guard.prepare_send(body.skill)
+
+
 @app.post("/api/skill/confirm-send")
 def skill_confirm(body: SkillBody):
-    """全自动发送的技术校验：看见完整新气泡才计数。不是人工审批。"""
+    """气泡位是调用方的声明，不是服务端看见了气泡。频率和静默在计数之前再查一次。"""
     return guard.confirm_send(bubble_visible=body.bubble_visible, observed_text=body.observed_text,
                               skill=body.skill)
+
+
+@app.post("/api/guard/reset")
+def guard_reset():
+    """人工看过手机之后才调用。Agent 不应该用它绕过风险提示。"""
+    guard.reset()
+    return {"ok": True, "tripped": guard.tripped}
 
 
 @app.get("/api/steps/{index}.jpg")
@@ -367,6 +434,7 @@ async def raw(t: Text):
 @app.post("/api/calibrate/start")
 async def calibrate_start():
     """Calibrate the pointer. {"auto": true}: done by itself; otherwise the user clicks the pointer next."""
+    refuse_if_tripped()
     check_manual()
     try:
         async with manual_lock:
@@ -388,6 +456,7 @@ async def calibrate_finish(p: Point):
 
 @app.post("/api/agent")
 async def agent_start(t: Text):
+    refuse_if_tripped()
     if manual_lock.locked():
         raise HTTPException(409, "phone is busy; wait for the current action")
     if not agent.actor.model or not agent.planner.model:
@@ -412,8 +481,13 @@ async def agent_stop():
     await asyncio.sleep(0.1)  # let a gesture in flight finish its own release
     # Emergency stop must stay available even while a direct action holds the lock.
     try:
-        if device.connected:
-            await phone.reset()
+        if getattr(device, "connected", False):
+            bypass = getattr(device, "unguarded", None)
+            if bypass:
+                with device.unguarded():
+                    await phone.reset()
+            else:
+                await phone.reset()
     except (DeviceError, RuntimeError) as e:
         raise HTTPException(409, for_user(str(e))) from e
     return {"ok": True}

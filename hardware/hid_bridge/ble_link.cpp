@@ -88,10 +88,11 @@ static bool appWorks(const String &line) {
 #define BLE_LOG(...) ((void)0)
 #endif
 
-// New phones may pair only this long after power-on (the board is powered by the phone it plugs into, so
-// setup always falls in it). Later, only phones bonded before can connect: nobody nearby can pair and drive it.
-const uint32_t PAIR_WINDOW_MS = 3 * 60 * 1000;
-static uint32_t pairOpened;  // power-on, or the last unpair
+// Pairing is off at boot. A serial command arms a short window (ble_allow_pairing).
+// Already-bonded phones can reconnect; a new Just Works bond outside the window is deleted.
+const uint32_t PAIR_WINDOW_MS = 60 * 1000;
+static bool pairArmed = false;
+static uint32_t pairUntil = 0;
 static NimBLEAddress known[8];  // bonds at boot plus those made in the window
 static int knownCount;
 
@@ -186,7 +187,7 @@ class ServerCb : public NimBLEServerCallbacks {
     if (!ci.isEncrypted()) return;
     NimBLEAddress a = ci.getIdAddress();
     if (isKnown(a)) return;
-    if (millis() - pairOpened < PAIR_WINDOW_MS && knownCount < 8) { known[knownCount++] = a; return; }
+    if (ble_pair_window_open() && knownCount < 8) { known[knownCount++] = a; return; }
     BLE_LOG("conn %u: new phone outside the pairing window, refused\n", ci.getConnHandle());
     NimBLEDevice::deleteBond(a);
     server->disconnect(ci.getConnHandle());
@@ -402,7 +403,9 @@ void ble_begin(const String &name) {
   NimBLEDevice::setMTU(517);
   NimBLEDevice::setPower(9);  // dBm: retain link margin during setup, including a board powered by a Mac.
   NimBLEDevice::setDefaultPhy(BLE_GAP_LE_PHY_1M_MASK, BLE_GAP_LE_PHY_1M_MASK);
-  NimBLEDevice::setSecurityAuth(true, false, true);  // bonding, Just Works, LE Secure Connections
+  // Bonding + LE Secure Connections. Just Works has no passcode; new bonds are refused unless
+  // `0 ble pair on` armed the short window (see onAuthenticationComplete).
+  NimBLEDevice::setSecurityAuth(true, false, true);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
   NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
   NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
@@ -550,8 +553,8 @@ void ble_unpair() {
   NimBLEDevice::deleteAllBonds();  // unpairs each bond (also drops it from the controller's resolving list)
   ble_store_clear();               // and any CCCD/peer records left in NVS
   cli_forget_all();                // and paired computers
-  knownCount = 0;                  // forgotten phones are strangers now; a new pairing window opens
-  pairOpened = millis();
+  knownCount = 0;                  // forgotten phones are strangers; pairing stays closed until serial says so
+  pairArmed = false;
   bool any = false;
   for (int i = 0; i < MAX_PEERS; i++)
     if (peers[i] >= 0) { server->disconnect(peers[i]); any = true; }  // onDisconnect restarts advertising
@@ -559,7 +562,16 @@ void ble_unpair() {
 }
 
 // Hooks for cli_link.cpp.
-bool ble_pair_window_open() { return millis() - pairOpened < PAIR_WINDOW_MS; }
+bool ble_pair_window_open() { return pairArmed && (int32_t)(pairUntil - millis()) > 0; }
+
+void ble_allow_pairing(uint32_t window_ms) {
+  if (window_ms < 5000) window_ms = 5000;
+  if (window_ms > 120000) window_ms = 120000;
+  pairArmed = true;
+  pairUntil = millis() + window_ms;
+}
+
+void ble_deny_pairing() { pairArmed = false; }
 
 uint16_t ble_cli_mtu(int slot) {
   int h = slot >= 0 && slot < MAX_PEERS ? peers[slot] : -1;

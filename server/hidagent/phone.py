@@ -245,7 +245,13 @@ class Phone:
         await self.device.send(f"scroll {lines} 0")
 
     async def type(self, text: str) -> None:
-        await self.device.send(f"type {text}")
+        # 固件串口一行最多 512 字节，含 "<id> type "。超长就切开，每段都要等到 ok。
+        limit = 480
+        if len(text) <= limit:
+            await self.device.send(f"type {text}")
+            return
+        for start in range(0, len(text), limit):
+            await self.device.send("type " + text[start:start + limit])
 
     async def key(self, combo: str) -> None:
         await self.device.send(f"key {combo}")

@@ -22,18 +22,18 @@
 1. 安装 Python 3.10+（python.org 的安装包即可），在仓库根目录运行 `./scripts/setup.sh`。
 2. 从 Actions 的 Firmware 作业下载 `esp32s3-n16r8-merged.bin` 放到 `hardware/dist/`。COM 口接电脑，运行 `./hardware/flash.sh`。
 3. `./scripts/wifi.sh --ssid '你家的2.4GHz'`，按提示输入密码。
-4. USB 口接手机，打开辅助触控，屏幕镜像选 **ESP32 Agent**。`./scripts/run-local.sh`，打开 `http://127.0.0.1:8890`。三个灯都绿再校准。
+4. USB 口接手机，打开辅助触控，屏幕镜像选 **ESP32 Agent**。`./scripts/run-local.sh`，打开 `http://127.0.0.1:8890`。先等 device 和 screen 两盏灯变绿，再点校准，点中圆点后第三盏灯才绿。
 5. `./scripts/mcp-config.sh`，让 Agent 把指针移到屏幕中央并停住。
 
 细节：[docs/setup-macos.md](docs/setup-macos.md)
 
 ## Windows 10 / 11
 
-1. 安装 Python 3.10+，勾选 Add python.exe to PATH。`powershell -File scripts\setup.ps1`
-2. 下载同一个 `esp32s3-n16r8-merged.bin` 放到 `hardware\dist\`。COM 口接电脑。`powershell -File hardware\flash.ps1`
-3. `powershell -File scripts\wifi.ps1 --ssid "你家的2.4GHz"`
-4. USB 口接手机，辅助触控，屏幕镜像选 **ESP32 Agent**。`powershell -File scripts\run-server.ps1`，打开 `http://127.0.0.1:8890`，三个灯都绿再校准。
-5. `powershell -File scripts\mcp-config.ps1`
+1. 安装 Python 3.10+，勾选 Add python.exe to PATH。`powershell -ExecutionPolicy Bypass -File scripts\setup.ps1`
+2. 下载同一个 `esp32s3-n16r8-merged.bin` 放到 `hardware\dist\`。COM 口接电脑。`powershell -ExecutionPolicy Bypass -File hardware\flash.ps1`
+3. `powershell -ExecutionPolicy Bypass -File scripts\wifi.ps1 --ssid "你家的2.4GHz"`
+4. USB 口接手机，辅助触控，屏幕镜像选 **ESP32 Agent**。`powershell -ExecutionPolicy Bypass -File scripts\run-server.ps1`，打开 `http://127.0.0.1:8890`，先等 device 和 screen 两盏灯变绿，再点校准，点中圆点后第三盏灯才绿。
+5. `powershell -ExecutionPolicy Bypass -File scripts\mcp-config.ps1`
 
 没有 COM 口时再装沁恒 CH343 驱动：https://www.wch.cn/downloads/CH343SER_EXE.html
 
@@ -55,7 +55,7 @@ iPhone 用系统自带的屏幕镜像和辅助触控。不装测试 App，不用
 
 群回复是第二阶段，不挡住上面的五步。它是全自动的：没有草稿，也没有等人批准。说什么只由 [skills/wechat-group-reply/SKILL.md](skills/wechat-group-reply/SKILL.md) 决定。
 
-代码里另有关不掉的熔断：见到「操作频繁 / 风控 / 验证码」就停并且不重试；有频率和夜间静默；只有屏幕上出现完整的新气泡才算发送成功。请用专用运营号，不要用主号。说明在 [docs/wechat.md](docs/wechat.md)。
+熔断是协作的，但跳闸之后所有会发出 HID 的接口都会拒绝，只剩状态、截图和重置。见到「操作频繁 / 风控 / 验证码」就停并且不重试。频率和夜间静默要在按下发送之前检查，不是发完再算。`bubble_visible` 只是调用方声明自己看见了新气泡，服务端看不见屏幕，不能证明气泡是真的，也不能把输入框清空或收到 ok 当成发送成功。请用专用运营号，不要用主号。说明在 [docs/wechat.md](docs/wechat.md)。
 
 ## 开发者
 

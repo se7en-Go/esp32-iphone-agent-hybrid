@@ -15,7 +15,7 @@ Apple Silicon 和 Intel 都用同一套步骤。不需要先装 Homebrew。不�
 1. 在仓库根目录运行 `./scripts/setup.sh`。
 2. 从 GitHub Actions 里最近一次成功的 Firmware 作业下载 `esp32s3-n16r8-merged.bin`，放到 `hardware/dist/`。COM 口接 Mac，运行 `./hardware/flash.sh`。第一次会写完整的 16MB 镜像，请等到脚本自己说刷好了。
 3. 运行 `./scripts/wifi.sh --ssid '你家的2.4GHz'`，按提示输入密码。密码只进板子的 NVS，不进仓库。
-4. USB 口接 iPhone（Lightning 用相机转换器）。控制中心 → 屏幕镜像 → **ESP32 Agent**。运行 `./scripts/run-local.sh`，浏览器打开 `http://127.0.0.1:8890`。三个灯都绿之后点「校准」，再在画面里点一下圆点。
+4. USB 口接 iPhone（Lightning 用相机转换器）。控制中心 → 屏幕镜像 → **ESP32 Agent**。运行 `./scripts/run-local.sh`，浏览器打开 `http://127.0.0.1:8890`。先等 device 和 screen 两盏灯变绿，再点「校准」，点中圆点后第三盏灯才绿。
 5. 运行 `./scripts/mcp-config.sh`，把片段放进 Agent。让它把指针移到屏幕中央，核对后停住。
 
 ## 只有网线的电脑才考虑热点

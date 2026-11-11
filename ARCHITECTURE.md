@@ -92,6 +92,8 @@ STA 的限制也写清楚：路由器要有 2.4GHz；不能开 AP 隔离或访�
 
 串口速率 115200，只传命令。视频不能走这根线。
 
+蓝牙配对默认关闭。固件不再在每次上电后的 3 分钟里接受没有密码的 Just Works 配对，否则旁边的设备可以读到 Wi-Fi 密码、vtok，并发 HID 或用 vtok 做 OTA。需要实验 BLE / 7202 时，在 COM 口发送 `0 ble pair on`，窗口 60 秒，`0 ble pair off` 可以提前关掉。已经绑定过的设备仍可重连。日常控制不需要这一步。
+
 Kz 的 `Device.send()` 原来要求回复恰好是 `ok`。适配层剥掉 `<id> ` 前缀后再做同样的判断，所以 `phone.py` 不用改命令字符串。`netinfo` 和 `status` 的正文是 JSON，不是 `ok`，走单独的 `query()`，不会被当成 HID 失败。
 
 `0 netinfo` / `0 status` / `0 net ` 在固件里是按整行匹配的快捷分支，所以这三条的 id 固定用 `0`。其它命令用递增 id，避免和启动时的杂散字节对上。
@@ -149,7 +151,7 @@ Windows 10/11 上的运行时是：官方 Python 3.10+、PowerShell、pip wheel�
 1. 安装 Python 3.10+（Windows 用 python.org 的安装包，勾选 PATH），运行 `setup`。
 2. COM 口插电脑，运行 `flash`（esptool 写入 CI 打好的 merged.bin）。
 3. 运行 `wifi`，把家里的 2.4GHz 名称和密码经串口写进 NVS。
-4. USB 口经数据线（Lightning 手机要用相机转换器）接 iPhone，打开辅助触控，屏幕镜像选 “ESP32 Agent”。运行 `run-server`，打开 `http://127.0.0.1:8890`，三个灯都绿再校准。
+4. USB 口经数据线（Lightning 手机要用相机转换器）接 iPhone，打开辅助触控，屏幕镜像选 “ESP32 Agent”。运行 `run-server`，打开 `http://127.0.0.1:8890`，先等 device 和 screen 变绿，再校准，第三盏灯随后才绿。
 5. 运行 `mcp-config`，把片段贴进 Agent，让它把指针移到屏幕中央并停住，不要只看 ACK。
 
 每一步失败都走中文错误，带下一步，不把 traceback 甩给用户。网页上 `device` / `screen` / `calibrated` 三个灯常亮，缺一个就显示缺什么、怎么修。

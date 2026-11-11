@@ -39,6 +39,19 @@ class FakePhone:
     async def key(self, text): self.calls.append(("key", text))
 
 
+def test_long_ascii_is_split_under_the_firmware_line_limit(tmp_path):
+    sent = []
+
+    async def send(command):
+        assert len(command) <= 480 + len("type ")
+        sent.append(command)
+
+    phone = Phone(SimpleNamespace(send=send), tmp_path / "calibration.json", None)
+    asyncio.run(phone.type("x" * 1000))
+    assert len(sent) == 3
+    assert "".join(part.removeprefix("type ") for part in sent) == "x" * 1000
+
+
 def test_pixel_coordinates_return_evidence_and_single_use_token():
     phone, screen = FakePhone(), Screen()
     control = Controls(phone, screen)
@@ -260,7 +273,7 @@ def test_emergency_stop_cancels_new_action_without_ticket_or_waiting_for_lock(mo
                 "action": "tap", "x": .5, "y": .5, "screen_id": observation["screen_id"]}))
             await entered.wait()
             assert (await client.get("/api/control/observe")).status_code == 409
-            result = await asyncio.wait_for(client.post("/api/agent/stop"), 1)
+            result = await asyncio.wait_for(client.post("/api/agent/stop", json={}), 1)
             assert result.status_code == 200
             assert (await pending).status_code == 409
             assert control.ticket is None

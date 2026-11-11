@@ -59,6 +59,12 @@ class IPhoneClient:
     def skill(self, name: str) -> dict:
         return self.request("GET", f"/api/skills/{name}").json()
 
+    def skill_prepare(self, skill: str = "") -> dict:
+        return self.request("POST", "/api/skill/prepare-send", {"skill": skill}).json()
+
+    def guard_reset(self) -> dict:
+        return self.request("POST", "/api/guard/reset", {}).json()
+
     def skill_check(self, observed_text: str = "", skill: str = "") -> dict:
         return self.request("POST", "/api/skill/check",
                             {"observed_text": observed_text, "skill": skill}).json()

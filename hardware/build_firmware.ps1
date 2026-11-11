@@ -1,5 +1,5 @@
-# 开发者在 Windows 上从源码编译 N16R8 固件。普通使用者不要运行本脚本。
-# 用法：powershell -File hardware\build_firmware.ps1 [-DebugBuild] [-Sta] [-ApTune]
+﻿# 开发者在 Windows 上从源码编译 N16R8 固件。普通使用者不要运行本脚本。
+# 用法：powershell -ExecutionPolicy Bypass -File hardware\build_firmware.ps1 [-DebugBuild] [-Sta] [-ApTune]
 param(
     [switch]$DebugBuild,
     [switch]$Sta,

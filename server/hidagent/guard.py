@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -96,14 +97,26 @@ class Guard:
         self.sends: list[float] = []
         self._load()
 
+    def _fail_closed(self, reason: str) -> None:
+        self.tripped = True
+        self.reason = reason
+        self.sends = []
+
     def _load(self) -> None:
         if self._path is None or not self._path.is_file():
             return
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            self._fail_closed("guard.json 读不出来，按已熔断处理。")
             return
-        if not isinstance(data, dict):
+        if not isinstance(data, dict) or "tripped" not in data or not isinstance(data.get("sends", []), list):
+            self._fail_closed("guard.json 内容无法核对，按已熔断处理。")
+            return
+        try:
+            self.sends = [float(item) for item in data.get("sends", [])]
+        except (TypeError, ValueError):
+            self._fail_closed("guard.json 的发送时间损坏，按已熔断处理。")
             return
         self.tripped = bool(data.get("tripped"))
         self.reason = str(data.get("reason") or "")
@@ -112,17 +125,20 @@ class Guard:
         if self._path is None:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"tripped": self.tripped, "reason": self.reason}
-        self._path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        payload = json.dumps(
+            {"tripped": self.tripped, "reason": self.reason, "sends": self.sends},
+            ensure_ascii=False,
+        )
+        temporary = self._path.with_suffix(".json.tmp")
+        temporary.write_text(payload, encoding="utf-8")
+        os.replace(temporary, self._path)
 
     def reset(self) -> None:
         """显式解除。重启服务不会调用这里。"""
         self.tripped = False
         self.reason = ""
-        if self._path is not None and self._path.is_file():
-            self._path.unlink()
-        elif self._path is not None:
-            self._save()
+        self.sends = []
+        self._save()
 
     def phrases(self, skill: str) -> tuple[str, ...]:
         extra = limits_for(skill)["extra_stop"]
@@ -147,12 +163,16 @@ class Guard:
                 "allowed": False,
                 "reason": f"熔断还在（{self.reason}）。不要重试。重启服务也不会让这次风险提示消失，请先人工看手机。",
             }
-        return {"stop": False, "counted": False, "allowed": True, "reason": ""}
+        return {"stop": False, "counted": False, "allowed": False,
+                "reason": "这只是观察，还不是发送许可。发送前要先做频率和静默检查。"}
 
-    def confirm_send(self, *, bubble_visible: bool, observed_text: str, skill: str = "") -> dict:
-        seen = self.observe(observed_text, skill)
-        if seen["stop"]:
-            return seen
+    def _rate_block(self, skill: str) -> dict | None:
+        """频率和静默。不计入发送次数。返回 None 表示这一刻可以发。"""
+        if self.tripped:
+            return {
+                "stop": True, "counted": False, "allowed": False,
+                "reason": f"熔断还在（{self.reason}）。不要重试。",
+            }
         limits = limits_for(skill)
         now = self._clock()
         moment = datetime.fromtimestamp(now)
@@ -174,12 +194,29 @@ class Guard:
                 "stop": False, "counted": False, "allowed": False,
                 "reason": f"这一小时已经发送 {limits['max_per_hour']} 次。",
             }
+        return None
+
+    def prepare_send(self, skill: str = "") -> dict:
+        """发送动作之前调用。不过频率或静默就不许发，也不计入次数。"""
+        blocked = self._rate_block(skill)
+        if blocked:
+            return blocked
+        return {"stop": False, "counted": False, "allowed": True, "reason": ""}
+
+    def confirm_send(self, *, bubble_visible: bool, observed_text: str, skill: str = "") -> dict:
+        seen = self.observe(observed_text, skill)
+        if seen["stop"]:
+            return seen
+        blocked = self._rate_block(skill)
+        if blocked:
+            return blocked
         if not bubble_visible:
             return {
                 "stop": False, "counted": False, "allowed": False,
                 "reason": "屏幕上还没有完整的新消息气泡。输入框清空和收到 ok 都不算发送成功。",
             }
-        self.sends.append(now)
+        self.sends.append(self._clock())
+        self._save()
         return {"stop": False, "counted": True, "allowed": True, "reason": ""}
 
 
