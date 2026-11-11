@@ -10,6 +10,19 @@ SERVER = ROOT / "server"
 VENV = SERVER / ".venv"
 
 
+def configure_stdio() -> None:
+    """Windows 控制台默认不是 UTF-8。帮助文字是中文，不改编码就会在 --help 时崩掉。"""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
+configure_stdio()
+
+
 def venv_python() -> Path:
     if sys.platform == "win32":
         return VENV / "Scripts" / "python.exe"

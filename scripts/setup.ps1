@@ -1,4 +1,5 @@
 $ErrorActionPreference = "Stop"
+$env:PYTHONUTF8 = "1"
 Set-Location (Split-Path -Parent $PSScriptRoot)
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     Write-Error "Python was not found. Install Python 3.10+ from python.org and enable Add python.exe to PATH."

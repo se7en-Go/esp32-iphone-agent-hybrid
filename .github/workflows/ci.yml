@@ -77,6 +77,7 @@ jobs:
         shell: pwsh
         run: |
           if ($env:WSL_DISTRO_NAME) { throw "this job is inside a Linux subsystem" }
+          $env:PYTHONUTF8 = "1"
           python -c "import sys; assert sys.platform == 'win32'"
           $files = Get-ChildItem -Path scripts, hardware -Filter *.ps1
           foreach ($file in $files) {
