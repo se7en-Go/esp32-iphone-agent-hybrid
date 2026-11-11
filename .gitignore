@@ -1,0 +1,39 @@
+# 凭据与本机配置。只提交 *.example。
+.env
+.env.*
+!.env.example
+hardware/hid_bridge/secrets.h
+*.pem
+*.key
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.local-data/
+*.log
+
+# 校准、轨迹、运行时数据可能含屏幕内容，不要提交
+calibration.json
+traces/
+
+# 固件编译产物。预编译 bin 由 CI 上传，不进 git。
+hardware/build/
+hardware/dist/
+hardware/tests/test
+hardware/hid_bridge/build/
+.arduino/
+.tools/
+build/
+dist/
+
+# 编辑器与系统
+.DS_Store
+.idea/
+.vscode/
+Thumbs.db

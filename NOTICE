@@ -1,0 +1,61 @@
+ESP32 iPhone Agent Hybrid
+=========================
+
+This repository combines two MIT projects and one GPL-3.0 firmware subtree.
+The computer-side code does not link the GPL code. It talks to the board
+over a serial protocol and a TCP video port.
+
+Computer-side code (MIT)
+------------------------
+`server/`, `scripts/`, `skills/`, `prompts/`, `docs/`, and the root README are
+MIT, under the copyrights in `LICENSE`:
+
+- Copyright (c) 2026 Kz-Aven
+- Copyright (c) 2026 Henry Yuan
+
+The Python server started from Kz-Aven/esp32-to-iphone
+(https://github.com/Kz-Aven/esp32-to-iphone, commit 5e7b4c2), which itself
+descends from the legacy server of ESP32 iPhone Agent. Tool names, the
+Chinese Pinyin compose flow, calibration, and single-use `screen_id`
+observations come from that project. The screen transport and the device
+transport were replaced: TCP port 7201 decoded with PyAV, and the CH343
+serial port instead of UxPlay and the old TCP port 7300.
+
+Firmware (GPL-3.0 as a whole)
+-----------------------------
+`hardware/hid_bridge/` is the HID bridge from:
+
+  ESP32 iPhone Agent by Henry Yuan
+  https://github.com/onehumanbeing/esp32-iphone-agent
+  commit 5a4fddf
+
+The Handsy project as a whole is MIT (see upstream `LICENSE` and `NOTICE`).
+`hardware/hid_bridge/src/airplay/` is a GPL-3.0 port of the UxPlay AirPlay
+receiver (itself derived from RPiPlay and playfair). See
+`hardware/hid_bridge/src/airplay/LICENSE-GPL.md` and
+`hardware/hid_bridge/src/airplay/playfair/LICENSE.md`.
+
+Because the firmware binary links that directory, the firmware source tree
+in this repository and any firmware binary built from it are distributed
+under GPL-3.0. If you give someone a flashed board or a firmware file, you
+must also offer them the corresponding complete firmware source.
+
+Do not copy `src/airplay/` or `playfair` into the MIT Python tree.
+
+Attribution
+-----------
+Please keep this credit where the project is shown publicly, as upstream
+asked:
+
+  Based on ESP32 iPhone Agent by Henry Yuan
+  https://github.com/onehumanbeing/esp32-iphone-agent
+
+  The host tools also derive from Kz-Aven/esp32-to-iphone
+  https://github.com/Kz-Aven/esp32-to-iphone
+
+What this project deliberately does not include
+------------------------------------------------
+The Handsy iOS app, TestFlight, and the Go `esp32agent` CLI (Bluetooth
+pairing) are not part of this tree. Control is the COM serial port. Video
+is TCP 7201. Port 7202 and BLE pairing are documented as experimental and
+are not required.
