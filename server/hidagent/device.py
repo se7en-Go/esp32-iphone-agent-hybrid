@@ -266,7 +266,14 @@ class Device:
         try:
             await asyncio.wait({task})
         except asyncio.CancelledError:
+            # 3.10 不会跟着把子任务取消掉。这里自己关掉串口，下一句才不会读到半截回复。
             task.cancel()
+            if not self._abort:
+                link = self._link
+                if link is not None:
+                    link.close()
+                    if self._link is link:
+                        self._link = None
             raise
         finally:
             self._exchanges.discard(task)
