@@ -7,6 +7,7 @@ work for any frame size.
 """
 
 import asyncio
+import inspect
 import io
 import json
 import logging
@@ -96,6 +97,15 @@ WAKE_NUDGE = 2
 POINTER_FADE_SECONDS = 3.0
 OBSERVATION_REFRESH_WAIT = 3.5
 PASTE_CONTEXT_WAIT = 3.5  # bounded allowance for a dismissed Shortcut alert to leave the mirror
+
+
+def _accepts_stage(callback) -> bool:
+    try:
+        parameters = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        return False
+    return "stage" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
 
 
 def _serialized(method):
@@ -231,6 +241,7 @@ class Phone:
         return sent
 
     @_serialized
+    @bounded_operation
     async def start_calibration(self) -> bool:
         """Find the pointer on screen at two known distances from the corner and fit the mapping from both.
 
@@ -520,18 +531,23 @@ class Phone:
                     continue
                 if (clock is not None and snapshot.board_ts is not None
                         and self._board_delta(snapshot.board_ts, sent * 1000 + clock) <= 0):
-                    history[:] = [after]
+                    # A pre-command frame can become a newer baseline, but it cannot prove the nudge,
+                    # and it must not erase the frame that shows where the pointer rested.
+                    if not history or after != history[-1]:
+                        history.append(after)
                     await asyncio.sleep(.02)
                     continue
-                if not history or after != history[-1]:
+                priors = [item for item in dict.fromkeys(history) if item != after]
+                if priors:
                     # the frame before the nudge, and the latest one (the before frame may predate the last move);
                     # each comparison is tens of ms of pure Python, and hogging the GIL starves the video thread
-                    for before in dict.fromkeys(history[:1] + history[-1:]):
+                    for before in dict.fromkeys(priors[:1] + priors[-1:]):
                         for look, reach in searches:
                             moved = vision.pointer_move(before, after, look, shift, reach)
                             if moved:
                                 return moved[0] if at_start else moved[1]
                             await asyncio.sleep(0)
+                if not history or after != history[-1]:
                     history.append(after)
             await asyncio.sleep(.02)
         return None
@@ -572,13 +588,25 @@ class Phone:
 
     def _snapshot(self) -> FrameSnapshot | None:
         snap = getattr(self.screen, "snapshot", None)
+        frame = None if self.screen is None else getattr(self.screen, "frame", None)
+        if isinstance(snap, FrameSnapshot) and frame is not None:
+            board_ts = getattr(self.screen, "frame_ts", snap.board_ts)
+            generation = getattr(self.screen, "generation", snap.generation)
+            # A mirror can replace the image, its board stamp, or the session generation
+            # without publishing a new arrival object. Keep the arrival when nothing changed.
+            if snap.frame is frame and snap.board_ts == board_ts and snap.generation == generation:
+                return snap
+            updated = getattr(self.screen, "updated", snap.updated)
+            arrived = time.monotonic() - max(0.0, time.time() - updated)
+            return FrameSnapshot(frame, board_ts, arrived, updated, generation, snap.observed_live)
         if isinstance(snap, FrameSnapshot):
             return snap
-        if self.screen is None or getattr(self.screen, "frame", None) is None:
+        if frame is None:
             return None
         updated = getattr(self.screen, "updated", time.time())
         arrived = time.monotonic() - max(0.0, time.time() - updated)
-        return FrameSnapshot(self.screen.frame, getattr(self.screen, "frame_ts", None), arrived, updated)
+        return FrameSnapshot(frame, getattr(self.screen, "frame_ts", None), arrived, updated,
+                             getattr(self.screen, "generation", 0))
 
     async def _fresh_snapshot(self, since: float, timeout: float) -> FrameSnapshot | None:
         fresh = getattr(self.screen, "fresh_snapshot", None)
@@ -749,6 +777,7 @@ class Phone:
         if aim and self.screen is not None:
             await self._aim(x, y)
 
+    @bounded_operation
     @_serialized
     async def point_verified(self, x: float, y: float) -> tuple[float, float]:
         """Use calibrated landings, correcting at most once from a plausible visible disc."""
@@ -815,6 +844,7 @@ class Phone:
         if error is None or error[0] * 2 > min(x - left, right - x) or error[1] * 2 > min(y - top, bottom - y):
             raise RuntimeError("校准与已测落点不足，或落点误差相对目标过大，未发送点击。")
 
+    @bounded_operation
     @_serialized
     async def tap_verified(self, x: float, y: float, *,
                            before_click: Callable[[], None] | None = None,
@@ -999,6 +1029,8 @@ class Phone:
     def _gesture_guard(self, point, before_action):
         if before_action is not None:
             before_action()
+        if self.screen is None:
+            return before_action
         observed = freshness.require_fresh(self.screen)
         guard = TextTargetGuard(self.screen, observed.frame, SimpleNamespace(center=point), observation=observed)
 
@@ -1027,7 +1059,10 @@ class Phone:
             if hold:
                 await asyncio.sleep(HOLD)
         finally:
-            await self.device.send("release")
+            try:
+                await shield_cleanup(asyncio.wait_for(self._command("release"), RELEASE_TIMEOUT))
+            except asyncio.TimeoutError as exc:
+                raise DeviceError("release cleanup timed out") from exc
 
     @_serialized
     async def scroll(self, x: float, y: float, lines: int, *,
@@ -1051,42 +1086,54 @@ class Phone:
                 raise DeviceError("已紧急停止，后面的内容没有发出。")
             if before_action is not None:
                 before_action()  # serialization may have waited while the observed context changed
-            first_write = before_action
+            chunks_sent = False
+
+            def invoke(stage: str) -> None:
+                if before_action is None:
+                    return
+                if _accepts_stage(before_action):
+                    before_action(stage=stage)
+                elif stage == "accept":
+                    return
+                else:
+                    before_action()
 
             async def send_input(command):
-                nonlocal first_write
+                nonlocal chunks_sent
                 paste_command = selected == "paste" and command == "key cmd+v"
+                stage = "chunk" if command.startswith("type ") and chunks_sent else "context"
                 validate_paste = getattr(self.clipboard, "validate_paste", None) if paste_command else None
-                if paste_command and first_write is not None:
-                    # In manual mode Cmd+V is the first write. Copy/focus can be
-                    # confirmed before the mirror shows the original context again.
+                if paste_command and before_action is not None:
+                    # Cmd+V still needs the original field, after a Shortcut alert has left the mirror.
                     deadline = time.monotonic() + PASTE_CONTEXT_WAIT
                     while True:
                         if self._stopped(epoch):
                             raise DeviceError("已紧急停止，后面的内容没有发出。")
-                        if validate_paste is not None:
-                            validate_paste()
                         try:
-                            first_write()
+                            invoke("context")
                             break
                         except (RuntimeError, ValueError) as exc:
+                            if type(exc).__name__ == "BlindError":
+                                raise
                             if time.monotonic() >= deadline:
                                 raise DeviceError("等待原输入画面恢复超时，没有粘贴；"
                                                   "请重新观察并核对快捷指令。") from exc
                         await asyncio.sleep(.05)
 
                 def validate_input():
-                    if first_write is not None:
-                        first_write()
+                    # Re-check at the write, including while this task waited on the device lock.
+                    invoke("context" if paste_command else stage)
                     if self._stopped(epoch):
                         raise DeviceError("已紧急停止，后面的内容没有发出。")
-                    # Context validation can itself span the deadline while the
-                    # event loop cannot run its expiry/cancellation callbacks.
-                    validate_paste()
+                    if validate_paste is not None:
+                        validate_paste()
 
-                await self._send(epoch, command,
-                                 before_write=validate_input if validate_paste is not None else first_write)
-                first_write = None  # later chunks/Shortcut stages intentionally alter the screen
+                guarded = before_action is not None or validate_paste is not None
+                await self._send(epoch, command, before_write=validate_input if guarded else None)
+                if command.startswith("type "):
+                    # Typing may change the field. Later chunks keep that result, not the pre-type pixels.
+                    invoke("accept")
+                    chunks_sent = True
 
             if selected == "paste":
                 await self.clipboard.paste(text, stopped=lambda: self._stopped(epoch),

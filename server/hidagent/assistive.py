@@ -107,13 +107,34 @@ class AssistiveTouch:
             raise RuntimeError("返回主屏幕期间画面连接已变化，请重新观察。")
         return observation
 
+    def _write_profile(self) -> None:
+        body = dict(self._saved)
+        if self.last_position is not None:
+            body["last_position"] = list(self.last_position)
+            body["aspect"] = self.last_aspect
+        self.path.write_text(json.dumps(body), encoding="utf-8")
+
     def _remember(self, position: Point, frame: bytes) -> None:
         self.last_position, self.last_aspect = position, _aspect(frame)
         try:
-            self.path.write_text(json.dumps({**self._saved, "last_position": position,
-                                             "aspect": self.last_aspect}), encoding="utf-8")
+            self._write_profile()
         except OSError as exc:
             log.warning("AssistiveTouch: 无法保存悬浮按钮位置：%s", exc)
+
+    def _set_verified_route(self, route: str) -> None:
+        self._saved["verified_route"] = route
+        try:
+            self._write_profile()
+        except OSError as exc:
+            log.warning("AssistiveTouch: 无法保存回主屏幕方式：%s", exc)
+
+    def reset_routes(self) -> None:
+        """Forget the verified Home route so the next recovery may probe HID fallbacks again."""
+        self._saved.pop("verified_route", None)
+        try:
+            self._write_profile()
+        except OSError as exc:
+            log.warning("AssistiveTouch: 无法清除回主屏幕方式：%s", exc)
 
     async def _wait(self, epoch: int, since: float, timeout: float, accept, *, stable=False):
         deadline = time.monotonic() + timeout
@@ -235,7 +256,12 @@ class AssistiveTouch:
         # An unavailable route returns False. Eligibility/context exceptions
         # abort recovery instead of authorizing a different physical action.
         if await self._assistive_home(epoch):
+            self._set_verified_route("assistive-touch")
             return
+        if self._saved.get("verified_route") == "assistive-touch":
+            raise RuntimeError(
+                "这台设备已确认用辅助触控回主屏幕；没有再试上滑、Consumer Home 或 Cmd+H。"
+                "请观察屏幕，或调用 reset_routes() 后重新探测。")
         acknowledged = False
         last_error = None
         for route in ("swipe-up", "homescreen", "cmd+h"):
@@ -246,13 +272,15 @@ class AssistiveTouch:
                 continue
             log.warning("go_home: HID 退路 %s", route)
             try:
+                # Start the effect window before the gesture. Release waits for its ACK,
+                # and the mirror may publish the resulting frame during that wait.
+                since = time.time()
                 if route == "swipe-up":
                     await self.phone.swipe(0.5, 0.995, 0.5, 0.6, hold=False,
                                            before_action=self._require_frame)
                 else:
                     await self.phone._send(epoch, "homescreen" if route == "homescreen" else "key cmd+h",
                                            before_write=self._require_frame)
-                since = time.time()
                 acknowledged = True
             except (DeviceError, OSError) as exc:
                 self._check(epoch)

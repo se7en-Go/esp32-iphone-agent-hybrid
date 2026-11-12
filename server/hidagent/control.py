@@ -187,11 +187,16 @@ class Controls:
             raise ValueError(f"unknown action {name}")
         return planned
 
-    def _validate_context(self, planned):
+    def _validate_context(self, planned, *, stage: str = "context"):
         original = planned["observation"]
         current = require_fresh(self.screen)
-        if (current.generation != original.generation
-                or screen_compare.observation_changed(original.frame, current.frame)):
+        if current.generation != original.generation:
+            raise RuntimeError("screen changed since the original observation; observe again before acting")
+        if stage == "accept":
+            planned["_input_baseline"] = current.frame
+            return
+        reference = planned.get("_input_baseline", original.frame) if stage == "chunk" else original.frame
+        if screen_compare.observation_changed(reference, current.frame):
             raise RuntimeError("screen changed since the original observation; observe again before acting")
 
     async def _execute(self, planned: dict) -> float | None:
@@ -222,11 +227,13 @@ class Controls:
             await self.phone.scroll(*planned["xy"], planned["lines"],
                                     before_action=lambda: self._validate_context(planned))
         elif name == "type":
-            await self.phone.type(planned["text"], mode=planned["mode"],
-                                  before_action=lambda: self._validate_context(planned))
+            await self.phone.type(
+                planned["text"], mode=planned["mode"],
+                before_action=lambda stage="context": self._validate_context(planned, stage=stage))
         elif name == "compose_chinese":
-            await self.phone.type(planned["text"], mode="keys",
-                                  before_action=lambda: self._validate_context(planned))
+            await self.phone.type(
+                planned["text"], mode="keys",
+                before_action=lambda stage="context": self._validate_context(planned, stage=stage))
         elif name == "key":
             for _ in range(planned["repeat"]):
                 await self.phone.key(planned["text"].lower(),

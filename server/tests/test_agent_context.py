@@ -150,7 +150,8 @@ def test_action_identity_uses_arguments_not_result_fields():
     agent, _, screen = setup()
     action = {"action": "tap", "x": 200, "y": 350, "precise": True}
     recorded = {**action, **tap_result(screen), "changed": False, "thought": "again"}
-    assert _key(recorded) == action
+    assert _key(recorded) == {"action": "tap", "x": 200, "y": 350}
+    assert _key(recorded) == _key({"action": "tap", "x": 200, "y": 350})
     agent.steps = [recorded, recorded]
     assert agent._repeating(action)
     assert not agent._repeating({**action, "x": 201})
@@ -244,11 +245,15 @@ def test_input_validates_start_without_rejecting_its_own_screen_changes(tmp_path
 
     agent, _, screen = setup()
     writes = []
+    original = screen.frame
 
     async def send(command):
         writes.append(command)
         screen.frame = frame("black")  # typing or opening the Shortcut changes the observed UI
         screen.updated = time.time()
+        if mode == "clipboard" and command == "key ctrl+alt+p":
+            screen.frame = original  # the Shortcut alert has left; Cmd+V still needs this field
+            screen.updated = time.time()
 
     async def paste(text, *, stopped, send):
         assert not stopped()
@@ -266,3 +271,171 @@ def test_input_validates_start_without_rejecting_its_own_screen_changes(tmp_path
     else:
         assert len(writes) == 2
         assert "".join(command.removeprefix("type ") for command in writes) == text
+
+
+class GateLock(asyncio.Lock):
+    """The second acquire waits until the test has changed the screen."""
+
+    def __init__(self):
+        super().__init__()
+        self.acquires = 0
+        self.waiting = asyncio.Event()
+        self.allow = asyncio.Event()
+
+    async def acquire(self):
+        self.acquires += 1
+        if self.acquires == 2:
+            self.waiting.set()
+            await self.allow.wait()
+        return await super().acquire()
+
+
+def test_paste_does_not_send_when_the_original_field_does_not_return(tmp_path, monkeypatch):
+    from hidagent.device import DeviceError
+    from hidagent.phone import Phone
+
+    agent, _, screen = setup()
+    writes = []
+
+    async def send(command):
+        writes.append(command)
+        screen.frame = frame("black")
+        screen.updated = time.time()
+
+    async def paste(text, *, stopped, send):
+        await send("key ctrl+alt+p")
+        await send("key cmd+v")
+
+    monkeypatch.setattr("hidagent.phone.PASTE_CONTEXT_WAIT", 0.05)
+    agent.phone = Phone(SimpleNamespace(send=send), tmp_path / "calibration.json", screen,
+                        clipboard=SimpleNamespace(paste=paste))
+    action = {"action": "type", "text": "中文", "_shot": screen.frame, "_observation": snapshot(screen)}
+    with pytest.raises(DeviceError, match="没有粘贴"):
+        asyncio.run(agent._do(action))
+    assert writes == ["key ctrl+alt+p"]
+
+
+@pytest.mark.parametrize("transition", ["content", "generation", "disconnect"])
+def test_later_type_chunk_rechecks_context_while_waiting_for_the_device_lock(tmp_path, transition):
+    from hidagent.device import Device
+    from hidagent.phone import Phone
+
+    class Link:
+        def __init__(self):
+            self.written = []
+            self.replies = asyncio.Queue()
+
+        def write(self, data):
+            self.written.append(data)
+            self.replies.put_nowait(data.split(b" ", 1)[0] + b" ok\n")
+
+        async def readline(self):
+            return await self.replies.get()
+
+        def is_open(self):
+            return True
+
+        def close(self):
+            pass
+
+    async def scenario():
+        agent, _, screen = setup()
+        screen.generation = 0
+        device, link = Device(), Link()
+        device.attach(link)
+        device._lock = GateLock()
+        agent.phone = Phone(device, tmp_path / "calibration.json", screen)
+        action = {"action": "type", "text": "x" * 600, "_shot": screen.frame,
+                  "_observation": snapshot(screen)}
+        task = asyncio.create_task(agent._do(action))
+        await asyncio.wait_for(device._lock.waiting.wait(), 1)
+        if transition == "content":
+            screen.frame = frame("red")
+        elif transition == "generation":
+            screen.generation += 1
+        else:
+            screen.live = False
+        screen.updated = time.time()
+        device._lock.allow.set()
+        with pytest.raises((ValueError, module.BlindError), match="changed|lost the phone screen"):
+            await task
+        assert len(link.written) == 1
+        device.close()
+
+    asyncio.run(scenario())
+
+
+def test_highlight_fade_does_not_count_as_tap_progress(monkeypatch):
+    from test_verified_tap import keypad_edit
+
+    agent, phone, screen = setup()
+    before, after = keypad_edit(), keypad_edit(highlight=True)
+    screen.frame = before
+    screen.updated = time.time()
+    agent.actor = Model(["DO: tap 200 350", "DO: tap 200 350", "DO: done"])
+
+    async def tap(*_point, **_kwargs):
+        phone.calls.append("click")
+        return {**tap_result(screen), "fresh": True, "screen_changed": False,
+                "_after_frame": after, "_after_snapshot": snapshot(screen)}
+
+    monkeypatch.setattr(phone, "tap_verified", tap)
+
+    async def scenario():
+        await agent._step()
+        await agent._step()
+
+    asyncio.run(scenario())
+    assert phone.calls == ["click"]
+    taps = [step for step in agent.steps if step["action"] == "tap"]
+    assert len(taps) == 1 and taps[0]["changed"] is False
+    assert module.vision.changed(before, after) is True
+
+
+def test_cmd_v_rechecks_the_original_field_inside_the_device_lock(tmp_path):
+    from hidagent.device import Device
+    from hidagent.phone import Phone
+
+    class Link:
+        def __init__(self):
+            self.written = []
+            self.replies = asyncio.Queue()
+
+        def write(self, data):
+            self.written.append(data)
+            self.replies.put_nowait(data.split(b" ", 1)[0] + b" ok\n")
+
+        async def readline(self):
+            return await self.replies.get()
+
+        def is_open(self):
+            return True
+
+        def close(self):
+            pass
+
+    async def paste(text, *, stopped, send):
+        await send("key ctrl+alt+p")
+        await send("key cmd+v")
+
+    async def scenario():
+        agent, _, screen = setup()
+        device, link = Device(), Link()
+        device.attach(link)
+        device._lock = GateLock()
+        agent.phone = Phone(device, tmp_path / "calibration.json", screen,
+                            clipboard=SimpleNamespace(paste=paste))
+        action = {"action": "type", "text": "中文", "_shot": screen.frame,
+                  "_observation": snapshot(screen)}
+        task = asyncio.create_task(agent._do(action))
+        await asyncio.wait_for(device._lock.waiting.wait(), 1)
+        screen.frame = frame("black")
+        screen.updated = time.time()
+        device._lock.allow.set()
+        with pytest.raises(ValueError, match="changed"):
+            await task
+        assert len(link.written) == 1
+        assert link.written[0].endswith(b" key ctrl+alt+p\n")
+        device.close()
+
+    asyncio.run(scenario())

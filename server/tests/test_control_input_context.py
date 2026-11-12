@@ -163,11 +163,14 @@ def test_input_checks_start_but_allows_its_own_screen_changes(tmp_path, monkeypa
 
     screen = Screen()
     screen._on_jpeg(jpeg())
+    original = screen.frame
     writes = []
 
     async def send(command):
         writes.append(command)
         screen._on_jpeg(jpeg("black"))
+        if mode == "clipboard" and command == "key ctrl+alt+p":
+            screen._on_jpeg(original)
 
     async def paste(text, *, stopped, send):
         assert not stopped()
@@ -191,3 +194,77 @@ def test_input_checks_start_but_allows_its_own_screen_changes(tmp_path, monkeypa
     else:
         assert len(writes) == 2
         assert "".join(command.removeprefix("type ") for command in writes) == text
+
+
+def test_controls_do_not_paste_over_a_replaced_screen(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    screen = Screen()
+    screen._on_jpeg(jpeg())
+    writes = []
+
+    async def send(command):
+        writes.append(command)
+        screen._on_jpeg(jpeg("black"))
+
+    async def paste(text, *, stopped, send):
+        await send("key ctrl+alt+p")
+        await send("key cmd+v")
+
+    async def respond(_before, _completed, _began, _ready, acknowledged, error, *_args):
+        return {"command_acknowledged": acknowledged, "error": error}
+
+    phone = Phone(SimpleNamespace(send=send), tmp_path / "calibration.json", screen,
+                  clipboard=SimpleNamespace(paste=paste))
+    controls = Controls(phone, screen)
+    monkeypatch.setattr(controls, "_respond", respond)
+    monkeypatch.setattr("hidagent.phone.PASTE_CONTEXT_WAIT", 0.05)
+    result = asyncio.run(controls.perform(ControlAction(
+        action="type", text="中文", screen_id=controls.observation()["screen_id"])))
+    assert result["command_acknowledged"] is False
+    assert "没有粘贴" in result["error"]
+    assert writes == ["key ctrl+alt+p"]
+
+
+def test_controls_recheck_a_later_chunk_after_an_identical_reconnect(tmp_path, monkeypatch):
+    screen, device, link = Screen(), Device(), Link()
+    screen._on_jpeg(jpeg())
+    device.attach(link)
+
+    class Gate(asyncio.Lock):
+        def __init__(self):
+            super().__init__()
+            self.acquires = 0
+            self.waiting = asyncio.Event()
+            self.allow = asyncio.Event()
+
+        async def acquire(self):
+            self.acquires += 1
+            if self.acquires == 2:
+                self.waiting.set()
+                await self.allow.wait()
+            return await super().acquire()
+
+    device._lock = Gate()
+
+    async def respond(_before, _completed, _began, _ready, acknowledged, error, *_args):
+        return {"command_acknowledged": acknowledged, "error": error}
+
+    async def scenario():
+        phone = Phone(device, tmp_path / "calibration.json", screen)
+        controls = Controls(phone, screen)
+        monkeypatch.setattr(controls, "_respond", respond)
+        task = asyncio.create_task(controls.perform(ControlAction(
+            action="type", text="x" * 600, screen_id=controls.observation()["screen_id"])))
+        await asyncio.wait_for(device._lock.waiting.wait(), 1)
+        frame = screen.frame
+        screen._on_ready()
+        screen._on_jpeg(frame)
+        device._lock.allow.set()
+        result = await task
+        assert result["command_acknowledged"] is False
+        assert "changed" in result["error"]
+        assert len(link.written) == 1
+        device.close()
+
+    asyncio.run(scenario())

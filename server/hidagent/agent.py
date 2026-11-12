@@ -150,9 +150,7 @@ def _key(step: dict) -> dict:
     """Identity contains only declared arguments, regardless of new feedback fields."""
     name = step.get("action")
     keys = ("action", *ACTIONS.get(name, ()))
-    if name == "tap":
-        keys += ("precise",)
-    elif name in ("find_text", "tap_text"):
+    if name in ("find_text", "tap_text"):
         keys += ("region", "nth", "exact")
     return {key: step[key] for key in keys if key in step}
 
@@ -281,12 +279,14 @@ class Agent:
                 before = self.screen.frame
                 try:
                     tap_completed = await self._do(act)
-                except (Exception, asyncio.CancelledError):
-                    if name in ("tap", "tap_text"):
-                        # The click may have been written before its ACK was lost.
-                        # Keep its identity before recovery/replanning can propose it again.
+                except (Exception, asyncio.CancelledError) as exc:
+                    # A click, key, or text write may already have left the host. Record that
+                    # uncertain attempt before recovery can plan the same action again.
+                    written = isinstance(exc, DeviceError) and "串口断了" in str(exc)
+                    if name in ("tap", "tap_text") or (
+                            name in ("type", "key") and (written or isinstance(exc, asyncio.CancelledError))):
                         attempted = {key: value for key, value in act.items()
-                                     if key not in {"_shot", "_observation"}}
+                                     if key not in {"_shot", "_observation", "_input_baseline"}}
                         attempted.update(outcome="unknown", changed=None, fresh=False, clicked=None,
                                          effect_verified=False, act_s=round(time.time() - started, 2))
                         self._record(act["_shot"], **attempted)
@@ -304,7 +304,13 @@ class Agent:
                         after = await feedback.wait_after_action(self.screen, tap_completed or time.time(), 1.5)
                         usable = after is not None
                     act["screen_diff"] = await screen_diff.summarize(before, after, fresh=usable, ocr_enabled=False)
-                    act["changed"] = vision.changed(before, after, ignore=tuple(spots)) if usable else None
+                    if not usable:
+                        act["changed"] = None
+                    elif "screen_changed" in act:
+                        # Phone already ignored pointer fade and button highlights.
+                        act["changed"] = act["screen_changed"]
+                    else:
+                        act["changed"] = vision.changed(before, after, ignore=tuple(spots))
                     act["effect_verified"] = False
             act.pop("_observation", None)
             self._record(act.pop("_shot"), **act)
@@ -325,8 +331,10 @@ class Agent:
                      and step["action"] not in {"find_text", "wait", "replan", "done", "fail"}), {})
 
     def _missed(self) -> bool:
-        """Unchanged or unknown tap evidence cannot authorize an automatic retry."""
+        """Unchanged or unknown input evidence cannot authorize an automatic retry."""
         previous = self._last_input()
+        if previous.get("outcome") == "unknown":
+            return True
         return (previous.get("changed") is False
                 or (previous.get("action") in ("tap", "tap_text")
                     and (previous.get("changed") is not True or previous.get("fresh") is False)))
@@ -379,17 +387,27 @@ class Agent:
             return [{**a, "_shot": observation.frame, "_observation": observation} for a in acts]
         raise ValueError(f"actor gave no valid action: {reply[:200]}")
 
-    def _validate_context(self, action: dict) -> FrameSnapshot:
-        """Every queued action still belongs to the coherent observation given to the model."""
+    def _validate_context(self, action: dict, *, stage: str = "context") -> FrameSnapshot:
+        """Every write still belongs to the observation, with a stage-specific pixel check.
+
+        ``context`` requires the original frame (paste and the first chunk). ``chunk`` allows the
+        text produced by earlier chunks of this same action. ``accept`` records that result.
+        """
         original = action.get("_observation")
         current = fresh_frame(self.screen)
         if current is None:
             raise BlindError("lost the phone screen: reconnect Screen Mirroring")
-        if (not isinstance(original, FrameSnapshot) or original.frame != action.get("_shot")
-                or current.generation != original.generation
-                or screen_compare.observation_changed(original.frame, current.frame)):
+        if not isinstance(original, FrameSnapshot) or original.frame != action.get("_shot"):
             raise ValueError("screen changed since the original observation; discard queued actions and observe again")
-        return original
+        if current.generation != original.generation:
+            raise ValueError("screen changed since the original observation; discard queued actions and observe again")
+        if stage == "accept":
+            action["_input_baseline"] = current.frame
+            return current
+        reference = action.get("_input_baseline", original.frame) if stage == "chunk" else original.frame
+        if screen_compare.observation_changed(reference, current.frame):
+            raise ValueError("screen changed since the original observation; discard queued actions and observe again")
+        return current
 
     async def _do(self, a: dict) -> dict | float | None:
         observation = self._validate_context(a)
@@ -409,7 +427,10 @@ class Agent:
             case "circle":
                 await self.phone.drag(circle(p("x"), p("y"), p("r"), self.screen.aspect),
                                       before_action=lambda: self._validate_context(a))
-            case "type": await self.phone.type(a["text"], before_action=lambda: self._validate_context(a))
+            case "type":
+                await self.phone.type(
+                    a["text"],
+                    before_action=lambda stage="context": self._validate_context(a, stage=stage))
             case "key": await self.phone.key(a["combo"], before_action=lambda: self._validate_context(a))
             case "home": await self.phone.go_home()
             case "back": await self.phone.go_back(before_action=lambda: self._validate_context(a))

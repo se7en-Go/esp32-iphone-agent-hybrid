@@ -20,6 +20,7 @@ from hidagent import app as app_module
 from hidagent import phone as phone_module
 from hidagent.control import Controls
 from hidagent.device import Device
+from hidagent.freshness import snapshot as freshness_snapshot
 from hidagent.phone import Phone
 
 
@@ -49,12 +50,12 @@ class MemoryTransport(asyncio.Transport):
 
 class Screen:
     live = True
-    updated = 0
 
     def __init__(self):
         buffer = io.BytesIO()
         Image.new("RGB", (20, 40), "white").save(buffer, "JPEG")
         self.frame = buffer.getvalue()
+        self.updated = time.time()
 
     async def settled(self, **kwargs):
         pass
@@ -81,8 +82,8 @@ def test_tap_budget_covers_all_verification_rounds(tmp_path):
 
     async def find(*args, **kwargs):
         attempts.append(len(attempts))
-        await asyncio.sleep(0.07)
-        return (0.53, 0.53) if len(attempts) == 1 else (0.5, 0.5)
+        await asyncio.sleep(0.2)
+        return (0.5, 0.5)
 
     phone._find_pointer = find
 
@@ -93,7 +94,8 @@ def test_tap_budget_covers_all_verification_rounds(tmp_path):
         await asyncio.sleep(0.15)
         assert sent == commands
         assert "click" not in sent
-        assert len(attempts) == 2  # the second round shares the first round's budget
+        # Verified taps search once. That search uses the tap's budget, so it cannot click after the deadline.
+        assert len(attempts) == 1
 
     asyncio.run(scenario())
 
@@ -112,7 +114,7 @@ def test_cancelled_nudge_does_not_send_a_return_move(tmp_path):
             await asyncio.Event().wait()
 
         phone._catch_up, phone._watch = catch_up, watch
-        task = asyncio.create_task(phone.tap_verified(0.5, 0.5))
+        task = asyncio.create_task(phone._find_pointer((0.5, 0.5)))
         await entered.wait()
         before_cancel = list(sent)
         task.cancel()
@@ -134,15 +136,12 @@ def test_http_disconnect_cancels_catch_up_before_any_later_hid(tmp_path, monkeyp
         waiting = asyncio.Event()
         resume = asyncio.Event()
 
-        async def catch_up(epoch):
+        async def ensure_observation():
             waiting.set()
             await resume.wait()
-            return None
+            return freshness_snapshot(phone.screen)
 
-        async def watch(*args, **kwargs):
-            return (0.5, 0.5)
-
-        phone._catch_up, phone._watch = catch_up, watch
+        phone.ensure_observation = ensure_observation
         observation = app_module.controls.observation()
         config = uvicorn.Config(app_module.app, lifespan="off", log_level="error", http="h11")
         state = ServerState()

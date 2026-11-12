@@ -114,8 +114,12 @@ def test_manual_paste_refuses_ineligible_or_expired_context(tmp_path, monkeypatc
                 screen._on_jpeg(original)
             elif transition == "stale":
                 screen._on_jpeg(original)
+                aged = time.time() - 10
+                snap = screen.snapshot
+                screen._snapshot = type(snap)(
+                    snap.frame, snap.board_ts, snap.arrived, aged, snap.generation, snap.observed_live)
                 with screen._frame_lock:
-                    screen.updated = time.time() - 10
+                    screen.updated = aged
             elif transition == "disconnect":
                 screen.stop()
             elif transition == "stop":
@@ -203,9 +207,9 @@ def test_paste_expiring_during_final_validation_never_writes(tmp_path, monkeypat
         monkeypatch.setattr(clipboard_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
         original_validate = controls._validate_context
 
-        def validate(plan):
-            original_validate(plan)
-            if route == "observed_manual" and screen._frame_lock._is_owned():
+        def validate(plan, *, stage="context"):
+            original_validate(plan, stage=stage)
+            if route == "observed_manual" and stage != "accept" and screen._frame_lock._is_owned():
                 # The deadline passes inside synchronous final image validation,
                 # before asyncio's timeout callback can run.
                 clock[0] = 2.0

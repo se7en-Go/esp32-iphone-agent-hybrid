@@ -3,6 +3,7 @@
 import asyncio
 import io
 import json
+import math
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +13,8 @@ from PIL import Image, ImageEnhance
 
 from hidagent import freshness
 from hidagent import phone as phone_module
-from hidagent.phone import Phone
+from hidagent.phone import USB_PACE, Phone
+from hidagent.screen import FrameSnapshot, Screen
 from hidagent.vision import pointer, pointer_move
 
 FIXTURES = Path(__file__).parent / "fixtures" / "ios26"
@@ -88,12 +90,22 @@ class MirrorPhone:
               (350, 350): "04_m200_2000ms", (362, 350): "05_nudge_r_400ms"}
 
     def __init__(self, lag: float):
+        self.t0 = time.monotonic()
         self.lag, self.pos, self.sent, self.links = lag, None, [], 0
         self.frame = frame("00_home_1500ms")
         self.updated = time.time()
         self._pending = []
+        self._publish(self.frame)
         self.live = True
         self.aspect = W / H
+
+    def board_ms(self) -> int:
+        return (3_600_000 + int((time.monotonic() - self.t0) * 1000)) % 2**32
+
+    def _publish(self, jpeg, ts=None):
+        updated = time.time()
+        self.snapshot = FrameSnapshot(jpeg, ts, time.monotonic(), updated, 0, True)
+        self.frame, self.frame_ts, self.updated = jpeg, ts, updated
 
     async def send(self, command: str) -> None:
         self.sent.append(command)
@@ -105,12 +117,14 @@ class MirrorPhone:
         name = next((n for (x, y), n in self.FRAMES.items()
                      if abs(x - self.pos[0]) <= 3 and abs(y - self.pos[1]) <= 3), None)
         if name:
+            # The board receives the resulting AirPlay image after the HID command, even at short mirror lag.
             self._pending.append((time.monotonic() + self.lag, frame(name)))
 
     def _deliver(self) -> None:
         now = time.monotonic()
         while self._pending and self._pending[0][0] <= now:
-            self.frame, self.updated = self._pending.pop(0)[1], time.time()
+            _, jpeg = self._pending.pop(0)
+            self._publish(jpeg)
 
     async def settled(self, **kwargs) -> None:
         await asyncio.sleep(kwargs.get("least", 0.25))
@@ -215,17 +229,16 @@ class ReplayingMirror(MirrorPhone):
     def _deliver(self) -> None:
         now = time.monotonic()
         if now < self.replay_until:
-            self.frame = self._replay[int(now * 10) % 2]
-            self.frame_ts, self.updated = 1000, time.time()  # an hour behind the board's clock
+            # an hour behind the board's clock
+            self._publish(self._replay[int(now * 10) % 2], 1000)
             return
         if not self._live_baseline:
             self._live_baseline = True
-            self.frame = frame("01_m150_2000ms")
-            self.frame_ts, self.updated = self.board_ms(), time.time()
+            self._publish(frame("01_m150_2000ms"), self.board_ms())
         while self._pending and self._pending[0][0] <= now:
-            _, self.frame = self._pending.pop(0)
-            self.frame_ts = self.board_ms()  # firmware stamps board receipt, after mirror transport
-            self.updated = time.time()
+            _, jpeg = self._pending.pop(0)
+            # firmware stamps board receipt, after mirror transport
+            self._publish(jpeg, self.board_ms())
 
 
 def test_pointer_search_waits_out_the_board_replaying_old_video(tmp_path, monkeypatch):
@@ -283,3 +296,188 @@ def test_a_still_screen_is_not_mistaken_for_a_replay(tmp_path):
     assert phone._frame_age(clock) == pytest.approx(0.3, abs=0.01)
     screen.frame_ts = 1_000_000 - 1_500_000  # 25 minutes old when it came: the board replaying its GOP
     assert phone._frame_age(clock) > phone_module.REPLAY_LAG
+
+
+@pytest.mark.parametrize("board_at_nudge", [1000, 2**32 - 20])
+@pytest.mark.parametrize("delta", [-100, 0, 40])
+def test_nudge_candidate_must_be_newer_than_the_command_even_across_wrap(
+        tmp_path, monkeypatch, board_at_nudge, delta):
+    monkeypatch.setattr(phone_module, "POINTER_WAIT", .08)
+    screen = Screen()
+    phone = Phone(SimpleNamespace(), tmp_path / "calibration.json", screen)
+    comparisons = []
+    original = phone_module.vision.pointer_move
+
+    def compare(*args):
+        comparisons.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(phone_module.vision, "pointer_move", compare)
+    sent = time.monotonic()
+    clock = board_at_nudge - sent * 1000
+    screen._on_ts((board_at_nudge + delta) % 2**32)
+    screen._on_jpeg(frame("live_tap_corrected_nudged"))
+    # Windows often returns the same monotonic reading for both calls above.
+    # The frame was still published after the command. fresh_snapshot requires
+    # a strictly later arrival, so step it past that reading without changing
+    # the board timestamp the assertion is about.
+    snap = screen.snapshot
+    if snap.arrived <= sent:
+        screen._snapshot = FrameSnapshot(snap.frame, snap.board_ts, math.nextafter(sent, math.inf))
+    found = asyncio.run(phone._watch(0, [frame("live_tap_corrected")], (.75, .4),
+                                    12 / 678, sent, False, True, clock))
+    if delta <= 0:
+        assert found is None and not comparisons
+    else:
+        assert comparisons and found is not None
+        assert found[0] * W == pytest.approx(540.5, abs=2)
+
+
+def test_still_screen_can_establish_a_baseline_without_waiting_for_unsolicited_frames(tmp_path, monkeypatch):
+    mirror = MirrorPhone(.15)
+    mirror.pos = (150, 150)
+    mirror._publish(frame("01_m150_2000ms"), mirror.board_ms() - 30_300)
+    mirror.snapshot = FrameSnapshot(mirror.frame, mirror.snapshot.board_ts, time.monotonic() - 30)
+    phone = Phone(mirror, tmp_path / "calibration.json", mirror)
+    monkeypatch.setattr(time, "time", lambda: -10_000)
+    started = time.monotonic()
+    found = asyncio.run(phone._find_pointer())
+    assert found is not None and found[0] * W == pytest.approx(250.9, abs=2)
+    assert time.monotonic() - started < 2
+
+
+def test_verified_tap_rejects_the_last_five_seconds_of_replay(tmp_path, monkeypatch):
+    """Old target/nudge frames must not confirm a landing, and a verified tap must not click."""
+    monkeypatch.setattr(phone_module, "POINTER_WAIT", 0.1)
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(json.dumps({"w": 678, "h": 1466, "x0": .1273, "y0": -.0006}))
+    screen = Screen()
+
+    class Board:
+        links = 0
+        abort_epoch = 0
+
+        def __init__(self):
+            self.started = time.monotonic()
+            self.sent = []
+            self.replayed = 0
+            self.actual = None
+
+        def ms(self):
+            return 3_600_000 + int((time.monotonic() - self.started) * 1000)
+
+        async def query(self, command):
+            if command == "pace":
+                return f"ok {USB_PACE}"
+            assert command == "status"
+            return json.dumps({"up": self.ms()})
+
+        async def send(self, command):
+            self.sent.append(command)
+            if command == "home":
+                self.actual = (91.6, 0)
+            elif command in {"move 12 0", "move -12 0"}:
+                await asyncio.sleep(.01)
+                screen._on_ts(self.ms() - 4000)
+                screen._on_jpeg(frame("live_tap_corrected_nudged" if command == "move 12 0"
+                                      else "live_tap_corrected"))
+                self.replayed += 1
+
+    board = Board()
+    screen._on_ts(board.ms() - 4200)
+    screen._on_jpeg(frame("live_tap_corrected"))
+    phone = Phone(board, calibration, screen)
+    found = asyncio.run(phone._find_pointer((.75, .40)))
+    assert found is None
+    assert board.replayed >= 2, "the test must actually deliver old frames"
+    screen._on_ts(board.ms())
+    screen._on_jpeg(frame("live_tap_corrected"))
+    with pytest.raises(RuntimeError, match="落点|目标|新鲜|重放"):
+        asyncio.run(phone.tap_verified(.75, .40))
+    assert "click" not in board.sent
+
+
+def test_a_frame_from_before_the_actual_serial_write_cannot_verify_a_queued_nudge(tmp_path, monkeypatch):
+    """Device.send may queue behind a serial exchange; the command boundary is link.write, not its caller."""
+    from hidagent.device import Device
+
+    monkeypatch.setattr(phone_module, "POINTER_WAIT", .05)
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(json.dumps({"w": 678, "h": 1466, "x0": .1273, "y0": -.0006}))
+
+    async def scenario():
+        screen = Screen()
+        device = Device()
+        started = time.monotonic()
+
+        def board_ms():
+            return 3_600_000 + int((time.monotonic() - started) * 1000)
+
+        class Link:
+            def __init__(self):
+                self.replies = asyncio.Queue()
+                self.written = []
+                self.clicked = None
+
+            def write(self, data):
+                req_id, command = data.decode().strip().split(" ", 1)
+                self.written.append((command, board_ms()))
+                if command == "click":
+                    self.clicked = True
+                reply = json.dumps({"up": board_ms()}) if command == "status" else "ok"
+                self.replies.put_nowait(f"{req_id} {reply}\n".encode())
+
+            async def readline(self):
+                return await self.replies.get()
+
+            def is_open(self):
+                return True
+
+            def close(self):
+                pass
+
+        link = Link()
+        device.attach(link)
+
+        async def query(command):
+            assert command == "status"
+            return json.dumps({"up": board_ms()})
+
+        device.query = query
+        phone = Phone(device, calibration, screen)
+        phone._pos, phone._link = (150, 150), device.links
+        replayed = []
+        producers = []
+
+        async def replay_while_queued():
+            try:
+                await asyncio.sleep(.02)
+                timestamp = board_ms()
+                screen._on_ts(timestamp)
+                screen._on_jpeg(frame("live_tap_corrected_nudged"))
+                replayed.append(timestamp)
+                await asyncio.sleep(.02)
+            finally:
+                device._lock.release()
+
+        async def settle_and_queue(**_kwargs):
+            screen._on_ts(board_ms() - 4200)
+            screen._on_jpeg(frame("live_tap_corrected"))
+            await device._lock.acquire()
+            producers.append(asyncio.create_task(replay_while_queued()))
+
+        screen.settled = settle_and_queue
+        screen._on_ts(board_ms() - 4200)
+        screen._on_jpeg(frame("live_tap_corrected"))
+        try:
+            found = await phone._find_pointer((.75, .40))
+        finally:
+            await asyncio.gather(*producers)
+        nudge_writes = [timestamp for command, timestamp in link.written if command == "move 12 0"]
+        assert found is None
+        assert replayed and len(replayed) == len(nudge_writes)
+        assert all(old < sent for old, sent in zip(replayed, nudge_writes, strict=True))
+        assert link.clicked is None and all(command != "click" for command, _ in link.written)
+        device.close()
+
+    asyncio.run(scenario())

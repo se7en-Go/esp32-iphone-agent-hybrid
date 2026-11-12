@@ -168,8 +168,10 @@ class Screen:
             self.frame = jpeg
             updated = time.time()
             self.updated = updated
+            # A test can publish a frame before start(); that screen is live, matching live().
+            observed_live = jpeg is not None and not self._stopping and (not self._started or self._session_ok)
             self._snapshot = FrameSnapshot(
-                jpeg, board_ts, arrived, updated, self.generation, self._session_ok and jpeg is not None)
+                jpeg, board_ts, arrived, updated, self.generation, observed_live)
         if self.last_error.startswith("画面停住了"):
             self.last_error = ""
 

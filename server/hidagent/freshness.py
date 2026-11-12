@@ -31,6 +31,10 @@ def snapshot(screen) -> FrameSnapshot:
     if callable(take):
         observed = take()
         if isinstance(observed, FrameSnapshot):
+            # Pixels stay frozen, but a stopped or disconnected screen is no longer eligible.
+            if observed.live and hasattr(screen, "live") and not screen.live:
+                return FrameSnapshot(observed.frame, observed.updated, observed.frame_ts,
+                                     observed.generation, False)
             return observed
     if take is not None and (hasattr(take, 'board_ts') or hasattr(take, 'frame_ts')):
         return FrameSnapshot(

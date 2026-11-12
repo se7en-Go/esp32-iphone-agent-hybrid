@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import time
 
 import pytest
@@ -188,3 +189,24 @@ def test_cancellation_does_not_trigger_another_fallback(tmp_path):
         asyncio.run(phone.go_home())
 
     assert device.sent == ["homescreen"]
+
+
+def test_known_assistive_route_is_not_followed_by_hid_fallbacks(tmp_path):
+    device = Device()
+    screen = Screen()
+    phone = make_phone(tmp_path, device, screen)
+    phone.assistive_touch._saved["verified_route"] = "assistive-touch"
+    phone.assistive_touch._write_profile()
+    reloaded = make_phone(tmp_path, Device(), Screen())
+    assert reloaded.assistive_touch._saved["verified_route"] == "assistive-touch"
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="辅助触控"):
+            asyncio.run(phone.go_home())
+    assert device.sent == []
+
+    phone.assistive_touch.reset_routes()
+    assert "verified_route" not in json.loads(phone.assistive_touch.path.read_text())
+    with pytest.raises(RuntimeError, match="未确认"):
+        asyncio.run(phone.go_home())
+    assert "homescreen" in device.sent and "key cmd+h" in device.sent

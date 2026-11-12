@@ -129,9 +129,12 @@ def test_watch_keeps_operation_boundary_separate_from_receive_cursor(tmp_path):
         mirror.pos = (150, 150)
         phone = Phone(mirror, tmp_path / "calibration.json", mirror)
         started = time.time()
+        sent = time.monotonic()
+        # _watch's clock is board millis minus monotonic millis. This mirror stamps wall time.
+        clock = started * 1000 - sent * 1000
         await mirror.send("move 12 0")
         found = await phone._watch(0, [frame("01_m150_2000ms")], None, .025,
-                                   started, False, True, 0)
+                                   sent, False, True, clock)
         assert freshness.fresh_frame(mirror, clock=0) is not None
         assert freshness.fresh_frame(mirror, clock=0, since=started) is None
         assert found is None
@@ -145,6 +148,8 @@ def test_watch_accepts_eligible_motion_after_rejecting_a_queued_frame(tmp_path):
         mirror.pos = (150, 150)
         phone = Phone(mirror, tmp_path / "calibration.json", mirror)
         started = time.time()
+        sent = time.monotonic()
+        clock = started * 1000 - sent * 1000
         await mirror.send("move 12 0")
         delivered = False
         original_fresh = mirror.fresh
@@ -163,7 +168,7 @@ def test_watch_accepts_eligible_motion_after_rejecting_a_queued_frame(tmp_path):
 
         mirror.fresh = fresh
         found = await phone._watch(0, [frame("01_m150_2000ms")], None, .025,
-                                   started, False, True, 0)
+                                   sent, False, True, clock)
         assert found == pytest.approx((250.9 / 720, 158.8 / 1560), abs=.003)
 
     asyncio.run(run())
