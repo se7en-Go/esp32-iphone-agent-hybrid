@@ -36,6 +36,8 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--status", action="store_true", help="只查询当前模式和蓝牙状态")
     parser.add_argument("--port", default="", help="例如 COM5 或 /dev/cu.usbserial-…。留空则自动找 CH343/FTDI/CP210x")
     args = parser.parse_args(argv)
+    if args.status and (args.mode or args.pair or args.unpair):
+        parser.error("--status 只查询，不能与模式、pair 或 unpair 组合使用。")
     # Docs and the wrappers pass `pair` / `unpair` as the first word, same as `ble`.
     if args.mode == "pair":
         args.pair = True

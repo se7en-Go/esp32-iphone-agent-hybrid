@@ -1,12 +1,14 @@
 // BLE HID mouse + keyboard + consumer (AC Home, globe) beside the app GATT service.
 // iOS requires bonding. Just Works is already the board's security mode (ble_begin).
-// Reports wait until the host accepts the notify and the previous HID notify has
-// given its mbufs back. The video reserve (16 blocks) is left free. The connection
+// Reports wait until the host accepts the notify, leaving a 16-block mbuf reserve.
+// Mbuf availability is a preflight check, not a per-report completion signal: the
+// ESP32 VHCI transport can free a report's mbuf before notify returns. The connection
 // interval stays at the 15 ms tuneLink already set: a shorter request is outside
 // Apple's rules, and a longer one would slow GATT video on the same ACL.
 #include "ble_hid.h"
 
 #include <Preferences.h>
+#include <atomic>
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
 #include "nimble/nimble/host/include/host/ble_hs.h"
@@ -44,21 +46,11 @@ static uint16_t connHandle;
 static uint8_t buttons;
 static uint8_t lastMod, lastKeys[6];
 static uint16_t lastConsumer;
-static int hidOwed;       // mbuf blocks the last HID notify is still holding
-static int hidWatermark;  // os_msys_num_free() just after that notify was queued
+static std::atomic<bool> unpairing;
 
 static int blocksFor(size_t n) {
   const int data = MYNEWT_VAL(MSYS_1_BLOCK_SIZE) - 16;
   return (int)((n + 3 + 4 + 4 + 8 + data - 1) / data) + 1;
-}
-
-static bool earlierHidDone() {
-  if (hidOwed <= 0) return true;
-  if (os_msys_num_free() >= hidWatermark + hidOwed) {
-    hidOwed = 0;
-    return true;
-  }
-  return false;
 }
 
 static bool encrypted(uint16_t h) {
@@ -77,10 +69,13 @@ static void saveBonds() {
   store.putBytes("bonds", bonds, sizeof bonds);
 }
 
-void ble_hid_set_pref(int next) {
-  if (next < HID_PREF_USB || next > HID_PREF_AUTO) return;
+bool ble_hid_set_pref(int next) {
+  if (next < HID_PREF_USB || next > HID_PREF_AUTO) return false;
+  if (next == pref) return true;
+  if (!hid_prepare_pref(next)) return false;
   pref = next;
   savePref();
+  return true;
 }
 
 bool ble_hid_pair_window_open() {
@@ -107,6 +102,7 @@ void ble_hid_allow_pairing(uint32_t window_ms) {
 void ble_hid_deny_pairing() { pairArmed = false; }
 
 void ble_hid_remember(uint8_t type, const uint8_t addr[6]) {
+  if (unpairing) return; // a disconnect/subscription callback must not reinsert a deleted bond
   for (int i = 0; i < bondCount; i++)
     if (bonds[i].type == type && memcmp(bonds[i].val, addr, 6) == 0) return;
   if (bondCount >= 8) return;
@@ -127,7 +123,6 @@ void ble_hid_bonds_cleared() {
   bondCount = 0;
   saveBonds();
   mouseOn = keyOn = consOn = haveConn = false;
-  hidOwed = 0;
   clearLatch();
 }
 
@@ -135,10 +130,40 @@ bool ble_hid_using(uint16_t handle) {
   return haveConn && handle == connHandle && (mouseOn || keyOn || consOn);
 }
 
-void ble_hid_unpair() {
-  for (int i = 0; i < bondCount; i++) {
+static bool bondStored(const Bond &bond, bool &present) {
+  ble_store_key_sec key = {};
+  key.peer_addr.type = bond.type;
+  memcpy(key.peer_addr.val, bond.val, sizeof bond.val);
+  ble_store_value_sec value;
+  // isBonded() hides read errors and only enumerates OUR_SEC. A partial delete
+  // can leave PEER_SEC behind, so confirm both records and distinguish ENOENT.
+  int ours = ble_store_read_our_sec(&key, &value);
+  int peer = ble_store_read_peer_sec(&key, &value);
+  if ((ours != 0 && ours != BLE_HS_ENOENT) || (peer != 0 && peer != BLE_HS_ENOENT)) return false;
+  present = ours == 0 || peer == 0;
+  return true;
+}
+
+bool ble_hid_unpair() {
+  if (unpairing.exchange(true)) return false;
+  if (!ble_pause_advertising()) {
+    unpairing = false;
+    return false;
+  }
+  bool ok = true;
+  for (int i = 0; i < bondCount;) {
     NimBLEAddress addr(bonds[i].val, bonds[i].type);
-    NimBLEDevice::deleteBond(addr);
+    // NimBLE needs advertising stopped to remove an IRK. Check storage too:
+    // some lower-level store errors are logged without reaching deleteBond's result.
+    // A record already absent from NimBLE is safe to remove from our mirror.
+    bool present;
+    bool deleted = bondStored(bonds[i], present) &&
+                   (!present || (NimBLEDevice::deleteBond(addr) && bondStored(bonds[i], present) && !present));
+    if (!deleted) {
+      ok = false;
+      i++;
+      continue;
+    }
     ble_forget_addr(bonds[i].type, bonds[i].val);
     for (uint16_t h = 0; h < 8; h++) {
       ble_gap_conn_desc d;
@@ -148,14 +173,19 @@ void ble_hid_unpair() {
         if (server) server->disconnect(h);
       }
     }
+    memmove(bonds + i, bonds + i + 1, (bondCount - i - 1) * sizeof(Bond));
+    bondCount--;
+    saveBonds();
   }
-  ble_hid_bonds_cleared();
+  if (!bondCount) ble_hid_bonds_cleared();
+  ble_resume_advertising();
+  unpairing = false;
+  return ok;
 }
 
 void ble_hid_on_disconnect(uint16_t handle) {
   if (!haveConn || handle != connHandle) return;
   mouseOn = keyOn = consOn = haveConn = false;
-  hidOwed = 0;
   clearLatch();
 }
 
@@ -191,17 +221,10 @@ static bool emit(NimBLECharacteristic *chr, const uint8_t *data, size_t n) {
   uint32_t start = millis();
   while ((int32_t)(millis() - start) < 40) {
     if (!ble_hid_connected()) return false;
-    if (earlierHidDone() && os_msys_num_free() >= blocks + reserve) {
-      int before = os_msys_num_free();
+    if (os_msys_num_free() >= blocks + reserve) {
       os_mbuf *om = ble_hs_mbuf_from_flat(data, n);
       int rc = om ? ble_gatts_notify_custom(connHandle, chr->getHandle(), om) : BLE_HS_ENOMEM;
-      if (rc == 0) {
-        int after = os_msys_num_free();
-        hidOwed = before - after;
-        if (hidOwed < 1) hidOwed = blocks;
-        hidWatermark = after;
-        return true;
-      }
+      if (rc == 0) return true; // host accepted it; this is not an over-the-air acknowledgement
       if (rc != BLE_HS_ENOMEM) return false;
     }
     delay(2);
@@ -261,8 +284,7 @@ String ble_hid_command(const char *arg) {
   if (hid_parse_cmd(arg, &cmd) != 0) return "err usage: hid usb|ble|auto|pair|unpair";
   if (cmd.kind == HID_CMD_QUERY) return String("ok ") + hid_pref_name(pref);
   if (cmd.kind == HID_CMD_SET) {
-    ble_hid_set_pref(cmd.pref);
-    return "ok";
+    return ble_hid_set_pref(cmd.pref) ? "ok" : "err hid release pending";
   }
   if (cmd.kind == HID_CMD_PAIR) {
     ble_hid_allow_pairing(60000);
@@ -273,8 +295,7 @@ String ble_hid_command(const char *arg) {
     return "ok";
   }
   if (cmd.kind == HID_CMD_UNPAIR) {
-    ble_hid_unpair();
-    return "ok";
+    return ble_hid_unpair() ? "ok" : "err hid unpair failed";
   }
   return "err usage: hid usb|ble|auto|pair|unpair";
 }

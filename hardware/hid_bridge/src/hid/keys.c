@@ -9,6 +9,7 @@ static int named(const char *tok, int len, const char *lit) {
 
 int hid_ascii(char c, uint8_t *usage, int *shift) {
   *shift = 0;
+  if (c == '\0') return 0; // strchr would match a table's terminator.
   if (c == '\n' || c == '\r') {
     *usage = 0x28;
     return 1;

@@ -38,3 +38,5 @@ void ble_cli_drop(int slot);
 void ble_cli_push_cmd(const char *line, size_t n);
 void ble_forget_addr(uint8_t type, const uint8_t addr[6]); // drop one address from the in-RAM known list
 bool ble_app_advertising();                                // public identity, the one that carries HID, is on air
+bool ble_pause_advertising(); // stop and prevent background/callback restarts during bond deletion
+void ble_resume_advertising(); // restore normal identity scheduling after a successful pause

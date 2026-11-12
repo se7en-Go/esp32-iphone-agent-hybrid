@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 BANNED = ("请先装 WSL", "请先安装 WSL", "install WSL", "先装 WSL2", "Windows 用户请先装 WSL")
 
@@ -23,6 +25,19 @@ def test_pair_and_unpair_are_positional():
     assert flagged.pair and flagged.mode is None
     both = mod._parse(["ble", "--pair"])
     assert both.mode == "ble" and both.pair
+
+
+@pytest.mark.parametrize("action", ["usb", "ble", "auto", "pair", "unpair", "--pair", "--unpair"])
+def test_hid_status_rejects_changes(action):
+    path = ROOT / "scripts" / "hid_mode.py"
+    spec = importlib.util.spec_from_file_location("hid_mode", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    status = mod._parse(["--status", "--port", "COM5"])
+    assert status.status and status.mode is None and not status.pair and not status.unpair
+    with pytest.raises(SystemExit) as exc:
+        mod._parse([action, "--status"])
+    assert exc.value.code == 2
 
 
 def test_help_exits_cleanly():

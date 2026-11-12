@@ -70,9 +70,106 @@ static hid_link_t hidFacts() {
   return link;
 }
 
+// Only the command/loop task touches this state. Keep the report's originating
+// path until its release is accepted, even if USB resumes or the preference changes.
+enum { HELD_MOUSE = 1, HELD_KEYS = 2, HELD_CONSUMER = 4, HELD_ALL = 7 };
+static uint8_t heldReports[3];
+static bool releasePending[3];
+
+static bool releaseReports(int path, uint8_t reports) {
+  if (!reports) {
+    if (!heldReports[path]) releasePending[path] = false;
+    return true;
+  }
+  bool ready = path == HID_PATH_USB ? tud_mounted() && !tud_suspended() : ble_hid_connected();
+  if (!ready) {
+    releasePending[path] = true;
+    return false;
+  }
+  bool ok = true;
+  for (uint8_t bit = HELD_MOUSE; bit <= HELD_CONSUMER; bit <<= 1) {
+    if (!(reports & bit)) continue;
+    bool sent = true;
+    if (path == HID_PATH_BLE) {
+      if (bit == HELD_MOUSE) sent = ble_hid_button(false);
+      else if (bit == HELD_KEYS) sent = ble_hid_keyboard(0, NULL, 0);
+      else sent = ble_hid_consumer(0);
+    } else {
+      // Mouse/keyboard release have no return value in the Arduino USB API.
+      // Never discard a pending release while USB is suspended or detached.
+      if (bit == HELD_MOUSE) mouse.release(MOUSE_LEFT);
+      else if (bit == HELD_KEYS) keyboard.releaseAll();
+      else sent = consumer.release() != 0;
+      sent = sent && tud_mounted() && !tud_suspended();
+    }
+    if (sent) heldReports[path] &= ~bit;
+    else { heldReports[path] |= bit; ok = false; }
+  }
+  releasePending[path] = !ok || (releasePending[path] && heldReports[path]);
+  return ok;
+}
+
+static bool releasePath(int path, bool force, uint8_t mask) {
+  uint8_t reports = heldReports[path] & mask;
+  bool ready = path == HID_PATH_USB ? tud_mounted() && !tud_suspended() : ble_hid_connected();
+  if (force && ready) reports = mask;
+  return releaseReports(path, reports);
+}
+
+// Emergency stop bypasses selection and phoneReady: a live alternate route must
+// still be released when the preferred route is absent. Try both even on failure.
+static bool releaseHidReports(uint8_t reports) {
+  bool usb = releasePath(HID_PATH_USB, true, reports);
+  bool ble = releasePath(HID_PATH_BLE, true, reports);
+  return usb && ble;
+}
+
+static bool releaseHid() { return releaseHidReports(HELD_ALL); }
+
+static bool syncHidPath(int next) {
+  bool ok = true;
+  for (int path = HID_PATH_USB; path <= HID_PATH_BLE; path++) {
+    if ((path != next || releasePending[path]) && !releasePath(path, false, HELD_ALL)) ok = false;
+  }
+  return ok;
+}
+
+// Called by ble_hid_set_pref before saving or acknowledging an explicit switch.
+bool hid_prepare_pref(int next) {
+  hid_link_t link = hidFacts();
+  return syncHidPath(hid_select(next, &link));
+}
+
 static int activePath() {
   hid_link_t link = hidFacts();
-  return hid_select(ble_hid_pref(), &link);
+  int next = hid_select(ble_hid_pref(), &link);
+  return syncHidPath(next) ? next : HID_PATH_NONE;
+}
+
+static bool buttonOn(int path, bool down) {
+  if (path == HID_PATH_NONE) return false;
+  if (!down) return releaseReports(path, HELD_MOUSE);
+  if (path == HID_PATH_BLE) {
+    if (!ble_hid_button(true)) return false;
+  } else {
+    mouse.press(MOUSE_LEFT);
+  }
+  heldReports[path] |= HELD_MOUSE;
+  return true;
+}
+
+static bool bleKeyboard(uint8_t mod, const uint8_t *keys, int n) {
+  if (!mod && !n) return releaseReports(HID_PATH_BLE, HELD_KEYS);
+  if (!ble_hid_keyboard(mod, keys, n)) return false;
+  heldReports[HID_PATH_BLE] |= HELD_KEYS;
+  return true;
+}
+
+static bool bleConsumer(uint16_t usage) {
+  if (!usage) return releaseReports(HID_PATH_BLE, HELD_CONSUMER);
+  if (!ble_hid_consumer(usage)) return false;
+  heldReports[HID_PATH_BLE] |= HELD_CONSUMER;
+  return true;
 }
 
 // Wake a suspended USB phone only when USB is the path we would use.
@@ -86,6 +183,10 @@ static bool phoneReady(const char **why) {
     tud_remote_wakeup();
     for (int i = 0; i < 50 && tud_suspended(); i++) delay(10);
     link = hidFacts();
+  }
+  if (!syncHidPath(hid_select(pref, &link))) {
+    if (why) *why = "err hid release pending";
+    return false;
   }
   const char *err = hid_ready_error(pref, &link);
   if (err) {
@@ -157,35 +258,35 @@ static int pressCombo(String combo) {
   int n = 0;
   uint16_t cons = 0;
   if (!hid_fill_combo(combo.c_str(), &mod, keys, &n, &cons)) {
-    keyboard.releaseAll();
+    releaseReports(HID_PATH_USB, heldReports[HID_PATH_USB] & HELD_KEYS);
     return 0;
   }
   int path = activePath();
   if (path == HID_PATH_BLE) {
     ble_hid_arm_interval(1);
-    bool down = cons ? ble_hid_consumer(cons) : ble_hid_keyboard(mod, keys, n);
+    bool down = cons ? bleConsumer(cons) : bleKeyboard(mod, keys, n);
     delay(30);
-    bool up = cons ? ble_hid_consumer(0) : ble_hid_keyboard(0, NULL, 0);
+    bool up = cons ? bleConsumer(0) : bleKeyboard(0, NULL, 0);
     ble_hid_arm_interval(0);
     return down && up ? 1 : -1;
   }
   if (path != HID_PATH_USB) return -1;
   if (cons) {
+    heldReports[HID_PATH_USB] |= HELD_CONSUMER;
     consumer.press(cons);
     delay(30);
-    consumer.release();
-    return 1;
+    return releaseReports(HID_PATH_USB, HELD_CONSUMER) ? 1 : -1;
   }
   // USB keeps the Arduino keymap. The tokens hid_fill_combo accepted are the same names keyCode maps.
   combo += '+';
   for (int i; (i = combo.indexOf('+')) >= 0; combo = combo.substring(i + 1)) {
     uint8_t c = keyCode(combo.substring(0, i));
-    if (!c) { keyboard.releaseAll(); return 0; }
+    if (!c) { releaseReports(HID_PATH_USB, HELD_KEYS); return 0; }
+    heldReports[HID_PATH_USB] |= HELD_KEYS;
     keyboard.press(c);
   }
   delay(30);
-  keyboard.releaseAll();
-  return 1;
+  return releaseReports(HID_PATH_USB, HELD_KEYS) ? 1 : -1;
 }
 
 // 1 ok, 0 unknown before anything was sent, -1 the link dropped before the first
@@ -197,19 +298,19 @@ static int bleType(const String &text) {
     uint8_t usage = 0;
     int shift = 0;
     if (!hid_ascii(text[i], &usage, &shift)) {
-      ble_hid_keyboard(0, NULL, 0);
+      bleKeyboard(0, NULL, 0);
       ble_hid_arm_interval(0);
       return sent ? -2 : 0;
     }
     uint8_t one[6] = {usage};
-    if (!ble_hid_keyboard(shift ? 0x02 : 0, one, 1)) {
-      ble_hid_keyboard(0, NULL, 0);
+    if (!bleKeyboard(shift ? 0x02 : 0, one, 1)) {
+      bleKeyboard(0, NULL, 0);
       ble_hid_arm_interval(0);
       return sent ? -2 : -1;
     }
     sent++;
     delay(12);
-    if (!ble_hid_keyboard(0, NULL, 0)) {
+    if (!bleKeyboard(0, NULL, 0)) {
       ble_hid_arm_interval(0);
       return -2;
     }
@@ -234,6 +335,7 @@ String run(const String &line) {
     int pref = ble_hid_pref();
     return String("ok ") + hid_pace_version(pref, hid_select(pref, &link));
   }
+  if (cmd == "release") return releaseHid() ? "ok" : "err hid release pending";
   const char *why = NULL;
   if (!phoneReady(&why)) return why ? why : "err phone not connected over usb/ble";
   int path = activePath();
@@ -249,29 +351,11 @@ String run(const String &line) {
     if (step > 40) step = 40;
     return movePaced(a, b, step) ? "ok" : down;
   }
-  if (cmd == "press") {
-    if (path == HID_PATH_BLE) return ble_hid_button(true) ? "ok" : down;
-    if (path != HID_PATH_USB) return down;
-    mouse.press(MOUSE_LEFT);
-    return "ok";
-  }
-  if (cmd == "release") {
-    if (path == HID_PATH_BLE) return ble_hid_button(false) ? "ok" : down;
-    if (path != HID_PATH_USB) return down;
-    mouse.release(MOUSE_LEFT);
-    return "ok";
-  }
+  if (cmd == "press") return buttonOn(path, true) ? "ok" : down;
   if (cmd == "click") {
-    if (path == HID_PATH_BLE) {
-      if (!ble_hid_button(true)) return down;
-      delay(60);
-      return ble_hid_button(false) ? "ok" : down;
-    }
-    if (path != HID_PATH_USB) return down;
-    mouse.press(MOUSE_LEFT);
+    if (!buttonOn(path, true)) return down;
     delay(60);
-    mouse.release(MOUSE_LEFT);
-    return "ok";
+    return buttonOn(path, false) ? "ok" : down;
   }
   if (cmd == "scroll") {
     if (path == HID_PATH_BLE) return ble_hid_mouse(0, 0, clamp8(a), clamp8(b)) ? "ok" : down;
@@ -281,8 +365,9 @@ String run(const String &line) {
   }
   if (cmd == "type") {
     if (path == HID_PATH_USB) {
+      heldReports[HID_PATH_USB] |= HELD_KEYS;
       keyboard.print(arg);
-      return "ok";
+      return releaseReports(HID_PATH_USB, HELD_KEYS) ? "ok" : "err partial type";
     }
     if (path != HID_PATH_BLE) return down;
     int typed = bleType(arg);
@@ -297,16 +382,16 @@ String run(const String &line) {
   }
   if (cmd == "homescreen") {
     if (path == HID_PATH_BLE) {
-      if (!ble_hid_consumer(AC_HOME)) return down;
+      if (!bleConsumer(AC_HOME)) return down;
       delay(40);
-      if (!ble_hid_consumer(0)) return down;
+      if (!bleConsumer(0)) return down;
       return "ok";
     }
     if (path != HID_PATH_USB) return down;
+    heldReports[HID_PATH_USB] |= HELD_CONSUMER;
     consumer.press(AC_HOME);
     delay(40);
-    consumer.release();
-    return "ok";
+    return releaseReports(HID_PATH_USB, HELD_CONSUMER) ? "ok" : down;
   }
   return "err unknown command";
 }
@@ -613,26 +698,20 @@ void loop() {
   static bool linked = false, cliLinked = false;
   esp_task_wdt_reset();
   net_poll();
+  // Detect automatic route changes even while no HID command is arriving, and
+  // retry failed releases once their original transport becomes usable again.
+  activePath();
   bool cli = cli_slot() >= 0;
   // A gesture cut off mid-way must not leave the button held (long press); only the side that went holds it.
   bool app = ble_app_connected(), appActive = ble_app_active();
   if (linked && !app) {
-    if (arb_gone(&arb, ARB_APP)) {
-      mouse.release(MOUSE_LEFT);
-      ble_hid_button(false);
-    }
-    keyboard.releaseAll();
-    ble_hid_keyboard(0, NULL, 0);
-    consumer.release();
-    ble_hid_consumer(0);
+    if (arb_gone(&arb, ARB_APP)) releaseHidReports(HELD_MOUSE);
+    releaseHidReports(HELD_KEYS | HELD_CONSUMER);
     video_stream(false, FROM_APP);
     appHears = false;  // until the app says so again
   }
   if (cliLinked && !cli) {
-    if (arb_gone(&arb, ARB_CLI)) {
-      mouse.release(MOUSE_LEFT);
-      ble_hid_button(false);
-    }
+    if (arb_gone(&arb, ARB_CLI)) releaseHidReports(HELD_MOUSE);
     video_stream(false, FROM_CLI);
   }
   // The app wins: a CLI session up alongside it stops at once and is dropped shortly after, once its status
@@ -640,10 +719,7 @@ void loop() {
   static uint32_t cliDropAt = 0;
   if (appActive && cli) {
     if (!cliDropAt) {
-      if (arb_gone(&arb, ARB_CLI)) {
-        mouse.release(MOUSE_LEFT);
-        ble_hid_button(false);
-      }
+      if (arb_gone(&arb, ARB_CLI)) releaseHidReports(HELD_MOUSE);
       video_stream(false, FROM_CLI);
       ble_cli_status(statusJson(true, FROM_CLI), statusJson(false, FROM_CLI));
       cliDropAt = millis() + 300;

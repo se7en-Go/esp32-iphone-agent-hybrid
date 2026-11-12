@@ -20,8 +20,9 @@ void ble_hid_remember(uint8_t type, const uint8_t addr[6]);
 void ble_hid_bonds_cleared(); // companion `unpair` already deleted the controller bonds
 
 int ble_hid_pref();
-void ble_hid_set_pref(int pref);
-void ble_hid_unpair();
+bool ble_hid_set_pref(int pref);
+bool hid_prepare_pref(int pref); // bridge releases held inputs before changing paths
+bool ble_hid_unpair();
 
 bool ble_hid_mouse(int8_t x, int8_t y, int8_t wheel, int8_t pan);
 bool ble_hid_button(bool left_down);

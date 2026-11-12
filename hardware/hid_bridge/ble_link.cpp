@@ -17,6 +17,7 @@
 #include "cli_link.h"
 #include "src/cli/cli_proto.h"
 #include "src/ble/pair_window.h"
+#include "src/ble/advertising_gate.h"
 #include "src/ble/ingress.h"
 #include "src/hid/command_line.h"
 #include "logbuf.h"
@@ -359,7 +360,7 @@ static void toText(Text &t, const String &s) {
 }
 
 static NimBLEAdvertisementData appAdv, cliAdv;
-static SemaphoreHandle_t advLock;
+static BleAdvertisingGate advGate;
 static AdvId advNow = ADV_NONE;
 static volatile bool appOnAir;
 
@@ -395,19 +396,34 @@ static AdvId wantedAdv() {
 
 // Brings advertising to the identity wanted now; a connection ends it, so this also restarts it.
 static void advertise() {
-  xSemaphoreTake(advLock, portMAX_DELAY);
-  AdvId want = wantedAdv();
-  NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
-  bool active = adv->isAdvertising();
-  if (!active || want != advNow) {
-    if (active) adv->stop();
+  advGate.run([] {
+    AdvId want = wantedAdv();
+    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+    bool active = adv->isAdvertising();
+    if (!active || want != advNow) {
+      if (active) adv->stop();
+      advNow = ADV_NONE;
+      if (want != ADV_NONE && NimBLEDevice::setOwnAddrType(want == ADV_CLI ? BLE_OWN_ADDR_RANDOM : BLE_OWN_ADDR_PUBLIC) &&
+          adv->setAdvertisementData(want == ADV_CLI ? cliAdv : appAdv) && adv->start())
+        advNow = want;
+    }
+    appOnAir = advNow == ADV_APP;
+  });
+}
+
+bool ble_pause_advertising() {
+  return advGate.pause([] {
+    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+    if (!adv->stop()) return false;
     advNow = ADV_NONE;
-    if (want != ADV_NONE && NimBLEDevice::setOwnAddrType(want == ADV_CLI ? BLE_OWN_ADDR_RANDOM : BLE_OWN_ADDR_PUBLIC) &&
-        adv->setAdvertisementData(want == ADV_CLI ? cliAdv : appAdv) && adv->start())
-      advNow = want;
-  }
-  appOnAir = advNow == ADV_APP;
-  xSemaphoreGive(advLock);
+    appOnAir = false;
+    return true;
+  });
+}
+
+void ble_resume_advertising() {
+  advGate.resume();
+  advertise();
 }
 
 static void setUpAdvertising(const std::string &name) {
@@ -487,7 +503,7 @@ void ble_begin(const String &name) {
   for (auto *c : chars) c->setCallbacks(&charCb);
   server->start();
 
-  advLock = xSemaphoreCreateMutex();
+  advGate.begin();
   setUpAdvertising(name.c_str());
   advertise();
   xTaskCreatePinnedToCore(txTask, "ble_tx", 3072, NULL, 3, NULL, 1);

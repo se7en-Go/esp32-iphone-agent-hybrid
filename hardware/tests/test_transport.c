@@ -115,6 +115,8 @@ static void test_keys(void) {
   CHECK(hid_ascii('_', &usage, &shift) && usage == 0x2D && shift);
   CHECK(hid_ascii('\n', &usage, &shift) && usage == 0x28 && !shift);
   CHECK(hid_ascii('\r', &usage, &shift) && usage == 0x28 && !shift);
+  CHECK(!hid_ascii('\0', &usage, &shift));
+  CHECK(!hid_key_token("\0", 1, &mod, &usage, &cons));
 
   CHECK(hid_fill_combo("cmd+h", &mod, keys, &n, &cons) && mod == 0x08 && n == 1 && keys[0] == 0x0B && cons == 0);
   CHECK(hid_fill_combo("ctrl+space", &mod, keys, &n, &cons) && mod == 0x01 && n == 1 && keys[0] == 0x2C);
