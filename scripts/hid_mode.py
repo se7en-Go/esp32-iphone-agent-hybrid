@@ -27,12 +27,23 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         description="选择手机控制走 USB 还是蓝牙 HID，或打开 60 秒配对窗口。",
         epilog="默认 auto：插着 USB 就走 USB，否则走已经连上的蓝牙 HID。蓝牙 HID 还没有在真机上验证。",
     )
-    parser.add_argument("mode", nargs="?", choices=("usb", "ble", "auto"), help="写入板子 NVS 的传输偏好")
+    parser.add_argument(
+        "mode", nargs="?", choices=("usb", "ble", "auto", "pair", "unpair"),
+        help="usb、ble、auto 写入偏好；pair 打开 60 秒配对；unpair 忘掉绑定",
+    )
     parser.add_argument("--pair", action="store_true", help="打开 60 秒 HID 配对窗口")
     parser.add_argument("--unpair", action="store_true", help="让板子忘掉 HID 绑定。手机系统蓝牙里也要忽略此设备")
     parser.add_argument("--status", action="store_true", help="只查询当前模式和蓝牙状态")
     parser.add_argument("--port", default="", help="例如 COM5 或 /dev/cu.usbserial-…。留空则自动找 CH343/FTDI/CP210x")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # Docs and the wrappers pass `pair` / `unpair` as the first word, same as `ble`.
+    if args.mode == "pair":
+        args.pair = True
+        args.mode = None
+    elif args.mode == "unpair":
+        args.unpair = True
+        args.mode = None
+    return args
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -52,7 +63,10 @@ async def _run(args: argparse.Namespace) -> None:
     try:
         if args.unpair:
             await device.send("hid unpair")
-            print("板子已忘掉 HID 绑定。请在 iPhone 的系统蓝牙里忽略此设备，然后重新配对。")
+            print(
+                "板子已忘掉 HID 绑定。这块板的蓝牙绑定存在同一处，配套 App 的绑定也会一起删掉。"
+                "请在 iPhone 的系统蓝牙里忽略此设备，然后重新配对。"
+            )
         elif args.mode:
             await device.send(f"hid {args.mode}")
             print(f"传输已设为 {args.mode}，并写入板子，重启后仍然有效。")

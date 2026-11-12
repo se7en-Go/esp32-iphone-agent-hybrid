@@ -68,8 +68,10 @@ def test_ble_pace_clears_the_span_and_the_same_pace_keeps_it(tmp_path):
     assert phone.calibrated
     phone.adopt_pace(4)
     assert phone.span is None and not phone.calibrated
+    assert phone.origin == {"x": 0.0, "y": 0.0}
     saved = json.loads(path.read_text())
     assert "w" not in saved and saved["pace"] == 4
+    assert saved["x0"] == 0 and saved["y0"] == 0
     phone.span = {"w": 800, "h": 1600}
     phone._save()
     phone.adopt_pace(4)
@@ -91,16 +93,48 @@ def test_status_query_sets_the_pace_number():
     assert fake.board_status["hid"]["path"] == "ble"
 
 
-def test_tripped_guard_still_blocks_the_serial_write(tmp_path):
+class _ScriptLink:
+    def __init__(self):
+        self.written: list[bytes] = []
+        self.replies: list[bytes] = []
+        self._open = True
+
+    def is_open(self) -> bool:
+        return self._open
+
+    def write(self, data: bytes) -> None:
+        self.written.append(data)
+
+    def close(self) -> None:
+        self._open = False
+
+    async def readline(self) -> bytes:
+        return self.replies.pop(0)
+
+
+def test_tripped_guard_blocks_exchange_before_the_serial_write(tmp_path):
     saved = (module.guard.tripped, module.guard.reason, list(module.guard.sends), module.guard._path)
     module.guard._path = tmp_path / "guard.json"
     module.guard.sends = []
+    device = Device()
+    link = _ScriptLink()
+    device.attach(link)
+    device.gate = module._hid_gate
     try:
         module.guard.tripped = True
         module.guard.reason = "hid test"
-        with pytest.raises(DeviceError):
-            module._hid_gate("move 1 0")
-        module.guard.tripped = False
-        assert module._hid_gate("hid ble") is None
+
+        async def blocked():
+            with pytest.raises(DeviceError):
+                await device.exchange("move 1 0")
+            assert link.written == []
+            link.replies.append(b"1 ok\n")
+            assert await device.exchange("release") == "ok"
+            link.replies.append(b"2 ok\n")
+            assert await device.exchange("home") == "ok"
+
+        asyncio.run(blocked())
+        assert [w.split()[1] for w in link.written] == [b"release", b"home"]
     finally:
+        device.close()
         module.guard.tripped, module.guard.reason, module.guard.sends, module.guard._path = saved

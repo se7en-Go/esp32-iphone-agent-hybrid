@@ -1,8 +1,9 @@
 // BLE HID mouse + keyboard + consumer (AC Home, globe) beside the app GATT service.
 // iOS requires bonding. Just Works is already the board's security mode (ble_begin).
-// Reports wait until the host accepts the notify. NimBLE's NOTIFY_TX means "queued",
-// not "on air", so the gesture also sleeps hid_pace_profile.gap_ms and asks for a
-// 7.5–15 ms connection interval only while the gesture runs.
+// Reports wait until the host accepts the notify and the previous HID notify has
+// given its mbufs back. The video reserve (16 blocks) is left free. The connection
+// interval stays at the 15 ms tuneLink already set: a shorter request is outside
+// Apple's rules, and a longer one would slow GATT video on the same ACL.
 #include "ble_hid.h"
 
 #include <Preferences.h>
@@ -43,6 +44,22 @@ static uint16_t connHandle;
 static uint8_t buttons;
 static uint8_t lastMod, lastKeys[6];
 static uint16_t lastConsumer;
+static int hidOwed;       // mbuf blocks the last HID notify is still holding
+static int hidWatermark;  // os_msys_num_free() just after that notify was queued
+
+static int blocksFor(size_t n) {
+  const int data = MYNEWT_VAL(MSYS_1_BLOCK_SIZE) - 16;
+  return (int)((n + 3 + 4 + 4 + 8 + data - 1) / data) + 1;
+}
+
+static bool earlierHidDone() {
+  if (hidOwed <= 0) return true;
+  if (os_msys_num_free() >= hidWatermark + hidOwed) {
+    hidOwed = 0;
+    return true;
+  }
+  return false;
+}
 
 static bool encrypted(uint16_t h) {
   ble_gap_conn_desc d;
@@ -78,6 +95,13 @@ void ble_hid_allow_pairing(uint32_t window_ms) {
   if (window_ms > 120000) window_ms = 120000;
   pairArmed = true;
   pairUntil = millis() + window_ms;
+  // A phone that already bonded through the companion window is encrypted now.
+  // Copy it into the HID list so a later unpair can delete that shared bond.
+  for (uint16_t h = 0; h < 8; h++) {
+    ble_gap_conn_desc d;
+    if (ble_gap_conn_find(h, &d) != 0 || !d.sec_state.encrypted) continue;
+    ble_hid_remember(d.peer_id_addr.type, d.peer_id_addr.val);
+  }
 }
 
 void ble_hid_deny_pairing() { pairArmed = false; }
@@ -103,7 +127,12 @@ void ble_hid_bonds_cleared() {
   bondCount = 0;
   saveBonds();
   mouseOn = keyOn = consOn = haveConn = false;
+  hidOwed = 0;
   clearLatch();
+}
+
+bool ble_hid_using(uint16_t handle) {
+  return haveConn && handle == connHandle && (mouseOn || keyOn || consOn);
 }
 
 void ble_hid_unpair() {
@@ -126,6 +155,7 @@ void ble_hid_unpair() {
 void ble_hid_on_disconnect(uint16_t handle) {
   if (!haveConn || handle != connHandle) return;
   mouseOn = keyOn = consOn = haveConn = false;
+  hidOwed = 0;
   clearLatch();
 }
 
@@ -139,6 +169,12 @@ class HidCb : public NimBLECharacteristicCallbacks {
     if (on) {
       haveConn = true;
       connHandle = ci.getConnHandle();
+      // Remember any encrypted central that subscribes, not only one that
+      // bonded while the HID window was open. Otherwise hid unpair misses it.
+      if (ci.isEncrypted()) {
+        NimBLEAddress id = ci.getIdAddress();
+        ble_hid_remember(id.getType(), id.getVal());
+      }
     } else if (!mouseOn && !keyOn && !consOn) {
       haveConn = false;
     }
@@ -150,14 +186,22 @@ static HidCb hidCb;
 static bool emit(NimBLECharacteristic *chr, const uint8_t *data, size_t n) {
   if (!chr || !ble_hid_connected()) return false;
   chr->setValue(data, n);
+  const int reserve = 16; // same MBUF_RESERVE video refuses to enter
+  int blocks = blocksFor(n);
   uint32_t start = millis();
   while ((int32_t)(millis() - start) < 40) {
     if (!ble_hid_connected()) return false;
-    // Leave the video reserve alone: one HID report is a single mbuf.
-    if (os_msys_num_free() >= 4) {
+    if (earlierHidDone() && os_msys_num_free() >= blocks + reserve) {
+      int before = os_msys_num_free();
       os_mbuf *om = ble_hs_mbuf_from_flat(data, n);
       int rc = om ? ble_gatts_notify_custom(connHandle, chr->getHandle(), om) : BLE_HS_ENOMEM;
-      if (rc == 0) return true;
+      if (rc == 0) {
+        int after = os_msys_num_free();
+        hidOwed = before - after;
+        if (hidOwed < 1) hidOwed = blocks;
+        hidWatermark = after;
+        return true;
+      }
       if (rc != BLE_HS_ENOMEM) return false;
     }
     delay(2);
@@ -206,12 +250,10 @@ void ble_hid_release_all() {
   ble_hid_consumer(0);
 }
 
-void ble_hid_arm_interval(int tight) {
-  if (!ble_hid_connected()) return;
-  NimBLEServer *server = NimBLEDevice::getServer();
-  if (!server) return;
-  if (tight) server->updateConnParams(connHandle, 6, 12, 0, 400);
-  else server->updateConnParams(connHandle, 12, 24, 0, 400);
+void ble_hid_arm_interval(int) {
+  // Intentionally empty. tuneLink already asked for 15/15 ms. Apple rejects a
+  // 7.5 ms minimum, and opening the range to 30 ms after a gesture slows the
+  // GATT video that shares this ACL.
 }
 
 String ble_hid_command(const char *arg) {

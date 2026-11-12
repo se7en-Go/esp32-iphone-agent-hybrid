@@ -11,7 +11,7 @@ extern "C" {
 int hid_ascii(char c, uint8_t *usage, int *shift);
 
 // One combo token (no '+'): a name the USB path already accepts, a single
-// character, or the globe/ime consumer key (usage 0x01AE, AL Keyboard Layout).
+// character, or the globe/ime consumer key (usage 0x029D).
 // On success exactly one of *modifier, *usage, *consumer is non-zero.
 int hid_key_token(const char *tok, int len, uint8_t *modifier, uint8_t *usage, uint16_t *consumer);
 

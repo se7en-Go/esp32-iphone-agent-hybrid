@@ -9,6 +9,10 @@ static int named(const char *tok, int len, const char *lit) {
 
 int hid_ascii(char c, uint8_t *usage, int *shift) {
   *shift = 0;
+  if (c == '\n' || c == '\r') {
+    *usage = 0x28;
+    return 1;
+  }
   if (c >= 'a' && c <= 'z') {
     *usage = (uint8_t)(0x04 + (c - 'a'));
     return 1;
@@ -76,7 +80,7 @@ int hid_key_token(const char *tok, int len, uint8_t *modifier, uint8_t *usage, u
   else if (named(tok, len, "shift")) *modifier = 0x02;
   else if (named(tok, len, "alt")) *modifier = 0x04;
   else if (named(tok, len, "cmd")) *modifier = 0x08;
-  else if (named(tok, len, "globe") || named(tok, len, "ime")) *consumer = 0x01AE;
+  else if (named(tok, len, "globe") || named(tok, len, "ime")) *consumer = 0x029D;
   else return 0;
   return 1;
 }

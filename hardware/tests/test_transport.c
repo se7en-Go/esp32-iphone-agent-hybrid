@@ -68,7 +68,7 @@ static void test_pace(void) {
   CHECK(usb.conn_min == 0 && usb.conn_max == 0);
   CHECK(ble.step > usb.step && ble.gap_ms >= 15 && ble.home_gap_ms >= 15);
   CHECK(ble.version == HID_PACE_BLE);
-  CHECK(ble.conn_min == 6 && ble.conn_max == 12); // 7.5 ms .. 15 ms
+  CHECK(ble.conn_min == 0 && ble.conn_max == 0); // stay on the 15 ms link; do not ask for 7.5 ms
   CHECK(ble.step <= 127);
 
   hid_link_t mounted = link_of(1, 0, 1, 1);
@@ -113,14 +113,15 @@ static void test_keys(void) {
   CHECK(hid_ascii('!', &usage, &shift) && usage == 0x1E && shift);
   CHECK(hid_ascii(' ', &usage, &shift) && usage == 0x2C && !shift);
   CHECK(hid_ascii('_', &usage, &shift) && usage == 0x2D && shift);
-  CHECK(!hid_ascii('\n', &usage, &shift));
+  CHECK(hid_ascii('\n', &usage, &shift) && usage == 0x28 && !shift);
+  CHECK(hid_ascii('\r', &usage, &shift) && usage == 0x28 && !shift);
 
   CHECK(hid_fill_combo("cmd+h", &mod, keys, &n, &cons) && mod == 0x08 && n == 1 && keys[0] == 0x0B && cons == 0);
   CHECK(hid_fill_combo("ctrl+space", &mod, keys, &n, &cons) && mod == 0x01 && n == 1 && keys[0] == 0x2C);
   CHECK(hid_fill_combo("enter", &mod, keys, &n, &cons) && n == 1 && keys[0] == 0x28 && mod == 0);
   CHECK(hid_fill_combo("backspace", &mod, keys, &n, &cons) && keys[0] == 0x2A);
-  CHECK(hid_fill_combo("globe", &mod, keys, &n, &cons) && cons == 0x01AE && n == 0);
-  CHECK(hid_fill_combo("ime", &mod, keys, &n, &cons) && cons == 0x01AE);
+  CHECK(hid_fill_combo("globe", &mod, keys, &n, &cons) && cons == 0x029D && n == 0);
+  CHECK(hid_fill_combo("ime", &mod, keys, &n, &cons) && cons == 0x029D);
   CHECK(!hid_fill_combo("cmd+globe", &mod, keys, &n, &cons));
   CHECK(!hid_fill_combo("nope", &mod, keys, &n, &cons));
   CHECK(!hid_fill_combo("", &mod, keys, &n, &cons));

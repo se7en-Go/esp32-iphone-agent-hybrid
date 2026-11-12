@@ -193,7 +193,9 @@ class ServerCb : public NimBLEServerCallbacks {
     NimBLEAddress a = ci.getIdAddress();
     bool hidWindow = ble_hid_pair_window_open();
     if (isKnown(a)) {
-      if (hidWindow) ble_hid_remember(a.getType(), a.getVal());
+      // Subscribed before encryption finished: the subscribe callback saw a
+      // plain link and did not store the identity. Store it now.
+      if (hidWindow || ble_hid_using(ci.getConnHandle())) ble_hid_remember(a.getType(), a.getVal());
       return;
     }
     if ((ble_pair_window_open() || hidWindow) && knownCount < 8) {

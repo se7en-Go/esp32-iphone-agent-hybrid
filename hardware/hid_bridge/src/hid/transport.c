@@ -50,16 +50,15 @@ const char *hid_ready_error(int pref, const hid_link_t *link) {
 
 void hid_pace_profile(int path, hid_pace_t *out) {
   if (path == HID_PATH_BLE) {
-    // iOS often grants 15 ms and sometimes only 30 ms. One larger step per
-    // interval is less airtime than USB's 8 ms / 10-unit reports, and it leaves
-    // the shared radio for AirPlay. 6..12 units is 7.5..15 ms, asked only while
-    // a gesture is in flight.
+    // Fewer, larger steps than USB. The link stays at the 15 ms interval
+    // tuneLink already asked for: Apple rejects anything under 11.25 ms, and
+    // widening it after a gesture would slow the GATT video on the same ACL.
     out->step = 30;
     out->gap_ms = 16;
     out->home_gap_ms = 16;
     out->version = HID_PACE_BLE;
-    out->conn_min = 6;
-    out->conn_max = 12;
+    out->conn_min = 0;
+    out->conn_max = 0;
     return;
   }
   out->step = 10;

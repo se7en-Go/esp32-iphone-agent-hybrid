@@ -46,7 +46,7 @@ COM 口没连上，或固件没刷进去。拔插 COM 线，看启动窗口里�
 
 ## 手机蓝牙列表里没有 ESP32 Agent
 
-COM 口仍接电脑。运行 `scripts/hid-mode.sh pair`（Windows 用 `hid-mode.ps1`），60 秒内在 iPhone 设置 → 蓝牙里选择名字以 **ESP32 Agent** 开头的设备，并打开辅助触控。列表里已经有旧的同名设备时，先在系统蓝牙里忽略它，再运行 `hid-mode.sh unpair` 或 `hid-mode.ps1 unpair`，然后重新 pair。网页 `/api/status` 的 `hid.ble` 会写着是否在广播、是否连上、是否已绑定。这一步还没有在真机上验证。
+COM 口仍接电脑。运行 `scripts/hid-mode.sh pair`（Windows 用 `hid-mode.ps1`），60 秒内在 iPhone 设置 → 蓝牙里选择名字以 **ESP32 Agent** 开头的设备，并打开辅助触控。列表里已经有旧的同名设备时，先在系统蓝牙里忽略它，再运行 `hid-mode.sh unpair` 或 `hid-mode.ps1 unpair`，然后重新 pair。unpair 会删掉这块板上的蓝牙绑定，配套 App 的绑定也在同一处，会一起被删掉。网页 `/api/status` 的 `hid.ble` 会写着是否在广播、是否连上、是否已绑定。这一步还没有在真机上验证。
 
 ## 命令说 phone not connected over usb/ble
 

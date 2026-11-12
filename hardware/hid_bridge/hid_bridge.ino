@@ -75,15 +75,19 @@ static int activePath() {
   return hid_select(ble_hid_pref(), &link);
 }
 
-// Wake a suspended USB phone, then accept USB or BLE per the saved preference.
+// Wake a suspended USB phone only when USB is the path we would use.
+// Waking it while BLE is selected makes the next select() flip to USB,
+// which changes the pace and drops the BLE calibration.
 // The error string is the whole reply ("err ...").
 static bool phoneReady(const char **why) {
-  if (tud_suspended()) {
+  int pref = ble_hid_pref();
+  hid_link_t link = hidFacts();
+  if (pref != HID_PREF_BLE && hid_select(pref, &link) != HID_PATH_BLE && tud_suspended()) {
     tud_remote_wakeup();
     for (int i = 0; i < 50 && tud_suspended(); i++) delay(10);
+    link = hidFacts();
   }
-  hid_link_t link = hidFacts();
-  const char *err = hid_ready_error(ble_hid_pref(), &link);
+  const char *err = hid_ready_error(pref, &link);
   if (err) {
     if (why) *why = err;
     return false;
@@ -102,7 +106,8 @@ static bool movePaced(long dx, long dy, int step) {
   bool ok = true;
   while (ok && pace_next(&p, &sx, &sy)) {
     if (path == HID_PATH_BLE) ok = ble_hid_mouse(clamp8(sx), clamp8(sy), 0, 0);
-    else mouse.move(sx, sy);
+    else if (path == HID_PATH_USB) mouse.move(sx, sy);
+    else ok = false;
     delay(prof.gap_ms);
   }
   if (path == HID_PATH_BLE) ble_hid_arm_interval(0);
@@ -120,7 +125,8 @@ static bool slamHome() {
       int8_t x = axis == 0 ? -127 : 0;
       int8_t y = axis == 0 ? 0 : -127;
       if (path == HID_PATH_BLE) ok = ble_hid_mouse(x, y, 0, 0);
-      else mouse.move(x, y);
+      else if (path == HID_PATH_USB) mouse.move(x, y);
+      else ok = false;
       delay(prof.home_gap_ms);
     }
   }
@@ -157,13 +163,13 @@ static int pressCombo(String combo) {
   int path = activePath();
   if (path == HID_PATH_BLE) {
     ble_hid_arm_interval(1);
-    bool ok = cons ? ble_hid_consumer(cons) : ble_hid_keyboard(mod, keys, n);
+    bool down = cons ? ble_hid_consumer(cons) : ble_hid_keyboard(mod, keys, n);
     delay(30);
-    if (cons) ble_hid_consumer(0);
-    else ble_hid_keyboard(0, NULL, 0);
+    bool up = cons ? ble_hid_consumer(0) : ble_hid_keyboard(0, NULL, 0);
     ble_hid_arm_interval(0);
-    return ok ? 1 : -1;
+    return down && up ? 1 : -1;
   }
+  if (path != HID_PATH_USB) return -1;
   if (cons) {
     consumer.press(cons);
     delay(30);
@@ -182,23 +188,31 @@ static int pressCombo(String combo) {
   return 1;
 }
 
+// 1 ok, 0 unknown before anything was sent, -1 the link dropped before the first
+// character, -2 some characters were sent (or a key-up failed) so a retry would repeat them.
 static int bleType(const String &text) {
   ble_hid_arm_interval(1);
+  int sent = 0;
   for (unsigned i = 0; i < text.length(); i++) {
     uint8_t usage = 0;
     int shift = 0;
     if (!hid_ascii(text[i], &usage, &shift)) {
       ble_hid_keyboard(0, NULL, 0);
       ble_hid_arm_interval(0);
-      return 0;
+      return sent ? -2 : 0;
     }
     uint8_t one[6] = {usage};
     if (!ble_hid_keyboard(shift ? 0x02 : 0, one, 1)) {
+      ble_hid_keyboard(0, NULL, 0);
       ble_hid_arm_interval(0);
-      return -1;
+      return sent ? -2 : -1;
     }
+    sent++;
     delay(12);
-    ble_hid_keyboard(0, NULL, 0);
+    if (!ble_hid_keyboard(0, NULL, 0)) {
+      ble_hid_arm_interval(0);
+      return -2;
+    }
     delay(8);
   }
   ble_hid_arm_interval(0);
@@ -237,11 +251,13 @@ String run(const String &line) {
   }
   if (cmd == "press") {
     if (path == HID_PATH_BLE) return ble_hid_button(true) ? "ok" : down;
+    if (path != HID_PATH_USB) return down;
     mouse.press(MOUSE_LEFT);
     return "ok";
   }
   if (cmd == "release") {
     if (path == HID_PATH_BLE) return ble_hid_button(false) ? "ok" : down;
+    if (path != HID_PATH_USB) return down;
     mouse.release(MOUSE_LEFT);
     return "ok";
   }
@@ -251,6 +267,7 @@ String run(const String &line) {
       delay(60);
       return ble_hid_button(false) ? "ok" : down;
     }
+    if (path != HID_PATH_USB) return down;
     mouse.press(MOUSE_LEFT);
     delay(60);
     mouse.release(MOUSE_LEFT);
@@ -258,15 +275,18 @@ String run(const String &line) {
   }
   if (cmd == "scroll") {
     if (path == HID_PATH_BLE) return ble_hid_mouse(0, 0, clamp8(a), clamp8(b)) ? "ok" : down;
+    if (path != HID_PATH_USB) return down;
     mouse.move(0, 0, a, b);
     return "ok";
   }
   if (cmd == "type") {
-    if (path != HID_PATH_BLE) {
+    if (path == HID_PATH_USB) {
       keyboard.print(arg);
       return "ok";
     }
+    if (path != HID_PATH_BLE) return down;
     int typed = bleType(arg);
+    if (typed == -2) return "err partial type";
     if (typed < 0) return down;
     return typed ? "ok" : "err unknown key";
   }
@@ -279,9 +299,10 @@ String run(const String &line) {
     if (path == HID_PATH_BLE) {
       if (!ble_hid_consumer(AC_HOME)) return down;
       delay(40);
-      ble_hid_consumer(0);
+      if (!ble_hid_consumer(0)) return down;
       return "ok";
     }
+    if (path != HID_PATH_USB) return down;
     consumer.press(AC_HOME);
     delay(40);
     consumer.release();

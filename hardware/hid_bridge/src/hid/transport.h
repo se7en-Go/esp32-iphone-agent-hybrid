@@ -31,7 +31,7 @@ typedef struct {
   int gap_ms;     // pause after each pointer report
   int home_gap_ms;
   int version;    // HID_PACE_USB or HID_PACE_BLE
-  int conn_min;   // BLE connection interval, units of 1.25 ms; 0 on USB
+  int conn_min;   // 1.25 ms units. 0 means do not request a new interval (USB, and BLE stays at 15 ms)
   int conn_max;
 } hid_pace_t;
 
