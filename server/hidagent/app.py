@@ -18,7 +18,6 @@ from .control import Controls
 from .debug import Trace
 from .device import Device, DeviceError, supervise_maintain
 from .enter_context import verify_enter_context
-from .freshness import require_fresh
 from .guard import Guard, limits_for, skill_file
 from .input_context import InputContextGuard
 from .layouts import list_layouts, resolve_point
@@ -592,7 +591,8 @@ async def type_text(t: TypeText, request: Request):
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     async def type_observed():
-        validate = InputContextGuard(screen, require_fresh(screen))
+        observed = await phone.ensure_observation()
+        validate = InputContextGuard(screen, observed)
         await phone.type(t.text, mode=t.mode, before_action=validate)
 
     return await while_connected(request, act(type_observed))

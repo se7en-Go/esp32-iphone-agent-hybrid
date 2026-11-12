@@ -1,6 +1,8 @@
 """A firmware ACK cannot turn a replacement screen into typing evidence."""
 
 import asyncio
+import json
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -194,5 +196,69 @@ def test_direct_type_endpoint_rechecks_screen_after_copy_ack(tmp_path, monkeypat
                     task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
                 device.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reconnected", [False, True], ids=["fresh-phone", "reconnected"])
+def test_direct_type_endpoint_syncs_clock_for_timestamped_frame(tmp_path, monkeypatch, reconnected):
+    from hidagent import app as module
+    from hidagent.guard import Guard
+
+    async def scenario():
+        screen, device, link = Screen(), Device(), Link()
+        device.attach(link)
+        board_start, host_start = 123_456, time.monotonic()
+        queries, copied = [], []
+
+        def board_time():
+            return board_start + round((time.monotonic() - host_start) * 1000)
+
+        def publish():
+            screen._on_ready()
+            screen._on_ts(board_time())
+            screen._on_jpeg(input_frame())
+
+        async def query(command):
+            assert command == "status"
+            queries.append(command)
+            return json.dumps({"up": board_time()})
+
+        async def paste(text, *, stopped, send):
+            assert not stopped()
+            copied.append(text)
+            await send("key cmd+v")
+
+        monkeypatch.setattr(device, "query", query)
+        publish()
+        phone = Phone(device, tmp_path / "cal.json", screen,
+                      clipboard=SimpleNamespace(paste=paste))
+        if reconnected:
+            await phone.ensure_observation()
+            assert phone._clock is not None
+            device.close()
+            link = Link()
+            device.attach(link)
+            publish()
+            assert phone._clock_link != device.links
+        else:
+            assert phone._clock is None
+        queries.clear()
+        for name, value in (("phone", phone), ("device", device), ("screen", screen),
+                            ("controls", Controls(phone, screen)), ("guard", Guard()),
+                            ("manual_lock", asyncio.Lock()), ("agent", SimpleNamespace(running=False))):
+            monkeypatch.setattr(module, name, value)
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=module.app),
+                                         base_url="http://test") as client:
+                response = await client.post("/api/type", json={"text": "中文", "mode": "paste"})
+            assert response.status_code == 200, response.text
+            assert response.json() == {"ok": True}
+            assert queries == ["status"]
+            assert phone._clock is not None and phone._clock_link == device.links
+            assert copied == ["中文"]
+            assert [data.decode().strip().split(" ", 1)[1] for data in link.written] == ["key cmd+v"]
+        finally:
+            device.close()
 
     asyncio.run(scenario())
