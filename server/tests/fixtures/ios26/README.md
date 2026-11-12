@@ -30,3 +30,8 @@ establish whether the missing disc was faded or morphed into a control highlight
 It preserves the receiver icons and the AssistiveTouch button at normalized
 `(655/720, 1220/1560)` for button detection without cached coordinates. The
 receiver glyphs must not be mistaken for the button's concentric rings.
+
+OCR fixture `dial_final.jpg` is the original 720x1560 JPEG from
+`/workspace/hybrid-ptr/dial_final.jpg` (53 KB): Phone keypad displaying `132 6717 9555`
+without placing a call. OCR tests also reuse `00_home_1500ms.jpg` for Chinese Settings
+labels and the English word `iPhone`.

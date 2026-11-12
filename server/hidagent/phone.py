@@ -11,9 +11,10 @@ import json
 import logging
 import time
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 
-from . import screen_compare, vision
+from . import feedback, screen_compare, vision
 from .assistive import AssistiveTouch
 from .device import RELEASE_TIMEOUT, Device, DeviceError, exchange_timing
 from .operation import OPERATION_TIMEOUT, bounded_operation, check_operation, shield_cleanup
@@ -536,7 +537,8 @@ class Phone:
                 self.origin["y"] + self._pos[1] / self.span["h"])
 
     @bounded_operation
-    async def tap_verified(self, x: float, y: float) -> dict:
+    async def tap_verified(self, x: float, y: float, *,
+                           before_click: Callable[[], None] | None = None) -> dict:
         """Click once even if iOS hides the disc, then report visible evidence without retrying."""
         began = time.monotonic()
         epoch = getattr(self.device, "abort_epoch", 0)
@@ -545,13 +547,15 @@ class Phone:
         self._pointer_seen = False
         self.last_tap = None
         await self.point_verified(x, y)
+        if before_click is not None:
+            before_click()  # e.g. tap_text re-validates the OCR target right before clicking
         before = getattr(self.screen, "frame", None)
-        sent = time.time()
         self._click_mono = await self._send(epoch, "click")
+        sent = time.time()
         ignore = previous + self._pointer_spots + ((x, y),)
         changed, fresh = await self._tap_effect(before, sent, epoch, ignore, hover)
         result = {"clicked": True, "pointer_seen": self._pointer_seen, "screen_changed": changed,
-                  "fresh": fresh, "latency": round(time.monotonic() - began, 3),
+                  "fresh": fresh, "completed_at": sent, "latency": round(time.monotonic() - began, 3),
                   "warning": None if changed else "已点击，但等待窗口内未见画面变化；请观察后再操作，勿自动重试。"}
         self.last_tap = result
         return result
@@ -563,6 +567,11 @@ class Phone:
         # _clock is board millis minus monotonic millis, not wall-clock millis.
         click_mono = getattr(self, "_click_mono", None)
         clicked_at = click_mono * 1000 + self._clock if self._clock is not None and click_mono is not None else None
+        if clicked_at is None:
+            # No board clock to tell capture time from arrival: only frames that arrive after the
+            # known mirror-lag bound can show the click's result (shared rule with feedback.py).
+            since += feedback.MIRROR_LAG_SECONDS
+            deadline += feedback.MIRROR_LAG_SECONDS
         fresh = False
         while time.monotonic() < deadline:
             if self._stopped(epoch):
@@ -633,11 +642,13 @@ class Phone:
         await self._command("home")
         self._pos, self._moves = (0, 0), 0
 
-    async def tap(self, x: float, y: float, aim: bool = False) -> None:
-        """aim=True finds the pointer on screen first (slower); worth it when a tap just missed."""
+    async def tap(self, x: float, y: float, aim: bool = False) -> float:
+        """aim=True checks the pointer first; return the click ACK time."""
         await self.point(x, y, aim)
         await self._command("click")
+        completed_at = time.time()
         await asyncio.sleep(TAP_GAP)
+        return completed_at
 
     async def swipe(self, x1: float, y1: float, x2: float, y2: float, hold: bool = True) -> None:
         await self.drag([(x1, y1), (x2, y2)], hold)

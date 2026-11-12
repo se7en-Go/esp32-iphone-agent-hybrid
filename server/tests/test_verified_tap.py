@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 from PIL import Image, ImageDraw
 
+from hidagent import feedback
+from hidagent import phone as phone_module
 from hidagent.app import ControlAction
 from hidagent.control import Controls
 from hidagent.device import DeviceError
@@ -184,7 +186,8 @@ def test_clock_and_pointer_only_updates_report_no_effect_without_retry(tmp_path)
     assert mirror.commands.count("click") == 1
     assert result["clicked"] is True
     assert result["screen_changed"] is False
-    assert result["latency"] <= 2.1
+    # no board clock here: a no-effect tap waits out the mirror-lag bound plus the effect window
+    assert result["latency"] <= phone_module.TAP_EFFECT_WAIT + feedback.MIRROR_LAG_SECONDS + .1
 
 
 def test_target_highlight_without_content_change_is_not_a_tap_effect(tmp_path):

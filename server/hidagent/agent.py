@@ -8,12 +8,13 @@ import os
 import re
 import time
 
-from . import vision
+from . import feedback, ocr, screen_diff, vision
 from .debug import Trace
 from .device import DeviceError
 from .llm import LLM
 from .phone import Phone
 from .screen import Screen
+from .text_target import TextTargetGuard
 
 log = logging.getLogger(__name__)
 
@@ -33,12 +34,14 @@ DO: <action>
 Give several DO lines (up to 6, run in order) whenever the next actions do not depend on seeing the
 result: e.g. ticking several visible checkboxes or days, several drawing strokes, typing then pressing enter.
 Give ONE DO line when the next action depends on what this one opens or changes.
+Use find_text and tap_text alone, then inspect the result before continuing.
 
 Coordinates are integers 0-1000 relative to the screenshot (x left->right, y top->bottom).
 Aim at the visual center of the element you want, not its edge or its label.
 Look before you act: describe what is really on the screen now, not what you expect.
 Each recent action says whether the screen changed after it. If it did NOT change, the action
 missed or had no effect: do not assume it worked; aim again more precisely or try another way.
+If feedback is stale, the tap outcome is unknown; inspect a new screen before continuing.
 Only type when a text field is visibly focused (the keyboard is showing).
 Swipes have no momentum: content moves exactly as far as the finger and stops. Prefer short swipes
 (100-250 units) and check the result; repeat if needed rather than one big swipe.
@@ -53,6 +56,8 @@ If you are unsure what an element does, tap it alone (one DO line) and check the
 Actions:
   tap X Y [precise]         (precise: the pointer is located and corrected before tapping, about 1 s slower;
                              use it for small or tightly packed targets: list rows, checkmarks, toggles, small icons)
+  find_text TEXT            (optional OCR: read the best visible text match, then look at the result before acting)
+  tap_text TEXT             (optional OCR: locate visible text and tap its center with pointer verification)
   swipe X1 Y1 X2 Y2         (finger moves from X1,Y1 to X2,Y2: "swipe down" means Y2 > Y1)
   path X1 Y1 X2 Y2 X3 Y3 …  (one continuous stroke through 2-20 points, for drawing)
   circle X Y R              (draw a circle centered at X Y; R is the radius in x units)
@@ -67,11 +72,13 @@ Example:
 THINK: My last tap opened the home screen as intended. The App Store icon is visible, so I tap it.
 DO: tap 152 362"""
 
-META = ("t", "thought", "thought_zh", "think_s", "act_s", "shot", "_shot", "changed")  # not part of the action
+META = ("t", "thought", "thought_zh", "think_s", "act_s", "shot", "_shot", "changed",
+        "text_match", "screen_diff")  # not part of the action
 
 # action name -> argument names; numeric arguments are 0-1000 screen coordinates
 ACTIONS = {"tap": ("x", "y"), "swipe": ("x1", "y1", "x2", "y2"), "circle": ("x", "y", "r"), "path": ("points",),
            "type": ("text",), "key": ("combo",), "done": ("answer",), "fail": ("reason",),
+           "find_text": ("text",), "tap_text": ("text",),
            "home": (), "back": (), "wait": (), "replan": ()}
 TEXT_ARGS = ("text", "combo", "answer", "reason")
 
@@ -118,6 +125,18 @@ def parse_plan(text: str) -> tuple[str, str]:
 def _key(step: dict) -> dict:
     """The action itself, without thoughts, timings and other bookkeeping."""
     return {k: v for k, v in step.items() if k not in META}
+
+
+def _diff_feedback(step: dict) -> str:
+    """Keep changed text visible in model history without the full region geometry."""
+    diff = step.get("screen_diff")
+    if not diff:
+        return ""
+    compact = {key: diff.get(key) for key in ("status", "changed_fraction", "text_status")}
+    for key in ("texts_appeared", "texts_disappeared"):
+        texts = diff.get(key)
+        compact[key] = None if texts is None else [text[:60] for text in texts[:3]]
+    return " -> screen diff: " + json.dumps(compact, ensure_ascii=False)
 
 
 class BlindError(RuntimeError):
@@ -220,22 +239,31 @@ class Agent:
                 return False
             if name not in ("done", "fail"):
                 started = time.time()
-                await self._do(act)
+                before = self.screen.frame
+                tap_completed = await self._do(act)
                 act["act_s"] = round(time.time() - started, 2)
                 spots += _pointer_path(act)
                 self._pointer = spots[-1]
+                if name in ("tap", "tap_text"):
+                    fresh = await feedback.wait_after_action(self.screen, tap_completed or time.time(), 1.5)
+                    await self.screen.settled()
+                    after = self.screen.frame
+                    usable = bool(fresh) and self.screen.live and bool(after)
+                    act["screen_diff"] = await screen_diff.summarize(before, after, fresh=usable)
+                    act["changed"] = vision.changed(before, after, ignore=tuple(spots)) if usable else None
             self._record(act.pop("_shot"), **act)
             if name in ("done", "fail"):
                 return True
+            if name in ("find_text", "tap_text"):
+                return False  # text targets and their results need a new actor observation
             following = acts[i + 1]["action"] if i < len(acts) - 1 else None
-            if name == "tap" and following in ("type", "key"):  # typing into a field that a missed tap never opened
-                await self.screen.settled()
-                if not vision.changed(seen, self.screen.frame, ignore=tuple(spots)):
-                    self.steps[-1]["changed"] = False
+            if name in ("tap", "tap_text") and following in ("type", "key"):
+                if act.get("changed") is not True:  # a missed tap may not have opened the input field
                     return False  # skip the rest; the actor looks again
-        await self.screen.settled()
         # feedback for the next round
-        self.steps[-1]["changed"] = vision.changed(seen, self.screen.frame, ignore=tuple(spots))
+        if self.steps[-1]["action"] not in ("tap", "tap_text"):
+            await self.screen.settled()
+            self.steps[-1]["changed"] = vision.changed(seen, self.screen.frame, ignore=tuple(spots))
         return False
 
     def _missed(self) -> bool:
@@ -264,10 +292,10 @@ class Agent:
 
     async def _next_actions(self) -> list[dict]:
         # actions and their effect only: echoing earlier thoughts makes the model repeat them instead of looking
-        hidden = ("t", "plan", "plan_zh", "think_s", "act_s", "shot", "thought", "thought_zh", "changed")
+        hidden = ("t", "plan", "plan_zh", "think_s", "act_s", "shot", "thought", "thought_zh", "changed", "screen_diff")
         effect = {True: " -> screen changed", False: " -> screen did NOT change"}
         history = "\n".join(json.dumps({k: v for k, v in s.items() if k not in hidden})[:300]
-                            + effect.get(s.get("changed"), "")
+                            + effect.get(s.get("changed"), "") + _diff_feedback(s)
                             for s in self.steps[-8:] if "plan" not in s) or "(none)"
         prompt = f"Goal: {self.task}\n\nPlan:\n{self.plan}\n\nRecent actions:\n{history}\n\nNext action?"
         for attempt in range(3):  # retry unparseable replies, a little less deterministically
@@ -286,10 +314,12 @@ class Agent:
             return [{**a, "_shot": frame} for a in acts]  # every action is drawn on the same screenshot
         raise ValueError(f"actor gave no valid action: {reply[:200]}")
 
-    async def _do(self, a: dict) -> None:
+    async def _do(self, a: dict) -> float | None:
         p = lambda k: a[k] / 1000  # noqa: E731
         match a["action"]:
-            case "tap": await self.phone.tap(p("x"), p("y"), aim=a.get("precise", False) or self._missed())
+            case "tap":
+                return await self.phone.tap(p("x"), p("y"), aim=a.get("precise", False) or self._missed())
+            case "find_text" | "tap_text": return await self._text_action(a)
             case "swipe": await self.phone.swipe(p("x1"), p("y1"), p("x2"), p("y2"))
             case "path": await self.phone.drag([(x / 1000, y / 1000) for x, y in a["points"]])
             case "circle": await self.phone.drag(circle(p("x"), p("y"), p("r"), self.screen.aspect))
@@ -300,12 +330,32 @@ class Agent:
             case "wait": pass
             case other: raise ValueError(f"unknown action {other!r}")
 
+    async def _text_action(self, action: dict) -> float | None:
+        seen = action.get("_shot")
+        if not self.screen.live or not seen:
+            raise BlindError("lost the phone screen: reconnect Screen Mirroring")
+        if vision.changed(seen, self.screen.frame):
+            raise ValueError("screen changed before OCR; observe again")
+        match = await ocr.find_text_async(seen, action["text"])
+        if not self.screen.live or not self.screen.frame:
+            raise BlindError("lost the phone screen: reconnect Screen Mirroring")
+        if vision.changed(seen, self.screen.frame):
+            raise ValueError("screen changed during OCR; observe again")
+        action["text_match"] = None if match is None else {
+            "text": match.text, "box": match.box, "center": match.center, "conf": match.conf}
+        if action["action"] == "tap_text":
+            if match is None:
+                raise ValueError("未找到屏幕文字，请重新观察")
+            guard = TextTargetGuard(self.screen, seen, match)
+            return await self.phone.tap_verified(*match.center, before_click=guard)
+
 
 def _pointer_path(act: dict) -> list[tuple[float, float]]:
     """Screen points (fractions) the pointer passes through for one action."""
     f = lambda x, y: (x / 1000, y / 1000)  # noqa: E731
     match act["action"]:
         case "tap": return [f(act["x"], act["y"])]
+        case "tap_text": return [tuple(act["text_match"]["center"])] if act.get("text_match") else []
         case "swipe": return [f(act["x1"], act["y1"]), f(act["x2"], act["y2"])]
         case "path": return [f(*p) for p in act["points"]]
         case "circle": return [f(act["x"] + act["r"], act["y"])]

@@ -31,6 +31,8 @@ def create_server(url: str | None = None):
         "Prefer iphone_batch for several actions that do not need a new look between them; do not batch "
         "candidate selection or sending together with compose_chinese. "
         "Named UI points come from iphone_layouts (skill layout.json), not from guessing. "
+        "With the optional OCR backend, iphone_find_text locates visible text without consuming screen_id; "
+        "iphone_tap_text taps a ranked match and returns the resulting image and screen_diff. "
         "WeChat wording lives only in skills/wechat-group-reply/SKILL.md. Before sending, call skill_check. "
         "After sending, call skill_confirm_send and set bubble_visible only when the new bubble is fully visible. "
         "If skill_check says stop, do not retry. There is no draft and no human approval step. "
@@ -78,6 +80,28 @@ def create_server(url: str | None = None):
                    ) -> list[TextContent | ImageContent]:
         """Click once using calibration; report pointer_seen, screen_changed and latency. Never auto-retry."""
         return action("tap", screen_id, x=x, y=y, coordinate_space=coordinate_space)
+
+    @mcp.tool()
+    def iphone_find_text(text: str, screen_id: str, nth: int = 1,
+                         exact: bool = False) -> list[TextContent | ImageContent]:
+        """Find visible text with optional OCR; retain screen_id. nth is 1-based in ranked matches.
+
+        Match boxes and centers are normalized 0..1. Width, spaces and case are normalized;
+        exact=True requires the complete normalized text. Inspect matches before choosing duplicates.
+        """
+        with IPhoneClient(url) as client:
+            return content(client.request("POST", "/api/control/find_text",
+                                          {"screen_id": screen_id, "text": text, "nth": nth, "exact": exact}).json())
+
+    @mcp.tool()
+    def iphone_tap_text(text: str, screen_id: str, nth: int = 1,
+                        exact: bool = False) -> list[TextContent | ImageContent]:
+        """Locate visible text with optional OCR, verify pointer and tap once. nth is 1-based.
+
+        Inspect the returned image and screen_diff; OCR text and changed pixels do not prove success.
+        Missing text or an unavailable OCR backend sends no HID command.
+        """
+        return action("tap_text", screen_id, text=text, nth=nth, exact=exact)
 
     @mcp.tool()
     def iphone_swipe(x1: float, y1: float, x2: float, y2: float, screen_id: str,

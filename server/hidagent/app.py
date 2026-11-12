@@ -22,6 +22,7 @@ from .guard import Guard, limits_for, skill_file
 from .layouts import list_layouts, resolve_point
 from .llm import LLM
 from .messages import for_user, hints
+from .ocr import OCRError, OCRUnavailable
 from .operation import ActionLifetimeMiddleware
 from .paths import skill_roots
 from .phone import Phone
@@ -205,7 +206,7 @@ class TypeText(KeyboardText):
 
 
 class ActionStep(BaseModel):
-    action: Literal["point", "tap", "swipe", "scroll", "type", "compose_chinese", "key", "home", "back"]
+    action: Literal["point", "tap", "tap_text", "swipe", "scroll", "type", "compose_chinese", "key", "home", "back"]
     coordinate_space: Literal["normalized", "pixels"] = "normalized"
     x: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     y: float | None = Field(default=None, ge=0, allow_inf_nan=False)
@@ -218,11 +219,22 @@ class ActionStep(BaseModel):
     input_mode: Literal["pinyin"] | None = None
     mode: TypeMode = "auto"
     repeat: int = Field(default=1, ge=1, le=50)
+    nth: int = Field(default=1, ge=1, strict=True)
+    exact: bool = False
 
 
 class BatchBody(BaseModel):
     screen_id: str = Field(min_length=1)
     steps: list[ActionStep] = Field(min_length=1, max_length=8)
+    include_diff: bool = True
+    ocr_diff: bool = True
+
+
+class FindTextBody(BaseModel):
+    screen_id: str = Field(min_length=1)
+    text: str = Field(min_length=1, max_length=4000)
+    nth: int = Field(default=1, ge=1, strict=True)
+    exact: bool = False
 
 
 class LayoutTap(BaseModel):
@@ -238,7 +250,7 @@ class SkillBody(BaseModel):
 
 
 class ControlAction(BaseModel):
-    action: Literal["point", "tap", "swipe", "scroll", "type", "compose_chinese", "key", "home", "back"]
+    action: Literal["point", "tap", "tap_text", "swipe", "scroll", "type", "compose_chinese", "key", "home", "back"]
     screen_id: str = Field(min_length=1)
     coordinate_space: Literal["normalized", "pixels"] = "normalized"
     x: float | None = Field(default=None, ge=0, allow_inf_nan=False)
@@ -252,6 +264,10 @@ class ControlAction(BaseModel):
     input_mode: Literal["pinyin"] | None = None
     mode: TypeMode = "auto"
     repeat: int = Field(default=1, ge=1, le=50)
+    nth: int = Field(default=1, ge=1, strict=True)
+    exact: bool = False
+    include_diff: bool = True
+    ocr_diff: bool = True
 
 
 def check_keyboard(text):
@@ -335,6 +351,25 @@ async def control_observe():
             raise HTTPException(409, str(e)) from e
 
 
+@app.post("/api/control/find_text")
+async def control_find_text(request: FindTextBody):
+    check_manual()
+    async with manual_lock:
+        controls.job = asyncio.current_task()
+        try:
+            return await controls.find_text(request.screen_id, request.text, request.nth, request.exact)
+        except ValueError as e:
+            raise HTTPException(409, str(e)) from e
+        except OCRUnavailable as e:
+            raise HTTPException(503, str(e)) from e
+        except OCRError as e:
+            raise HTTPException(409, str(e)) from e
+        except asyncio.CancelledError as e:
+            raise HTTPException(409, "查找已停止，请重新观察。") from e
+        finally:
+            controls.job = None
+
+
 @app.post("/api/control/action")
 async def control_action(request: ControlAction, http_request: Request):
     refuse_if_tripped()
@@ -344,6 +379,10 @@ async def control_action(request: ControlAction, http_request: Request):
         try:
             return await while_connected(http_request, controls.perform(request))
         except ValueError as e:
+            raise HTTPException(409, str(e)) from e
+        except OCRUnavailable as e:
+            raise HTTPException(503, str(e)) from e
+        except OCRError as e:
             raise HTTPException(409, str(e)) from e
         except asyncio.CancelledError as e:
             raise HTTPException(409, "action stopped; observe before continuing") from e
@@ -364,8 +403,13 @@ async def control_batch(request: BatchBody, http_request: Request):
         controls.job = asyncio.current_task()
         try:
             return await while_connected(
-                http_request, controls.perform_batch(request.screen_id, _steps(request.screen_id, request.steps)))
+                http_request, controls.perform_batch(request.screen_id, _steps(request.screen_id, request.steps),
+                                                     include_diff=request.include_diff, ocr_diff=request.ocr_diff))
         except ValueError as e:
+            raise HTTPException(409, str(e)) from e
+        except OCRUnavailable as e:
+            raise HTTPException(503, str(e)) from e
+        except OCRError as e:
             raise HTTPException(409, str(e)) from e
         except asyncio.CancelledError as e:
             raise HTTPException(409, "action stopped; observe before continuing") from e
