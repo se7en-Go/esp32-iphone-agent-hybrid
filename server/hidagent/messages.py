@@ -1,11 +1,14 @@
 """给使用者看的中文说明。不包含密码、聊天内容或堆栈。"""
 
 NO_PORT = (
-    "没找到串口。请把板子上标着 COM 的 Type-C（CH343，不是标着 USB 的那个口）"
+    "没找到串口。请把板子上标着 COM 的 Type-C（不是标着 USB 的那个口）"
     "用能传数据的线接到电脑。只充电的线不行。"
-    "Windows 如果仍然没有 COM 口，先安装沁恒 CH343 驱动："
-    "https://www.wch.cn/downloads/CH343SER_EXE.html 。"
-    "也可以设置环境变量 HIDAGENT_PORT，例如 COM5 或 /dev/cu.wchusbserial110。"
+    "COM 口上的芯片可能是沁恒 CH343、FTDI 或 CP210x。"
+    "Mac 上一般是 /dev/cu.usbserial-… 或 /dev/cu.wchusbserial…，Windows 是 COMx。"
+    "Windows 如果仍然没有 COM 口，FTDI 板子装 FTDI VCP 驱动："
+    "https://ftdichip.com/drivers/vcp-drivers/ ；沁恒板子装 CH343 驱动："
+    "https://www.wch.cn/downloads/CH343SER_EXE.html 。macOS 上 FTDI 通常不用装驱动。"
+    "也可以设置环境变量 HIDAGENT_PORT，例如 COM5 或 /dev/cu.usbserial-A5069RR4。"
 )
 
 PORT_SILENT = (
@@ -39,7 +42,7 @@ UXPLAY_WINDOWS = (
 def port_open_failed(name: str) -> str:
     return (
         f"打不开串口 {name}。它可能正被串口监视器占用，请先关掉监视器，或拔插 COM 口。"
-        "插到标着 USB 的口时，电脑上看不到 CH343。"
+        "插到标着 USB 的口时，电脑上看不到这个串口。"
     )
 
 

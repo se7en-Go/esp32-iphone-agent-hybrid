@@ -10,7 +10,7 @@
 
 | 板子上的口 | 接到 | 作用 |
 |---|---|---|
-| COM（CH343） | 电脑 | 刷机、命令、读 vtok、把 Wi-Fi 写进 NVS |
+| COM（USB 转串口，可能是 CH343 / FTDI / CP210x） | 电脑 | 刷机、命令、读 vtok、把 Wi-Fi 写进 NVS |
 | USB（GPIO19/20） | iPhone | USB 鼠标键盘。Lightning 要用相机转换器 |
 
 默认是 STA：板子、手机、电脑连同一个 **2.4GHz** 路由器。换地方就再跑一次配网，不用重烧，也不会把密码放进仓库。板子自己的热点不提供互联网，只适合电脑另外插了网线的时候。
@@ -35,7 +35,7 @@
 4. USB 口接手机，辅助触控，屏幕镜像选 **ESP32 Agent**。`powershell -ExecutionPolicy Bypass -File scripts\run-server.ps1`，打开 `http://127.0.0.1:8890`，先等 device 和 screen 两盏灯变绿，再点校准，点中圆点后第三盏灯才绿。
 5. `powershell -ExecutionPolicy Bypass -File scripts\mcp-config.ps1`
 
-没有 COM 口时再装沁恒 CH343 驱动：https://www.wch.cn/downloads/CH343SER_EXE.html
+Mac 上端口可能是 `/dev/cu.usbserial-…` 或 `/dev/cu.wchusbserial…`，Windows 是 `COMx`。FTDI 在 macOS 上通常不用装驱动。Windows 没有 COM 口时，按芯片装驱动：FTDI 用 VCP 驱动 https://ftdichip.com/drivers/vcp-drivers/ ，沁恒用 CH343 驱动 https://www.wch.cn/downloads/CH343SER_EXE.html 。
 
 细节：[docs/setup-windows.md](docs/setup-windows.md)
 

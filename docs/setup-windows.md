@@ -5,7 +5,7 @@
 ## 准备
 
 - 到 https://www.python.org/downloads/windows/ 安装 Python 3.10 或更新，勾选 **Add python.exe to PATH**。新开一个 PowerShell，`python --version` 能打出来。
-- 若设备管理器里没有 COM 口，安装沁恒 CH343 驱动：https://www.wch.cn/downloads/CH343SER_EXE.html 。Win10/11 有时免驱动，没有口再装。
+- 若设备管理器里没有 COM 口，按芯片装驱动：FTDI 用 VCP 驱动 https://ftdichip.com/drivers/vcp-drivers/ ，沁恒用 CH343 驱动 https://www.wch.cn/downloads/CH343SER_EXE.html 。Win10/11 有时免驱动，没有口再装。
 - 线要能传数据。板子上标着 **COM** 的口接电脑，标着 **USB** 的口接手机。
 - iPhone 打开辅助触控。路由器要有 2.4GHz，且没有 AP 隔离。
 

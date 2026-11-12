@@ -5,12 +5,18 @@ import time
 import pytest
 
 from hidagent.device import (
+    CP210X_VID,
+    ESPRESSIF_VID,
+    FTDI_PIDS,
+    FTDI_VID,
     WCH_VID,
     Device,
     DeviceError,
     SerialLink,
+    candidate_ports,
     open_serial,
     port_is_ch343,
+    port_is_com_bridge,
     supervise_maintain,
     wait_for_ping,
 )
@@ -442,6 +448,47 @@ def test_discover_without_a_wch_port_explains_the_next_step(monkeypatch):
             await Device().connect()
         assert "COM" in str(caught.value)
         assert "CH343" in str(caught.value)
+        assert "FTDI" in str(caught.value)
 
     asyncio.run(scenario())
     assert "HIDAGENT_PORT" in NO_PORT
+
+
+class _FakePort:
+    def __init__(self, device, vid=None, pid=None, manufacturer=""):
+        self.device = device
+        self.vid = vid
+        self.pid = pid
+        self.manufacturer = manufacturer
+
+
+def test_com_bridge_accepts_ftdi_and_cp210x_but_not_espressif():
+    assert port_is_com_bridge(_FakePort("/dev/cu.usbserial-A5069RR4", FTDI_VID, 0x6001))
+    for pid in sorted(FTDI_PIDS):
+        assert port_is_com_bridge(_FakePort("COM8", FTDI_VID, pid))
+    assert port_is_com_bridge(_FakePort("/dev/cu.SLAB_USBtoUART", CP210X_VID, 0xEA60))
+    assert port_is_com_bridge(_FakePort("COM5", WCH_VID, 0x55D3))
+    assert not port_is_com_bridge(_FakePort("/dev/cu.usbmodem14101", ESPRESSIF_VID, 0x1001))
+    assert not port_is_com_bridge(_FakePort("/dev/ttyS0"))
+    assert not port_is_com_bridge(_FakePort("/dev/cu.Bluetooth-Incoming-Port"))
+    assert not port_is_com_bridge(_FakePort("COM9", FTDI_VID, 0x1234))
+    assert not port_is_com_bridge(_FakePort("COM10", 0x1234, 0x5678))
+    assert not port_is_ch343(_FakePort("/dev/cu.usbserial-A5069RR4", FTDI_VID, 0x6001))
+
+
+def test_candidate_ports_lists_known_bridges_only(monkeypatch):
+    ports = [
+        _FakePort("/dev/cu.usbserial-A5069RR4", FTDI_VID, 0x6001),
+        _FakePort("/dev/cu.SLAB_USBtoUART", CP210X_VID, 0xEA60),
+        _FakePort("/dev/cu.usbmodem14101", ESPRESSIF_VID, 0x1001),
+        _FakePort("/dev/cu.Bluetooth-Incoming-Port"),
+        _FakePort("/dev/ttyS0"),
+        _FakePort("COM5", WCH_VID, 0x55D3),
+        _FakePort("COM9", FTDI_VID, 0x1234),
+    ]
+    monkeypatch.setattr("hidagent.device.list_ports.comports", lambda: ports)
+    assert candidate_ports() == [
+        "/dev/cu.usbserial-A5069RR4",
+        "/dev/cu.SLAB_USBtoUART",
+        "COM5",
+    ]

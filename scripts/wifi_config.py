@@ -76,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ssid", default="", help="2.4GHz 网络名称")
     parser.add_argument("--password", default="", help="不建议写在命令行里；留空则提示输入")
     parser.add_argument("--ap", action="store_true", help="改回热点。仅适合电脑另有网线的情况")
-    parser.add_argument("--port", default="", help="留空则自动寻找 CH343")
+    parser.add_argument("--port", default="", help="例如 COM5 或 /dev/cu.usbserial-…。留空则自动找 CH343/FTDI/CP210x")
     args = parser.parse_args(argv)
     if not args.ap and not args.ssid:
         fail("请提供 --ssid，或在确认电脑另有网线后使用 --ap。")

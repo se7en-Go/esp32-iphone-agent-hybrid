@@ -18,7 +18,7 @@
 
 | 板子上的口 | 接到 | 作用 |
 |---|---|---|
-| **COM**（CH343 USB 转串口） | 电脑 | 刷机、发命令、读 vtok、把 Wi-Fi 写进 NVS，同时给板子供电 |
+| **COM**（USB 转串口，可能是 CH343 / FTDI / CP210x） | 电脑 | 刷机、发命令、读 vtok、把 Wi-Fi 写进 NVS，同时给板子供电 |
 | **USB**（GPIO19/20，原生 USB） | iPhone | USB 鼠标键盘（HID）。Lightning 手机要用相机转换器 |
 
 出处：`README.md:11–16`；`ARCHITECTURE.md:7、31`。
@@ -29,10 +29,10 @@
   **出处：** `README.md:18`；`scripts/flash.py:94`；`docs/troubleshooting.md:23–25`。
 
 - [ ] **用能传数据的 Type-C 线，把 COM 口接电脑。** 只能充电的线刷不了机，也不会出现串口。
-  **通过标准：** 电脑上能看到沁恒串口。
-  - **Windows：** 设备管理器 →「端口 (COM 和 LPT)」里出现一个 COM 口（例如 `COM5`）。没有的话，安装沁恒 CH343 驱动：https://www.wch.cn/downloads/CH343SER_EXE.html （Win10/11 有时不用装驱动）。
-  - **Mac：** 出现 `/dev/cu.wchusbserial…` 这样的设备，仓库里的示例是 `/dev/cu.wchusbserial110`。
-  - 程序只自动认 VID `0x1A86`、PID `0x55D3 / 0x55D4 / 0x7523 / 0x5523` 的沁恒串口。只找到一个就直接用；找到多个，或者想手动指定，就设置 `HIDAGENT_PORT`（Windows：`$env:HIDAGENT_PORT = "COM5"`），或者给脚本加 `--port`。
+  **通过标准：** 电脑上能看到 USB 转串口（可能是沁恒 CH343、FTDI 或 CP210x）。
+  - **Windows：** 设备管理器 →「端口 (COM 和 LPT)」里出现一个 COM 口（例如 `COM5`）。没有的话，按芯片装驱动：FTDI 用 VCP 驱动 https://ftdichip.com/drivers/vcp-drivers/ ，沁恒用 CH343 驱动：https://www.wch.cn/downloads/CH343SER_EXE.html （Win10/11 有时不用装驱动）。
+  - **Mac：** 出现 `/dev/cu.usbserial-…` 或 `/dev/cu.wchusbserial…`。FTDI 板子常见前者，例如 `/dev/cu.usbserial-A5069RR4`；沁恒常见后者。FTDI 在 macOS 上通常不用装驱动。
+  - 程序自动认沁恒（VID `0x1A86`，PID `0x55D3 / 0x55D4 / 0x7523 / 0x5523`）、FTDI（VID `0x0403`，PID `0x6001 / 0x6010 / 0x6011 / 0x6014 / 0x6015`）和 CP210x（VID `0x10C4`，PID `0xEA60`）。不会去认乐鑫原生 USB（VID `0x303A`，也就是标着 USB 的口）。只找到一个就直接用；找到多个，或者想手动指定，就设置 `HIDAGENT_PORT`（Windows：`$env:HIDAGENT_PORT = "COM5"`），或者给脚本加 `--port`。
 
   **失败记录：** Windows 设备管理器「端口」的截图；Mac 上 `ls /dev/cu.*` 的输出；线和口的照片。
   **出处：** `docs/setup-windows.md:8、26`；`server/.env.example:7–8`；`server/hidagent/device.py:25–26、115–126`；`scripts/flash.py:44–68`。
@@ -134,7 +134,7 @@
   必须指定端口时，配置项是 `HIDAGENT_PORT`。仓库给出的示例是：
 
   ```text
-  HIDAGENT_PORT=/dev/cu.wchusbserial110
+  HIDAGENT_PORT=/dev/cu.usbserial-A5069RR4
   ```
 
   Windows 文档示例：

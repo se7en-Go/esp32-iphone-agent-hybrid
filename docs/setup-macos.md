@@ -6,7 +6,7 @@ Apple Silicon 和 Intel 都用同一套步骤。不需要先装 Homebrew。不�
 
 - Python 3.10 或更新。没有的话用 python.org 的 macOS 安装包。终端里 `python3 --version` 能打出来即可。
 - 一根能传数据的 Type-C 线。只充电的线会让刷机失败。
-- 板子有两个口。**COM** 接 Mac，**USB** 接 iPhone。
+- 板子有两个口。**COM** 接 Mac，**USB** 接 iPhone。COM 口上的芯片可能是 FTDI、沁恒 CH343 或 CP210x。端口一般是 `/dev/cu.usbserial-…` 或 `/dev/cu.wchusbserial…`。FTDI 在 macOS 上通常不用装驱动。
 - iPhone 打开「设置 → 辅助功能 → 触控 → 辅助触控」。
 - 路由器要有 2.4GHz。不要用只有 5GHz 的网络，不要开 AP 隔离。
 

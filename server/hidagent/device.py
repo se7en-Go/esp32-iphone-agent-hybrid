@@ -22,9 +22,21 @@ from . import messages
 
 log = logging.getLogger(__name__)
 
+# COM 口上常见的 USB 转串口芯片。这里是自动识别的唯一名单。
+# 不要把乐鑫原生 USB（VID 0x303A，USB-JTAG / HID）算进去，那个口是给 iPhone 的。
 WCH_VID = 0x1A86
 # CH343 是 0x55D3。克隆板有时报成 CH340 / CH9102，所以同一厂家的这几个 PID 都接受。
 WCH_PIDS = {0x55D3, 0x55D4, 0x7523, 0x5523}
+FTDI_VID = 0x0403
+FTDI_PIDS = {0x6001, 0x6010, 0x6011, 0x6014, 0x6015}
+CP210X_VID = 0x10C4
+CP210X_PIDS = {0xEA60}
+ESPRESSIF_VID = 0x303A
+COM_BRIDGES = {
+    WCH_VID: WCH_PIDS,
+    FTDI_VID: FTDI_PIDS,
+    CP210X_VID: CP210X_PIDS,
+}
 # 打开串口后有的克隆板会复位，setup() 要几秒。同一句柄上每隔 300ms 再问一次，不要反复开关口。
 PING_EVERY = 0.3
 PING_WINDOW = 8.0
@@ -121,9 +133,18 @@ def port_is_ch343(port) -> bool:
     return getattr(port, "vid", None) == WCH_VID and getattr(port, "pid", None) in WCH_PIDS
 
 
+def port_is_com_bridge(port) -> bool:
+    """COM 口上的 USB 转串口：沁恒、FTDI、CP210x。不要认乐鑫 0x303A，也不要认没有 VID 的本机口。"""
+    vid = getattr(port, "vid", None)
+    pid = getattr(port, "pid", None)
+    if vid == ESPRESSIF_VID or vid is None or pid is None:
+        return False
+    return pid in COM_BRIDGES.get(vid, ())
+
+
 def candidate_ports() -> list[str]:
-    """只列出沁恒 USB 串口。不要去打开 /dev/ttyS0 这种本机串口。"""
-    return [port.device for port in list_ports.comports() if port_is_ch343(port)]
+    """只列出 COM 口上的 USB 转串口。不要去打开 /dev/ttyS0，也不要打开乐鑫原生 USB。"""
+    return [port.device for port in list_ports.comports() if port_is_com_bridge(port)]
 
 
 class Device:

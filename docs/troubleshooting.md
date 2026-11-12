@@ -4,7 +4,7 @@
 
 ## 没找到串口
 
-线要插在标着 **COM** 的口，并且是数据线。标着 USB 的口在电脑上不会出现 CH343。Windows 没有 COM 口时安装 https://www.wch.cn/downloads/CH343SER_EXE.html 。仍不行就设置 `HIDAGENT_PORT`（`COM5` 或 `/dev/cu.wchusbserial110`）。先关掉已经打开的串口监视器。
+线要插在标着 **COM** 的口，并且是数据线。标着 USB 的口在电脑上不会出现这个串口。芯片可能是 FTDI、沁恒 CH343 或 CP210x。Mac 上一般是 `/dev/cu.usbserial-…` 或 `/dev/cu.wchusbserial…`，Windows 是 `COMx`。FTDI 在 macOS 上通常不用装驱动。Windows 没有 COM 口时，FTDI 装 https://ftdichip.com/drivers/vcp-drivers/ ，沁恒装 https://www.wch.cn/downloads/CH343SER_EXE.html 。仍不行就设置 `HIDAGENT_PORT`（`COM5` 或 `/dev/cu.usbserial-A5069RR4`）。先关掉已经打开的串口监视器。
 
 ## device 灯是红的
 

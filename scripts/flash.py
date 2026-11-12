@@ -60,9 +60,11 @@ def pick_port(explicit: str) -> str:
         return ports[0]
     if not ports:
         fail(
-            "没找到 CH343 串口。请把标着 COM 的口接到电脑（不是标着 USB 的口），"
-            "换一根能传数据的线。Windows 若没有 COM 口，安装沁恒驱动："
-            "https://www.wch.cn/downloads/CH343SER_EXE.html"
+            "没找到 COM 串口。请把标着 COM 的口接到电脑（不是标着 USB 的口），"
+            "换一根能传数据的线。芯片可能是沁恒 CH343、FTDI 或 CP210x。"
+            "Mac 上一般是 /dev/cu.usbserial-… 或 /dev/cu.wchusbserial…，Windows 是 COMx。"
+            "Windows 若没有 COM 口，FTDI 装 https://ftdichip.com/drivers/vcp-drivers/ ，"
+            "沁恒装 https://www.wch.cn/downloads/CH343SER_EXE.html 。macOS 上 FTDI 通常不用装驱动。"
         )
     fail("找到多个串口：" + ", ".join(ports) + "。请设置 HIDAGENT_PORT 指定 COM 口。")
     return ""
@@ -80,7 +82,7 @@ def build_only() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="把 N16R8 固件刷进标着 COM 的口。")
-    parser.add_argument("--port", default="", help="例如 COM5 或 /dev/cu.wchusbserial110。留空则自动找 CH343")
+    parser.add_argument("--port", default="", help="例如 COM5 或 /dev/cu.usbserial-…。留空则自动找 CH343/FTDI/CP210x")
     parser.add_argument("--bin", default="", help="merged.bin 的路径。留空则用 hardware/dist 里的预编译文件")
     parser.add_argument("--baud", type=int, default=460800)
     parser.add_argument("--build-only", action="store_true", help="从源码编译。需要本机已安装 arduino-cli")

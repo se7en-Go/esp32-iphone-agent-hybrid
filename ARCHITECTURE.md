@@ -4,7 +4,7 @@
 
 ## 一句话
 
-电脑上的任意 MCP Agent，通过本仓库的 Python 服务（`127.0.0.1:8890`）控制一块 ESP32-S3 N16R8。板子的 **COM（CH343）** 接电脑，只传命令、vtok 和配网；板子的 **USB（GPIO19/20）** 接 iPhone，做 USB HID 鼠标键盘。画面不经过 UxPlay：iPhone 系统“屏幕镜像”到板载 AirPlay 接收器，板子把 H.264 从 **TCP 7201** 推给电脑，电脑用 **PyAV** 解成 JPEG。
+电脑上的任意 MCP Agent，通过本仓库的 Python 服务（`127.0.0.1:8890`）控制一块 ESP32-S3 N16R8。板子的 **COM（USB 转串口，可能是 CH343 / FTDI / CP210x）** 接电脑，只传命令、vtok 和配网；板子的 **USB（GPIO19/20）** 接 iPhone，做 USB HID 鼠标键盘。画面不经过 UxPlay：iPhone 系统“屏幕镜像”到板载 AirPlay 接收器，板子把 H.264 从 **TCP 7201** 推给电脑，电脑用 **PyAV** 解成 JPEG。
 
 ```
 Codex / Pi / Claude Code / Cursor / 任意 MCP 客户端
@@ -31,7 +31,7 @@ iPhone（Lightning 或 USB-C，目标 iOS 16.7+）
 2. **拓扑固定成双 Type-C。** 标着 USB 的口接手机（HID）。标着 COM 的口接电脑（命令、`0 netinfo` 读 vtok、配网）。视频只走 Wi-Fi 7201。不要求蓝牙。7202 + BLE 配对留作实验，本阶段不交付。
 3. **iOS 目标 16.7+。** 不装 Handsy iOS App，不用 TestFlight，不越狱，不开开发者模式。板载接收器代码里没有 iOS 版本判断，但 Handsy 作者的记录是 iOS 18/26/27；Kz-Aven 在 iOS 16.7.16 上测通的是电脑上的 UxPlay，不是这块板子。**iOS 16/17 镜像到板载接收器是第一道硬件关，本仓库没有测过。** 失败时的退路：把手机升到 iOS 18，或仅在 Mac 上把 `SCREEN_BACKEND=uxplay` 打开（要自己装 UxPlay 和 GStreamer，Windows 不走这条）。
 4. **许可证拆开。** `hardware/` 里的固件链接了 GPL-3.0 的 AirPlay 代码，固件源码与固件二进制按 GPL-3.0 分发，保留 `src/airplay/LICENSE-GPL.md` 和各文件头。`server/`、`scripts/`、`skills/`、`docs/` 是独立程序，只通过串口和 TCP 与固件说话，按 MIT 分发，保留 Kz-Aven 与 Henry Yuan 的版权声明。根目录 `NOTICE` 说明边界。
-5. **小白不装 arduino-cli。** GitHub Actions 用报告里已编译通过的 FQBN 打出 N16R8 的 `merged.bin`。日常刷机是 `esptool`（pip）一键脚本，按 VID `0x1A86`（沁恒 CH343）自动找 COM 口。想改固件的人仍可从源码编译。
+5. **小白不装 arduino-cli。** GitHub Actions 用报告里已编译通过的 FQBN 打出 N16R8 的 `merged.bin`。日常刷机是 `esptool`（pip）一键脚本，按 VID 自动找 COM 口：沁恒 `0x1A86`、FTDI `0x0403`、CP210x `0x10C4`；不会去认乐鑫原生 USB（`0x303A`）。想改固件的人仍可从源码编译。
 6. **微信群自动回复是第二阶段，不挡住核心。** 按 seven 的选择，发送是全自动的：代码里没有草稿、没有人工确认弹窗。回复内容只受 `skills/wechat-group-reply/SKILL.md` 约束。系统级熔断另算，而且不能被 skill 关掉：见到「操作频繁 / 风控 / 验证码」立刻停、不重试；有频率上限；只有调用方声明屏幕上出现了完整的新气泡，才把这一次计为发送成功。微信逻辑不进核心服务，skill 可插拔。
 
 ## 决策与理由
