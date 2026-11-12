@@ -13,7 +13,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-from . import vision
+from . import screen_compare, vision
 from .device import RELEASE_TIMEOUT, Device, DeviceError, exchange_timing
 from .operation import OPERATION_TIMEOUT, bounded_operation, check_operation, shield_cleanup
 from .screen import FrameSnapshot
@@ -76,8 +76,11 @@ POINTER_WAIT = 2.5      # seconds per direction (nudge, then the way back), neve
 REPLAY_LAG = 5          # seconds
 CATCH_UP_WAIT = 15      # leave time for verification and a response inside the total operation budget
 AIM_TOLERANCE = 0.008   # screen fraction; a bigger miss is corrected before pressing
-MAX_MISS = 0.06         # bigger misses are still corrected, but not learned from (they may be misreadings)
+MAX_MISS = 0.06         # larger misses may be misreadings; never correct or learn from them
 USB_PACE = 3            # firmware HID_PACE_USB. A saved file with no pace number is this schedule.
+TAP_POINTER_WAIT = 0.12  # opportunistic disc check; a late/hidden pointer uses the calibrated landing
+TAP_EFFECT_WAIT = 1.75  # one mirror-lag window after the click; no automatic retry
+WAKE_NUDGE = 2
 
 
 class Phone:
@@ -102,6 +105,11 @@ class Phone:
         # a straight-line fit through them corrects every later move, so taps get better as the agent works
         seen = body.get("seen", {})
         self._seen = {axis: deque(map(tuple, seen.get(axis, [])), maxlen=12) for axis in ("x", "y")}
+        self._pointer_seen = False
+        self._pointer_spots = ()
+        self._clock = None  # board millis minus monotonic millis
+        self._clock_link = None
+        self.last_tap = None
 
     @property
     def calibrated(self) -> bool:
@@ -196,7 +204,8 @@ class Phone:
         return span, origin
 
     async def _find_pointer(self, near: tuple[float, float] | None = None,
-                            conservative: bool = False, epoch: int | None = None) -> tuple[float, float] | None:
+                            conservative: bool = False, epoch: int | None = None,
+                            quick: bool = False) -> tuple[float, float] | None:
         """Wiggle the pointer and find where it rests (the span may still be unknown).
 
         The mirror lags and stays silent while the screen is still, so the frame taken before the nudge may
@@ -206,6 +215,8 @@ class Phone:
         """
         if epoch is None:
             epoch = getattr(self.device, "abort_epoch", 0)
+        if quick:
+            return await self._quick_pointer(near, epoch)
         clock = await self._catch_up(epoch)
         await self._wait_screen(epoch, self.screen.settled(
             quiet=0.2, least=0.3, most=1.5, transport=conservative))
@@ -224,6 +235,66 @@ class Phone:
             # the nudge was not seen: the pointer rests where the way back leaves it
             found = await self._watch(epoch, history, near, -shift, back, conservative, False, clock)
         return found if found and 0.03 < found[0] < 0.97 and 0.03 < found[1] < 0.97 else None
+
+    async def _quick_pointer(self, near: tuple[float, float], epoch: int) -> tuple[float, float] | None:
+        """Wake the pointer; only a local pair of moving discs can justify a correction."""
+        started = time.monotonic()  # point() has finished; earlier captures cannot describe this landing
+        clock = self._clock
+        if clock is None or self._clock_link != getattr(self.device, "links", 0):
+            clock = await self._board_clock()
+        age = self._frame_age(clock)
+        if age is not None and age > REPLAY_LAG:
+            raise DeviceError("画面还在重放旧视频，请稍后再试。")
+        history = []
+        frame_ts = getattr(self.screen, "frame_ts", None)
+        if (clock is not None and frame_ts is not None
+                and self._board_delta(frame_ts, started * 1000 + clock) >= 0):
+            history.append((self.screen.frame, frame_ts))
+        nudge = WAKE_NUDGE if near[0] < 0.9 else -WAKE_NUDGE
+        position, self._pos = self._pos, None
+        since = time.time()  # screen.fresh compares wall-clock updated
+        nudged = await self._send(epoch, f"move {nudge} 0")
+        back = await self._send(epoch, f"move {-nudge} 0")
+        self._pos = position
+        if clock is None or frame_ts is None or (age is not None and age >= TAP_POINTER_WAIT):
+            return None  # no capture timing, or mirror too late to relate a pair to this wake
+        moved_at, nudged_at, back_at = (stamp * 1000 + clock for stamp in (started, nudged, back))
+        deadline = time.monotonic() + TAP_POINTER_WAIT
+        shift = nudge / self.span["w"]
+        while time.monotonic() < deadline:
+            if self._stopped(epoch):
+                raise DeviceError("已紧急停止，后面的内容没有发出。")
+            after = await self.screen.fresh(since, min(.05, max(0, deadline - time.monotonic())))
+            if after:
+                since = self.screen.updated
+                age = self._frame_age(clock)
+                if age is not None and age > REPLAY_LAG:
+                    raise DeviceError("画面还在重放旧视频，请稍后再试。")
+                captured = getattr(self.screen, "frame_ts", None)
+                if captured is None or self._board_delta(captured, moved_at) < 0:
+                    continue
+                for before, before_ts in history[-2:]:
+                    if self._board_delta(captured, before_ts) <= 0:
+                        continue
+                    outward = (self._board_delta(nudged_at, before_ts) > 0
+                               and self._board_delta(captured, nudged_at) >= 0
+                               and self._board_delta(back_at, captured) > 0)
+                    inward = (self._board_delta(before_ts, nudged_at) >= 0
+                              and self._board_delta(back_at, before_ts) > 0
+                              and self._board_delta(captured, back_at) >= 0)
+                    if outward:
+                        direction = 1
+                    elif inward:
+                        direction = -1
+                    else:
+                        continue  # both frames on one side of the wake, or missed its outward leg
+                    moved = vision.pointer_move(before, after, near, direction * shift,
+                                                (MAX_MISS + .03, MAX_MISS + .02), strict=True)
+                    if moved:
+                        return moved[0] if direction == 1 else moved[1]
+                history.append((after, captured))
+            await asyncio.sleep(0.005)
+        return None
 
     async def _watch(self, epoch: int, history: list, near, shift: float, since: float,
                      conservative: bool, at_start: bool, clock: float | None = None) -> tuple[float, float] | None:
@@ -281,7 +352,9 @@ class Phone:
             with exchange_timing() as timing:
                 up = json.loads(await query("status"))["up"]
             sent = timing.sent_at if timing.sent_at is not None else sent
-            return up + 1 - sent * 1000  # millis() truncates: include its sub-millisecond uncertainty
+            self._clock = up + 1 - sent * 1000  # millis() truncates: include its sub-millisecond uncertainty
+            self._clock_link = getattr(self.device, "links", 0)
+            return self._clock
         except (DeviceError, OSError, ValueError, KeyError, TypeError) as exc:
             raise DeviceError("无法确认画面对应的板子时间；没有继续验证或点击，请重试。") from exc
 
@@ -424,36 +497,80 @@ class Phone:
 
     @bounded_operation
     async def point_verified(self, x: float, y: float) -> tuple[float, float]:
-        """Locate and correct the real pointer; never silently accept a blind move."""
+        """Use calibrated landings, correcting at most once from a plausible visible disc."""
         if self.screen is None or not self.screen.live:
             raise RuntimeError("live screen required to locate pointer")
-        cold = (self._pos is None or self._moves >= REHOME_EVERY
-                or self._link != getattr(self.device, "links", self._link))
-        await self.point(x, y)
-        for attempt in range(3):
-            found = (await self._find_pointer((x, y), conservative=True) if cold or attempt == 2
-                     else await self._find_pointer((x, y)))
-            if found is None:
-                continue
-            fx, fy = found
-            if attempt == 0 and self.span and max(abs(fx - x), abs(fy - y)) <= MAX_MISS:
-                # long moves go further than the calibration stops (iOS accelerates): 422 units across landed
-                # 30 px right of the fit on the 15 Pro Max; learn it so the next move starts closer
-                self._seen["x"].append((self._fix(x, "x"), fx))
-                self._seen["y"].append((self._fix(y, "y"), fy))
-                self._save()
-            if abs(fx - x) <= AIM_TOLERANCE and abs(fy - y) <= AIM_TOLERANCE:
-                return found
-            dx, dy = round((x - fx) * self.span["w"]), round((y - fy) * self.span["h"])
-            await self._command(f"move {dx} {dy}")
-            self._pos = (self._pos[0] + dx, self._pos[1] + dy)
-        raise RuntimeError("pointer could not be verified; no click sent; observe or recalibrate")
+        epoch = getattr(self.device, "abort_epoch", 0)
+        self._pointer_seen = False
+        self._pointer_spots = ((x, y),)
+        found = await self._find_pointer((x, y), epoch=epoch, quick=True)
+        if found is None or not all(abs(f - t) <= MAX_MISS for f, t in zip(found, (x, y), strict=True)):
+            return x, y
+        self._pointer_seen = True
+        self._pointer_spots += (found,)
+        fx, fy = found
+        self._seen["x"].append((self._fix(x, "x"), fx))
+        self._seen["y"].append((self._fix(y, "y"), fy))
+        self._save()
+        if abs(fx - x) <= AIM_TOLERANCE and abs(fy - y) <= AIM_TOLERANCE:
+            return found
+        dx, dy = round((x - fx) * self.span["w"]), round((y - fy) * self.span["h"])
+        position, self._pos = self._pos, None
+        await self._send(epoch, f"move {dx} {dy}")
+        self._pos = (position[0] + dx, position[1] + dy)
+        return x, y
+
+    def _pointer_position(self) -> tuple[float, float] | None:
+        if self._pos is None or self.span is None:
+            return None
+        return (self.origin["x"] + self._pos[0] / self.span["w"],
+                self.origin["y"] + self._pos[1] / self.span["h"])
 
     @bounded_operation
-    async def tap_verified(self, x: float, y: float) -> None:
+    async def tap_verified(self, x: float, y: float) -> dict:
+        """Click once even if iOS hides the disc, then report visible evidence without retrying."""
+        began = time.monotonic()
+        epoch = getattr(self.device, "abort_epoch", 0)
+        previous = self._pointer_spots + tuple(p for p in (self._pointer_position(),) if p is not None)
+        hover = self._pointer_spots[:1] + ((x, y),)
+        self._pointer_seen = False
+        self.last_tap = None
         await self.point_verified(x, y)
-        await self._command("click")
-        await asyncio.sleep(TAP_GAP)
+        before = getattr(self.screen, "frame", None)
+        sent = time.time()
+        self._click_mono = await self._send(epoch, "click")
+        ignore = previous + self._pointer_spots + ((x, y),)
+        changed, fresh = await self._tap_effect(before, sent, epoch, ignore, hover)
+        result = {"clicked": True, "pointer_seen": self._pointer_seen, "screen_changed": changed,
+                  "fresh": fresh, "latency": round(time.monotonic() - began, 3),
+                  "warning": None if changed else "已点击，但等待窗口内未见画面变化；请观察后再操作，勿自动重试。"}
+        self.last_tap = result
+        return result
+
+    async def _tap_effect(self, before, since: float, epoch: int, ignore: tuple, hover: tuple) -> tuple[bool, bool]:
+        if before is None:
+            return False, False
+        deadline = time.monotonic() + TAP_EFFECT_WAIT
+        # _clock is board millis minus monotonic millis, not wall-clock millis.
+        click_mono = getattr(self, "_click_mono", None)
+        clicked_at = click_mono * 1000 + self._clock if self._clock is not None and click_mono is not None else None
+        fresh = False
+        while time.monotonic() < deadline:
+            if self._stopped(epoch):
+                raise DeviceError("已紧急停止，后面的内容没有发出。")
+            after = await self.screen.fresh(since, min(.1, max(0, deadline - time.monotonic())))
+            if after is not None and self.screen.updated > since:
+                fresh = True
+                since = self.screen.updated
+                frame_ts = getattr(self.screen, "frame_ts", None)
+                if (clicked_at is not None and frame_ts is not None
+                        and self._board_delta(frame_ts, clicked_at) < 0):
+                    before = after
+                    continue  # received after the click, but captured before it
+                if screen_compare.effect_changed(before, after, ignore=ignore, hover=hover):
+                    return True, True
+            await asyncio.sleep(.005)
+        return False, fresh
 
     async def _aim(self, x: float, y: float) -> None:
         """Closed loop: find the real pointer on screen, fix a miss, and learn the error for later moves."""
@@ -463,6 +580,8 @@ class Phone:
             return
         fx, fy = found
         log.debug("aim (%.3f, %.3f): pointer at (%.3f, %.3f)", x, y, fx, fy)
+        if not all(abs(f - t) <= MAX_MISS for f, t in zip(found, (x, y), strict=True)):
+            return
         if max(abs(fx - x), abs(fy - y)) <= MAX_MISS:  # learn from normal drift only, never from a stray reading
             self._seen["x"].append((self._fix(x, "x"), fx))
             self._seen["y"].append((self._fix(y, "y"), fy))

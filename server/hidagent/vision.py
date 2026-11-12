@@ -43,7 +43,7 @@ def pointer(before: bytes, after: bytes, near: tuple[float, float], shift: float
 
 
 def pointer_move(before: bytes, after: bytes, near: tuple[float, float], shift: float,
-                 reach: tuple[float, float] = (0.12, 0.08)):
+                 reach: tuple[float, float] = (0.12, 0.08), *, strict: bool = False):
     """The pointer in `before` and in `after` ((x, y), (x, y)), given it was nudged by about `shift`.
 
     First the moved disc: a small round blob of one flat colour that sits in both frames, displaced
@@ -84,7 +84,7 @@ def pointer_move(before: bytes, after: bytes, near: tuple[float, float], shift: 
                         best = (score, (ax, ay), (bx, by))
     if best:
         return best[1], best[2]
-    if saw_disc:  # a round blob changed, but not as a nudge: an older frame, or something else moving
+    if saw_disc or strict:  # corrections require a paired disc, never just changed pixels
         return None
     return _centroid_move(diff, box, w, h, shift)
 

@@ -204,7 +204,7 @@ def test_partial_repeat_failure_stops_without_replaying():
     assert result["error"] and result["action_may_have_executed"]
 
 
-def test_verified_tap_corrects_drift_and_never_clicks_when_pointer_unseen(tmp_path):
+def test_verified_tap_corrects_drift_and_clicks_once_when_pointer_unseen(tmp_path):
     commands = []
 
     async def send(command): commands.append(command)
@@ -217,41 +217,42 @@ def test_verified_tap_corrects_drift_and_never_clicks_when_pointer_unseen(tmp_pa
         positions = iter(found)
         async def locate(near, **kwargs): return next(positions)
         phone._find_pointer = locate
-        await phone.tap_verified(.5, .5)
+        return await phone.tap_verified(.5, .5)
 
     asyncio.run(scenario([(.55, .45), (.5, .5)]))
     assert commands == ["move -20 40", "click"]
     commands.clear()
-    with pytest.raises(RuntimeError, match="no click"):
-        asyncio.run(scenario([None, None, None]))
-    assert not commands
+    result = asyncio.run(scenario([None]))
+    assert commands == ["click"]
+    assert result["clicked"] and not result["pointer_seen"] and not result["screen_changed"]
 
 
-def test_verified_tap_uses_conservative_last_attempt_before_click(tmp_path):
+def test_verified_tap_checks_once_before_using_calibrated_position(tmp_path):
     async def scenario():
         commands, attempts = [], []
         async def send(command): commands.append(command)
         phone = Phone(SimpleNamespace(send=send), tmp_path / "calibration", Screen())
         phone._pos = (200, 400)
         async def point(x, y): pass
-        async def locate(near, conservative=False):
-            attempts.append(conservative)
-            return (.5, .5) if conservative else None
+        async def locate(near, quick=False, **kwargs):
+            attempts.append(quick)
+            return None
         phone.point, phone._find_pointer = point, locate
         await phone.tap_verified(.5, .5)
-        assert attempts == [False, False, True]
+        assert attempts == [True]
         assert commands == ["click"]
     asyncio.run(scenario())
 
 
-def test_cold_pointer_initialization_preserves_conservative_frame_drain(tmp_path):
+def test_cold_pointer_initialization_uses_bounded_pointer_check(tmp_path):
     async def scenario():
         attempts = []
         async def send(command): pass
         phone = Phone(SimpleNamespace(send=send), tmp_path / "calibration", Screen())
+        phone.span = {"w": 400, "h": 800}
         async def point(x, y): phone._pos = (200, 400)
-        async def locate(near, conservative=False):
-            attempts.append(conservative)
+        async def locate(near, quick=False, **kwargs):
+            attempts.append(quick)
             return (.5, .5)
         phone.point, phone._find_pointer = point, locate
         await phone.tap_verified(.5, .5)

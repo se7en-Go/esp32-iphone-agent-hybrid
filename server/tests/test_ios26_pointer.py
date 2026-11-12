@@ -215,11 +215,11 @@ def test_verified_tap_clicks_on_the_real_pointer_with_a_slow_mirror(tmp_path, mo
     monkeypatch.setattr(time, "time", lambda: -10_000)  # wall-clock corrections cannot affect frame ordering
     phone = Phone(mirror, tmp_path / "calibration.json", mirror)
     assert asyncio.run(phone.start_calibration())
-    phone._pos = None  # cold: re-homed before the move, then the conservative check
+    phone._pos = None  # cold: re-home, then use calibration if the disc arrives too late
     mirror.sent.clear()
     asyncio.run(phone.tap_verified(463.5 / W, 371.3 / H))
     assert mirror.sent[0] == "home" and mirror.sent[-1] == "click"
-    assert mirror.sent.count("move 12 0") == mirror.sent.count("move -12 0") >= 1
+    assert mirror.sent.count("move 2 0") == mirror.sent.count("move -2 0") == 1
 
 
 class ReplayingMirror(MirrorPhone):

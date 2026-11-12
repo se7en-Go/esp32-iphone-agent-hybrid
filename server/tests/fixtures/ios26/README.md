@@ -19,3 +19,8 @@ origin (0.127, -0.001):
 | live_tap_landed_nudged.jpg | + `move 12 0` | (580.7, 663.6) |
 | live_tap_corrected.jpg | after the correction `move -28 -37` | (540.5, 624.0) |
 | live_tap_corrected_nudged.jpg | + `move 12 0` | (545.6, 624.0): the same nudge moved only 5.1 px |
+
+`keypad_no_disc.jpg`: `/workspace/hybrid-ptr/dial_final.jpg`, resized to 360x780, JPEG quality 85.
+Real Phone keypad showing the completed dial test; no visible pointer disc. Tests draw explicit
+synthetic highlights, clock changes and digit changes on this image; the capture alone does not
+establish whether the missing disc was faded or morphed into a control highlight.

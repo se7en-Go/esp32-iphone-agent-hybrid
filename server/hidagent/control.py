@@ -12,7 +12,7 @@ import uuid
 from PIL import Image
 from pypinyin import lazy_pinyin
 
-from . import vision
+from . import screen_compare, vision
 
 
 class Controls:
@@ -49,7 +49,7 @@ class Controls:
         if time.monotonic() - ticket[1] > 30:
             raise ValueError("screen_id expired; observe again")
         frame, width, height = self.capture()
-        if (width, height) != ticket[3:] or vision.changed(ticket[2], frame):
+        if (width, height) != ticket[3:] or screen_compare.observation_changed(ticket[2], frame):
             raise ValueError("screen changed since observation; observe again")
         return ticket[2], width, height
 
@@ -110,10 +110,13 @@ class Controls:
         name = planned["name"]
         extra = planned["extra"]
         if name == "tap":
-            await self.phone.tap_verified(*planned["xy"])
+            result = await self.phone.tap_verified(*planned["xy"])
+            if result is not None:
+                extra.update(result)
         elif name == "point":
             located = await self.phone.point_verified(*planned["xy"])
             extra["pointer"] = {"x": located[0], "y": located[1]}
+            extra["pointer_seen"] = getattr(self.phone, "_pointer_seen", False)
         elif name == "swipe":
             x1, y1, x2, y2 = planned["swipe"]
             await self.phone.swipe(x1, y1, x2, y2)
@@ -136,9 +139,11 @@ class Controls:
 
     async def _respond(self, before, started, began, ready, acknowledged, error, extra):
         device_done = time.perf_counter()
-        fresh = await self.screen.fresh(started, 1.5)
+        tap_checked = "screen_changed" in extra
+        fresh = extra["fresh"] if tap_checked else await self.screen.fresh(started, 1.5)
         fresh_done = time.perf_counter()
-        await self.screen.settled(least=0.3, most=2)
+        if not tap_checked:
+            await self.screen.settled(least=0.3, most=2)
         settled_done = time.perf_counter()
         try:
             shot = self.observation()
@@ -150,7 +155,8 @@ class Controls:
                    "wait_fresh": fresh_done - device_done, "wait_settled": settled_done - fresh_done,
                    "capture": captured - settled_done, "total": captured - began}
         return {**shot, "command_acknowledged": acknowledged, "fresh": bool(fresh),
-                "changed": vision.changed(before, self.screen.frame) if fresh else None,
+                "changed": extra["screen_changed"] if tap_checked else (
+                    vision.changed(before, self.screen.frame) if fresh else None),
                 "effect_verified": False, "error": error, "action_may_have_executed": True,
                 "verification_required": "Inspect the returned image. Never retry a send automatically.",
                 "timing_ms": {key: round(value * 1000, 1) for key, value in timings.items()}, **extra}
@@ -180,7 +186,7 @@ class Controls:
         try:
             for plan in plans:
                 await self._execute(plan)
-                done.append({"action": plan["name"], "ok": True})
+                done.append({"action": plan["name"], "ok": True, **plan["extra"]})
             acknowledged = True
         except (RuntimeError, OSError) as exc:
             error = str(exc)

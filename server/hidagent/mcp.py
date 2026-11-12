@@ -68,14 +68,14 @@ def create_server(url: str | None = None):
     def iphone_point(x: float, y: float, screen_id: str,
                      coordinate_space: Literal["normalized", "pixels"] = "normalized"
                      ) -> list[TextContent | ImageContent]:
-        """Move and visually verify pointer without clicking; failure never falls back to blind clicking."""
+        """Move without clicking; pointer_seen says whether the calibrated landing was visually checked."""
         return action("point", screen_id, x=x, y=y, coordinate_space=coordinate_space)
 
     @mcp.tool()
     def iphone_tap(x: float, y: float, screen_id: str,
                    coordinate_space: Literal["normalized", "pixels"] = "normalized"
                    ) -> list[TextContent | ImageContent]:
-        """Verify pointer position then click once; inspect returned image for actual target effect."""
+        """Click once using calibration; report pointer_seen, screen_changed and latency. Never auto-retry."""
         return action("tap", screen_id, x=x, y=y, coordinate_space=coordinate_space)
 
     @mcp.tool()
