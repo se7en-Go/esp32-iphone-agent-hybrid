@@ -83,7 +83,11 @@ def build_only() -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="把 N16R8 固件刷进标着 COM 的口。",
-        epilog="这份固件同时保留 USB HID，并增加蓝牙 HID。选哪种用 scripts/hid-mode.sh 或 hid-mode.ps1。蓝牙 HID 还没有在真机上验证。",
+        epilog=(
+            "这份固件同时保留 USB HID，并增加蓝牙 HID。"
+            "选哪种用 scripts/hid-mode.sh 或 hid-mode.ps1。"
+            "蓝牙 HID 还没有在真机上验证。"
+        ),
     )
     parser.add_argument("--port", default="", help="例如 COM5 或 /dev/cu.usbserial-…。留空则自动找 CH343/FTDI/CP210x")
     parser.add_argument("--bin", default="", help="merged.bin 的路径。留空则用 hardware/dist 里的预编译文件")
