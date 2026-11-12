@@ -3,10 +3,18 @@ import asyncio
 import time
 
 import pytest
+from fake_clock import ManualClock
 from test_verified_tap import KEYPAD, LaggingMirror, calibrated_phone, keypad_edit
 
 from hidagent import freshness
 from hidagent.device import Device
+
+
+@pytest.fixture(autouse=True)
+def paced_clock(monkeypatch):
+    clock = ManualClock()
+    clock.install(monkeypatch)
+    return clock
 
 
 def test_board_receipt_timestamp_does_not_make_queued_preclick_image_evidence():
@@ -62,7 +70,10 @@ def test_click_rechecks_after_real_device_lock_wait(tmp_path, transition):
         task = asyncio.create_task(phone.tap_verified(.5, .44, target_frame=KEYPAD,
                                   target_box=(.4, .3, .6, .6)))
         await positioned.wait()
-        await asyncio.sleep(.02)
+        while not device._lock._waiters:
+            if task.done():
+                raise AssertionError(await task)
+            await asyncio.sleep(0)
         if transition == 'content':
             view.frame = keypad_edit(digit=True)
         elif transition == 'generation':
@@ -127,13 +138,24 @@ def test_receipt_stamped_preclick_change_is_not_tap_evidence(tmp_path, monkeypat
     monkeypatch.setattr(phone_module, 'TAP_EFFECT_WAIT', .02)
     view = LaggingMirror(.031, keypad_edit(digit=True), paced=True)
     original_send = view.send
+    receipts = []
+    original_fresh = view.fresh
 
     async def send(command):
         await original_send(command)
         if command == 'click' and later_evidence:
+            # Virtual firmware completion precedes both receipts. The second is
+            # beyond the full mirror lag and inside the unchanged effect budget.
             view.pending.append((time.monotonic() + .07, view.effect))
 
+    async def fresh(since, timeout):
+        result = await original_fresh(since, timeout)
+        if result is not None:
+            receipts.append(view.frame_ts)
+        return result
+
     view.send = send
+    view.fresh = fresh
     phone = calibrated_phone(tmp_path, view)
     phone._clock, phone._clock_link = 0, 0
     phone._pos = (phone._dx(.5), phone._dy(.44))
@@ -145,6 +167,9 @@ def test_receipt_stamped_preclick_change_is_not_tap_evidence(tmp_path, monkeypat
     assert result['effect_observed'] is (True if later_evidence else None)
     assert result['screen_changed'] is later_evidence and result['effect_verified'] is False
     assert view.commands == ['click']
+    deltas = [freshness.board_delta(stamp, result['completed_at'] * 1000) for stamp in receipts]
+    assert deltas == pytest.approx([31, 70] if later_evidence else [31], abs=.001)
+    assert (deltas[-1] >= freshness.MIRROR_LAG_SECONDS * 1000) is later_evidence
 
 
 def test_idle_refresh_timeout_is_bounded_and_serializes_normal_keys(tmp_path, monkeypatch):
@@ -157,11 +182,25 @@ def test_idle_refresh_timeout_is_bounded_and_serializes_normal_keys(tmp_path, mo
         view = LaggingMirror()
         view.updated -= 20
         phone = calibrated_phone(tmp_path, view)
+        nudged, resume = asyncio.Event(), asyncio.Event()
+        original_send = view.send
+
+        async def send(command):
+            await original_send(command)
+            if command == 'move 2 0':
+                nudged.set()
+                await resume.wait()
+
+        view.send = send
         refresh = asyncio.create_task(phone.ensure_observation())
-        await asyncio.sleep(.005)
+        await nudged.wait()
         key = asyncio.create_task(phone.key('tab'))
-        await asyncio.sleep(.01)
+        while not phone._interaction_lock._waiters:
+            if key.done():
+                raise AssertionError(await key)
+            await asyncio.sleep(0)
         assert not key.done() and view.commands == ['move 2 0']
+        resume.set()
         with pytest.raises(RuntimeError, match='新鲜'):
             await refresh
         await key

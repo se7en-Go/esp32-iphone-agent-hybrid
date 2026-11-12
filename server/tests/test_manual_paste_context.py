@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+from fake_clock import ManualClock
 from test_control_input_context import Link
 from test_controls import jpeg
 
@@ -20,6 +21,9 @@ from hidagent.screen import Screen
 
 
 def test_manual_paste_waits_for_delayed_original_context(tmp_path, monkeypatch):
+    clock = ManualClock()
+    clock.install(monkeypatch)
+
     async def respond(_before, _completed, _began, _ready, acknowledged, error, *_args):
         return {"command_acknowledged": acknowledged, "error": error}
 
@@ -48,14 +52,20 @@ def test_manual_paste_waits_for_delayed_original_context(tmp_path, monkeypatch):
                     screen._on_jpeg(jpeg("black"))  # dismissed alert still visible in the mirror
                     clipboard.acknowledge(token, copied=True, focused=True)
                     confirmed = time.monotonic()
-                    await asyncio.sleep(.8)
-                    if task.done():
-                        raise AssertionError(await task)
-                    screen._on_jpeg(original)
+                    restored = asyncio.Event()
+
+                    def restore_original():
+                        assert not task.done()
+                        assert clipboard.status(token)["paste_sent"] is False
+                        screen._on_jpeg(original)
+                        restored.set()
+
+                    clock.call_later(.8, restore_original)
                     while not clipboard.status(token)["paste_sent"]:
                         if task.done():
                             raise AssertionError(await task)
                         await asyncio.sleep(.005)
+                    assert restored.is_set()
                     assert time.monotonic() - confirmed >= .8
                     clipboard.complete(token, pasted=True)
 
@@ -139,6 +149,9 @@ def test_manual_paste_refuses_ineligible_or_expired_context(tmp_path, monkeypatc
 
 
 def test_restored_manual_paste_revalidates_after_device_lock_wait(tmp_path, monkeypatch):
+    clock = ManualClock()
+    clock.install(monkeypatch)
+
     async def respond(_before, _completed, _began, _ready, acknowledged, error, *_args):
         return {"command_acknowledged": acknowledged, "error": error}
 
@@ -165,9 +178,14 @@ def test_restored_manual_paste_revalidates_after_device_lock_wait(tmp_path, monk
             clipboard.fetch(token)
             screen._on_jpeg(jpeg("black"))
             clipboard.acknowledge(token, copied=True, focused=True)
-            await asyncio.sleep(.8)
-            assert not task.done()
-            screen._on_jpeg(original)
+            restored = asyncio.Event()
+
+            def restore_original():
+                assert not task.done()
+                screen._on_jpeg(original)
+                restored.set()
+
+            clock.call_later(.8, restore_original)
 
             async def waiting():
                 while not device._lock._waiters:
@@ -176,6 +194,7 @@ def test_restored_manual_paste_revalidates_after_device_lock_wait(tmp_path, monk
                     await asyncio.sleep(.005)
 
             await asyncio.wait_for(waiting(), 1)
+            assert restored.is_set()
             screen._on_jpeg(jpeg("black"))
             device._lock.release()
             result = await asyncio.wait_for(task, 1)

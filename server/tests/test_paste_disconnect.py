@@ -112,9 +112,8 @@ def test_http_disconnect_invalidates_paste_token(tmp_path, monkeypatch, path, ph
                 if phase == "ack_race":
                     raced = await client.post(item["ack_url"], json={"copied": True, "focused": True})
                     assert raced.status_code in (200, 404)
-                await asyncio.sleep(.05)
-                assert provider._pending is None
                 await asyncio.wait_for(request_task, 1)
+                assert provider._pending is None
                 assert original.text is None
                 assert not module.manual_lock.locked()
                 assert (await client.get(item["text_url"])).status_code == 404

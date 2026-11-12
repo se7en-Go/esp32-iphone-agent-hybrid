@@ -5,6 +5,7 @@ import json
 import time
 
 import pytest
+from fake_clock import ManualClock
 from test_assistive_fallback import Device, Screen, make_phone
 from test_ios26_pointer import MirrorPhone, frame
 
@@ -142,7 +143,10 @@ def test_watch_keeps_operation_boundary_separate_from_receive_cursor(tmp_path):
     asyncio.run(run())
 
 
-def test_watch_accepts_eligible_motion_after_rejecting_a_queued_frame(tmp_path):
+def test_watch_accepts_eligible_motion_after_rejecting_a_queued_frame(tmp_path, monkeypatch):
+    manual_clock = ManualClock()
+    manual_clock.install(monkeypatch)
+
     async def run():
         mirror = QueuedCalibration()
         mirror.pos = (150, 150)

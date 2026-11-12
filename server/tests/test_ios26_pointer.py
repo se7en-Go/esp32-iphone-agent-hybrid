@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fake_clock import ManualClock
 from PIL import Image, ImageEnhance
 
 from hidagent import freshness
@@ -401,6 +402,8 @@ def test_a_frame_from_before_the_actual_serial_write_cannot_verify_a_queued_nudg
     """Device.send may queue behind a serial exchange; the command boundary is link.write, not its caller."""
     from hidagent.device import Device
 
+    clock = ManualClock()
+    clock.install(monkeypatch)
     monkeypatch.setattr(phone_module, "POINTER_WAIT", .05)
     calibration = tmp_path / "calibration.json"
     calibration.write_text(json.dumps({"w": 678, "h": 1466, "x0": .1273, "y0": -.0006}))
@@ -451,12 +454,16 @@ def test_a_frame_from_before_the_actual_serial_write_cannot_verify_a_queued_nudg
 
         async def replay_while_queued():
             try:
-                await asyncio.sleep(.02)
+                while not device._lock._waiters:
+                    if watch.done():
+                        raise AssertionError(await watch)
+                    await asyncio.sleep(0)
+                clock.advance(.02)
                 timestamp = board_ms()
                 screen._on_ts(timestamp)
                 screen._on_jpeg(frame("live_tap_corrected_nudged"))
                 replayed.append(timestamp)
-                await asyncio.sleep(.02)
+                clock.advance(.02)
             finally:
                 device._lock.release()
 
@@ -469,8 +476,9 @@ def test_a_frame_from_before_the_actual_serial_write_cannot_verify_a_queued_nudg
         screen.settled = settle_and_queue
         screen._on_ts(board_ms() - 4200)
         screen._on_jpeg(frame("live_tap_corrected"))
+        watch = asyncio.create_task(phone._find_pointer((.75, .40)))
         try:
-            found = await phone._find_pointer((.75, .40))
+            found = await watch
         finally:
             await asyncio.gather(*producers)
         nudge_writes = [timestamp for command, timestamp in link.written if command == "move 12 0"]

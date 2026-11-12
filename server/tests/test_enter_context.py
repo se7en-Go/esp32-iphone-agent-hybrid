@@ -8,6 +8,7 @@ from datetime import datetime
 
 import httpx
 import pytest
+from fake_clock import ManualClock
 from PIL import Image
 
 from hidagent import ocr
@@ -164,8 +165,10 @@ def test_changed_or_expired_evidence_refuses_at_actual_write(setup, monkeypatch,
     from hidagent import enter_context
 
     module, guard, link, screen, _boxes = setup
+    clock = ManualClock(monotonic=time.monotonic())
     if change == "expiry":
         monkeypatch.setattr(enter_context, "ENTER_EVIDENCE_TTL", .01)
+        monkeypatch.setattr(enter_context, "time", clock)
 
     async def scenario():
         validate = await enter_context.verify_enter_context(screen, screen.frame, "navigation")
@@ -178,7 +181,7 @@ def test_changed_or_expired_evidence_refuses_at_actual_write(setup, monkeypatch,
             elif change == "stale":
                 screen.updated -= 10
             else:
-                await asyncio.sleep(.02)
+                clock.advance(.02)
             with pytest.raises(DeviceError):
                 with fence:
                     link.write(b"1 key enter\n")

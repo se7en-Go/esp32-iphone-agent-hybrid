@@ -2,6 +2,7 @@ import asyncio
 import io
 import time
 
+from fake_clock import ManualClock
 from PIL import Image
 
 from hidagent.screen import Screen
@@ -13,74 +14,68 @@ def frame(color):
     return buffer.getvalue()
 
 
-def test_repeated_identical_video_frames_do_not_force_maximum_wait():
+def test_repeated_identical_video_frames_do_not_force_maximum_wait(monkeypatch):
+    clock = ManualClock()
+    clock.install(monkeypatch)
+
     async def scenario():
         screen = Screen()
         screen.frame = frame("white")
 
-        async def duplicate_frames():
-            while True:
-                screen.updated = time.time()
-                screen.frame = bytes(bytearray(screen.frame))
-                await asyncio.sleep(.01)
+        def duplicate_frame():
+            screen.updated = time.time()
+            screen.frame = bytes(bytearray(screen.frame))
+            clock.call_later(.01, duplicate_frame)
 
-        task = asyncio.create_task(duplicate_frames())
-        try:
-            started = time.monotonic()
-            await screen.settled(quiet=.05, least=.01, most=.3)
-            assert .04 <= time.monotonic() - started < .2
-        finally:
-            task.cancel()
+        clock.call_later(.01, duplicate_frame)
+        started = time.monotonic()
+        await screen.settled(quiet=.05, least=.01, most=.3)
+        assert .04 <= time.monotonic() - started < .2
     asyncio.run(scenario())
 
 
-def test_real_content_change_restarts_quiet_window():
+def test_real_content_change_restarts_quiet_window(monkeypatch):
+    clock = ManualClock()
+    clock.install(monkeypatch)
+
     async def scenario():
         screen = Screen()
         screen.frame = frame("white")
 
-        async def change():
-            await asyncio.sleep(.03)
+        def change():
             screen.frame = frame("black")
             screen.updated = time.time()
 
-        task = asyncio.create_task(change())
+        clock.call_later(.03, change)
         started = time.monotonic()
         await screen.settled(quiet=.06, least=.01, most=.4)
         assert time.monotonic() - started >= .10
-        await task
     asyncio.run(scenario())
 
 
-def test_animation_still_obeys_maximum_wait():
+def test_animation_still_obeys_maximum_wait(monkeypatch):
+    clock = ManualClock()
+    clock.install(monkeypatch)
+
     async def scenario():
         screen = Screen()
         screen.frame = frame("white")
 
-        async def animate():
-            # A black/white toggle can land back on the frame last sampled.
-            # Windows sleeps in ~15.6ms ticks, so the 40ms flip and the 50ms
-            # poll often take an even number of flips between samples. settled
-            # then treats the screen as quiet and returns at quiet (0.15s).
-            # The 0.172s failure is that path, not a 0.2s maximum measured
-            # short: the same monotonic clock cannot take the max path before
-            # most. A new, obviously different image each step is still a
-            # change no matter how many steps fall between samples.
-            n = 0
-            while True:
-                n += 1
-                screen.frame = frame(((n * 97) % 256, (n * 57) % 256, 255 - (n * 23) % 256))
-                screen.updated = time.time()
-                await asyncio.sleep(.02)
+        n = 0
 
-        task = asyncio.create_task(animate())
-        try:
-            started = time.monotonic()
-            await screen.settled(quiet=.15, least=.01, most=.2)
-            # Stay above the quiet window. 0.19 - 0.05 would accept the 0.172s return.
-            assert .19 <= time.monotonic() - started < .4
-        finally:
-            task.cancel()
+        def animate():
+            # Each publication remains different even when several arrive between polls.
+            nonlocal n
+            n += 1
+            screen.frame = frame(((n * 97) % 256, (n * 57) % 256, 255 - (n * 23) % 256))
+            screen.updated = time.time()
+            clock.call_later(.02, animate)
+
+        clock.call_later(.02, animate)
+        started = time.monotonic()
+        await screen.settled(quiet=.15, least=.01, most=.2)
+        # Stay above the quiet window. 0.19 - 0.05 would accept the 0.172s return.
+        assert .19 <= time.monotonic() - started < .4
     asyncio.run(scenario())
 
 
@@ -129,6 +124,8 @@ def test_snapshot_wait_and_liveness_survive_wall_clock_changes(monkeypatch):
 
     from hidagent import screen as screen_module
 
+    clock = ManualClock()
+    clock.install(monkeypatch)
     wall = [time.time()]
     monkeypatch.setattr(screen_module, "time", SimpleNamespace(time=lambda: wall[0], monotonic=time.monotonic))
 
@@ -179,6 +176,8 @@ def test_legacy_fresh_timeout_uses_monotonic_clock(monkeypatch):
 
     from hidagent import screen as screen_module
 
+    clock = ManualClock()
+    clock.install(monkeypatch)
     # A frozen wall clock would make the original fresh() wait forever.
     monkeypatch.setattr(screen_module, "time", SimpleNamespace(time=lambda: 1000.0, monotonic=time.monotonic))
 
