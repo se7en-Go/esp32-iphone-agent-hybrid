@@ -222,7 +222,7 @@
 - [ ] **输入一行英文和数字。**在不会对外发送的文本框中，确认焦点和英文输入状态，用 `iphone_type` 输入 `test 123`。
   
   **通过标准：**输入内容、空格都正确，没有自动发送；需要时用 `iphone_key` 的 `backspace` 修改。  
-  **失败记录：**输入前后截图、输入法状态、工具返回。网页普通输入框和 `iphone_type` 都不是中文粘贴入口。  
+  **失败记录：**输入前后截图、输入法状态、工具返回。中文粘贴需先按 [PASTE_INPUT.md](PASTE_INPUT.md) 配置剪贴板通道。
   **出处：**`server/hidagent/mcp.py:95–118`；`server/hidagent/control.py:84–87`；`server/hidagent/app.py:243–245、458–461`。
 
 - [ ] **测试紧急停止。**在无风险控制过程中点击网页紧急停止，或调用 `stop_task()`。
@@ -231,15 +231,15 @@
   **失败记录：**停止时刻、动作返回、停止后截图及终端输出。  
   **出处：**`server/hidagent/mcp.py:232–236`；`server/hidagent/app.py:529–549`；`server/hidagent/device.py:214–224`。
 
-## 3．中文快速输入：当前是拼音输入，不是剪贴板
+## 3．中文输入：拼音路径验收
 
-**中文是按拼音打出来的**：先把汉字转成拼音，用 USB 键盘打进 iPhone 的拼音输入法，再由 Agent 看截图选候选词。不走剪贴板，也不能一次粘贴进去。README 里“短回复大约 30–60 秒”只是经验估计，不是本仓库的真机测量。
+本节验收 `iphone_compose_chinese` 的拼音路径：先把汉字转成拼音，用 USB 键盘打进 iPhone 的拼音输入法，再由 Agent 看截图选候选词。另有可选的[快捷指令粘贴路径](PASTE_INPUT.md)，配置后 `iphone_type` 可粘贴中文；复制、焦点和权限仍需真机验收。README 里“短回复大约 30–60 秒”只是经验估计，不是本仓库的真机测量。
 
 具体链路：
 
 **汉字 → `pypinyin.lazy_pinyin` 转为连续拼音 → 串口 `type` → 固件 USB 键盘 `keyboard.print` → iPhone 拼音候选 → Agent 看图选词。**
 
-`phone.py` 只负责把文本分块发给固件；转换发生在 `control.py`。`layouts.py` 只读取命名坐标，不负责拼音、选词或剪贴板。
+拼音路径由 `phone.py` 把 ASCII 分块发给固件；转换发生在 `control.py`。`layouts.py` 只读取命名坐标，不负责拼音、选词或剪贴板。
 
 出处：`server/pyproject.toml:16`；`server/hidagent/control.py:13、88–96、124–125`；`server/hidagent/phone.py:318–324`；`hardware/hid_bridge/hid_bridge.ino:125`；`server/hidagent/layouts.py:33–45`。
 
@@ -270,7 +270,7 @@
   
   **通过标准：**合法短句可完成；把标点、emoji 或混合内容塞进中文组合工具时明确报错，没有假装成功。  
   **失败记录：**原始测试文本、错误返回、最终手机截图。  
-  **明确缺口：**没有中文剪贴板粘贴、任意 Unicode 直输或 emoji 输入方案；不能直接用 `iphone_type` 输入中文标点。ASCII 标点在具体中文输入法下最终显示为何种符号，需要实测。超出该汉字范围的字也不在当前组合工具支持范围内。  
+  **范围：**未配置剪贴板通道时，`iphone_type` 只接受 ASCII；配置后可粘贴中文标点和 emoji，见 [PASTE_INPUT.md](PASTE_INPUT.md)。ASCII 标点在具体中文输入法下最终显示为何种符号，需要实测。超出该汉字范围的字仍不在拼音组合工具支持范围内。
   **出处：**`server/hidagent/control.py:84–96`；`server/hidagent/mcp.py:95–108`；`skills/wechat-group-reply/SKILL.md:27、34`。
 
 ### 3.3 测量“快不快”
@@ -462,7 +462,7 @@
 | **普通坐标点击无法识别“发送”** | 自动计费 gate 识别 Enter 和命名 `send` 的 click，普通 `iphone_tap` 点到发送键没有这个语义 | 日常使用规定的命名发送流程；不能宣称服务端能拦住所有方式的限流绕过。熔断后的 HID 拦截是另一项机制 | `server/hidagent/app.py:119–127、352–364` |
 | **风险词和气泡依赖 Agent 上报** | 服务端不自动理解截图；漏报风险词或虚报 `bubble_visible` 都可能产生错误判断 | 必须保存图像证据，不能只验返回布尔值 | `server/hidagent/mcp.py:173–204`；`guard.py:180–202、288–304` |
 | **“skill 只能加严”与代码有差异** | 代码下限是 3 秒、上限 30 次；允许 `quiet_hours: off`，并非始终固定默认 8 秒／20 次且必须夜间静默 | 以实际 skill 和 `limits_for()` 返回为准；不要把文档表述当成绝对限制 | `server/hidagent/guard.py:57–80`；`server/tests/test_guard.py:34–45` |
-| **中文输入准确率与速度** | 拼音逐字符经键盘输入，选词依赖截图；无中文剪贴板、Unicode 直输和 emoji 方案 | 输入法配置、候选准确率、多音字、标点、长句与速度全部待真机验证 | `control.py:84–96`；`phone.py:318–324`；`README.md:52` |
+| **中文输入准确率与速度** | 拼音输入保留；可选快捷指令/伴侣应用确认后粘贴 Unicode | 输入法、剪贴板权限、焦点、长句与速度待真机验证 | [粘贴输入](PASTE_INPUT.md)；`control.py`；`phone.py` |
 | **iOS 版本兼容性** | 目标版本不等于本仓库已实测；16/17 与文档列出的 iOS 27 均有未验证说明 | seven 的具体型号和版本必须单独过投屏第一关 | `README.md:46`；`docs/hardware-test.md:5、15` |
 | **USB-C 直连、Lightning 与供电** | 手机识别 HID、线材、配件权限、转换器耗电、焊盘倒灌，本仓库都没有真机证明 | 每种连接方式单独记录；USB-OTG / IN-OUT 焊盘必须断开 | `docs/hardware-test.md:9–20`；`README.md:18` |
 | **蓝牙 HID** | 配对、Just Works 绑定、重启重连、指针加速、中文输入、与 AirPlay 共用射频，都没有真机记录 | 按第 6 节逐项做。CI 绿灯不能代替 iPhone 蓝牙列表里的一次配对 | `docs/ACCEPTANCE.md` 第 6 节；`scripts/hid-mode.sh` |

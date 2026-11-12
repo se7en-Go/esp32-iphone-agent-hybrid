@@ -1,4 +1,5 @@
 import math
+import time
 
 import pytest
 
@@ -59,6 +60,9 @@ def test_actor_may_not_repeat_a_move_that_changed_nothing():
     from hidagent.debug import Trace
 
     class Screen:
+        def __init__(self):
+            self.updated = time.time()
+
         live, frame, aspect = True, b"jpeg", 0.46
 
     class Actor:
@@ -104,6 +108,9 @@ def test_agent_resumes_real_key_command_after_device_reconnects(tmp_path, monkey
     from hidagent.phone import Phone
 
     class Screen:
+        def __init__(self):
+            self.updated = time.time()
+
         live, frame, aspect = True, b"jpeg", 0.46
 
         async def settled(self):

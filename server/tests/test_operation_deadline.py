@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import uvicorn
+from fake_clock import ManualClock
 from PIL import Image
 from uvicorn.protocols.http.h11_impl import H11Protocol
 from uvicorn.server import ServerState
@@ -20,6 +21,7 @@ from hidagent import app as app_module
 from hidagent import phone as phone_module
 from hidagent.control import Controls
 from hidagent.device import Device
+from hidagent.freshness import snapshot as freshness_snapshot
 from hidagent.phone import Phone
 
 
@@ -49,12 +51,12 @@ class MemoryTransport(asyncio.Transport):
 
 class Screen:
     live = True
-    updated = 0
 
     def __init__(self):
         buffer = io.BytesIO()
         Image.new("RGB", (20, 40), "white").save(buffer, "JPEG")
         self.frame = buffer.getvalue()
+        self.updated = time.time()
 
     async def settled(self, **kwargs):
         pass
@@ -81,8 +83,8 @@ def test_tap_budget_covers_all_verification_rounds(tmp_path):
 
     async def find(*args, **kwargs):
         attempts.append(len(attempts))
-        await asyncio.sleep(0.07)
-        return (0.53, 0.53) if len(attempts) == 1 else (0.5, 0.5)
+        await asyncio.sleep(0.2)
+        return (0.5, 0.5)
 
     phone._find_pointer = find
 
@@ -93,7 +95,8 @@ def test_tap_budget_covers_all_verification_rounds(tmp_path):
         await asyncio.sleep(0.15)
         assert sent == commands
         assert "click" not in sent
-        assert len(attempts) == 2  # the second round shares the first round's budget
+        # Verified taps search once. That search uses the tap's budget, so it cannot click after the deadline.
+        assert len(attempts) == 1
 
     asyncio.run(scenario())
 
@@ -112,7 +115,7 @@ def test_cancelled_nudge_does_not_send_a_return_move(tmp_path):
             await asyncio.Event().wait()
 
         phone._catch_up, phone._watch = catch_up, watch
-        task = asyncio.create_task(phone.tap_verified(0.5, 0.5))
+        task = asyncio.create_task(phone._find_pointer((0.5, 0.5)))
         await entered.wait()
         before_cancel = list(sent)
         task.cancel()
@@ -134,15 +137,12 @@ def test_http_disconnect_cancels_catch_up_before_any_later_hid(tmp_path, monkeyp
         waiting = asyncio.Event()
         resume = asyncio.Event()
 
-        async def catch_up(epoch):
+        async def ensure_observation():
             waiting.set()
             await resume.wait()
-            return None
+            return freshness_snapshot(phone.screen)
 
-        async def watch(*args, **kwargs):
-            return (0.5, 0.5)
-
-        phone._catch_up, phone._watch = catch_up, watch
+        phone.ensure_observation = ensure_observation
         observation = app_module.controls.observation()
         config = uvicorn.Config(app_module.app, lifespan="off", log_level="error", http="h11")
         state = ServerState()
@@ -159,10 +159,9 @@ def test_http_disconnect_cancels_catch_up_before_any_later_hid(tmp_path, monkeyp
         assert not transport.output
         commands = list(sent)
         protocol.connection_lost(None)
-        await asyncio.sleep(0.05)
-        resume.set()
         if state.tasks:
             await asyncio.wait_for(asyncio.gather(*state.tasks), 1)
+        resume.set()
         assert sent == commands, "disconnected HTTP request sent later HID"
         assert "click" not in sent
         assert app_module.controls.job is None
@@ -204,6 +203,7 @@ class HeldButtonLink:
             self.pressed = True
         elif command == "release":
             self.pressed = False
+            self.release_waiting.set()
         reply = f"{ident} ok\n".encode()
         if (self.pause == "press" and command == "press") or (
             self.pause == "drag" and self.pressed and command.startswith("move ")
@@ -232,6 +232,20 @@ def test_cancelled_gesture_releases_before_serial_close(tmp_path, monkeypatch, p
 
     async def scenario():
         device, link = Device(), HeldButtonLink(pause, hold_release=repeat_cancel)
+        original_shield = asyncio.shield
+        shielded = {}
+        interrupted_shields = {}
+        resuming = {}
+
+        def observe_shield(awaitable):
+            task = asyncio.current_task()
+            if task in resuming and awaitable is interrupted_shields[task]:
+                resuming[task].set()
+            shielded[task] = awaitable
+            return original_shield(awaitable)
+
+        if repeat_cancel:
+            monkeypatch.setattr(asyncio, "shield", observe_shield)
         device.attach(link)
         phone = Phone(device, tmp_path / "calibration.json")
         phone.span = {"w": 500, "h": 1000}
@@ -253,21 +267,29 @@ def test_cancelled_gesture_releases_before_serial_close(tmp_path, monkeypatch, p
         try:
             await asyncio.wait_for(link.waiting.wait(), 1)
             assert link.pressed, "cancellation must interrupt an actually held button"
+            link.release_waiting.clear()  # discard the positioning path's initial release
             before_cancel = len(link.writes)
             if disconnect:
                 protocol.connection_lost(None)
             if repeat_cancel:
                 await asyncio.wait_for(link.release_waiting.wait(), 1)
                 assert app_module.manual_lock.locked()
+                cancelled_tasks = {task for task in shielded if not task.done()}
+                assert set(device._exchanges) <= cancelled_tasks
+                interrupted_shields.update((task, shielded[task]) for task in cancelled_tasks)
+                resuming.update((task, asyncio.Event()) for task in cancelled_tasks)
                 device.request_abort()
                 for task in list(state.tasks):
                     task.cancel()
-                await asyncio.sleep(0.01)
+                # Each cancelled task must resume awaiting the same cleanup before
+                # its release ACK arrives; observing one loop turn is insufficient.
+                await asyncio.wait_for(asyncio.gather(*(event.wait() for event in resuming.values())), 1)
                 assert app_module.manual_lock.locked(), "cleanup released the route lock before its ACK"
+                assert all(not task.done() for task in cancelled_tasks), "cleanup finished before its release ACK"
                 assert state.tasks and all(not task.done() for task in state.tasks)
                 assert not link.closed
                 link.replies.put_nowait(link.release_reply)
-            await asyncio.sleep(0.08)
+            await asyncio.wait_for(link.release_waiting.wait(), 1)
             # A late command ACK must not resume the gesture after cancellation.
             link.replies.put_nowait(link.delayed)
             if state.tasks:
@@ -288,15 +310,15 @@ def test_cancelled_gesture_releases_before_serial_close(tmp_path, monkeypatch, p
     asyncio.run(scenario())
 
 
-def test_deadline_is_checked_after_synchronous_pointer_recognition(tmp_path):
-    import time
-
+def test_deadline_is_checked_after_synchronous_pointer_recognition(tmp_path, monkeypatch):
+    clock = ManualClock()
+    clock.install(monkeypatch)
     phone, sent = make_phone(tmp_path)
     phone.operation_timeout = 0.03
 
     async def find(*args, **kwargs):
         # A CPU-bound image search can delay the asyncio timer callback.
-        time.sleep(0.05)
+        clock.advance(0.05)
         return (0.5, 0.5)
 
     phone._find_pointer = find
@@ -364,11 +386,12 @@ def test_http_deadline_includes_the_final_observation(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
-def test_device_rechecks_deadline_after_waiting_for_serial_lock():
-    import time
-
+def test_device_rechecks_deadline_after_waiting_for_serial_lock(monkeypatch):
     from hidagent.device import Device
     from hidagent.operation import operation_scope
+
+    clock = ManualClock()
+    clock.install(monkeypatch)
 
     class Link:
         writes = []
@@ -391,9 +414,11 @@ def test_device_rechecks_deadline_after_waiting_for_serial_lock():
         await device._lock.acquire()
         async with operation_scope(0.03):
             queued = asyncio.create_task(device.send("click"))
-            await asyncio.sleep(0)  # exchange queues behind the held serial lock
-            await asyncio.sleep(0)
-            time.sleep(0.05)  # expire before the event loop can run its timeout callback
+            while not device._lock._waiters:
+                if queued.done():
+                    raise AssertionError(await queued)
+                await asyncio.sleep(0)
+            clock.advance(0.05)  # expire before the event loop can run its timeout callback
             device._lock.release()
             with pytest.raises((RuntimeError, asyncio.CancelledError)):
                 await queued
@@ -403,10 +428,11 @@ def test_device_rechecks_deadline_after_waiting_for_serial_lock():
     assert Link.writes == []
 
 
-def test_exchange_timing_excludes_serial_lock_queueing():
-    import time
-
+def test_exchange_timing_excludes_serial_lock_queueing(monkeypatch):
     from hidagent.device import Device, exchange_timing
+
+    clock = ManualClock()
+    clock.install(monkeypatch)
 
     class Link:
         def is_open(self):
@@ -427,7 +453,11 @@ def test_exchange_timing_excludes_serial_lock_queueing():
         await device._lock.acquire()
         with exchange_timing() as timing:
             queued = asyncio.create_task(device.query("status"))
-            await asyncio.sleep(0.03)
+            while not device._lock._waiters:
+                if queued.done():
+                    raise AssertionError(await queued)
+                await asyncio.sleep(0)
+            clock.advance(0.03)
             assert timing.sent_at is None
             unlocked = time.monotonic()
             device._lock.release()

@@ -22,6 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
 mcp = ["mcp>=1.2,<2"]
+ocr = ["rapidocr-onnxruntime==1.4.4"]
 
 [project.scripts]
 iphone-agent = "hidagent.cli:main"
@@ -45,3 +46,4 @@ ignore = ["E701"]  # one-line `case` arms keep the action dispatch compact
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["ocr: real OCR fixture tests requiring the optional ocr extra"]

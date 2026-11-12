@@ -19,3 +19,19 @@ origin (0.127, -0.001):
 | live_tap_landed_nudged.jpg | + `move 12 0` | (580.7, 663.6) |
 | live_tap_corrected.jpg | after the correction `move -28 -37` | (540.5, 624.0) |
 | live_tap_corrected_nudged.jpg | + `move 12 0` | (545.6, 624.0): the same nudge moved only 5.1 px |
+
+`keypad_no_disc.jpg`: `/workspace/hybrid-ptr/dial_final.jpg`, resized to 360x780, JPEG quality 85.
+Real Phone keypad showing the completed dial test; no visible pointer disc. Tests draw explicit
+synthetic highlights, clock changes and digit changes on this image; the capture alone does not
+establish whether the missing disc was faded or morphed into a control highlight.
+
+`airplay_receiver_button.jpg` is a 360x780 downsample of
+`/workspace/hybrid-ptr/live/cal-144728/1794466059.430_n+0.0254.jpg` (about 16 KB).
+It preserves the receiver icons and the AssistiveTouch button at normalized
+`(655/720, 1220/1560)` for button detection without cached coordinates. The
+receiver glyphs must not be mistaken for the button's concentric rings.
+
+OCR fixture `dial_final.jpg` is the original 720x1560 JPEG from
+`/workspace/hybrid-ptr/dial_final.jpg` (53 KB): Phone keypad displaying `132 6717 9555`
+without placing a call. OCR tests also reuse `00_home_1500ms.jpg` for Chinese Settings
+labels and the English word `iPhone`.

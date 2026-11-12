@@ -21,11 +21,23 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class FrameSnapshot:
-    """One published image and its clocks; readers retain this object across awaits."""
+    """One published image and its clocks; readers retain this object across awaits.
 
-    frame: bytes
+    Calling the snapshot returns the shared observation record (wall-clock updated,
+    board timestamp, generation). Attribute access stays the monotonic arrival record.
+    """
+
+    frame: bytes | None
     board_ts: int | None
     arrived: float  # host monotonic seconds, never wall-clock time
+    updated: float = 0.0
+    generation: int = 0
+    observed_live: bool = False
+
+    def __call__(self):
+        from .freshness import FrameSnapshot as ObservedFrame
+
+        return ObservedFrame(self.frame, self.updated, self.board_ts, self.generation, self.observed_live)
 
 
 class Screen:
@@ -42,6 +54,8 @@ class Screen:
         self.frame_ts: int | None = None
         self._next_ts: int | None = None
         self._snapshot: FrameSnapshot | None = None
+        self._frame_lock = threading.RLock()
+        self.generation = 0
         # one decoder for the whole stream from this board, so a reconnect can go on from its last AU
         self._decoder = None
         self._decoder_for: tuple[str, str] | None = None
@@ -57,17 +71,22 @@ class Screen:
         self._device = device
 
     def start(self) -> None:
-        if self._started:
-            return
-        self._started = True
-        self._stopping = False
-        self._stop.clear()
+        with self._frame_lock:
+            if self._started:
+                return
+            self._started = True
+            self._stopping = False
+            self._stop.clear()
         threading.Thread(target=self._supervise, name="screen-7201", daemon=True).start()
 
     def stop(self) -> None:
-        self._stopping = True
-        self._stop.set()
-        self._session_ok = False
+        # Eligibility changes share the same lock as final HID validation/write.
+        # A receiver/stop thread must not invalidate an already validated frame
+        # between that check and the synchronous link.write call.
+        with self._frame_lock:
+            self._stopping = True
+            self._stop.set()
+            self._session_ok = False
         for sock in list(self._sockets):
             try:
                 sock.shutdown(socket.SHUT_RDWR)
@@ -90,11 +109,14 @@ class Screen:
         while not self._stopping:
             host, token = self._endpoint()
             if not host or not token:
-                self._session_ok = False
+                self._on_disconnect()
                 self.last_error = "还没有板子的 IP 或 vtok。COM 口连上之后，服务会从 0 netinfo 里读。"
                 time.sleep(1)
                 continue
-            self._stop.clear()
+            with self._frame_lock:
+                if self._stopping:
+                    return
+                self._stop.clear()
             if self._decoder_for != (host, token):  # another board or a rebooted one: nothing to go on from
                 self._decoder, self._decoder_for = video7201.H264Decoder(), (host, token)
             try:
@@ -108,27 +130,48 @@ class Screen:
             except Exception as exc:
                 self.last_error = _friendly_video_error(exc)
                 log.info("screen: %s", self.last_error)
-            self._session_ok = False
+            self._on_disconnect()
             if not self._stopping:
                 time.sleep(1)
 
+    def _on_disconnect(self) -> None:
+        with self._frame_lock:
+            self._session_ok = False
+
     def _on_ready(self) -> None:
-        self._session_ok = True
+        with self._frame_lock:
+            if self._stopping:
+                return
+            self.generation += 1
+            self.frame = None
+            self.updated = 0.0
+            self.frame_ts = None
+            self._next_ts = None
+            self._session_ok = True
+            self._snapshot = FrameSnapshot(None, None, time.monotonic(), 0.0, self.generation, False)
         self.last_error = ""
 
     def _on_stall(self) -> None:
         self.last_error = "画面停住了。请在控制中心重新选一次「屏幕镜像 → ESP32 Agent」。板子可能还留着旧缓冲。"
 
     def _on_ts(self, ts) -> None:
-        self._next_ts = ts
+        with self._frame_lock:
+            self._next_ts = ts
 
     def _on_jpeg(self, jpeg: bytes) -> None:
-        snapshot = FrameSnapshot(jpeg, self._next_ts, time.monotonic())
-        self.frame_ts, self._next_ts = snapshot.board_ts, None
-        self.frame = jpeg
-        self.updated = time.time()
-        # Publish one immutable object: the decoder thread may run between any two reader bytecodes.
-        self._snapshot = snapshot
+        arrived = time.monotonic()
+        with self._frame_lock:
+            board_ts = self._next_ts
+            # Legacy fields update before the wall clock is read. A concurrent reader that
+            # does not take this lock can still be holding the previous immutable snapshot.
+            self.frame_ts, self._next_ts = board_ts, None
+            self.frame = jpeg
+            updated = time.time()
+            self.updated = updated
+            # A test can publish a frame before start(); that screen is live, matching live().
+            observed_live = jpeg is not None and not self._stopping and (not self._started or self._session_ok)
+            self._snapshot = FrameSnapshot(
+                jpeg, board_ts, arrived, updated, self.generation, observed_live)
         if self.last_error.startswith("画面停住了"):
             self.last_error = ""
 
@@ -138,14 +181,15 @@ class Screen:
 
     @property
     def live(self) -> bool:
-        if self.frame is None:
-            return False
-        # 测试直接塞 frame、没有启动线程时，当作画面可用。
-        if not self._started:
-            return True
-        # 静止画面时 AirPlay 不推新帧。会话还在、最近 90 秒内有过帧，就算活着。
-        snapshot = self.snapshot
-        return self._session_ok and snapshot is not None and time.monotonic() - snapshot.arrived < 90
+        with self._frame_lock:
+            if self.frame is None or self._stopping:
+                return False
+            # 测试直接塞 frame、没有启动线程时，当作画面可用。
+            if not self._started:
+                return True
+            # 静止画面时 AirPlay 不推新帧。会话还在、最近 90 秒内有过帧，就算活着。
+            snapshot = self._snapshot
+            return self._session_ok and snapshot is not None and time.monotonic() - snapshot.arrived < 90
 
     @property
     def aspect(self) -> float:

@@ -1,13 +1,16 @@
 import asyncio
 import base64
 import io
+import math
 import time
 from types import SimpleNamespace
 
 import httpx
 import pytest
+from fake_clock import ManualClock
 from PIL import Image
 
+from hidagent import feedback, freshness
 from hidagent.app import ControlAction
 from hidagent.control import Controls
 from hidagent.phone import TYPE_LIMIT, Phone
@@ -21,12 +24,30 @@ def jpeg(color="white"):
 
 class Screen:
     live = True
-    updated = time.time()
+    def __init__(self):
+        self.updated = time.time()
     frame = jpeg()
     new_frame = True
 
-    async def fresh(self, *args): return self.frame if self.new_frame else None
+    async def fresh(self, *args):
+        if not self.new_frame:
+            return None
+        # A delivered frame is a later event, even on a coarse Windows wall clock.
+        await asyncio.sleep(1 / 30)
+        self.updated = time.time()
+        return self.frame
     async def settled(self, **kwargs): pass
+
+
+@pytest.fixture(autouse=True)
+def instant_mirror(monkeypatch, request):
+    # These fake screens publish the next frame without mirror lag; latency tests use paced fakes.
+    if "delayed_pointer_frame" not in request.node.name:
+        clock = ManualClock()
+        clock.install(monkeypatch)
+        monkeypatch.setattr(feedback, "MIRROR_LAG_SECONDS", 0)
+        monkeypatch.setattr(freshness, "MIRROR_LAG_SECONDS", 0)
+        return clock
 
 
 class FakePhone:
@@ -34,9 +55,18 @@ class FakePhone:
     async def point_verified(self, x, y):
         self.calls.append(("point", x, y))
         return x, y
-    async def tap_verified(self, x, y): self.calls.append(("tap", x, y))
-    async def type(self, text): self.calls.append(("type", text))
-    async def key(self, text): self.calls.append(("key", text))
+    async def tap_verified(self, x, y, *, before_click=None, target_box=None, target_frame=None):
+        if before_click is not None:
+            before_click()
+        self.calls.append(("tap", x, y))
+    async def type(self, text, mode="auto", *, before_action=None):
+        if before_action is not None:
+            before_action()
+        self.calls.append(("type", text))
+    async def key(self, text, *, before_action=None):
+        if before_action is not None:
+            before_action()
+        self.calls.append(("key", text))
 
 
 def test_long_ascii_is_split_under_the_firmware_line_limit(tmp_path):
@@ -103,6 +133,22 @@ def test_pixel_coordinates_return_evidence_and_single_use_token():
     assert len(phone.calls) == 1
 
 
+@pytest.mark.parametrize("quantum", [.015625, .001])
+def test_post_action_evidence_with_coarse_wall_clock(monkeypatch, instant_mirror, quantum):
+    clock = instant_mirror
+    monkeypatch.setattr(time, "time", lambda: math.floor(clock.time() / quantum) * quantum)
+    phone, screen = FakePhone(), Screen()
+    control = Controls(phone, screen)
+    token = control.observation()["screen_id"]
+    completed_at = time.time()
+    result = asyncio.run(control.perform(ControlAction(action="tap", screen_id=token, x=.5, y=.5)))
+    assert phone.calls == [("tap", .5, .5)]
+    assert screen.updated > completed_at
+    assert result["fresh"] is True and result["changed"] is False
+    assert result["screen_diff"]["changed_fraction"] == 0
+    assert result["screen_id"] and result["screen_id"] != token
+
+
 @pytest.mark.parametrize("reason", ["expired", "changed", "normalized", "pixels"])
 def test_bad_observations_and_coordinates_never_reach_hid(reason):
     phone, screen = FakePhone(), Screen()
@@ -150,7 +196,7 @@ def test_uncertain_input_is_not_retried_and_unchanged_frame_is_not_verified():
     phone, screen = FakePhone(), Screen()
     screen.new_frame = False
 
-    async def failing(text):
+    async def failing(text, **kwargs):
         phone.calls.append(("key", text))
         raise RuntimeError("connection lost after write")
 
@@ -190,7 +236,7 @@ def test_repeat_cannot_batch_sends_or_other_actions(key):
 def test_partial_repeat_failure_stops_without_replaying():
     phone = FakePhone()
 
-    async def fail_second(key):
+    async def fail_second(key, **kwargs):
         phone.calls.append(("key", key))
         if len(phone.calls) == 2:
             raise RuntimeError("lost ACK; key may have executed")
@@ -204,7 +250,7 @@ def test_partial_repeat_failure_stops_without_replaying():
     assert result["error"] and result["action_may_have_executed"]
 
 
-def test_verified_tap_corrects_drift_and_never_clicks_when_pointer_unseen(tmp_path):
+def test_verified_tap_refuses_unmeasured_drift_or_unseen_pointer(tmp_path):
     commands = []
 
     async def send(command): commands.append(command)
@@ -217,41 +263,44 @@ def test_verified_tap_corrects_drift_and_never_clicks_when_pointer_unseen(tmp_pa
         positions = iter(found)
         async def locate(near, **kwargs): return next(positions)
         phone._find_pointer = locate
-        await phone.tap_verified(.5, .5)
+        return await phone.tap_verified(.5, .5)
 
-    asyncio.run(scenario([(.55, .45), (.5, .5)]))
-    assert commands == ["move -20 40", "click"]
+    with pytest.raises(RuntimeError, match="未发送点击"):
+        asyncio.run(scenario([(.55, .45), (.5, .5)]))
+    assert commands == ["move -20 40"]
     commands.clear()
-    with pytest.raises(RuntimeError, match="no click"):
-        asyncio.run(scenario([None, None, None]))
-    assert not commands
+    with pytest.raises(RuntimeError, match="未发送点击"):
+        asyncio.run(scenario([None]))
+    assert commands == []
 
 
-def test_verified_tap_uses_conservative_last_attempt_before_click(tmp_path):
+def test_verified_tap_checks_once_before_using_calibrated_position(tmp_path):
     async def scenario():
         commands, attempts = [], []
         async def send(command): commands.append(command)
         phone = Phone(SimpleNamespace(send=send), tmp_path / "calibration", Screen())
         phone._pos = (200, 400)
         async def point(x, y): pass
-        async def locate(near, conservative=False):
-            attempts.append(conservative)
-            return (.5, .5) if conservative else None
+        async def locate(near, quick=False, **kwargs):
+            attempts.append(quick)
+            return None
         phone.point, phone._find_pointer = point, locate
-        await phone.tap_verified(.5, .5)
-        assert attempts == [False, False, True]
-        assert commands == ["click"]
+        with pytest.raises(RuntimeError, match="未发送点击"):
+            await phone.tap_verified(.5, .5)
+        assert attempts == [True]
+        assert commands == []
     asyncio.run(scenario())
 
 
-def test_cold_pointer_initialization_preserves_conservative_frame_drain(tmp_path):
+def test_cold_pointer_initialization_uses_bounded_pointer_check(tmp_path):
     async def scenario():
         attempts = []
         async def send(command): pass
         phone = Phone(SimpleNamespace(send=send), tmp_path / "calibration", Screen())
+        phone.span = {"w": 400, "h": 800}
         async def point(x, y): phone._pos = (200, 400)
-        async def locate(near, conservative=False):
-            attempts.append(conservative)
+        async def locate(near, quick=False, **kwargs):
+            attempts.append(quick)
             return (.5, .5)
         phone.point, phone._find_pointer = point, locate
         await phone.tap_verified(.5, .5)
@@ -269,11 +318,12 @@ def test_pointer_nudge_waits_for_its_visual_effect_not_an_older_pipeline_frame(t
         after = pointer_frame((262, 500))
 
         class DelayedScreen:
+            live = True
             frame = before
-            updated = 1
+            updated = time.time()
             async def settled(self, **kwargs): pass
             async def fresh(self, since, timeout):
-                self.updated += 1
+                self.updated = time.time()
                 frames.append(self.updated)
                 self.frame = before if len(frames) == 1 else after
                 return self.frame
@@ -294,7 +344,7 @@ def test_emergency_stop_cancels_new_action_without_ticket_or_waiting_for_lock(mo
         phone, screen = FakePhone(), Screen()
         control = Controls(phone, screen)
         entered = asyncio.Event()
-        async def stuck(x, y):
+        async def stuck(x, y, **kwargs):
             entered.set()
             await asyncio.Event().wait()
         phone.tap_verified = stuck

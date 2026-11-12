@@ -23,13 +23,16 @@ def create_server(url: str | None = None):
         "Coordinates are normalized 0..1 unless coordinate_space=pixels; NEVER use 0..1000. "
         "A command acknowledgement or changed pixels is NOT verification of the user's goal. "
         "If an action fails, observe before deciding; never replay a message/send automatically. "
-        "For Chinese, first visibly focus a field and confirm Chinese Pinyin keyboard. Compose a short phrase, "
-        "select the correct candidates from the image, and verify the final text before a separate send. "
+        "For Chinese, use iphone_type with a configured clipboard companion (docs/PASTE_INPUT.md). "
+        "Otherwise confirm Chinese Pinyin keyboard, compose a short phrase and select candidates. "
+        "Always verify the final text before a separate send. "
         "If you cannot see images, tell the user to use a vision-capable host or explicitly opt into a configured "
         "fallback model; do not automatically delegate. One controller only. stop_task needs no screen_id. "
         "Prefer iphone_batch for several actions that do not need a new look between them; do not batch "
         "candidate selection or sending together with compose_chinese. "
         "Named UI points come from iphone_layouts (skill layout.json), not from guessing. "
+        "With the optional OCR backend, iphone_find_text locates visible text without consuming screen_id; "
+        "iphone_tap_text taps a ranked match and returns the resulting image and screen_diff. "
         "WeChat wording lives only in skills/wechat-group-reply/SKILL.md. Before sending, call skill_check. "
         "After sending, call skill_confirm_send and set bubble_visible only when the new bubble is fully visible. "
         "If skill_check says stop, do not retry. There is no draft and no human approval step. "
@@ -68,15 +71,48 @@ def create_server(url: str | None = None):
     def iphone_point(x: float, y: float, screen_id: str,
                      coordinate_space: Literal["normalized", "pixels"] = "normalized"
                      ) -> list[TextContent | ImageContent]:
-        """Move and visually verify pointer without clicking; failure never falls back to blind clicking."""
+        """Move without clicking; pointer_seen says whether the calibrated landing was visually checked."""
         return action("point", screen_id, x=x, y=y, coordinate_space=coordinate_space)
 
     @mcp.tool()
     def iphone_tap(x: float, y: float, screen_id: str,
-                   coordinate_space: Literal["normalized", "pixels"] = "normalized"
+                   coordinate_space: Literal["normalized", "pixels"] = "normalized",
+                   target_box: tuple[float, float, float, float] | None = None
                    ) -> list[TextContent | ImageContent]:
-        """Verify pointer position then click once; inspect returned image for actual target effect."""
-        return action("tap", screen_id, x=x, y=y, coordinate_space=coordinate_space)
+        """Click once with a visible pointer or measured error within an observed normalized target_box.
+
+        Screen changes are evidence only. No blind click without target size and bounded error; never retry.
+        """
+        fields = {"x": x, "y": y, "coordinate_space": coordinate_space}
+        if target_box is not None:
+            fields["target_box"] = target_box
+        return action("tap", screen_id, **fields)
+
+    @mcp.tool()
+    def iphone_find_text(text: str, screen_id: str, nth: int = 1,
+                         exact: bool = False, region: list[float] | None = None) -> list[TextContent | ImageContent]:
+        """Find visible text with optional OCR; retain screen_id. nth is 1-based in ranked matches.
+
+        Match boxes and centers are normalized 0..1. Width, spaces and case are normalized;
+        exact=True requires the complete normalized text. Inspect matches before choosing duplicates.
+        region=[left,top,right,bottom] scopes complete boxes to normalized screen coordinates.
+        """
+        with IPhoneClient(url) as client:
+            return content(client.request("POST", "/api/control/find_text",
+                                          {"screen_id": screen_id, "text": text, "nth": nth, "exact": exact,
+                                           **({"region": region} if region is not None else {})}).json())
+
+    @mcp.tool()
+    def iphone_tap_text(text: str, screen_id: str, nth: int | None = None,
+                        exact: bool = False, region: list[float] | None = None) -> list[TextContent | ImageContent]:
+        """Locate visible text with optional OCR, verify pointer and tap once. nth is 1-based.
+
+        Inspect the returned image and screen_diff; OCR text and changed pixels do not prove success.
+        Duplicates require explicit nth or region=[left,top,right,bottom] from the current image.
+        Send labels and substring-only targets require region. Missing or ambiguous text sends no HID.
+        """
+        return action("tap_text", screen_id, text=text, nth=nth, exact=exact,
+                      **({"region": region} if region is not None else {}))
 
     @mcp.tool()
     def iphone_swipe(x1: float, y1: float, x2: float, y2: float, screen_id: str,
@@ -93,9 +129,13 @@ def create_server(url: str | None = None):
         return action("scroll", screen_id, x=x, y=y, lines=lines, coordinate_space=coordinate_space)
 
     @mcp.tool()
-    def iphone_type(text: str, screen_id: str) -> list[TextContent | ImageContent]:
-        """Type printable ASCII in a visibly focused field. Never submits or sends."""
-        return action("type", screen_id, text=text)
+    def iphone_type(text: str, screen_id: str, mode: Literal["auto", "paste", "keys"] = "auto"
+                    ) -> list[TextContent | ImageContent]:
+        """Enter one line in a focused field; never sends. Auto uses the configured clipboard companion,
+        otherwise ASCII keys. Paste needs docs/PASTE_INPUT.md setup, copy/focus acknowledgment,
+        and confirmation that the text appeared before the request completes.
+        """
+        return action("type", screen_id, text=text, mode=mode)
 
     @mcp.tool()
     def iphone_compose_chinese(text: str, screen_id: str,
@@ -110,12 +150,17 @@ def create_server(url: str | None = None):
         return action("compose_chinese", screen_id, text=text, input_mode=input_mode)
 
     @mcp.tool()
-    def iphone_key(combo: str, screen_id: str, repeat: int = 1) -> list[TextContent | ImageContent]:
+    def iphone_key(combo: str, screen_id: str, repeat: int = 1,
+                   enter_intent: Literal["navigation", "editing"] | None = None) -> list[TextContent | ImageContent]:
         """Press a combination. repeat=1..50; >1 only for backspace/left/right, with one final screenshot.
 
         Enter MAY SEND: first verify recipient and final text. Never repeats Enter or retries failed sends.
+        enter_intent requires server-verified visible keyboard evidence; unknown contexts retain send limits.
         """
-        return action("key", screen_id, text=combo, repeat=repeat)
+        fields = {"text": combo, "repeat": repeat}
+        if enter_intent is not None:
+            fields["enter_intent"] = enter_intent
+        return action("key", screen_id, **fields)
 
     @mcp.tool()
     def iphone_home(screen_id: str) -> list[TextContent | ImageContent]:
@@ -137,8 +182,9 @@ def create_server(url: str | None = None):
     def iphone_batch(screen_id: str, steps: list[dict]) -> list[TextContent | ImageContent]:
         """Run 1..8 actions on one screen_id, then return a single new screenshot.
 
-        Use when the next actions do not need a fresh look (tap a known field, type pinyin).
-        Do not put candidate selection or send in the same batch as compose_chinese.
+        Stops after unverified taps, missing fresh evidence, or changed context.
+        Typing and keys (including Enter) must be the first step on a new observation;
+        observe and inspect focus after tapping before submitting a separate input action.
         Each step is an object: action, and the same fields as the single-action tool
         (x, y, x1, y1, x2, y2, lines, text, input_mode, repeat, coordinate_space).
         """

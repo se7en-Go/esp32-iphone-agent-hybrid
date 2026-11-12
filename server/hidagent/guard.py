@@ -13,6 +13,9 @@ import os
 import secrets
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +25,12 @@ STOP_PHRASES = ("操作频繁", "风控", "验证码")
 FLOOR_INTERVAL = 3.0
 CEILING_PER_HOUR = 30
 RESERVATION_TTL = 30.0
+
+
+@dataclass
+class _EnterEvidence:
+    validate: object
+    used: bool = False
 
 
 def _frontmatter(text: str) -> dict[str, str]:
@@ -99,6 +108,7 @@ class Guard:
         # 同步路由/串口线程和 asyncio 共用；临界区内绝不能 await。
         # observe/confirm/save 及最终 HID 写入会嵌套进入，所以必须可重入。
         self._lock = threading.RLock()
+        self._enter_evidence = ContextVar("verified_non_send_enter", default=None)
         with self._lock:
             self.tripped = False
             self.reason = ""
@@ -106,6 +116,32 @@ class Guard:
             self._pending = 0
             self._reservation: tuple[str, float] | None = None
             self._load()
+
+    @contextmanager
+    def verified_enter(self, intent: str, validate):
+        """Internal verifier scope, never a caller-supplied permission flag or token."""
+        if intent not in {"navigation", "editing"}:
+            raise ValueError("unknown Enter intent")
+        validate()
+        token = self._enter_evidence.set(_EnterEvidence(validate))
+        try:
+            yield
+        finally:
+            self._enter_evidence.reset(token)
+
+    def enter_evidence(self):
+        evidence = self._enter_evidence.get()
+        if evidence is not None:
+            self.check_enter_evidence(evidence)
+        return evidence
+
+    def check_enter_evidence(self, evidence, *, consume=False):
+        """Recheck under the HID write lock, and allow exactly one proven Enter."""
+        if evidence.used:
+            raise RuntimeError("Enter 的观察已使用，请重新观察。")
+        evidence.validate()
+        if consume:
+            evidence.used = True
 
     def _fail_closed(self, reason: str) -> None:
         self.tripped = True

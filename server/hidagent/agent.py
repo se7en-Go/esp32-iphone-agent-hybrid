@@ -7,13 +7,18 @@ import math
 import os
 import re
 import time
+from types import SimpleNamespace
 
-from . import vision
+from . import feedback, ocr, screen_compare, screen_diff, vision
 from .debug import Trace
-from .device import DeviceError
+from .device import DeviceError, input_attempt
+from .freshness import FrameSnapshot, fresh_frame
+from .input_context import InputContextGuard
 from .llm import LLM
 from .phone import Phone
 from .screen import Screen
+from .send_context import is_send_target, send_target_scope
+from .text_target import TextTargetGuard
 
 log = logging.getLogger(__name__)
 
@@ -31,14 +36,18 @@ THINK: <plain English a non-technical user understands: first check your last ac
 DO: <action>
 
 Give several DO lines (up to 6, run in order) whenever the next actions do not depend on seeing the
-result: e.g. ticking several visible checkboxes or days, several drawing strokes, typing then pressing enter.
+result: e.g. several drawing strokes or editing keys. A tap ends the round; inspect its result before
+typing or pressing Enter.
 Give ONE DO line when the next action depends on what this one opens or changes.
+Use find_text and tap_text alone, then inspect the result before continuing.
 
 Coordinates are integers 0-1000 relative to the screenshot (x left->right, y top->bottom).
 Aim at the visual center of the element you want, not its edge or its label.
 Look before you act: describe what is really on the screen now, not what you expect.
 Each recent action says whether the screen changed after it. If it did NOT change, the action
 missed or had no effect: do not assume it worked; aim again more precisely or try another way.
+If feedback is stale, the tap outcome is unknown; do not repeat it automatically. A new observation
+of the same screenshot does not prove failure. Inspect the result or stop for the user to check.
 Only type when a text field is visibly focused (the keyboard is showing).
 Swipes have no momentum: content moves exactly as far as the finger and stops. Prefer short swipes
 (100-250 units) and check the result; repeat if needed rather than one big swipe.
@@ -53,10 +62,17 @@ If you are unsure what an element does, tap it alone (one DO line) and check the
 Actions:
   tap X Y [precise]         (precise: the pointer is located and corrected before tapping, about 1 s slower;
                              use it for small or tightly packed targets: list rows, checkmarks, toggles, small icons)
+  find_text TEXT            (optional OCR: list visible text matches, then inspect their boxes before acting)
+  tap_text TEXT             (optional OCR: locate visible text and tap its center with pointer verification)
+  find_text {"text":"发送","region":[0.7,0.6,1,0.9],"exact":true}
+  tap_text {"text":"发送","region":[0.7,0.6,1,0.9],"nth":1,"exact":true}
+                            (OCR regions are normalized left,top,right,bottom, chosen from this screenshot;
+                             duplicate matches require explicit nth, starting at 1. Send labels and substring
+                             matches require a region that excludes message content. Never guess a region.)
   swipe X1 Y1 X2 Y2         (finger moves from X1,Y1 to X2,Y2: "swipe down" means Y2 > Y1)
   path X1 Y1 X2 Y2 X3 Y3 …  (one continuous stroke through 2-20 points, for drawing)
   circle X Y R              (draw a circle centered at X Y; R is the radius in x units)
-  type TEXT                 (ASCII only; tap the input field first)
+  type TEXT                 (paste via configured companion, otherwise ASCII; focus the field first)
   key COMBO                 (enter, backspace, esc, cmd+a, ...)
   home | back | wait
   replan                    (the plan no longer fits the screen)
@@ -67,11 +83,10 @@ Example:
 THINK: My last tap opened the home screen as intended. The App Store icon is visible, so I tap it.
 DO: tap 152 362"""
 
-META = ("t", "thought", "thought_zh", "think_s", "act_s", "shot", "_shot", "changed")  # not part of the action
-
 # action name -> argument names; numeric arguments are 0-1000 screen coordinates
 ACTIONS = {"tap": ("x", "y"), "swipe": ("x1", "y1", "x2", "y2"), "circle": ("x", "y", "r"), "path": ("points",),
            "type": ("text",), "key": ("combo",), "done": ("answer",), "fail": ("reason",),
+           "find_text": ("text",), "tap_text": ("text",),
            "home": (), "back": (), "wait": (), "replan": ()}
 TEXT_ARGS = ("text", "combo", "answer", "reason")
 
@@ -82,6 +97,23 @@ def parse_command(line: str) -> dict:
     name = name.lower()
     if name not in ACTIONS:
         raise ValueError(f"unknown action: {line[:100]}")
+    if name in ("find_text", "tap_text") and rest.lstrip().startswith("{"):
+        selector = json.loads(rest)
+        if (not isinstance(selector, dict) or not isinstance(selector.get("text"), str)
+                or not selector["text"].strip()
+                or set(selector) - {"text", "region", "nth", "exact"}):
+            raise ValueError("OCR selector needs text and optional region, nth, exact")
+        region = selector.get("region")
+        if region is not None and (not isinstance(region, list) or len(region) != 4
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or not math.isfinite(v) or not 0 <= v <= 1 for v in region)
+                or region[0] >= region[2] or region[1] >= region[3]):
+            raise ValueError("OCR region must be normalized left,top,right,bottom")
+        if "nth" in selector and (type(selector["nth"]) is not int or selector["nth"] < 1):
+            raise ValueError("OCR nth must be a positive integer")
+        if "exact" in selector and type(selector["exact"]) is not bool:
+            raise ValueError("OCR exact must be true or false")
+        return {"action": name, **selector}
     keys = ACTIONS[name]
     if keys and keys[0] in TEXT_ARGS:
         return {"action": name, keys[0]: rest.strip().strip('"')}
@@ -116,8 +148,38 @@ def parse_plan(text: str) -> tuple[str, str]:
 
 
 def _key(step: dict) -> dict:
-    """The action itself, without thoughts, timings and other bookkeeping."""
-    return {k: v for k, v in step.items() if k not in META}
+    """Identity contains only declared arguments, regardless of new feedback fields."""
+    name = step.get("action")
+    keys = ("action", *ACTIONS.get(name, ()))
+    if name in ("find_text", "tap_text"):
+        keys += ("region", "nth", "exact")
+    identity = {key: step[key] for key in keys if key in step}
+    if name in ("find_text", "tap_text"):
+        identity["text"] = ocr.normalize_text(identity.get("text", ""))
+        for key, default in (("exact", False), ("region", None), ("nth", None)):
+            if identity.get(key) == default:
+                identity.pop(key, None)
+    return identity
+
+
+def _same_text_target(previous: dict, current) -> bool:
+    """Different selectors can still resolve to the same observed OCR target."""
+    old = previous.get("text_match")
+    return bool(old and current is not None
+                and ocr.normalize_text(old["text"]) == ocr.normalize_text(current.text)
+                and tuple(old["box"]) == tuple(current.box))
+
+
+def _diff_feedback(step: dict) -> str:
+    """Keep changed text visible in model history without the full region geometry."""
+    diff = step.get("screen_diff")
+    if not diff:
+        return ""
+    compact = {key: diff.get(key) for key in ("status", "changed_fraction", "text_status")}
+    for key in ("texts_appeared", "texts_disappeared"):
+        texts = diff.get(key)
+        compact[key] = None if texts is None else [text[:60] for text in texts[:3]]
+    return " -> screen diff: " + json.dumps(compact, ensure_ascii=False)
 
 
 class BlindError(RuntimeError):
@@ -159,6 +221,7 @@ class Agent:
         self.task, self.plan, self.steps, self.shots = "", "", [], {}
 
     def _record(self, shot: bytes | None = None, **step) -> None:
+        step = {key: value for key, value in step.items() if not key.startswith("_")}
         if shot:
             self.shots[len(self.steps)] = shot
         self.steps.append({"t": time.time(), "shot": bool(shot), **step})
@@ -170,15 +233,20 @@ class Agent:
             log.info("agent: %s", step.get("action", "step"))
 
     async def _ask(self, role: str, llm: LLM, system: str, prompt: str,
-                   temperature: float = 0) -> tuple[str, float, bytes | None]:
-        if not self.screen.live:  # never let the model act blind
+                   temperature: float = 0) -> tuple[str, float, FrameSnapshot]:
+        ensure = getattr(self.phone, "ensure_observation", None)
+        try:
+            accepted = await ensure() if ensure is not None else fresh_frame(self.screen)
+        except RuntimeError as exc:
+            raise BlindError("lost the phone screen: reconnect Screen Mirroring") from exc
+        if accepted is None:  # never let the model act on stale video
             raise BlindError("lost the phone screen: reconnect Screen Mirroring")
-        frame, started = self.screen.frame, time.time()
+        frame, started = accepted.frame, time.time()
         reply = await llm.chat(system, prompt, frame, temperature=temperature)
         seconds = round(time.time() - started, 2)
         self.trace.write(frame, kind="llm", role=role, model=llm.model, prompt=prompt,
                          reply=reply, seconds=seconds)
-        return reply, seconds, frame
+        return reply, seconds, accepted
 
     async def _run(self) -> None:
         failures = 0
@@ -212,35 +280,79 @@ class Agent:
         seen = acts[0]["_shot"]
         spots = [self._pointer]  # where the pointer was and goes: pointer moves are not screen changes
         stuck = self._repeating(acts[0])
-        for i, act in enumerate(acts):
+        for act in acts:
+            self._validate_context(act)
             name = act["action"]
             if name == "replan" or stuck:
+                act.pop("_observation", None)
                 self._record(act.pop("_shot"), **act)
                 await self._replan(stuck=stuck)
                 return False
             if name not in ("done", "fail"):
+                if self._missed() and _key(act) == _key(self._last_input()):
+                    raise ValueError("automatic repeat blocked: the previous input outcome is unchanged or unknown")
                 started = time.time()
-                await self._do(act)
+                before = self.screen.frame
+                try:
+                    with input_attempt() as attempted_input:
+                        tap_completed = await self._do(act)
+                except (Exception, asyncio.CancelledError):
+                    # A click, key, or text write may already have left the host. Record that
+                    # uncertain attempt before recovery can plan the same action again.
+                    if attempted_input.written:
+                        attempted = {key: value for key, value in act.items()
+                                     if not key.startswith("_")}
+                        attempted.update(outcome="unknown", changed=None, fresh=False, clicked=None,
+                                         effect_verified=False, act_s=round(time.time() - started, 2))
+                        self._record(act["_shot"], **attempted)
+                    raise
                 act["act_s"] = round(time.time() - started, 2)
                 spots += _pointer_path(act)
                 self._pointer = spots[-1]
+                if name in ("tap", "tap_text"):
+                    if isinstance(tap_completed, dict):
+                        after = tap_completed.pop("_after_frame", None)
+                        tap_completed.pop("_after_snapshot", None)
+                        usable = tap_completed.get("fresh", False) and after is not None
+                        act.update(tap_completed)
+                    else:
+                        after = await feedback.wait_after_action(self.screen, tap_completed or time.time(), 1.5)
+                        usable = after is not None
+                    act["screen_diff"] = await screen_diff.summarize(before, after, fresh=usable, ocr_enabled=False)
+                    if not usable:
+                        act["changed"] = None
+                    elif "screen_changed" in act:
+                        # Phone already ignored pointer fade and button highlights.
+                        act["changed"] = act["screen_changed"]
+                    else:
+                        act["changed"] = vision.changed(before, after, ignore=tuple(spots))
+                    act["effect_verified"] = False
+            act.pop("_observation", None)
             self._record(act.pop("_shot"), **act)
             if name in ("done", "fail"):
                 return True
-            following = acts[i + 1]["action"] if i < len(acts) - 1 else None
-            if name == "tap" and following in ("type", "key"):  # typing into a field that a missed tap never opened
-                await self.screen.settled()
-                if not vision.changed(seen, self.screen.frame, ignore=tuple(spots)):
-                    self.steps[-1]["changed"] = False
-                    return False  # skip the rest; the actor looks again
-        await self.screen.settled()
+            if name in ("find_text", "tap", "tap_text"):
+                return False  # pixel changes alone never establish focus for queued type/key actions
         # feedback for the next round
-        self.steps[-1]["changed"] = vision.changed(seen, self.screen.frame, ignore=tuple(spots))
+        if self.steps[-1]["action"] not in ("tap", "tap_text"):
+            await self.screen.settled()
+            self.steps[-1]["changed"] = vision.changed(seen, self.screen.frame, ignore=tuple(spots))
         return False
 
+    def _last_input(self) -> dict:
+        """Reading the screen or revising a plan does not resolve an input's outcome."""
+        return next((step for step in reversed(self.steps)
+                     if step.get("action") in ACTIONS
+                     and step["action"] not in {"find_text", "wait", "replan", "done", "fail"}), {})
+
     def _missed(self) -> bool:
-        """The previous round changed nothing on screen, so a tap may have landed off target."""
-        return bool(self.steps) and self.steps[-1].get("changed") is False
+        """Unchanged or unknown input evidence cannot authorize an automatic retry."""
+        previous = self._last_input()
+        if previous.get("outcome") == "unknown":
+            return True
+        return (previous.get("changed") is False
+                or (previous.get("action") in ("tap", "tap_text")
+                    and (previous.get("changed") is not True or previous.get("fresh") is False)))
 
     def _repeating(self, act: dict, limit: int = 3) -> bool:
         """True when the actor picks the same action as its last limit-1 moves and the last one did nothing.
@@ -257,48 +369,122 @@ class Agent:
             last = self.steps[-1] if self.steps else {}
             prompt += (f"\n\nThe previous plan got stuck (last event: {last.get('action')} {last.get('reason', '')}):"
                        f"\n{self.plan}\nLook at the current screen and plan from here, another way if needed.")
-        reply, seconds, frame = await self._ask("planner", self.planner, PLANNER_PROMPT, prompt)
+        reply, seconds, observation = await self._ask("planner", self.planner, PLANNER_PROMPT, prompt)
         self.plan, plan_zh = parse_plan(reply)
-        self._record(frame, action="replan (stuck)" if stuck else "plan", plan=self.plan, plan_zh=plan_zh,
+        self._record(observation.frame, action="replan (stuck)" if stuck else "plan", plan=self.plan, plan_zh=plan_zh,
                      think_s=seconds)
 
     async def _next_actions(self) -> list[dict]:
         # actions and their effect only: echoing earlier thoughts makes the model repeat them instead of looking
-        hidden = ("t", "plan", "plan_zh", "think_s", "act_s", "shot", "thought", "thought_zh", "changed")
+        hidden = ("t", "plan", "plan_zh", "think_s", "act_s", "shot", "thought", "thought_zh", "changed", "screen_diff")
         effect = {True: " -> screen changed", False: " -> screen did NOT change"}
         history = "\n".join(json.dumps({k: v for k, v in s.items() if k not in hidden})[:300]
-                            + effect.get(s.get("changed"), "")
+                            + effect.get(s.get("changed"), "") + _diff_feedback(s)
                             for s in self.steps[-8:] if "plan" not in s) or "(none)"
         prompt = f"Goal: {self.task}\n\nPlan:\n{self.plan}\n\nRecent actions:\n{history}\n\nNext action?"
         for attempt in range(3):  # retry unparseable replies, a little less deterministically
-            reply, seconds, frame = await self._ask("actor", self.actor, ACTOR_PROMPT, prompt, 0.4 * attempt)
+            reply, seconds, observation = await self._ask("actor", self.actor, ACTOR_PROMPT, prompt, 0.4 * attempt)
             try:
                 acts = parse_actions(reply)
             except ValueError as e:
                 log.warning("unparseable actor reply (%s): %s", e, reply[:200])
                 continue
-            if self._missed() and _key(acts[0]) == _key(self.steps[-1]):  # same move that just did nothing
-                log.info("actor repeated an action that changed nothing; asking for another")
-                prompt += (f"\n\nYou just proposed {json.dumps(_key(acts[0]))} again, but it changed nothing last "
-                           "time. Choose a different action (another position, a shorter swipe, or another way).")
+            previous = self._last_input()
+            duplicate = _key(acts[0]) == _key(previous)
+            if (self._missed() and not duplicate and acts[0]["action"] == "tap_text"
+                    and previous.get("action") == "tap_text"):
+                candidate = acts[0]
+                region = candidate.get("region")
+                matches = await ocr.find_matches_async(
+                    observation.frame, candidate["text"], candidate.get("exact", False), region=region)
+                target = ocr.select_match(matches, candidate["text"], nth=candidate.get("nth"), region=region)
+                duplicate = _same_text_target(previous, target)
+            if self._missed() and duplicate:
+                log.info("actor repeated an action without confirmed progress; asking for another")
+                reason = ("it changed nothing last time" if previous.get("changed") is False
+                          else "its outcome is unknown; the first input may already have executed")
+                prompt += (f"\n\nYou just proposed {json.dumps(_key(acts[0]))} again, but {reason}. "
+                           "Do not repeat it automatically. Inspect the result, choose a different action, "
+                           "or stop for the user to check.")
                 continue
             acts[0]["think_s"] = seconds
-            return [{**a, "_shot": frame} for a in acts]  # every action is drawn on the same screenshot
+            return [{**a, "_shot": observation.frame, "_observation": observation} for a in acts]
         raise ValueError(f"actor gave no valid action: {reply[:200]}")
 
-    async def _do(self, a: dict) -> None:
+    def _validate_context(self, action: dict, *, stage: str = "context") -> FrameSnapshot:
+        """Every write still belongs to the observation, with a stage-specific pixel check.
+
+        ``context`` requires the original frame (paste and the first chunk). Later
+        stages allow field edits only within a region confirmed in that original.
+        """
+        original = action.get("_observation")
+        current = fresh_frame(self.screen)
+        if current is None:
+            raise BlindError("lost the phone screen: reconnect Screen Mirroring")
+        if not isinstance(original, FrameSnapshot) or original.frame != action.get("_shot"):
+            raise ValueError("screen changed since the original observation; discard queued actions and observe again")
+        if current.generation != original.generation:
+            raise ValueError("screen changed since the original observation; discard queued actions and observe again")
+        if stage in {"accept", "chunk"}:
+            if "_input_guard" not in action:
+                action["_input_guard"] = InputContextGuard(self.screen, original)
+            try:
+                return action["_input_guard"](stage=stage)
+            except RuntimeError as exc:
+                raise ValueError(str(exc)) from exc
+        if screen_compare.observation_changed(original.frame, current.frame):
+            raise ValueError("screen changed since the original observation; discard queued actions and observe again")
+        return current
+
+    async def _do(self, a: dict) -> dict | float | None:
+        observation = self._validate_context(a)
         p = lambda k: a[k] / 1000  # noqa: E731
         match a["action"]:
-            case "tap": await self.phone.tap(p("x"), p("y"), aim=a.get("precise", False) or self._missed())
-            case "swipe": await self.phone.swipe(p("x1"), p("y1"), p("x2"), p("y2"))
-            case "path": await self.phone.drag([(x / 1000, y / 1000) for x, y in a["points"]])
-            case "circle": await self.phone.drag(circle(p("x"), p("y"), p("r"), self.screen.aspect))
-            case "type": await self.phone.type(a["text"])
-            case "key": await self.phone.key(a["combo"])
+            case "tap":
+                target = SimpleNamespace(center=(p("x"), p("y")))
+                guard = TextTargetGuard(self.screen, observation.frame, target, observation=observation)
+                return await self.phone.tap_verified(*target.center, before_click=guard)
+            case "find_text" | "tap_text": return await self._text_action(a)
+            case "swipe":
+                await self.phone.swipe(p("x1"), p("y1"), p("x2"), p("y2"),
+                                       before_action=lambda: self._validate_context(a))
+            case "path":
+                await self.phone.drag([(x / 1000, y / 1000) for x, y in a["points"]],
+                                      before_action=lambda: self._validate_context(a))
+            case "circle":
+                await self.phone.drag(circle(p("x"), p("y"), p("r"), self.screen.aspect),
+                                      before_action=lambda: self._validate_context(a))
+            case "type":
+                await self.phone.type(
+                    a["text"],
+                    before_action=lambda stage="context": self._validate_context(a, stage=stage))
+            case "key": await self.phone.key(a["combo"], before_action=lambda: self._validate_context(a))
             case "home": await self.phone.go_home()
-            case "back": await self.phone.go_back()
+            case "back": await self.phone.go_back(before_action=lambda: self._validate_context(a))
             case "wait": pass
             case other: raise ValueError(f"unknown action {other!r}")
+
+    async def _text_action(self, action: dict) -> dict | float | None:
+        observation = self._validate_context(action)
+        seen, region = observation.frame, action.get("region")
+        matches = await ocr.find_matches_async(seen, action["text"], action.get("exact", False), region=region)
+        self._validate_context(action)
+        action["text_matches"] = [{"text": item.text, "box": item.box, "center": item.center, "conf": item.conf}
+                                  for item in matches]
+        match = (ocr.select_match(matches, action["text"], nth=action.get("nth"), region=region)
+                 if action["action"] == "tap_text" else (matches[0] if len(matches) == 1 else None))
+        action["text_match"] = None if match is None else {
+            "text": match.text, "box": match.box, "center": match.center, "conf": match.conf}
+        if action["action"] == "tap_text":
+            if match is None:
+                raise ValueError("未找到屏幕文字，请重新观察")
+            if (self._missed() and self._last_input().get("action") == "tap_text"
+                    and _same_text_target(self._last_input(), match)):
+                raise ValueError("automatic repeat blocked: the previous input outcome is unchanged or unknown")
+            guard = TextTargetGuard(self.screen, seen, match, observation=observation)
+            with send_target_scope(is_send_target(action["text"], match.text)):
+                return await self.phone.tap_verified(*match.center, before_click=guard,
+                                                      target_box=match.box, target_frame=seen)
 
 
 def _pointer_path(act: dict) -> list[tuple[float, float]]:
@@ -306,6 +492,7 @@ def _pointer_path(act: dict) -> list[tuple[float, float]]:
     f = lambda x, y: (x / 1000, y / 1000)  # noqa: E731
     match act["action"]:
         case "tap": return [f(act["x"], act["y"])]
+        case "tap_text": return [tuple(act["text_match"]["center"])] if act.get("text_match") else []
         case "swipe": return [f(act["x1"], act["y1"]), f(act["x2"], act["y2"])]
         case "path": return [f(*p) for p in act["points"]]
         case "circle": return [f(act["x"] + act["r"], act["y"])]
