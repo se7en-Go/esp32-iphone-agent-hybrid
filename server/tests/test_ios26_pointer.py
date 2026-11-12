@@ -12,7 +12,7 @@ import pytest
 from PIL import Image, ImageEnhance
 
 from hidagent import phone as phone_module
-from hidagent.phone import Phone
+from hidagent.phone import USB_PACE, Phone
 from hidagent.screen import FrameSnapshot, Screen
 from hidagent.vision import pointer, pointer_move
 
@@ -103,6 +103,8 @@ class MirrorPhone:
         return (3_600_000 + int((time.monotonic() - self.t0) * 1000)) % 2**32
 
     async def query(self, command: str) -> str:
+        if command == "pace":  # PR #3: the board's pointer pace number (USB schedule)
+            return f"ok {USB_PACE}"
         assert command == "status"
         return json.dumps({"up": self.board_ms()})
 
@@ -384,6 +386,8 @@ def test_verified_tap_rejects_the_last_five_seconds_of_replay(tmp_path, monkeypa
             return 3_600_000 + int((time.monotonic() - self.started) * 1000)
 
         async def query(self, command):
+            if command == "pace":  # PR #3: the board's pointer pace number (USB schedule)
+                return f"ok {USB_PACE}"
             assert command == "status"
             return json.dumps({"up": self.ms()})
 

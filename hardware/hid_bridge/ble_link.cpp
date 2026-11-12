@@ -17,9 +17,11 @@
 #include "cli_link.h"
 #include "src/cli/cli_proto.h"
 #include "src/ble/pair_window.h"
+#include "src/ble/advertising_gate.h"
 #include "src/ble/ingress.h"
 #include "src/hid/command_line.h"
 #include "logbuf.h"
+#include "ble_hid.h"
 
 static_assert(MYNEWT_VAL(MSYS_1_BLOCK_COUNT) == 64 && MYNEWT_VAL(MSYS_1_BLOCK_SIZE) == 320,
               "nimble_cfg.h not applied: build with hardware/flash.sh");
@@ -177,6 +179,7 @@ class ServerCb : public NimBLEServerCallbacks {
       peers[i] = -1;
       cli_reset(i);
     }
+    ble_hid_on_disconnect(ci.getConnHandle());
     BLE_LOG("disconnect conn %u, reason 0x%x\n", ci.getConnHandle(), reason);
     advertise();
   }
@@ -189,8 +192,18 @@ class ServerCb : public NimBLEServerCallbacks {
     logConn("security", ci);
     if (!ci.isEncrypted()) return;
     NimBLEAddress a = ci.getIdAddress();
-    if (isKnown(a)) return;
-    if (ble_pair_window_open() && knownCount < 8) { known[knownCount++] = a; return; }
+    bool hidWindow = ble_hid_pair_window_open();
+    if (isKnown(a)) {
+      // Subscribed before encryption finished: the subscribe callback saw a
+      // plain link and did not store the identity. Store it now.
+      if (hidWindow || ble_hid_using(ci.getConnHandle())) ble_hid_remember(a.getType(), a.getVal());
+      return;
+    }
+    if ((ble_pair_window_open() || hidWindow) && knownCount < 8) {
+      known[knownCount++] = a;
+      if (hidWindow) ble_hid_remember(a.getType(), a.getVal());
+      return;
+    }
     BLE_LOG("conn %u: new phone outside the pairing window, refused\n", ci.getConnHandle());
     NimBLEDevice::deleteBond(a);
     server->disconnect(ci.getConnHandle());
@@ -299,7 +312,8 @@ static void sendText(int ch, const Text &t, uint32_t timeout_ms) {
 // A plain link that is neither the app (it encrypts within a second) nor a CLI session: a stranger holding a slot.
 // Not within the pairing window: the app's first link stays plain while iOS shows its pairing dialog.
 static void dropIdlePlainLinks() {
-  if (ble_pair_window_open()) return;
+  // iOS stays unencrypted while the user is looking at the pairing dialog.
+  if (ble_pair_window_open() || ble_hid_pair_window_open()) return;
   for (int i = 0; i < MAX_PEERS; i++) {
     int h = peers[i];
     if (h >= 0 && !encrypted(h) && !cli_known(i) && millis() - connAt[i] > PLAIN_GRACE_MS) {
@@ -346,8 +360,19 @@ static void toText(Text &t, const String &s) {
 }
 
 static NimBLEAdvertisementData appAdv, cliAdv;
-static SemaphoreHandle_t advLock;
+static BleAdvertisingGate advGate;
 static AdvId advNow = ADV_NONE;
+static volatile bool appOnAir;
+
+bool ble_app_advertising() { return appOnAir; }
+
+void ble_forget_addr(uint8_t type, const uint8_t addr[6]) {
+  NimBLEAddress gone(addr, type);
+  int w = 0;
+  for (int i = 0; i < knownCount; i++)
+    if (!(known[i] == gone)) known[w++] = known[i];
+  knownCount = w;
+}
 
 // The identity a link came in on: our own address on it is the CLI's random one, or the public one.
 static bool viaCli(int h) {
@@ -363,29 +388,57 @@ static AdvId wantedAdv() {
   if (app && cli) return ADV_NONE;
   if (app) return ADV_CLI;  // the CLI still learns the app holds the board (owner app, busy)
   if (cli) return ADV_APP;  // the app can always come and take over
+  // HID pairing needs the public identity to stay on air. Cycling away for the CLI
+  // makes iOS give up before the user can tap the name.
+  if (ble_hid_pair_window_open()) return ADV_APP;
   return millis() % ADV_CYCLE_MS < ADV_CLI_MS ? ADV_CLI : ADV_APP;
 }
 
 // Brings advertising to the identity wanted now; a connection ends it, so this also restarts it.
 static void advertise() {
-  xSemaphoreTake(advLock, portMAX_DELAY);
-  AdvId want = wantedAdv();
-  NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
-  bool active = adv->isAdvertising();
-  if (!active || want != advNow) {
-    if (active) adv->stop();
+  advGate.run([] {
+    AdvId want = wantedAdv();
+    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+    bool active = adv->isAdvertising();
+    if (!active || want != advNow) {
+      if (active) adv->stop();
+      advNow = ADV_NONE;
+      if (want != ADV_NONE && NimBLEDevice::setOwnAddrType(want == ADV_CLI ? BLE_OWN_ADDR_RANDOM : BLE_OWN_ADDR_PUBLIC) &&
+          adv->setAdvertisementData(want == ADV_CLI ? cliAdv : appAdv) && adv->start())
+        advNow = want;
+    }
+    appOnAir = advNow == ADV_APP;
+  });
+}
+
+bool ble_pause_advertising() {
+  return advGate.pause([] {
+    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+    if (!adv->stop()) return false;
     advNow = ADV_NONE;
-    if (want != ADV_NONE && NimBLEDevice::setOwnAddrType(want == ADV_CLI ? BLE_OWN_ADDR_RANDOM : BLE_OWN_ADDR_PUBLIC) &&
-        adv->setAdvertisementData(want == ADV_CLI ? cliAdv : appAdv) && adv->start())
-      advNow = want;
-  }
-  xSemaphoreGive(advLock);
+    appOnAir = false;
+    return true;
+  });
+}
+
+void ble_resume_advertising() {
+  advGate.resume();
+  advertise();
 }
 
 static void setUpAdvertising(const std::string &name) {
   for (auto *d : {&appAdv, &cliAdv}) d->setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
   appAdv.setCompleteServices(NimBLEUUID(UUID("0000")));
   cliAdv.setCompleteServices(NimBLEUUID(UUID("0010")));
+  // HID service + generic HID appearance, still on this one legacy advert (31 bytes).
+  // The 128-bit app UUID stays so the companion keeps discovering the same identity.
+  appAdv.setAppearance(0x03C0);
+  appAdv.addServiceUUID(NimBLEUUID((uint16_t)0x1812));
+  if (appAdv.getPayload().size() > 31) {
+    appAdv.removeData(0x19);
+    board_log("ble: advert overflow, dropped appearance, now %u\n", (unsigned)appAdv.getPayload().size());
+  }
+  board_log("ble: app advert %u bytes\n", (unsigned)appAdv.getPayload().size());
   NimBLEAdvertisementData scan;
   scan.setName(name);
   NimBLEDevice::getAdvertising()->setScanResponseData(scan);
@@ -427,6 +480,7 @@ void ble_begin(const String &name) {
 
   server = NimBLEDevice::createServer();
   server->setCallbacks(new ServerCb());
+  ble_hid_begin(server);
   NimBLEService *svc = server->createService(UUID("0000"));
   NimBLECharacteristic *cmd = svc->createCharacteristic(UUID("0001"), NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR |
                                                                                    NIMBLE_PROPERTY::WRITE_ENC);
@@ -449,7 +503,7 @@ void ble_begin(const String &name) {
   for (auto *c : chars) c->setCallbacks(&charCb);
   server->start();
 
-  advLock = xSemaphoreCreateMutex();
+  advGate.begin();
   setUpAdvertising(name.c_str());
   advertise();
   xTaskCreatePinnedToCore(txTask, "ble_tx", 3072, NULL, 3, NULL, 1);
@@ -565,6 +619,7 @@ void ble_unpair() {
   cli_forget_all();                // and paired computers
   knownCount = 0;                  // forgotten phones are strangers; pairing stays closed until serial says so
   pairArmed = false;
+  ble_hid_bonds_cleared();         // the controller bonds are already gone; drop the HID list too
   bool any = false;
   for (int i = 0; i < MAX_PEERS; i++)
     if (peers[i] >= 0) { server->disconnect(peers[i]); any = true; }  // onDisconnect restarts advertising

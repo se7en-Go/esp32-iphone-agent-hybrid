@@ -244,6 +244,26 @@ $("guard-reset").addEventListener("click", () => {
 });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("zoom").open) post("/api/agent/stop"); });
 
+function formatHid(hid, hint) {
+  if (!hid || !hid.mode && !hid.path) return hint && (lang === "zh" ? hint.zh : hint.en) || "";
+  const ble = hid.ble || {};
+  const path = hid.path === "usb" ? "USB" : hid.path === "ble" ? "BLE" : (lang === "zh" ? "未连接" : "not connected");
+  const parts = [`HID ${hid.mode || "?"} → ${path}`];
+  if (hid.pace != null) parts.push(`pace ${hid.pace}`);
+  if (hid.mode !== "usb") {
+    const word = (on, zh, en) => (on ? (lang === "zh" ? zh[0] : en[0]) : (lang === "zh" ? zh[1] : en[1]));
+    parts.push([
+      word(ble.adv, ["广播中", "未广播"], ["advertising", "not advertising"]),
+      word(ble.conn, ["已连接", "未连接"], ["connected", "disconnected"]),
+      word(ble.bond, ["已绑定", "未绑定"], ["bonded", "not bonded"]),
+      ble.pair ? (lang === "zh" ? "配对窗口开着" : "pairing window open") : "",
+    ].filter(Boolean).join(lang === "zh" ? "，" : ", "));
+  }
+  const extra = hint && (lang === "zh" ? hint.zh : hint.en);
+  if (extra) parts.push(extra);
+  return parts.filter(Boolean).join(" · ");
+}
+
 // ---- polling -------------------------------------------------------------------------
 
 let shown = "";
@@ -263,7 +283,10 @@ async function poll() {
     });
     $("setup").classList.toggle("all-done", ready);
     const link = s.link || {};
-    if ($("link-line")) $("link-line").textContent = [link.port, link.mode, link.ip, link.receiver].filter(Boolean).join(" · ");
+    if ($("link-line")) {
+      const hidLine = formatHid(s.hid, s.hints && s.hints.hid);
+      $("link-line").textContent = [link.port, link.mode, link.ip, link.receiver, hidLine].filter(Boolean).join(" · ");
+    }
 
     const a = s.agent, steps = a.steps;
     $("run").disabled = a.running || !ready;

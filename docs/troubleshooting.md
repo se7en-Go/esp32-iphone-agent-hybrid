@@ -26,7 +26,7 @@ COM 口没连上，或固件没刷进去。拔插 COM 线，看启动窗口里�
 
 ## calibrated 灯是红的
 
-前两个灯先绿。然后在网页里点校准，再点画面上的圆点。圆点没出现就是辅助触控没开，或 USB 口没插对。
+前两个灯先绿。然后在网页里点校准，再点画面上的圆点。圆点没出现就是辅助触控没开，或当前这条控制通道没通。网页连接行会写着 HID 走 USB 还是蓝牙。走 USB 时检查标着 USB 的口。走蓝牙时，在 iPhone 设置 → 蓝牙里选择 **ESP32 Agent**，电脑上可运行 `scripts/hid-mode.sh pair`（Windows 用 `hid-mode.ps1`）。换了 USB 和蓝牙之后，旧的校准会被清掉，需要再点一次校准。蓝牙 HID 还没有在真机上验证。
 
 ## 中文只有拼音、或候选不对
 
@@ -43,3 +43,11 @@ COM 口没连上，或固件没刷进去。拔插 COM 线，看启动窗口里�
 ## 连上板子热点之后电脑上不了网
 
 这是预期。热点不提供互联网。请改回 STA：`wifi.sh --ssid ...`。只有电脑另有网线时才用 `--ap`。
+
+## 手机蓝牙列表里没有 ESP32 Agent
+
+COM 口仍接电脑。运行 `scripts/hid-mode.sh pair`（Windows 用 `hid-mode.ps1`），60 秒内在 iPhone 设置 → 蓝牙里选择名字以 **ESP32 Agent** 开头的设备，并打开辅助触控。列表里已经有旧的同名设备时，先在系统蓝牙里忽略它，再运行 `hid-mode.sh unpair` 或 `hid-mode.ps1 unpair`，然后重新 pair。unpair 会删掉这块板上的蓝牙绑定，配套 App 的绑定也在同一处，会一起被删掉。网页 `/api/status` 的 `hid.ble` 会写着是否在广播、是否连上、是否已绑定。这一步还没有在真机上验证。
+
+## 命令说 phone not connected over usb/ble
+
+当前模式是 auto，USB 没插上，蓝牙 HID 也没连上。插上标着 USB 的口，或按上面的步骤配对。想固定一种：`hid-mode.sh usb`、`hid-mode.sh ble` 或 `hid-mode.sh auto`。Windows 把 `hid-mode.sh` 换成 `hid-mode.ps1`。手机锁屏后 USB 可能休眠，解锁即可；回复里带 asleep 就是这件事。

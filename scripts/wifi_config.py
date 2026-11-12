@@ -72,7 +72,14 @@ async def _run(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="经 COM 口配置板子的 Wi-Fi，写入 NVS。")
+    parser = argparse.ArgumentParser(
+        description="经 COM 口配置板子的 Wi-Fi，写入 NVS。",
+        epilog=(
+            "配网不改变控制手机的方式。"
+            "USB 或蓝牙 HID 用 scripts/hid-mode.sh / hid-mode.ps1。"
+            "蓝牙 HID 还没有在真机上验证。"
+        ),
+    )
     parser.add_argument("--ssid", default="", help="2.4GHz 网络名称")
     parser.add_argument("--password", default="", help="不建议写在命令行里；留空则提示输入")
     parser.add_argument("--ap", action="store_true", help="改回热点。仅适合电脑另有网线的情况")

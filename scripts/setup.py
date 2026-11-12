@@ -54,13 +54,24 @@ def install(python: Path, dev: bool) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="安装电脑端依赖（PyAV、pyserial、esptool、MCP）。")
+    parser = argparse.ArgumentParser(
+        description="安装电脑端依赖（PyAV、pyserial、esptool、MCP）。",
+        epilog=(
+            "控制手机可以走 USB，也可以走蓝牙 HID。"
+            "配对见 scripts/hid-mode.sh 或 scripts/hid-mode.ps1。"
+            "蓝牙 HID 还没有在真机上验证。"
+        ),
+    )
     parser.add_argument("--dev", action="store_true", help="连同 pytest 和 ruff 一起装，给开发者用")
     args = parser.parse_args(argv)
     python = create_venv()
     install(python, args.dev)
     print("Python 环境好了。")
     print("下一步：把 CI 产物 esp32s3-n16r8-merged.bin 放到 hardware/dist/ ，COM 口接电脑，然后刷机。")
+    print(
+        "手机不方便插 USB 时，刷机并配网之后可以用蓝牙 HID："
+        "scripts/hid-mode.sh（Windows 用 hid-mode.ps1）。这一步还没有在真机上验证。"
+    )
     if sys.platform == "win32":
         print("刷机：powershell -ExecutionPolicy Bypass -File hardware\\flash.ps1")
     else:

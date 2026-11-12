@@ -1,16 +1,48 @@
 """入口脚本能打印帮助，并且文档没有叫人去装 Linux 子系统。"""
 
+import importlib.util
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 BANNED = ("请先装 WSL", "请先安装 WSL", "install WSL", "先装 WSL2", "Windows 用户请先装 WSL")
 
 
+def test_pair_and_unpair_are_positional():
+    path = ROOT / "scripts" / "hid_mode.py"
+    spec = importlib.util.spec_from_file_location("hid_mode", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    paired = mod._parse(["pair"])
+    assert paired.pair and paired.mode is None and not paired.unpair
+    unpaired = mod._parse(["unpair"])
+    assert unpaired.unpair and unpaired.mode is None and not unpaired.pair
+    flagged = mod._parse(["--pair"])
+    assert flagged.pair and flagged.mode is None
+    both = mod._parse(["ble", "--pair"])
+    assert both.mode == "ble" and both.pair
+
+
+@pytest.mark.parametrize("action", ["usb", "ble", "auto", "pair", "unpair", "--pair", "--unpair"])
+def test_hid_status_rejects_changes(action):
+    path = ROOT / "scripts" / "hid_mode.py"
+    spec = importlib.util.spec_from_file_location("hid_mode", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    status = mod._parse(["--status", "--port", "COM5"])
+    assert status.status and status.mode is None and not status.pair and not status.unpair
+    with pytest.raises(SystemExit) as exc:
+        mod._parse([action, "--status"])
+    assert exc.value.code == 2
+
+
 def test_help_exits_cleanly():
-    for script in ("scripts/setup.py", "scripts/flash.py", "scripts/wifi_config.py", "scripts/mcp_config.py"):
+    for script in ("scripts/setup.py", "scripts/flash.py", "scripts/wifi_config.py", "scripts/mcp_config.py",
+                   "scripts/hid_mode.py"):
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
         result = subprocess.run(

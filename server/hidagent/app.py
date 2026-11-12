@@ -276,17 +276,31 @@ def index():
     return FileResponse(Path(__file__).parent / "static" / "index.html")
 
 
+def _board_hid(dev) -> dict | None:
+    board = getattr(dev, "board_status", None)
+    hid = board.get("hid") if isinstance(board, dict) else None
+    if isinstance(hid, str):
+        return {"path": hid}
+    return hid if isinstance(hid, dict) else None
+
+
 @app.get("/api/status")
 def status():
     dev = bool(getattr(device, "connected", False))
     live = bool(getattr(screen, "live", False))
+    adopt = getattr(phone, "adopt_pace", None)
+    if adopt:
+        adopt(getattr(device, "pace_version", None))
     calibrated = bool(getattr(phone, "calibrated", False))
     last_error = str(getattr(device, "last_error", "") or getattr(screen, "last_error", "") or "")
+    hid = _board_hid(device)
     return {"device": dev, "screen": live, "calibrated": calibrated, "ready": dev and live and calibrated,
             "debug": DEBUG, "trace": str(agent.trace.dir or ""), "aspect": round(screen.aspect, 4),
             "hints": hints(dev, live, calibrated,
                            "" if dev else last_error,
-                           str(getattr(screen, "last_error", "") or "")),
+                           str(getattr(screen, "last_error", "") or ""),
+                           hid),
+            "hid": hid,
             "link": {"port": getattr(device, "port_name", ""), "mode": getattr(device, "mode", ""),
                      "ip": getattr(device, "ip", ""), "receiver": "ESP32 Agent"},
             "models": {"planner": agent.planner.model, "actor": agent.actor.model},

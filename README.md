@@ -11,7 +11,7 @@
 | 板子上的口 | 接到 | 作用 |
 |---|---|---|
 | COM（USB 转串口，可能是 CH343 / FTDI / CP210x） | 电脑 | 刷机、命令、读 vtok、把 Wi-Fi 写进 NVS |
-| USB（GPIO19/20） | iPhone | USB 鼠标键盘。Lightning 要用相机转换器 |
+| USB（GPIO19/20） | iPhone | USB 鼠标键盘。Lightning 要用相机转换器。不方便插线时，也可以在 iPhone 蓝牙里配对 **ESP32 Agent**，走蓝牙 HID。这一步还没有在真机上验证 |
 
 默认是 STA：板子、手机、电脑连同一个 **2.4GHz** 路由器。换地方就再跑一次配网，不用重烧，也不会把密码放进仓库。板子自己的热点不提供互联网，只适合电脑另外插了网线的时候。
 
@@ -22,7 +22,7 @@
 1. 安装 Python 3.10+（python.org 的安装包即可），在仓库根目录运行 `./scripts/setup.sh`。
 2. 从 Actions 的 Firmware 作业下载 `esp32s3-n16r8-merged.bin` 放到 `hardware/dist/`。COM 口接电脑，运行 `./hardware/flash.sh`。
 3. `./scripts/wifi.sh --ssid '你家的2.4GHz'`，按提示输入密码。
-4. USB 口接手机，打开辅助触控，屏幕镜像选 **ESP32 Agent**。`./scripts/run-local.sh`，打开 `http://127.0.0.1:8890`。先等 device 和 screen 两盏灯变绿，再点校准，点中圆点后第三盏灯才绿。
+4. USB 口接手机，打开辅助触控，屏幕镜像选 **ESP32 Agent**。不方便插线时，COM 口仍接电脑，运行 `./scripts/hid-mode.sh pair`，在 iPhone 设置 → 蓝牙里选择 **ESP32 Agent**（名字后面可能有四位字母）。`./scripts/run-local.sh`，打开 `http://127.0.0.1:8890`。先等 device 和 screen 两盏灯变绿，再点校准，点中圆点后第三盏灯才绿。蓝牙 HID 还没有在真机上验证。
 5. `./scripts/mcp-config.sh`，让 Agent 把指针移到屏幕中央并停住。
 
 细节：[docs/setup-macos.md](docs/setup-macos.md)
@@ -32,7 +32,7 @@
 1. 安装 Python 3.10+，勾选 Add python.exe to PATH。`powershell -ExecutionPolicy Bypass -File scripts\setup.ps1`
 2. 下载同一个 `esp32s3-n16r8-merged.bin` 放到 `hardware\dist\`。COM 口接电脑。`powershell -ExecutionPolicy Bypass -File hardware\flash.ps1`
 3. `powershell -ExecutionPolicy Bypass -File scripts\wifi.ps1 --ssid "你家的2.4GHz"`
-4. USB 口接手机，辅助触控，屏幕镜像选 **ESP32 Agent**。`powershell -ExecutionPolicy Bypass -File scripts\run-server.ps1`，打开 `http://127.0.0.1:8890`，先等 device 和 screen 两盏灯变绿，再点校准，点中圆点后第三盏灯才绿。
+4. USB 口接手机，辅助触控，屏幕镜像选 **ESP32 Agent**。不方便插线时，COM 口仍接电脑，运行 `powershell -ExecutionPolicy Bypass -File scripts\hid-mode.ps1 pair`，在 iPhone 设置 → 蓝牙里选择 **ESP32 Agent**。`powershell -ExecutionPolicy Bypass -File scripts\run-server.ps1`，打开 `http://127.0.0.1:8890`，先等 device 和 screen 两盏灯变绿，再点校准，点中圆点后第三盏灯才绿。蓝牙 HID 还没有在真机上验证。
 5. `powershell -ExecutionPolicy Bypass -File scripts\mcp-config.ps1`
 
 Mac 上端口可能是 `/dev/cu.usbserial-…` 或 `/dev/cu.wchusbserial…`，Windows 是 `COMx`。FTDI 在 macOS 上通常不用装驱动。Windows 没有 COM 口时，按芯片装驱动：FTDI 用 VCP 驱动 https://ftdichip.com/drivers/vcp-drivers/ ，沁恒用 CH343 驱动 https://www.wch.cn/downloads/CH343SER_EXE.html 。
