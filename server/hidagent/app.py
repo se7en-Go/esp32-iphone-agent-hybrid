@@ -21,6 +21,7 @@ from .guard import Guard, limits_for, skill_file
 from .layouts import list_layouts, resolve_point
 from .llm import LLM
 from .messages import for_user, hints
+from .operation import ActionLifetimeMiddleware
 from .paths import skill_roots
 from .phone import Phone
 from .screen import Screen
@@ -154,6 +155,9 @@ async def reject_cross_site_posts(request: Request, call_next):
         if not ctype and has_body:
             return JSONResponse({"detail": "只接受 application/json，不接受表单提交。"}, status_code=415)
     return await call_next(request)
+
+
+app.add_middleware(ActionLifetimeMiddleware)
 
 
 class Static(StaticFiles):

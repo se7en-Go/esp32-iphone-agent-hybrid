@@ -9,3 +9,13 @@ Real frames from `/api/frame.jpg` (720x1560 JPEG), iPhone 15 Pro Max, iOS 26.3.1
 | 04_m200_200ms.jpg | `move 200 200`, 0.2 s later, still on its way | (367.5, 275.3) |
 | 04_m200_2000ms.jpg | `move 200 200` | (463.5, 371.3) |
 | 05_nudge_r_400ms.jpg | `move 12 0` | (473.5, 371.3) |
+
+Live, 15:07 the same day, verified tap at (0.75, 0.40) = (540, 624) px after calibrating to span 678 x 1466,
+origin (0.127, -0.001):
+
+| file | what | pointer centre (px) |
+| --- | --- | --- |
+| live_tap_landed.jpg | after home + `move 422 587` | (570.1, 663.7): long moves go 30/40 px further |
+| live_tap_landed_nudged.jpg | + `move 12 0` | (580.7, 663.6) |
+| live_tap_corrected.jpg | after the correction `move -28 -37` | (540.5, 624.0) |
+| live_tap_corrected_nudged.jpg | + `move 12 0` | (545.6, 624.0): the same nudge moved only 5.1 px |
