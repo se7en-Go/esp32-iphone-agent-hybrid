@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import pytest
+from fake_clock import ManualClock
 from PIL import Image, ImageDraw
 
 from hidagent import feedback
@@ -19,6 +20,13 @@ from hidagent.phone import Phone
 
 FIXTURES = Path(__file__).parent / "fixtures" / "ios26"
 KEYPAD = (FIXTURES / "keypad_no_disc.jpg").read_bytes()
+
+
+@pytest.fixture(autouse=True)
+def paced_clock(monkeypatch):
+    clock = ManualClock()
+    clock.install(monkeypatch)
+    return clock
 
 
 def keypad_edit(*, digit=False, clock=False, pointer=False, highlight=False, pointer_at=(.5, .44)):

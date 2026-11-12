@@ -1,5 +1,6 @@
 import asyncio
 import io
+import math
 import threading
 import time
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ class Screen:
     fresh_frame = True
 
     async def fresh(self, *_):
+        await asyncio.sleep(1 / 30)
         self.updated = time.time()
         return self.frame if self.fresh_frame else None
 
@@ -174,7 +176,11 @@ def test_cancel_during_ocr_keeps_event_loop_live_and_sends_no_hid(monkeypatch):
 
 
 @pytest.mark.parametrize("name", ["tap", "tap_text"])
-def test_every_tap_records_screen_diff_before_next_action(monkeypatch, name):
+@pytest.mark.parametrize("coarse_wall", [False, True])
+def test_every_tap_records_screen_diff_before_next_action(monkeypatch, request, name, coarse_wall):
+    if coarse_wall:
+        clock = request.getfixturevalue("instant_mirror")
+        monkeypatch.setattr(time, "time", lambda: math.floor(clock.time() * 64) / 64)
     agent, phone, screen = setup()
     before, after = screen.frame, frame("black")
     monkeypatch.setattr(module.ocr, "find_matches", lambda *_, **__: [match()])

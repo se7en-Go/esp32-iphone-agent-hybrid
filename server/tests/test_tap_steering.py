@@ -3,7 +3,15 @@ import asyncio
 import time
 
 import pytest
+from fake_clock import ManualClock
 from test_verified_tap import KEYPAD, LaggingMirror, calibrated_phone
+
+
+@pytest.fixture(autouse=True)
+def paced_clock(monkeypatch):
+    clock = ManualClock()
+    clock.install(monkeypatch)
+    return clock
 
 
 def test_signed_offsets_reach_left_and_above_home(tmp_path):

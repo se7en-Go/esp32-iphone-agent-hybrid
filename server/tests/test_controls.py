@@ -1,11 +1,13 @@
 import asyncio
 import base64
 import io
+import math
 import time
 from types import SimpleNamespace
 
 import httpx
 import pytest
+from fake_clock import ManualClock
 from PIL import Image
 
 from hidagent import feedback, freshness
@@ -30,6 +32,8 @@ class Screen:
     async def fresh(self, *args):
         if not self.new_frame:
             return None
+        # A delivered frame is a later event, even on a coarse Windows wall clock.
+        await asyncio.sleep(1 / 30)
         self.updated = time.time()
         return self.frame
     async def settled(self, **kwargs): pass
@@ -37,10 +41,13 @@ class Screen:
 
 @pytest.fixture(autouse=True)
 def instant_mirror(monkeypatch, request):
-    # These fake screens deliver post-action frames instantly; latency regressions use paced fakes.
+    # These fake screens publish the next frame without mirror lag; latency tests use paced fakes.
     if "delayed_pointer_frame" not in request.node.name:
+        clock = ManualClock()
+        clock.install(monkeypatch)
         monkeypatch.setattr(feedback, "MIRROR_LAG_SECONDS", 0)
         monkeypatch.setattr(freshness, "MIRROR_LAG_SECONDS", 0)
+        return clock
 
 
 class FakePhone:
@@ -124,6 +131,22 @@ def test_pixel_coordinates_return_evidence_and_single_use_token():
     with pytest.raises(ValueError, match="consumed"):
         asyncio.run(control.perform(request))
     assert len(phone.calls) == 1
+
+
+@pytest.mark.parametrize("quantum", [.015625, .001])
+def test_post_action_evidence_with_coarse_wall_clock(monkeypatch, instant_mirror, quantum):
+    clock = instant_mirror
+    monkeypatch.setattr(time, "time", lambda: math.floor(clock.time() / quantum) * quantum)
+    phone, screen = FakePhone(), Screen()
+    control = Controls(phone, screen)
+    token = control.observation()["screen_id"]
+    completed_at = time.time()
+    result = asyncio.run(control.perform(ControlAction(action="tap", screen_id=token, x=.5, y=.5)))
+    assert phone.calls == [("tap", .5, .5)]
+    assert screen.updated > completed_at
+    assert result["fresh"] is True and result["changed"] is False
+    assert result["screen_diff"]["changed_fraction"] == 0
+    assert result["screen_id"] and result["screen_id"] != token
 
 
 @pytest.mark.parametrize("reason", ["expired", "changed", "normalized", "pixels"])

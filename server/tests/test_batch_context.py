@@ -2,6 +2,7 @@ import asyncio
 import time
 
 import pytest
+from fake_clock import ManualClock
 from test_controls import FakePhone, Screen, jpeg
 
 from hidagent import feedback, freshness
@@ -11,6 +12,7 @@ from hidagent.control import Controls
 
 @pytest.fixture(autouse=True)
 def instant_mirror(monkeypatch):
+    ManualClock().install(monkeypatch)
     monkeypatch.setattr(feedback, "MIRROR_LAG_SECONDS", 0)
     monkeypatch.setattr(freshness, "MIRROR_LAG_SECONDS", 0)
 
