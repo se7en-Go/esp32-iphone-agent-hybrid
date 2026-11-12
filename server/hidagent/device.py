@@ -14,12 +14,15 @@ import os
 import sys
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
+from dataclasses import dataclass
 
 import serial
 from serial.tools import list_ports
 
 from . import messages
+from .operation import check_operation
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +50,25 @@ FIXED_ID = {"netinfo", "status", "net"}
 
 class DeviceError(RuntimeError):
     pass
+
+
+@dataclass
+class ExchangeTiming:
+    sent_at: float | None = None
+
+
+_exchange_timing: ContextVar[ExchangeTiming | None] = ContextVar("exchange_timing", default=None)
+
+
+@contextmanager
+def exchange_timing():
+    """Capture the monotonic write boundary after any wait for the serial lock."""
+    timing = ExchangeTiming()
+    token = _exchange_timing.set(timing)
+    try:
+        yield timing
+    finally:
+        _exchange_timing.reset(token)
 
 
 def open_serial(port: str, baud: int = 115200, impl=None, platform: str | None = None):
@@ -272,6 +294,11 @@ class Device:
             try:
                 # 在 guard 的同一把锁内复查并写入；先释放它，再 await 应答。
                 with write_guard if write_guard is not None else nullcontext():
+                    if name in HID_COMMANDS and name != "release":
+                        check_operation()
+                    timing = _exchange_timing.get()
+                    if timing is not None:
+                        timing.sent_at = time.monotonic()
                     link.write(f"{req_id} {command}\n".encode())
                 reply = await self._read_reply(link, req_id, timeout)
             except asyncio.CancelledError:

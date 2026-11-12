@@ -34,7 +34,9 @@ def annexb_access_units(count: int = 4, gop: str = "1") -> list[bytes]:
     codec.pix_fmt = "yuv420p"
     codec.time_base = Fraction(1, 10)
     codec.framerate = 10
-    codec.options = {"preset": "ultrafast", "tune": "zerolatency", "profile": "baseline", "g": gop}
+    codec.thread_count = 1  # one slice per picture, so split_aus yields complete access units
+    codec.options = {"preset": "ultrafast", "tune": "zerolatency", "profile": "baseline", "g": gop,
+                     "threads": "1", "slices": "1"}
     codec.open()
     packets: list[bytes] = []
     for index in range(count):
@@ -253,8 +255,8 @@ def test_keepalive_ack_is_not_a_frozen_screen():
     assert stream_is_dead(12.5, last_frame=0, last_ack=0) is True
 
 
-def test_reconnect_uses_plain_hello_and_a_fresh_decoder():
-    """断线后不发 hello … at。新连接用新解码器，等板子重发 CONFIG/IDR。"""
+def test_first_connection_uses_plain_hello_with_a_fresh_decoder():
+    """第一次连接没有可续传的时间戳，发普通 hello，等板子重发 CONFIG/IDR。"""
     assert hello_line(TOKEN) == f"hello {TOKEN}\n".encode()
     assert b" at " not in hello_line(TOKEN)
 
@@ -327,6 +329,99 @@ def test_resume_timestamp_only_after_a_decoded_access_unit():
     decoder.last_ts = 7
     decoder.reconnect()  # a new session keeps the codec and its place
     assert decoder.last_ts == 7
+
+
+@pytest.mark.parametrize("disconnect", [b"", ConnectionResetError("connection reset")])
+def test_disconnect_publishes_pending_frame_before_resuming_a_still_screen(monkeypatch, disconnect):
+    """Real IDR/P frames from review_resume_7201.py: the last decoded AU must also reach the display."""
+    from hidagent import video7201
+
+    units = annexb_access_units(2, gop="100")
+    assert len(units) == 2
+    blob = keepalive()
+    seq = 0
+    for index, unit in enumerate(units):
+        chunk, seq = pack_access_unit(unit, seq, (index + 1) * 100, idr=index == 0)
+        blob += chunk
+
+    clock = [0.0]  # both AUs arrive inside one rate-limit interval
+    stop = threading.Event()
+
+    class Socket:
+        def __init__(self, payload, ending):
+            self.payload, self.ending = payload, ending
+            self.sent = []
+            self.closed = False
+
+        def setsockopt(self, *_args):
+            pass
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, data):
+            self.sent.append(data)
+
+        def recv(self, _size):
+            if self.payload is not None:
+                payload, self.payload = self.payload, None
+                return payload
+            if self.ending is None:
+                clock[0] += 1
+                stop.set()
+                raise TimeoutError
+            if isinstance(self.ending, Exception):
+                raise self.ending
+            return self.ending
+
+        def close(self):
+            self.closed = True
+
+    first = Socket(blob, disconnect)
+    # A still phone has no AU newer than 200 to send after the resume request.
+    second = Socket(keepalive(), None)
+    connections = iter([first, second])
+    monkeypatch.setattr(video7201.socket, "create_connection", lambda *_args, **_kw: next(connections))
+    monkeypatch.setattr(video7201.time, "monotonic", lambda: clock[0])
+    decoder = H264Decoder()
+    images, timestamps = [], []
+
+    with pytest.raises(ConnectionError):
+        run_tcp("board", 7201, TOKEN, images.append, stop, decoder=decoder, on_ts=timestamps.append)
+    assert first.closed and decoder.last_ts == 200
+    assert timestamps == [100, 200], "EOF/reset must publish the newest decoded frame, even below max_fps"
+    assert Image.open(io.BytesIO(images[0])).tobytes() != Image.open(io.BytesIO(images[1])).tobytes()
+
+    run_tcp("board", 7201, TOKEN, images.append, stop, decoder=decoder, on_ts=timestamps.append)
+    assert second.closed and second.sent[0] == hello_line(TOKEN, 200)
+    assert timestamps == [100, 200] and decoder.last_ts == 200
+
+
+def test_real_p_frames_resume_with_the_same_reference_chain():
+    """The retained codec resumes P frames pixel-identically and accepts a new IDR fallback."""
+    units = annexb_access_units(4, gop="100")
+    assert len(units) == 4
+
+    def decode(decoder, unit, seq, timestamp, *, idr=False):
+        blob, _next_seq = pack_access_unit(unit, seq, timestamp, idr=idr)
+        return [frame for record in RecordBuffer().feed(blob) for frame in decoder.push_chunk(record)]
+
+    reference = H264Decoder()
+    expected = [frame for index, unit in enumerate(units)
+                for frame in decode(reference, unit, index, (index + 1) * 100, idr=index == 0)]
+    resumed = H264Decoder()
+    actual = []
+    for index, unit in enumerate(units):
+        if index == 2:
+            resumed.reconnect()
+            assert resumed.last_ts == 200
+        actual.extend(decode(resumed, unit, index if index < 2 else index + 21,
+                             (index + 1) * 100, idr=index == 0))
+    assert len(actual) == len(expected) == 4
+    assert [frame.to_image().tobytes() for frame in actual] == [frame.to_image().tobytes() for frame in expected]
+    resumed.reconnect()
+    fallback = decode(resumed, units[0], 200, 500, idr=True)
+    assert len(fallback) == 1 and fallback[0].to_image().tobytes() == expected[0].to_image().tobytes()
 
 
 def _large_replay(monkeypatch, decode_cost):

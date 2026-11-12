@@ -188,10 +188,10 @@ class LatestFrameGate:
         self.pending = frame
         return self.flush(now)
 
-    def flush(self, now: float):
+    def flush(self, now: float, *, force: bool = False):
         if self.pending is None:
             return None
-        if self.gap and self.last is not None and now - self.last < self.gap:
+        if not force and self.gap and self.last is not None and now - self.last < self.gap:
             return None
         ready = self.pending
         self.pending = None
@@ -224,15 +224,24 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
             decoder: H264Decoder | None = None) -> None:
     """阻塞读取一路 7201，直到 stop 或对端断开。on_jpeg(jpeg_bytes) 在解码线程里调用。
 
-    每次连接都新建解码器。静屏时板子可能不再推新帧，但 hello/ka 的零长度应答还在。
+    同一板子/token 重连时保留解码器，以 hello <token> at <ts> 从已解码的最后一个 AU 续传；
+    新解码器发普通 hello。静屏时板子可能不再推新帧，但 hello/ka 的零长度应答还在。
     只有帧和应答都停了约 12 秒才调用 on_stall。序号断了就发 resync，让板子从 IDR 重来。
     on_ts(board_ms) 在每个 on_jpeg 之前调用：这张图对应的访问单元到达板子时的 millis()。
-    新连接时板子会把上一个 IDR 以来的整段 GOP 重放一遍（静屏时 iOS 很久才给一个 IDR），
+    普通 hello 或续传时间戳失效时，板子可能重放上一个 IDR 以来的 GOP（参考链完整时）；
     这段时间里的图都是旧的；拿它和板子当前的 millis() 比，就知道画面落后多少。
     """
     sock = socket.create_connection((host, int(port)), timeout=connect_timeout)
     if sockets is not None:
         sockets.append(sock)
+    gate = LatestFrameGate(max_fps)
+
+    def emit(ready) -> None:
+        frame, ts = ready
+        if on_ts is not None:
+            on_ts(ts)
+        on_jpeg(frame_to_jpeg(frame, quality))
+
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.settimeout(0.5)
@@ -242,18 +251,11 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
             decoder.reconnect()
         sock.sendall(hello_line(token, getattr(decoder, "last_ts", None)))
         records = RecordBuffer()
-        gate = LatestFrameGate(max_fps)
         authed = False
         stalled = False
         last_ka = time.monotonic()
         last_frame = time.monotonic()
         last_ack = time.monotonic()
-
-        def emit(ready) -> None:
-            frame, ts = ready
-            if on_ts is not None:
-                on_ts(ts)
-            on_jpeg(frame_to_jpeg(frame, quality))
 
         def send_keepalive(now: float) -> None:
             nonlocal last_ka
@@ -313,3 +315,8 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
             pass
         if sockets is not None and sock in sockets:
             sockets.remove(sock)
+        # last_ts already includes this decoded AU; a resumed still screen will never send it again.
+        # Publish the pending picture on EOF/reset/stop even if the frame-rate interval has not elapsed.
+        ready = gate.flush(time.monotonic(), force=True)
+        if ready is not None:
+            emit(ready)

@@ -12,10 +12,20 @@ import os
 import socket
 import threading
 import time
+from dataclasses import dataclass
 
 from . import video7201, vision
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FrameSnapshot:
+    """One published image and its clocks; readers retain this object across awaits."""
+
+    frame: bytes
+    board_ts: int | None
+    arrived: float  # host monotonic seconds, never wall-clock time
 
 
 class Screen:
@@ -31,6 +41,7 @@ class Screen:
         # board millis() of the access unit behind `frame` (None: unknown). See video7201.run_tcp.
         self.frame_ts: int | None = None
         self._next_ts: int | None = None
+        self._snapshot: FrameSnapshot | None = None
         # one decoder for the whole stream from this board, so a reconnect can go on from its last AU
         self._decoder = None
         self._decoder_for: tuple[str, str] | None = None
@@ -112,11 +123,18 @@ class Screen:
         self._next_ts = ts
 
     def _on_jpeg(self, jpeg: bytes) -> None:
-        self.frame_ts, self._next_ts = self._next_ts, None
+        snapshot = FrameSnapshot(jpeg, self._next_ts, time.monotonic())
+        self.frame_ts, self._next_ts = snapshot.board_ts, None
         self.frame = jpeg
         self.updated = time.time()
+        # Publish one immutable object: the decoder thread may run between any two reader bytecodes.
+        self._snapshot = snapshot
         if self.last_error.startswith("画面停住了"):
             self.last_error = ""
+
+    @property
+    def snapshot(self) -> FrameSnapshot | None:
+        return self._snapshot
 
     @property
     def live(self) -> bool:
@@ -126,7 +144,8 @@ class Screen:
         if not self._started:
             return True
         # 静止画面时 AirPlay 不推新帧。会话还在、最近 90 秒内有过帧，就算活着。
-        return self._session_ok and (time.time() - self.updated < 90)
+        snapshot = self.snapshot
+        return self._session_ok and snapshot is not None and time.monotonic() - snapshot.arrived < 90
 
     @property
     def aspect(self) -> float:
@@ -143,7 +162,8 @@ class Screen:
         if transport:
             started = time.monotonic()
             await asyncio.sleep(least)
-            while time.time() - self.updated < quiet and time.monotonic() - started < most:
+            while ((snapshot := self.snapshot) is not None and time.monotonic() - snapshot.arrived < quiet
+                   and time.monotonic() - started < most):
                 await asyncio.sleep(.1)
             return
         started = last_change = time.monotonic()
@@ -160,12 +180,23 @@ class Screen:
 
     async def fresh(self, since: float, timeout: float = 0.8) -> bytes | None:
         """The first frame received after `since`, or None if none arrives in time."""
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         while self.updated <= since:
-            if time.time() > deadline:
+            if time.monotonic() >= deadline:
                 return None
             await asyncio.sleep(0.02)
         return self.frame
+
+    async def fresh_snapshot(self, since: float, timeout: float = 0.8) -> FrameSnapshot | None:
+        """A coherent frame received after monotonic `since`, or None within `timeout`."""
+        deadline = time.monotonic() + timeout
+        while True:
+            snapshot = self.snapshot
+            if snapshot is not None and snapshot.arrived > since:
+                return snapshot
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(0.02)
 
 
 def _friendly_video_error(exc: Exception) -> str:

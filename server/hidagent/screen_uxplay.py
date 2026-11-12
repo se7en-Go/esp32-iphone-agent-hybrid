@@ -13,6 +13,7 @@ import threading
 import time
 
 from . import messages, vision
+from .screen import FrameSnapshot
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ class UxPlayScreen:
         self.name, self.fps, self.quality = name, fps, quality
         self.frame: bytes | None = None
         self.updated = 0.0
+        self._snapshot: FrameSnapshot | None = None
         self._proc = None
         self._clients_at, self._clients_n = 0.0, None
         self._stopping = False
@@ -52,6 +54,7 @@ class UxPlayScreen:
             self._read(read_fd)  # returns when UxPlay closes the pipe
             code = self._proc.wait()
             self.frame = None
+            self._snapshot = None
             log.warning("AirPlay receiver exited (code %s), restarting", code)
             time.sleep(1)
 
@@ -63,14 +66,15 @@ class UxPlayScreen:
         clients = self._clients()
         if clients is not None:  # Linux: is a phone connected to UxPlay right now?
             return clients > 0
-        return time.time() - self.updated < 90  # elsewhere: AirPlay sends no frames while the screen is still
+        snapshot = self.snapshot
+        return snapshot is not None and time.monotonic() - snapshot.arrived < 90
 
     def _clients(self) -> int | None:
         """Established TCP connections of the UxPlay process (a mirroring phone keeps some open).
 
         Read from /proc, cached for a second; None where /proc is not available (e.g. macOS).
         """
-        if time.time() - self._clients_at < 1:
+        if time.monotonic() - self._clients_at < 1:
             return self._clients_n
         try:
             fds = os.listdir(f"/proc/{self._proc.pid}/fd")
@@ -87,7 +91,7 @@ class UxPlayScreen:
                         n += cols[3] == "01" and cols[9] in inodes  # 01 = ESTABLISHED
         except OSError:
             n = None
-        self._clients_at, self._clients_n = time.time(), n
+        self._clients_at, self._clients_n = time.monotonic(), n
         return n
 
     @property
@@ -105,7 +109,8 @@ class UxPlayScreen:
         if transport:  # conservative pointer fallback: drain queued video, preserving conservative timing
             started = time.monotonic()
             await asyncio.sleep(least)
-            while time.time() - self.updated < quiet and time.monotonic() - started < most:
+            while ((snapshot := self.snapshot) is not None and time.monotonic() - snapshot.arrived < quiet
+                   and time.monotonic() - started < most):
                 await asyncio.sleep(.1)
             return
         started = last_change = time.monotonic()
@@ -122,12 +127,31 @@ class UxPlayScreen:
 
     async def fresh(self, since: float, timeout: float = 0.8) -> bytes | None:
         """The first frame received after `since`, or None if none arrives in time."""
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         while self.updated <= since:
-            if time.time() > deadline:
+            if time.monotonic() >= deadline:
                 return None
             await asyncio.sleep(0.02)
         return self.frame
+
+    @property
+    def snapshot(self) -> FrameSnapshot | None:
+        return self._snapshot
+
+    async def fresh_snapshot(self, since: float, timeout: float = 0.8) -> FrameSnapshot | None:
+        deadline = time.monotonic() + timeout
+        while True:
+            snapshot = self.snapshot
+            if snapshot is not None and snapshot.arrived > since:
+                return snapshot
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(0.02)
+
+    def _on_jpeg(self, jpeg: bytes) -> None:
+        snapshot = FrameSnapshot(jpeg, None, time.monotonic())
+        self.frame, self.updated = jpeg, time.time()
+        self._snapshot = snapshot
 
     def _read(self, fd: int) -> None:
         buf = b""
@@ -135,5 +159,5 @@ class UxPlayScreen:
             while chunk := pipe.read(1 << 16):
                 buf += chunk
                 while (start := buf.find(b"\xff\xd8")) >= 0 and (end := buf.find(b"\xff\xd9", start)) >= 0:
-                    self.frame, self.updated = buf[start:end + 2], time.time()
+                    self._on_jpeg(buf[start:end + 2])
                     buf = buf[end + 2:]
