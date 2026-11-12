@@ -168,7 +168,8 @@ def _pair(pa, pb, shift: float, w: int) -> float | None:
     dx, dy = pb[0] - pa[0], pb[1] - pa[1]
     # iOS accelerates the pointer, so a small nudge moves less than the calibrated scale says (12 units: 10 px
     # where 12 / span predicts 12.8 px on a 720 px wide iPhone 15 Pro Max frame); allow a broad band around it
-    if dx * shift <= 0 or not max(2.0, 0.35 * abs(shift) * w) <= abs(dx) <= 2.2 * abs(shift) * w:
+    # (live, 15 Pro Max: 10.6 and 5.1 px for the same 12 unit nudge at different moments)
+    if dx * shift <= 0 or not max(2.0, 0.25 * abs(shift) * w) <= abs(dx) <= 2.2 * abs(shift) * w:
         return None
     if abs(dy) > max(2.5, 0.15 * pa[2]):
         return None

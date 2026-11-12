@@ -63,8 +63,9 @@ NUDGE = 12              # mouse units the pointer is wiggled by to find it on sc
 POINTER_WAIT = 2.5      # seconds per direction (nudge, then the way back), never more
 # After every (re)connect to TCP 7201 the board replays all video since the last IDR, and iOS sends an IDR only
 # when mirroring starts: on the test phone that was 26 minutes of frames, 45 s to catch up. Frames older than
-# REPLAY_LAG on the board's clock are that replay, not the screen as it is now.
-REPLAY_LAG = 1.5        # seconds
+# REPLAY_LAG on the board's clock when they arrived are that replay, not the screen as it is now (live frames
+# arrive well under a second late; on a still screen the last frame just gets older, which is fine).
+REPLAY_LAG = 5          # seconds
 CATCH_UP_WAIT = 90      # seconds to wait for the replay to finish before giving up
 AIM_TOLERANCE = 0.008   # screen fraction; a bigger miss is corrected before pressing
 MAX_MISS = 0.06         # bigger misses are still corrected, but not learned from (they may be misreadings)
@@ -226,17 +227,22 @@ class Phone:
             return None
 
     def _frame_age(self, clock: float | None) -> float | None:
-        """Seconds the shown frame is behind the board's clock; None when unknown."""
+        """Seconds the shown frame was already behind the board's clock when it arrived; None when unknown.
+
+        Not its age now: a still screen keeps its last live frame for minutes, and that is the screen as it is.
+        """
         ts = getattr(self.screen, "frame_ts", None)
         if clock is None or ts is None:
             return None
-        return (time.time() * 1000 + clock - ts) / 1000
+        arrived = getattr(self.screen, "updated", 0) or time.time()
+        return (arrived * 1000 + clock - ts) / 1000
 
     async def _catch_up(self, epoch: int) -> float | None:
         """Wait (bounded) until the mirror shows the phone as it is now, not the board's replay of old video.
 
-        A frame far behind the board's clock is fine if nothing new has come for a while (a still screen);
-        while frames keep coming that old, the replay is still running. Returns the board clock offset.
+        While frames keep arriving far behind the board's clock the replay is running. A pause of 2 s ends the
+        wait (the screen may simply be still); frames that come late after that are still ignored by _watch.
+        Returns the board clock offset.
         """
         clock = await self._board_clock()
         if clock is None:
@@ -246,12 +252,12 @@ class Phone:
             if self._stopped(epoch):
                 raise DeviceError("已紧急停止，后面的内容没有发出。")
             age = self._frame_age(clock)
-            if age is None or age < REPLAY_LAG or time.time() - self.screen.updated > 4:
+            if age is None or age < REPLAY_LAG or time.time() - self.screen.updated > 2:
                 if logged:
                     log.info("screen: replay finished")
                 return clock
             if not logged:
-                log.info("screen: board is replaying old video (frame %.0f s behind), waiting", age)
+                log.info("screen: board is replaying old video (frame %.0f s behind on arrival), waiting", age)
                 logged = True
             await asyncio.sleep(0.2)
         raise DeviceError("画面还在重放旧视频（重连后板子从上一个关键帧重放），请稍后再试。")
@@ -320,6 +326,12 @@ class Phone:
             if found is None:
                 continue
             fx, fy = found
+            if attempt == 0 and self.span and max(abs(fx - x), abs(fy - y)) <= MAX_MISS:
+                # long moves go further than the calibration stops (iOS accelerates): 422 units across landed
+                # 30 px right of the fit on the 15 Pro Max; learn it so the next move starts closer
+                self._seen["x"].append((self._fix(x, "x"), fx))
+                self._seen["y"].append((self._fix(y, "y"), fy))
+                self._save()
             if abs(fx - x) <= AIM_TOLERANCE and abs(fy - y) <= AIM_TOLERANCE:
                 return found
             dx, dy = round((x - fx) * self.span["w"]), round((y - fy) * self.span["h"])

@@ -229,3 +229,46 @@ def test_pointer_search_waits_out_the_board_replaying_old_video(tmp_path, monkey
     found = asyncio.run(phone._find_pointer())
     assert found is not None  # the replayed nudge at (463, 371) never counts
     assert found[0] * W == pytest.approx(250.9, abs=2) and found[1] * H == pytest.approx(158.8, abs=2)
+
+
+@pytest.mark.parametrize("before, after, at", [
+    ("live_tap_landed", "live_tap_landed_nudged", (570.1, 663.7)),
+    ("live_tap_corrected", "live_tap_corrected_nudged", (540.5, 624.0)),  # a nudge of only 5.1 px
+])
+def test_live_verified_tap_frames(before, after, at):
+    found = pointer(frame(before), frame(after), near=(0.75, 0.40), shift=12 / 678)
+    assert found[0] * W == pytest.approx(at[0], abs=2) and found[1] * H == pytest.approx(at[1], abs=2)
+
+
+def test_a_verified_tap_learns_how_far_long_moves_go(tmp_path):
+    """Live: home + 422/587 units landed at (570.1, 663.7) px aiming at (540, 624); the next aim allows for it."""
+    calibration = {"w": 678, "h": 1466, "x0": 0.1273, "y0": -0.0006,
+                   "seen": {"x": [[0.3486, 0.3486], [0.6435, 0.6434]], "y": [[0.1018, 0.1018], [0.2382, 0.2382]]}}
+    (tmp_path / "calibration.json").write_text(json.dumps(calibration))
+    sent = []
+
+    async def send(command): sent.append(command)
+
+    screen = SimpleNamespace(live=True)
+    phone = Phone(SimpleNamespace(send=send, links=0), tmp_path / "calibration.json", screen)
+    seen = iter([(570.1 / W, 663.7 / H), (540.5 / W, 624.0 / H)])
+
+    async def locate(near, **kwargs): return next(seen)
+
+    phone._find_pointer = locate
+    asyncio.run(phone.tap_verified(0.75, 0.40))
+    assert sent[1] == "move 422 587" and sent[-2:] == ["move -28 -37", "click"]
+    # the long move went 1.135 px per unit, not the 1.063 of the calibration stops: aim shorter next time
+    assert phone._dx(0.75) < 412 and phone._dy(0.40) < 570
+    assert json.loads((tmp_path / "calibration.json").read_text())["seen"]["x"][-1][1] == pytest.approx(570.1 / W)
+
+
+def test_a_still_screen_is_not_mistaken_for_a_replay(tmp_path):
+    """Its last frame was live when it came, however long ago; only frames that arrive late are a replay."""
+    now = time.time()
+    screen = SimpleNamespace(frame=b"x", frame_ts=1_000_000, updated=now - 30, live=True)
+    phone = Phone(SimpleNamespace(), tmp_path / "calibration.json", screen)
+    clock = 1_000_000 + 300 - (now - 30) * 1000  # it reached the board 0.3 s before it got here, 30 s ago
+    assert phone._frame_age(clock) == pytest.approx(0.3, abs=0.01)
+    screen.frame_ts = 1_000_000 - 1_500_000  # 25 minutes old when it came: the board replaying its GOP
+    assert phone._frame_age(clock) > phone_module.REPLAY_LAG
