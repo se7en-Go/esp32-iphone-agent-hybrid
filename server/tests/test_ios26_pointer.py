@@ -185,3 +185,47 @@ def test_verified_tap_clicks_on_the_real_pointer_with_a_slow_mirror(tmp_path, mo
     asyncio.run(phone.tap_verified(463.5 / W, 371.3 / H))
     assert mirror.sent[0] == "home" and mirror.sent[-1] == "click"
     assert mirror.sent.count("move 12 0") == mirror.sent.count("move -12 0") >= 1
+
+
+class ReplayingMirror(MirrorPhone):
+    """Right after a reconnect the board replays old video as fast as it can: frames whose board timestamp is
+    minutes old, here a pointer being nudged somewhere else entirely. Live frames carry a current timestamp."""
+
+    def __init__(self, lag: float, replay_for: float):
+        super().__init__(lag)
+        self.t0 = time.monotonic()
+        self.replay_until = self.t0 + replay_for
+        self.frame_ts = 0
+        self._replay = [frame("04_m200_2000ms"), frame("05_nudge_r_400ms")]
+
+    def board_ms(self) -> int:
+        return int((time.monotonic() - self.t0) * 1000) + 3_600_000
+
+    async def query(self, command: str) -> str:
+        assert command == "status"
+        return json.dumps({"up": self.board_ms()})
+
+    async def send(self, command: str) -> None:
+        await super().send(command)
+        self._pending[-1:] = [(at, jpeg, self.board_ms()) for at, jpeg in self._pending[-1:]]
+
+    def _deliver(self) -> None:
+        now = time.monotonic()
+        if now < self.replay_until:
+            self.frame = self._replay[int(now * 10) % 2]
+            self.frame_ts, self.updated = 1000, time.time()  # an hour behind the board's clock
+            return
+        while self._pending and self._pending[0][0] <= now:
+            _, self.frame, self.frame_ts = self._pending.pop(0)
+            self.updated = time.time()
+
+
+def test_pointer_search_waits_out_the_board_replaying_old_video(tmp_path, monkeypatch):
+    monkeypatch.setattr(phone_module, "POINTER_WAIT", 2.0)
+    mirror = ReplayingMirror(lag=0.3, replay_for=1.5)
+    mirror.pos = (150, 150)
+    mirror._pending.clear()
+    phone = Phone(mirror, tmp_path / "calibration.json", mirror)
+    found = asyncio.run(phone._find_pointer())
+    assert found is not None  # the replayed nudge at (463, 371) never counts
+    assert found[0] * W == pytest.approx(250.9, abs=2) and found[1] * H == pytest.approx(158.8, abs=2)

@@ -61,6 +61,11 @@ NUDGE = 12              # mouse units the pointer is wiggled by to find it on sc
 # How long to watch for a nudge to show up. The AirPlay mirror lags: on an iPhone 15 Pro Max (iOS 26.3.1) a
 # 12 unit nudge appeared 0.15 to 1.5 s after it was sent, so the old fixed 1.2 s window missed some.
 POINTER_WAIT = 2.5      # seconds per direction (nudge, then the way back), never more
+# After every (re)connect to TCP 7201 the board replays all video since the last IDR, and iOS sends an IDR only
+# when mirroring starts: on the test phone that was 26 minutes of frames, 45 s to catch up. Frames older than
+# REPLAY_LAG on the board's clock are that replay, not the screen as it is now.
+REPLAY_LAG = 1.5        # seconds
+CATCH_UP_WAIT = 90      # seconds to wait for the replay to finish before giving up
 AIM_TOLERANCE = 0.008   # screen fraction; a bigger miss is corrected before pressing
 MAX_MISS = 0.06         # bigger misses are still corrected, but not learned from (they may be misreadings)
 
@@ -155,6 +160,7 @@ class Phone:
         """
         if epoch is None:
             epoch = getattr(self.device, "abort_epoch", 0)
+        clock = await self._catch_up(epoch)
         await self._wait_screen(epoch, self.screen.settled(
             quiet=0.2, least=0.3, most=1.5, transport=conservative))
         if self._stopped(epoch):
@@ -166,18 +172,18 @@ class Phone:
         found, back = None, time.time()
         await self._send(epoch, f"move {nudge} 0")
         try:
-            found = await self._watch(epoch, history, near, shift, sent, conservative, at_start=True)
+            found = await self._watch(epoch, history, near, shift, sent, conservative, True, clock)
         finally:
             if not self._stopped(epoch):
                 back = time.time()
                 await self.device.send(f"move {-nudge} 0")
         if found is None and not self._stopped(epoch):
             # the nudge was not seen: the pointer rests where the way back leaves it
-            found = await self._watch(epoch, history, near, -shift, back, conservative, at_start=False)
+            found = await self._watch(epoch, history, near, -shift, back, conservative, False, clock)
         return found if found and 0.03 < found[0] < 0.97 and 0.03 < found[1] < 0.97 else None
 
     async def _watch(self, epoch: int, history: list, near, shift: float, since: float,
-                     conservative: bool, at_start: bool) -> tuple[float, float] | None:
+                     conservative: bool, at_start: bool, clock: float | None = None) -> tuple[float, float] | None:
         """Watch new frames until one shows the pointer nudged by `shift` from an earlier frame.
 
         Returns where the pointer was before the nudge (at_start) or after it.
@@ -190,15 +196,65 @@ class Phone:
             after = await self.screen.fresh(since, min(.2, max(0, deadline - time.monotonic())))
             if after:
                 since = self.screen.updated
+                age = self._frame_age(clock)
+                if age is not None and age > REPLAY_LAG:  # replayed old video, not the nudge
+                    await asyncio.sleep(.02)
+                    continue
                 if not history or after != history[-1]:
-                    for before in reversed(history[-6:]):
+                    # the frame before the nudge, and the latest one (the before frame may predate the last move);
+                    # each comparison is tens of ms of pure Python, and hogging the GIL starves the video thread
+                    for before in dict.fromkeys(history[:1] + history[-1:]):
                         for look, reach in searches:
                             moved = vision.pointer_move(before, after, look, shift, reach)
                             if moved:
                                 return moved[0] if at_start else moved[1]
+                            await asyncio.sleep(0)
                     history.append(after)
             await asyncio.sleep(.02)
         return None
+
+    async def _board_clock(self) -> float | None:
+        """Board millis() minus wall-clock ms, from `0 status`; None when unknown (no frame time, no board)."""
+        query = getattr(self.device, "query", None)
+        if query is None or getattr(self.screen, "frame_ts", None) is None:
+            return None
+        try:
+            sent = time.time()
+            up = json.loads(await query("status"))["up"]
+            return up - (sent + time.time()) / 2 * 1000
+        except (DeviceError, OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def _frame_age(self, clock: float | None) -> float | None:
+        """Seconds the shown frame is behind the board's clock; None when unknown."""
+        ts = getattr(self.screen, "frame_ts", None)
+        if clock is None or ts is None:
+            return None
+        return (time.time() * 1000 + clock - ts) / 1000
+
+    async def _catch_up(self, epoch: int) -> float | None:
+        """Wait (bounded) until the mirror shows the phone as it is now, not the board's replay of old video.
+
+        A frame far behind the board's clock is fine if nothing new has come for a while (a still screen);
+        while frames keep coming that old, the replay is still running. Returns the board clock offset.
+        """
+        clock = await self._board_clock()
+        if clock is None:
+            return None
+        deadline, logged = time.monotonic() + CATCH_UP_WAIT, False
+        while time.monotonic() < deadline:
+            if self._stopped(epoch):
+                raise DeviceError("已紧急停止，后面的内容没有发出。")
+            age = self._frame_age(clock)
+            if age is None or age < REPLAY_LAG or time.time() - self.screen.updated > 4:
+                if logged:
+                    log.info("screen: replay finished")
+                return clock
+            if not logged:
+                log.info("screen: board is replaying old video (frame %.0f s behind), waiting", age)
+                logged = True
+            await asyncio.sleep(0.2)
+        raise DeviceError("画面还在重放旧视频（重连后板子从上一个关键帧重放），请稍后再试。")
 
     async def _wait_screen(self, epoch: int, awaitable) -> None:
         task = asyncio.create_task(awaitable)

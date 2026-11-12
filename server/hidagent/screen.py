@@ -28,6 +28,12 @@ class Screen:
         self.fps = fps if fps is not None else int(os.environ.get("VIDEO_FPS", "8"))
         self.frame: bytes | None = None
         self.updated = 0.0
+        # board millis() of the access unit behind `frame` (None: unknown). See video7201.run_tcp.
+        self.frame_ts: int | None = None
+        self._next_ts: int | None = None
+        # one decoder for the whole stream from this board, so a reconnect can go on from its last AU
+        self._decoder = None
+        self._decoder_for: tuple[str, str] | None = None
         self.last_error = ""
         self._device = None
         self._started = False
@@ -78,11 +84,14 @@ class Screen:
                 time.sleep(1)
                 continue
             self._stop.clear()
+            if self._decoder_for != (host, token):  # another board or a rebooted one: nothing to go on from
+                self._decoder, self._decoder_for = video7201.H264Decoder(), (host, token)
             try:
                 video7201.run_tcp(
                     host, self.port, token, self._on_jpeg, self._stop,
                     quality=self.quality, max_fps=max(1, self.fps),
                     on_ready=self._on_ready, on_stall=self._on_stall, sockets=self._sockets,
+                    on_ts=self._on_ts, decoder=self._decoder,
                 )
                 self.last_error = "7201 连接结束了，正在重连。"
             except Exception as exc:
@@ -99,7 +108,11 @@ class Screen:
     def _on_stall(self) -> None:
         self.last_error = "画面停住了。请在控制中心重新选一次「屏幕镜像 → ESP32 Agent」。板子可能还留着旧缓冲。"
 
+    def _on_ts(self, ts) -> None:
+        self._next_ts = ts
+
     def _on_jpeg(self, jpeg: bytes) -> None:
+        self.frame_ts, self._next_ts = self._next_ts, None
         self.frame = jpeg
         self.updated = time.time()
         if self.last_error.startswith("画面停住了"):

@@ -296,25 +296,37 @@ def test_partial_access_unit_does_not_publish_a_resume_timestamp():
     assert getattr(decoder, "last_ts", None) is None
 
 
-def test_screen_reconnect_after_a_timestamp_stays_on_plain_hello(monkeypatch):
+def test_screen_reconnect_goes_on_from_the_last_decoded_access_unit(monkeypatch):
+    """A reconnect keeps the decoder and says `hello <token> at <ts>`, so the board does not replay the whole GOP
+    since the last IDR (26 minutes of frames on a still iPhone screen, never caught up between resets)."""
     from hidagent.screen import Screen
 
     screen = Screen("10.0.0.8", TOKEN)
-    seen: list[dict] = []
+    seen: list = []
 
     def fake(_host, _port, _token, _on_jpeg, stop, **kwargs):
-        seen.append(kwargs)
-        hook = getattr(screen, "_on_timestamp", None)
-        if hook:
-            hook(2000)
+        decoder = kwargs["decoder"]
+        seen.append((decoder, decoder.last_ts))
+        decoder.last_ts = 2000  # as if it decoded an AU stamped 2000
         stop.set()
         if len(seen) >= 2:
             screen._stopping = True
 
     monkeypatch.setattr("hidagent.screen.video7201.run_tcp", fake)
+    monkeypatch.setattr("hidagent.screen.time.sleep", lambda _s: None)
     screen._supervise()
-    assert len(seen) >= 2
-    assert all(call.get("resume_ts") in (None,) for call in seen)
+    assert seen[0][1] is None and seen[1] == (seen[0][0], 2000)
+    assert hello_line(TOKEN, 2000) == f"hello {TOKEN} at 2000\n".encode()
+
+
+def test_resume_timestamp_only_after_a_decoded_access_unit():
+    decoder = H264Decoder()
+    decoder.last_ts = 5
+    decoder.reset()  # a decode error starts a new codec: nothing to go on from
+    assert decoder.last_ts is None
+    decoder.last_ts = 7
+    decoder.reconnect()  # a new session keeps the codec and its place
+    assert decoder.last_ts == 7
 
 
 def _large_replay(monkeypatch, decode_cost):
