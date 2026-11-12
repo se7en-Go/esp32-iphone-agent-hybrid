@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from contextlib import nullcontext
@@ -48,18 +49,28 @@ class DeviceError(RuntimeError):
     pass
 
 
-def open_serial(port: str, baud: int = 115200, impl=None):
-    """DTR/RTS 保持不复位。先赋值再 open，避免 pyserial 默认把线拉下去触发 EN。"""
+def open_serial(port: str, baud: int = 115200, impl=None, platform: str | None = None):
+    """打开 COM 口但不复位板子（打开串口会重启 ESP32，AirPlay 镜像就断了）。
+
+    板子的自动下载电路：RTS 有效、DTR 无效时把 EN 拉低，板子复位。
+    - macOS / Linux：内核在 open() 时同时拉起 DTR 和 RTS，pyserial 随后先放 DTR、再放 RTS，
+      中间那一下正好是 DTR 无效、RTS 有效，FTDI FT232R 的板子每次都会复位。
+      所以 open 前让 DTR 保持有效、RTS 无效：pyserial 只放 RTS，open 之后再放 DTR，全程不出现复位组合。
+    - Windows：两根线由同一个 DCB 一次设好，open 前都设成无效即可。
+    硬件流控（rtscts / dsrdtr）关掉，免得驱动替我们动这两根线。esptool 刷机自己负责复位，不走这里。
+    """
     ser = impl if impl is not None else serial.Serial()
     ser.port = port
     ser.baudrate = baud
     ser.timeout = 0.2
-    ser.dtr = False
+    ser.rtscts = False
+    ser.dsrdtr = False
     ser.rts = False
+    ser.dtr = (platform or sys.platform) != "win32"
     if not getattr(ser, "is_open", False):
         ser.open()
+    ser.rts = False  # RTS first: DTR low with RTS still high is the reset pulse
     ser.dtr = False
-    ser.rts = False
     return ser
 
 

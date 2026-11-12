@@ -58,6 +58,9 @@ REHOME_EVERY = 10       # gestures between re-homing
 HOLD = 0.25             # seconds to rest before lifting, so iOS adds no momentum (the swipe stops where it ends)
 TAP_GAP = 0.15          # seconds to stay still after a click, so iOS sees a finished tap, not the start of a drag
 NUDGE = 12              # mouse units the pointer is wiggled by to find it on screen
+# How long to watch for a nudge to show up. The AirPlay mirror lags: on an iPhone 15 Pro Max (iOS 26.3.1) a
+# 12 unit nudge appeared 0.15 to 1.5 s after it was sent, so the old fixed 1.2 s window missed some.
+POINTER_WAIT = 2.5      # seconds per direction (nudge, then the way back), never more
 AIM_TOLERANCE = 0.008   # screen fraction; a bigger miss is corrected before pressing
 MAX_MISS = 0.06         # bigger misses are still corrected, but not learned from (they may be misreadings)
 
@@ -68,6 +71,9 @@ class Phone:
         # mouse units needed to cross the full screen width / height
         saved = json.loads(calibration_file.read_text()) if calibration_file.exists() else None
         self.span = {"w": saved["w"], "h": saved["h"]} if saved else None
+        # where `home` leaves the pointer, as a screen fraction: not the corner itself on iPhones with rounded
+        # corners (the 15 Pro Max stops 91 of 720 px right of it), so every move is counted from there
+        self.origin = {"x": (saved or {}).get("x0", 0.0), "y": (saved or {}).get("y0", 0.0)}
         self._pos = None  # pointer position in mouse units; None = unknown
         self._moves = 0
         self._link = 0  # device.links when the pointer was last homed
@@ -106,62 +112,93 @@ class Phone:
             if not found:
                 break
             seen.append((units, *found))
-        if len(seen) < 2:
-            log.info("calibration: pointer not found on screen, waiting for a click")
-            if not seen:
-                await self._send(epoch, "home")
-                await self._send(epoch, f"move {CALIBRATION_MOVE} {CALIBRATION_MOVE}")
+        fit = self._fit(seen) if len(seen) == 2 else None
+        if fit is None:
+            log.info("calibration: pointer not found on screen (%s), waiting for a click", seen)
+            # the user clicks the pointer next, and finish_calibration counts from exactly this spot
+            await self._send(epoch, "home")
+            await self._send(epoch, f"move {CALIBRATION_MOVE} {CALIBRATION_MOVE}")
             return False
-        (u1, x1, y1), (u2, x2, y2) = seen
-        self.span = {"w": round((u2 - u1) / (x2 - x1)), "h": round((u2 - u1) / (y2 - y1))}
+        span, origin = fit
+        self.span, self.origin = span, origin
         for samples in self._seen.values():
             samples.clear()
-        for units, x, y in seen:  # where each stop landed, so moves are corrected for the offset too
-            self._seen["x"].append((units / self.span["w"], x))
-            self._seen["y"].append((units / self.span["h"], y))
+        for units, x, y in seen:  # where each stop landed, so later landings correct any residual drift
+            self._seen["x"].append((origin["x"] + units / span["w"], x))
+            self._seen["y"].append((origin["y"] + units / span["h"], y))
         self._save()
-        log.info("calibration: pointer at %s, span %s", [(round(x, 3), round(y, 3)) for _, x, y in seen], self.span)
+        log.info("calibration: pointer at %s, span %s, origin %s",
+                 [(round(x, 3), round(y, 3)) for _, x, y in seen], span,
+                 {k: round(v, 3) for k, v in origin.items()})
         return True
+
+    @staticmethod
+    def _fit(seen: list) -> tuple[dict, dict] | None:
+        """Span and origin from two stops (units, x, y); None if they make no sense."""
+        (u1, x1, y1), (u2, x2, y2) = seen
+        if x2 - x1 < 0.02 or y2 - y1 < 0.01:  # the pointer did not really move between the stops
+            return None
+        span = {"w": round((u2 - u1) / (x2 - x1)), "h": round((u2 - u1) / (y2 - y1))}
+        origin = {"x": x1 - u1 / span["w"], "y": y1 - u1 / span["h"]}
+        if not (-0.05 < origin["x"] < 0.3 and -0.05 < origin["y"] < 0.2):
+            return None
+        return span, origin
 
     async def _find_pointer(self, near: tuple[float, float] | None = None,
                             conservative: bool = False, epoch: int | None = None) -> tuple[float, float] | None:
-        """Wiggle the pointer and find it anywhere on screen (the span may still be unknown)."""
+        """Wiggle the pointer and find where it rests (the span may still be unknown).
+
+        The mirror lags and stays silent while the screen is still, so the frame taken before the nudge may
+        predate the last move. Every frame that arrives is kept and each new one is compared with the ones
+        before it; the pointer is the round blob that jumped sideways by about the nudge. If the nudge never
+        shows up, the way back is watched the same way. Both waits are bounded (POINTER_WAIT).
+        """
         if epoch is None:
             epoch = getattr(self.device, "abort_epoch", 0)
         await self._wait_screen(epoch, self.screen.settled(
             quiet=0.2, least=0.3, most=1.5, transport=conservative))
         if self._stopped(epoch):
             raise DeviceError("已紧急停止，后面的内容没有发出。")
-        before, sent = self.screen.frame, time.time()
-        nudged = False
-        await self._send(epoch, f"move {NUDGE} 0")
-        nudged = True
-        shift = NUDGE / self.span["w"] if self.span else 0.025
-        found, since, deadline = None, sent, time.monotonic() + 1.2
+        nudge = NUDGE if near is None or near[0] < 0.9 else -NUDGE  # stay clear of the right edge
+        shift = nudge / self.span["w"] if self.span else 0.025 * (1 if nudge > 0 else -1)
+        history = [self.screen.frame] if self.screen.frame else []
+        sent = time.time()
+        found, back = None, time.time()
+        await self._send(epoch, f"move {nudge} 0")
         try:
-            if conservative:
-                after = await self.screen.fresh(sent, 1.0)
-                if after:
-                    await self.screen.settled(quiet=.15, least=.1, most=.6, transport=True)
-                    found = before and vision.pointer(before, self.screen.frame, near or (.5, .5), shift,
-                                                       reach=(.12, .08) if near else (.5, .5))
-            # A fresh transport frame may still precede the nudge in the AirPlay pipeline.
-            # Hold the nudge until its actual visual effect is captured, not just any frame.
-            while not conservative and time.monotonic() < deadline:
-                if self._stopped(epoch):
-                    raise DeviceError("已紧急停止，后面的内容没有发出。")
-                after = await self.screen.fresh(since, min(.2, max(0, deadline - time.monotonic())))
-                if after:
-                    found = before and vision.pointer(before, after, near or (0.5, 0.5), shift,
-                                                       reach=(0.12, 0.08) if near else (0.5, 0.5))
-                    if found:
-                        break
-                    since = self.screen.updated
-                await asyncio.sleep(.02)
+            found = await self._watch(epoch, history, near, shift, sent, conservative, at_start=True)
         finally:
-            if nudged and not self._stopped(epoch):
-                await self.device.send(f"move -{NUDGE} 0")
+            if not self._stopped(epoch):
+                back = time.time()
+                await self.device.send(f"move {-nudge} 0")
+        if found is None and not self._stopped(epoch):
+            # the nudge was not seen: the pointer rests where the way back leaves it
+            found = await self._watch(epoch, history, near, -shift, back, conservative, at_start=False)
         return found if found and 0.03 < found[0] < 0.97 and 0.03 < found[1] < 0.97 else None
+
+    async def _watch(self, epoch: int, history: list, near, shift: float, since: float,
+                     conservative: bool, at_start: bool) -> tuple[float, float] | None:
+        """Watch new frames until one shows the pointer nudged by `shift` from an earlier frame.
+
+        Returns where the pointer was before the nudge (at_start) or after it.
+        """
+        deadline = time.monotonic() + POINTER_WAIT + (0.5 if conservative else 0)
+        searches = ([(near, (0.12, 0.08))] if near else []) + [((0.5, 0.5), (0.5, 0.5))]
+        while time.monotonic() < deadline:
+            if self._stopped(epoch):
+                raise DeviceError("已紧急停止，后面的内容没有发出。")
+            after = await self.screen.fresh(since, min(.2, max(0, deadline - time.monotonic())))
+            if after:
+                since = self.screen.updated
+                if not history or after != history[-1]:
+                    for before in reversed(history[-6:]):
+                        for look, reach in searches:
+                            moved = vision.pointer_move(before, after, look, shift, reach)
+                            if moved:
+                                return moved[0] if at_start else moved[1]
+                    history.append(after)
+            await asyncio.sleep(.02)
+        return None
 
     async def _wait_screen(self, epoch: int, awaitable) -> None:
         task = asyncio.create_task(awaitable)
@@ -182,15 +219,30 @@ class Phone:
                     pass
 
     def finish_calibration(self, x: float, y: float) -> None:
-        """x, y: where the pointer ended up after start_calibration() (one point, picked by the user)."""
-        self.span = {"w": round(CALIBRATION_MOVE / x), "h": round(CALIBRATION_MOVE / y)}
+        """x, y: where the pointer ended up after start_calibration() (one point, picked by the user).
+
+        One point cannot give both scale and offset, so this uses what is known about `home`: it runs up
+        the left edge, so the pointer starts at the very top (y = 0) but, on a rounded corner, some way right
+        of the left edge. The pointer moves the same number of pixels per unit across and down, so the
+        vertical scale gives the horizontal one, and the rest of x is the corner offset.
+        """
+        span = {"w": round(CALIBRATION_MOVE / x), "h": round(CALIBRATION_MOVE / y)}
+        origin = {"x": 0.0, "y": 0.0}
+        aspect = self.screen.aspect if self.screen is not None and getattr(self.screen, "frame", None) else None
+        if aspect:
+            w = round(CALIBRATION_MOVE * aspect / y)
+            x0 = x - CALIBRATION_MOVE / w
+            if 0 <= x0 < 0.25:  # otherwise the point is odd; fall back to the plain one point scale
+                span["w"], origin["x"] = w, x0
+        self.span, self.origin = span, origin
         for samples in self._seen.values():
             samples.clear()
         self._save()
 
     def _save(self) -> None:
         """Calibration plus the observed landings, so the correction survives a restart."""
-        self._file.write_text(json.dumps({**self.span, "seen": {k: list(v) for k, v in self._seen.items()}}))
+        self._file.write_text(json.dumps({**self.span, "x0": self.origin["x"], "y0": self.origin["y"],
+                                          "seen": {k: list(v) for k, v in self._seen.items()}}))
 
     async def point(self, x: float, y: float, aim: bool = False) -> None:
         if not self.calibrated:
@@ -226,21 +278,9 @@ class Phone:
 
     async def _aim(self, x: float, y: float) -> None:
         """Closed loop: find the real pointer on screen, fix a miss, and learn the error for later moves."""
-        nudge = NUDGE if x < 0.9 else -NUDGE  # stay clear of the screen edge
-        await self.screen.settled(quiet=0.15, least=0.1, most=0.6)  # pointer at rest
-        before, sent = self.screen.frame, time.time()
-        await self.device.send(f"move {nudge} 0")
-        after = await self.screen.fresh(sent, 0.6)
-        if after:
-            await self.screen.settled(quiet=0.1, least=0.05, most=0.4)
-            after = self.screen.frame
-        await self.device.send(f"move {-nudge} 0")
-        shift = nudge / self.span["w"]
-        found = before and after and (vision.pointer(before, after, (x, y), shift)  # near the target first,
-                                      or vision.pointer(before, after, (0.5, 0.5), shift, reach=(0.5, 0.5)))  # anywhere
+        found = await self._find_pointer((x, y))
         if not found:
-            log.debug("aim (%.3f, %.3f): pointer not found (%s)", x, y,
-                      "no new frame after the nudge" if not after else "no pointer-sized change near the target")
+            log.debug("aim (%.3f, %.3f): pointer not found", x, y)
             return
         fx, fy = found
         log.debug("aim (%.3f, %.3f): pointer at (%.3f, %.3f)", x, y, fx, fy)
@@ -333,7 +373,7 @@ class Phone:
         await self.swipe(0.005, 0.45, 0.6, 0.45, hold=False)
 
     def _dx(self, x: float) -> int:
-        return round(min(max(self._fix(x, "x"), 0), 1) * self.span["w"])
+        return round(min(max(self._fix(x, "x") - self.origin["x"], 0), 1) * self.span["w"])
 
     def _dy(self, y: float) -> int:
-        return round(min(max(self._fix(y, "y"), 0), 1) * self.span["h"])
+        return round(min(max(self._fix(y, "y") - self.origin["y"], 0), 1) * self.span["h"])

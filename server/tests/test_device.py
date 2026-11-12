@@ -1,6 +1,9 @@
 import asyncio
+import os
+import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -492,3 +495,66 @@ def test_candidate_ports_lists_known_bridges_only(monkeypatch):
         "/dev/cu.SLAB_USBtoUART",
         "COM5",
     ]
+
+
+RESET = (False, True)  # DTR released while RTS is held: the auto-program circuit pulls EN low
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX tty behaviour")
+def test_posix_open_never_pulses_reset_through_real_pyserial(tmp_path):
+    """FT232R on macOS: the tty raises DTR and RTS on open, then pyserial applies DTR before RTS."""
+    import serial.serialposix
+
+    class Lines(serial.serialposix.Serial):
+        def open(self):
+            self.history = [(True, True)]  # what the kernel does to both lines on open()
+            super().open()
+
+        def _reconfigure_port(self, force_update=False):
+            pass
+
+        def _record(self, **change):
+            dtr, rts = self.history[-1]
+            self.history.append((change.get("dtr", dtr), change.get("rts", rts)))
+
+        def _update_dtr_state(self):
+            self._record(dtr=self._dtr_state)
+
+        def _update_rts_state(self):
+            self._record(rts=self._rts_state)
+
+    master, slave = os.openpty()
+    try:
+        plain = Lines()  # the old way: both off before open, which pyserial applies DTR first
+        plain.port, plain.dtr, plain.rts = os.ttyname(slave), False, False
+        plain.open()
+        assert RESET in plain.history
+        plain.close()
+
+        ser = open_serial(os.ttyname(slave), impl=Lines(), platform="darwin")
+        try:
+            assert RESET not in ser.history, ser.history
+            assert ser.history[-1] == (False, False) and not ser.rtscts and not ser.dsrdtr
+        finally:
+            ser.close()
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_windows_open_sets_both_lines_off_at_once():
+    class WinSerial(FakeSerial):
+        def open(self):
+            super().open()
+            self.history = [(self.dtr, self.rts)]  # one DCB applies both states
+
+    fake = open_serial("COM9", impl=WinSerial(), platform="win32")
+    assert fake.history == [(False, False)] and fake.dtr is False and fake.rts is False
+    assert fake.rtscts is False and fake.dsrdtr is False
+
+
+def test_flashing_still_lets_esptool_reset_the_board():
+    """flash.py relies on esptool's own DTR/RTS reset into the bootloader; nothing may turn that off."""
+    text = (Path(__file__).resolve().parents[2] / "scripts" / "flash.py").read_text(encoding="utf-8")
+    assert '"-m", "esptool"' in text and "open_serial" not in text
+    assert "no_reset" not in text and "--before" not in text and "--after" not in text
