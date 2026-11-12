@@ -2,7 +2,7 @@
 
 import asyncio
 import os
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Literal
@@ -18,6 +18,7 @@ from .clipboard import CompanionClipboard, create_router
 from .control import Controls
 from .debug import Trace
 from .device import Device, DeviceError, supervise_maintain
+from .enter_context import verify_enter_context
 from .guard import Guard, limits_for, skill_file
 from .layouts import list_layouts, resolve_point
 from .llm import LLM
@@ -95,7 +96,7 @@ def refuse_if_tripped() -> None:
 
 
 def is_enter_key(command: str) -> bool:
-    """enter、Enter、enter+shift、shift+enter、带空格的 enter 都是发送键。"""
+    """Recognize Enter chords; observed context decides whether plain Enter sends."""
     name, _, arg = command.strip().partition(" ")
     if name.lower() != "key":
         return False
@@ -115,11 +116,24 @@ def _check_hid_trip(current: Guard, name: str) -> None:
 
 
 @contextmanager
-def _hid_write_guard(current: Guard, name: str):
+def _hid_write_guard(current: Guard, name: str, enter_evidence=None):
     # 与 observe/trip 同锁，复查到实际串口写入之间不能有线程插入，也不能 await。
     with current._lock:
         _check_hid_trip(current, name)
-        yield
+        if enter_evidence is not None:
+            publication_lock = getattr(screen, "_frame_lock", None)
+            if publication_lock is None:
+                raise DeviceError("画面后端没有发布锁，不能安全免除 Enter 的发送配额。")
+            # Keep the observed keyboard fixed through the synchronous HID write.
+            # Lock order matches Device.exchange: Guard first, screen second.
+            with publication_lock:
+                try:
+                    current.check_enter_evidence(enter_evidence, consume=True)
+                except RuntimeError as exc:
+                    raise DeviceError(str(exc)) from exc
+                yield
+        else:
+            yield
 
 
 def _hid_gate(command: str):
@@ -127,15 +141,21 @@ def _hid_gate(command: str):
     if name not in {"home", "move", "press", "release", "click", "scroll", "type", "key", "homescreen"}:
         return None
     current = guard
+    enter_evidence = None
     with current._lock:
         _check_hid_trip(current, name)
-        if is_enter_key(command) or (name == "click" and _named_send.get()):
+        if command.strip().lower() == "key enter":
+            try:
+                enter_evidence = current.enter_evidence()
+            except RuntimeError as exc:
+                raise DeviceError(str(exc)) from exc
+        if (is_enter_key(command) and enter_evidence is None) or (name == "click" and _named_send.get()):
             decision = current.consume_reservation("")
             if not decision["allowed"]:
                 if _named_send.get():
                     raise HTTPException(409, decision["reason"])
                 raise DeviceError(decision["reason"])
-    return _hid_write_guard(current, name)
+    return _hid_write_guard(current, name, enter_evidence)
 
 
 device.gate = _hid_gate
@@ -205,6 +225,11 @@ class TypeText(KeyboardText):
     mode: TypeMode = "auto"
 
 
+class KeyText(KeyboardText):
+    screen_id: str | None = None
+    enter_intent: Literal["navigation", "editing"] | None = None
+
+
 class ActionStep(BaseModel):
     action: Literal["point", "tap", "tap_text", "swipe", "scroll", "type", "compose_chinese", "key", "home", "back"]
     coordinate_space: Literal["normalized", "pixels"] = "normalized"
@@ -219,15 +244,18 @@ class ActionStep(BaseModel):
     input_mode: Literal["pinyin"] | None = None
     mode: TypeMode = "auto"
     repeat: int = Field(default=1, ge=1, le=50)
-    nth: int = Field(default=1, ge=1, strict=True)
+    nth: int | None = Field(default=None, ge=1, strict=True)
     exact: bool = False
+    region: tuple[float, float, float, float] | None = None
+    enter_intent: Literal["navigation", "editing"] | None = None
+    target_box: tuple[float, float, float, float] | None = None
 
 
 class BatchBody(BaseModel):
     screen_id: str = Field(min_length=1)
     steps: list[ActionStep] = Field(min_length=1, max_length=8)
     include_diff: bool = True
-    ocr_diff: bool = True
+    ocr_diff: bool = False
 
 
 class FindTextBody(BaseModel):
@@ -235,6 +263,7 @@ class FindTextBody(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
     nth: int = Field(default=1, ge=1, strict=True)
     exact: bool = False
+    region: tuple[float, float, float, float] | None = None
 
 
 class LayoutTap(BaseModel):
@@ -264,10 +293,13 @@ class ControlAction(BaseModel):
     input_mode: Literal["pinyin"] | None = None
     mode: TypeMode = "auto"
     repeat: int = Field(default=1, ge=1, le=50)
-    nth: int = Field(default=1, ge=1, strict=True)
+    nth: int | None = Field(default=None, ge=1, strict=True)
     exact: bool = False
+    region: tuple[float, float, float, float] | None = None
+    enter_intent: Literal["navigation", "editing"] | None = None
+    target_box: tuple[float, float, float, float] | None = None
     include_diff: bool = True
-    ocr_diff: bool = True
+    ocr_diff: bool = False
 
 
 def check_keyboard(text):
@@ -345,10 +377,17 @@ def frame():
 async def control_observe():
     check_manual()
     async with manual_lock:
+        controls.job = asyncio.current_task()
         try:
-            return controls.observation()
-        except ValueError as e:
+            ensure = getattr(controls.phone, "ensure_observation", None)
+            accepted = await ensure() if ensure is not None else None
+            return controls.observation(accepted)
+        except (ValueError, RuntimeError) as e:
             raise HTTPException(409, str(e)) from e
+        except asyncio.CancelledError as e:
+            raise HTTPException(409, "观察已停止，请重新观察。") from e
+        finally:
+            controls.job = None
 
 
 @app.post("/api/control/find_text")
@@ -357,7 +396,7 @@ async def control_find_text(request: FindTextBody):
     async with manual_lock:
         controls.job = asyncio.current_task()
         try:
-            return await controls.find_text(request.screen_id, request.text, request.nth, request.exact)
+            return await controls.find_text(request.screen_id, request.text, request.nth, request.exact, request.region)
         except ValueError as e:
             raise HTTPException(409, str(e)) from e
         except OCRUnavailable as e:
@@ -377,12 +416,22 @@ async def control_action(request: ControlAction, http_request: Request):
     async with manual_lock:
         controls.job = asyncio.current_task()
         try:
-            return await while_connected(http_request, controls.perform(request))
+            scope = nullcontext()
+            if request.enter_intent is not None:
+                if request.action != "key" or request.repeat != 1:
+                    raise ValueError("Enter 用途只适用于单独的一次 key 动作。")
+                before, _, _ = controls._validate_ticket(controls.ticket, request.screen_id)
+                validate = await verify_enter_context(screen, before, request.enter_intent, request.text)
+                scope = guard.verified_enter(request.enter_intent, validate)
+            with scope:
+                return await while_connected(http_request, controls.perform(request))
         except ValueError as e:
             raise HTTPException(409, str(e)) from e
         except OCRUnavailable as e:
             raise HTTPException(503, str(e)) from e
         except OCRError as e:
+            raise HTTPException(409, str(e)) from e
+        except (DeviceError, RuntimeError) as e:
             raise HTTPException(409, str(e)) from e
         except asyncio.CancelledError as e:
             raise HTTPException(409, "action stopped; observe before continuing") from e
@@ -399,6 +448,8 @@ async def control_batch(request: BatchBody, http_request: Request):
     """一次观察、连续多步，最后只回一张图。"""
     refuse_if_tripped()
     check_manual()
+    if any(step.enter_intent is not None for step in request.steps):
+        raise HTTPException(409, "导航/换行 Enter 需要单步的新观察，不能放进 batch。")
     async with manual_lock:
         controls.job = asyncio.current_task()
         try:
@@ -539,9 +590,28 @@ async def type_text(t: TypeText, request: Request):
 
 
 @app.post("/api/key")
-async def key(t: KeyboardText):
+async def key(t: KeyText):
     check_keyboard(t.text)
-    return await act(lambda: phone.key(t.text))
+    if t.enter_intent is None:
+        return await act(lambda: phone.key(t.text))
+    refuse_if_tripped()
+    check_manual()
+    async with manual_lock:
+        controls.job = asyncio.current_task()
+        try:
+            before, _, _ = controls.consume(t.screen_id)
+            validate = await verify_enter_context(screen, before, t.enter_intent, t.text)
+            with guard.verified_enter(t.enter_intent, validate):
+                await phone.key(t.text.strip().lower())
+            return {"ok": True, "enter_intent": t.enter_intent, "send_counted": False}
+        except OCRUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except asyncio.CancelledError as exc:
+            raise HTTPException(409, "Enter 已停止，请重新观察。") from exc
+        finally:
+            controls.job = None
 
 
 @app.post("/api/home")

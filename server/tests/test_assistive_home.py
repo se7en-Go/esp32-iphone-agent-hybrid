@@ -4,6 +4,7 @@ import json
 import time
 
 import pytest
+from home_scene import draw_home
 from PIL import Image, ImageDraw
 
 from hidagent import assistive, assistive_vision
@@ -15,11 +16,13 @@ from hidagent.screen import Screen
 def frame(*, menu=False, home=False, button=(333, 598), menu_offset=0, panel_color="#252525"):
     image = Image.new("RGB", (360, 780), "#a9bdcf" if home else "#e5dbc5")
     draw = ImageDraw.Draw(image)
+    if home:
+        draw_home(image)
     if menu:
         draw.rounded_rectangle((50, 245+menu_offset, 310, 505+menu_offset), radius=28, fill=panel_color)
         for x, y in ((180, 288), (100, 332), (260, 332), (100, 426), (260, 426), (180, 457)):
             y += menu_offset
-            draw.ellipse((x - 12, y - 12, x + 12, y + 12), outline="white", width=3)
+            draw.ellipse((x - 14, y - 14, x + 14, y + 14), outline="white", width=3)
     elif button is not None:
         x, y = button
         draw.rounded_rectangle((x-23, y-23, x+23, y+23), radius=11, fill="#333333")
@@ -79,7 +82,10 @@ class Mirror:
 
 @pytest.fixture(autouse=True)
 def short_waits(monkeypatch):
+    monkeypatch.setattr("hidagent.freshness.MIRROR_LAG_SECONDS", 0)
     monkeypatch.setattr("hidagent.phone.TAP_GAP", 0)
+    monkeypatch.setattr("hidagent.feedback.MIRROR_LAG_SECONDS", 0)
+    monkeypatch.setattr("hidagent.phone.TAP_EFFECT_WAIT", .02)
     monkeypatch.setattr(assistive, "MENU_WAIT", .4)
     monkeypatch.setattr(assistive, "RESULT_WAIT", .4)
     monkeypatch.setattr(assistive, "STABLE_QUIET", .04)
@@ -88,6 +94,8 @@ def short_waits(monkeypatch):
 def make_phone(tmp_path, mirror, **kwargs):
     phone = Phone(mirror, tmp_path / "calibration.json", mirror, **kwargs)
     phone.span = {"w": 360, "h": 780}
+    for samples in phone._seen.values():
+        samples.extend([(0., 0.), (.5, .5), (.99, .99)])
     return phone
 
 
@@ -96,7 +104,7 @@ def test_go_home_opens_assistive_touch_then_taps_home(tmp_path, monkeypatch):
     phone = make_phone(tmp_path, mirror)
 
     async def pointer_unavailable(*args, **kwargs):
-        raise AssertionError("Home must not require the pointer disc")
+        return None  # guarded blind targets work with exact measured fake calibration
 
     monkeypatch.setattr(phone, "_find_pointer", pointer_unavailable)
 
@@ -122,14 +130,14 @@ def test_position_survives_restart_as_a_search_hint(tmp_path, monkeypatch):
     data = json.loads((tmp_path / "calibration.assistive-touch.json").read_text())
     assert data["last_position"] == pytest.approx((333/360, 598/780), abs=.01)
     assert not (tmp_path / "calibration.json").exists()
-    detect = assistive_vision.find_button
+    detect = assistive_vision.find_button_target
     hints = []
 
     def find_button(image, near=None):
         hints.append(near)
         return detect(image, near=near)
 
-    monkeypatch.setattr(assistive_vision, "find_button", find_button)
+    monkeypatch.setattr(assistive_vision, "find_button_target", find_button)
     second = Mirror()
     asyncio.run(make_phone(tmp_path, second).go_home())
     assert len(second.clicks) == 2
@@ -176,14 +184,14 @@ def test_configured_position_takes_precedence(tmp_path, monkeypatch, source):
         monkeypatch.setenv("HIDAGENT_ASSISTIVE_TOUCH_POSITION", ",".join(map(str, position)))
     else:
         (tmp_path / "calibration.assistive-touch.json").write_text(json.dumps({"position": position}))
-    detect = assistive_vision.find_button
+    detect = assistive_vision.find_button_target
     hints = []
 
     def find_button(image, near=None):
         hints.append(near)
         return detect(image, near=near)
 
-    monkeypatch.setattr(assistive_vision, "find_button", find_button)
+    monkeypatch.setattr(assistive_vision, "find_button_target", find_button)
     mirror = Mirror()
     asyncio.run(make_phone(tmp_path, mirror, **options).go_home())
     assert len(mirror.clicks) == 2
@@ -374,7 +382,7 @@ def test_missing_menu_or_menu_dismissal_is_not_home(tmp_path, monkeypatch, menu_
     mirror.menu_opens, mirror.return_home = menu_opens, False
     monkeypatch.setattr(assistive, "MENU_WAIT", .4)
     monkeypatch.setattr(assistive, "RESULT_WAIT", .05)
-    with pytest.raises(RuntimeError, match="画面未确认变化"):
+    with pytest.raises(RuntimeError, match="未确认主屏幕"):
         asyncio.run(make_phone(tmp_path, mirror).go_home())
     assert len(mirror.clicks) == (2 if menu_opens else 1)
     assert mirror.sent[-2:] == ["homescreen", "key cmd+h"]
@@ -404,7 +412,7 @@ def test_fallback_dismissing_stuck_menu_is_not_success(tmp_path, monkeypatch):
         if command == "release":
             mirror.show(frame())  # Swipe only closes the panel.
         elif command == "homescreen":
-            mirror.show(frame(home=True))
+            asyncio.get_running_loop().call_soon(mirror.show, frame(home=True))
 
     mirror.send = send
     monkeypatch.setattr(assistive, "RESULT_WAIT", .4)
@@ -424,7 +432,7 @@ def test_transient_frame_does_not_verify_home_before_settling(tmp_path, monkeypa
         elif command == "release":
             mirror.show(frame())
         elif command == "homescreen":
-            mirror.show(frame(home=True))
+            asyncio.get_running_loop().call_soon(mirror.show, frame(home=True))
 
     mirror.send = send
     monkeypatch.setattr(assistive, "RESULT_WAIT", .4)
@@ -440,8 +448,63 @@ def test_rotated_frame_does_not_use_cached_button_position(tmp_path, monkeypatch
     buffer = io.BytesIO()
     image.save(buffer, "JPEG")
     mirror.show(buffer.getvalue())
-    monkeypatch.setattr(assistive_vision, "find_button", lambda *args, **kwargs: None)
+    monkeypatch.setattr(assistive_vision, "find_button_target", lambda *args, **kwargs: None)
     monkeypatch.setattr(assistive, "RESULT_WAIT", .02)
-    with pytest.raises(RuntimeError, match="画面未确认变化"):
+    with pytest.raises(RuntimeError, match="未确认主屏幕"):
         asyncio.run(make_phone(tmp_path, mirror).go_home())
+    assert not mirror.clicks
+
+
+def test_changed_app_after_menu_dismissal_is_not_home(tmp_path, monkeypatch):
+    mirror = Mirror()
+    phone = make_phone(tmp_path, mirror)
+    original_show = mirror.show
+    image = Image.new("RGB", (360, 780), "#43769a")
+    buffer = io.BytesIO()
+    image.save(buffer, "JPEG")
+
+    def show(image):
+        original_show(buffer.getvalue() if image == frame(home=True) else image)
+
+    mirror.show = show
+    monkeypatch.setattr(assistive, "RESULT_WAIT", .6)
+    assert not asyncio.run(phone.assistive_touch._assistive_home(0))
+    assert len(mirror.clicks) == 2
+
+
+@pytest.mark.parametrize("stale", ["arrival", "replay"])
+def test_assistive_rejects_stale_frame_before_any_click(tmp_path, stale):
+    mirror = Mirror()
+    phone = make_phone(tmp_path, mirror)
+    if stale == "arrival":
+        mirror.updated -= 10
+    else:
+        mirror.frame_ts = 1_000
+        phone.assistive_touch._clock = 11_000 - mirror.updated*1000
+    assert not asyncio.run(phone.assistive_touch._assistive_home(0))
+    assert not mirror.clicks
+
+
+def test_result_within_mirror_lag_is_not_home_evidence(tmp_path, monkeypatch):
+    mirror = Mirror()
+    mirror.show(frame(home=True))
+    phone = make_phone(tmp_path, mirror)
+    monkeypatch.setattr("hidagent.freshness.MIRROR_LAG_SECONDS", .1)
+    result = asyncio.run(phone.assistive_touch._wait(
+        0, mirror.updated-.01, .2, assistive_vision.is_home_screen, stable=True))
+    assert result is None
+
+
+def test_home_button_refuses_blind_click_without_measured_landing_error(tmp_path, monkeypatch):
+    mirror = Mirror()
+    phone = make_phone(tmp_path, mirror)
+    for samples in phone._seen.values():
+        samples.clear()
+
+    async def hidden(*_, **__):
+        return None
+
+    monkeypatch.setattr(phone, "_find_pointer", hidden)
+    with pytest.raises(RuntimeError, match="未发送点击"):
+        asyncio.run(phone.assistive_touch._assistive_home(0))
     assert not mirror.clicks

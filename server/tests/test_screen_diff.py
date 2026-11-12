@@ -24,6 +24,9 @@ def frame(color="white", boxes=(), size=(180, 390), quality=None):
 def isolated_worker(monkeypatch):
     monkeypatch.setattr(screen_diff, "_worker", screen_diff._TextWorker())
     monkeypatch.setattr(screen_diff.ocr, "available", lambda: False)
+    screen_diff.ocr.set_backend(None)
+    yield
+    screen_diff.ocr.set_backend(None)
 
 
 def test_pixel_regions_are_normalized_and_fraction_tracks_changed_area():
@@ -95,7 +98,7 @@ def test_fake_ocr_diff_normalizes_text_and_counts_duplicates(monkeypatch):
         return [SimpleNamespace(text=text) for text in texts]
 
     monkeypatch.setattr(screen_diff.ocr, "available", lambda: True)
-    monkeypatch.setattr(screen_diff.ocr, "read_text", read)
+    screen_diff.ocr.set_backend(SimpleNamespace(read_text=read))
     result = asyncio.run(screen_diff.summarize(before, after))
     assert result["text_status"] == "available"
     assert result["texts_appeared"] == ["新文字"]
@@ -129,7 +132,7 @@ def test_slow_ocr_times_out_without_queueing_or_blocking_asyncio_shutdown(monkey
         assert release.wait(2)
         return []
 
-    monkeypatch.setattr(screen_diff.ocr, "read_text", slow)
+    screen_diff.ocr.set_backend(SimpleNamespace(read_text=slow))
     worker = screen_diff._worker
     started = time.monotonic()
     try:
@@ -158,7 +161,7 @@ def test_cancelling_diff_does_not_wait_for_native_ocr(monkeypatch):
         assert release.wait(2)
         return []
 
-    monkeypatch.setattr(screen_diff.ocr, "read_text", slow)
+    screen_diff.ocr.set_backend(SimpleNamespace(read_text=slow))
 
     async def scenario():
         task = asyncio.create_task(screen_diff.summarize(frame(), frame("black")))

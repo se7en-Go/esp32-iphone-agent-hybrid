@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from pydantic import ValidationError
-from test_controls import FakePhone, Screen, jpeg
+from test_controls import FakePhone, Screen, instant_mirror, jpeg  # noqa: F401
 
 from hidagent import ocr, screen_diff
 from hidagent.app import ControlAction, FindTextBody
@@ -76,6 +76,22 @@ def test_screen_change_during_ocr_rejects_lookup_or_tap(monkeypatch, matches, lo
     assert not phone.calls
 
 
+def test_identical_image_reconnect_during_ocr_rejects_tap(monkeypatch, matches):
+    phone, screen = FakePhone(), Screen()
+    screen.generation = 0
+    controls = Controls(phone, screen)
+    token = controls.observation()["screen_id"]
+
+    async def reconnected(*_args):
+        screen.generation += 1
+        return matches
+
+    monkeypatch.setattr(ocr, "find_matches_async", reconnected)
+    with pytest.raises(ValueError):
+        asyncio.run(controls.perform(ControlAction(action="tap_text", screen_id=token, text="设置")))
+    assert not phone.calls
+
+
 def test_lookup_reports_no_match_without_consuming_token(monkeypatch):
     monkeypatch.setattr(ocr, "find_matches", lambda *_args: [])
     controls = Controls(FakePhone(), Screen())
@@ -102,7 +118,7 @@ def test_diff_describes_exact_returned_image_even_if_feed_advances(monkeypatch):
     token = controls.observation()["screen_id"]
     returned_frame = jpeg("black")
 
-    async def tap(x, y):
+    async def tap(x, y, **kwargs):
         screen.frame = returned_frame
 
     async def summarize(before, after, **kwargs):

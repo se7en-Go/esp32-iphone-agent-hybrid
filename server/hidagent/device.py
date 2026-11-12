@@ -112,7 +112,10 @@ class SerialLink:
     def _pump(self) -> None:
         while not self._closed:
             try:
-                data = self._ser.read(256)
+                # A size-256 read holds a short ACK until the 200 ms timeout.
+                # Block for one byte when idle, then drain only bytes already buffered.
+                waiting = getattr(self._ser, "in_waiting", 0)
+                data = self._ser.read(max(1, min(256, waiting)))
             except Exception:
                 break
             if not data:
@@ -304,7 +307,7 @@ class Device:
             if self._link is link:
                 self._link = None
 
-    async def exchange(self, command: str) -> str:
+    async def exchange(self, command: str, *, before_write=None, write_lock=None) -> str:
         if not self.connected:
             raise DeviceError(messages.BOARD_NOT_CONNECTED)
         timeout = self._timeout(command)
@@ -321,17 +324,23 @@ class Device:
             req_id = self._request_id(command)
             try:
                 # 板子收到这一行之后才选 USB 或 BLE。两条路都先经过这把锁里的熔断复查，没有第二条写手机的路。
-                with write_guard if write_guard is not None else nullcontext():
-                    if name in HID_COMMANDS and name != "release":
-                        check_operation()
-                    timing = _exchange_timing.get()
-                    if timing is not None:
-                        timing.sent_at = time.monotonic()
-                    if name == "press":
-                        self._pressed_link = link  # the write may succeed before its ACK arrives
-                    link.write(f"{req_id} {command}\n".encode())
-                    if name == "release" and self._pressed_link is link:
-                        self._pressed_link = None
+                with write_guard if write_guard is not None else nullcontext() as commit_write:
+                    with write_lock if write_lock is not None else nullcontext():
+                        if name in HID_COMMANDS and name != "release":
+                            check_operation()
+                        if before_write is not None:
+                            before_write()
+                        # A gate may defer accounting until all evidence checks pass.
+                        if commit_write is not None:
+                            commit_write()
+                        timing = _exchange_timing.get()
+                        if timing is not None:
+                            timing.sent_at = time.monotonic()
+                        if name == "press":
+                            self._pressed_link = link  # the write may succeed before its ACK arrives
+                        link.write(f"{req_id} {command}\n".encode())
+                        if name == "release" and self._pressed_link is link:
+                            self._pressed_link = None
                 reply = await self._read_reply(link, req_id, timeout)
             except asyncio.CancelledError:
                 await self._release_held(link)
@@ -356,9 +365,9 @@ class Device:
             log.debug("%s -> %s", name, reply[:80])
         return reply
 
-    async def _await_exchange(self, command: str) -> str:
+    async def _await_exchange(self, command: str, **kwargs) -> str:
         """在子任务里等应答。紧急停止只取消这次交换，调用方（包括维护循环）还在。"""
-        task = asyncio.create_task(self.exchange(command), name=f"exchange-{command.split(' ', 1)[0]}")
+        task = asyncio.create_task(self.exchange(command, **kwargs), name=f"exchange-{command.split(' ', 1)[0]}")
         self._exchanges.add(task)
         try:
             await asyncio.wait({task})
@@ -392,6 +401,12 @@ class Device:
 
     async def send(self, command: str) -> None:
         reply = await self._await_exchange(command)
+        if reply != "ok":
+            raise DeviceError(messages.explain_reply(command, reply))
+
+    async def send_guarded(self, command: str, before_write, *, write_lock=None) -> None:
+        """Validate after acquiring the device lock, at the actual write boundary."""
+        reply = await self._await_exchange(command, before_write=before_write, write_lock=write_lock)
         if reply != "ok":
             raise DeviceError(messages.explain_reply(command, reply))
 

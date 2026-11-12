@@ -55,7 +55,7 @@ def _regions(diff: Image.Image, threshold: int):
         yield points
 
 
-def _mask_pointer_discs(before: bytes, after: bytes, diff: Image.Image) -> None:
+def _mask_pointer_discs(before: bytes, after: bytes, diff: Image.Image, max_discs=None) -> None:
     """Mask visible gray discs in delayed move frames, without hiding other small edits."""
     w, h = diff.size
     boxes = []
@@ -70,7 +70,7 @@ def _mask_pointer_discs(before: bytes, after: bytes, diff: Image.Image) -> None:
                           min(w, x1 + margin), min(h, y1 + margin)))
     if not boxes or len(boxes) > 12:
         return
-    draw = ImageDraw.Draw(diff)
+    masks = set()
     for jpeg in (before, after):
         with Image.open(io.BytesIO(jpeg)) as original:
             image = original.convert("RGB").resize((w, h), Image.Resampling.BILINEAR)
@@ -81,15 +81,21 @@ def _mask_pointer_discs(before: bytes, after: bytes, diff: Image.Image) -> None:
                     continue
                 x, y = x + box[0], y + box[1]
                 radius = diameter / 2 + 1
-                draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=0)
+                masks.add((x - radius, y - radius, x + radius, y + radius))
+    if max_discs is not None and len(masks) > max_discs:
+        return
+    draw = ImageDraw.Draw(diff)
+    for bounds in masks:
+        draw.ellipse(bounds, fill=0)
 
 
-def _mask_pointer_highlights(before: bytes, after: bytes, diff: Image.Image,
-                             unmasked: Image.Image | None = None) -> None:
+def mask_pointer_highlights(before: bytes | Image.Image, after: bytes | Image.Image, diff: Image.Image,
+                            unmasked: Image.Image | None = None) -> tuple[tuple, tuple]:
     """Ignore neutral, hollow, rounded hover outlines, including an unknown old hover.
 
     Mask only the outline and its JPEG edge; content inside the control remains visible.
     Solid patches, colored outlines and changes to a control's label are not highlights.
+    Return recognized centers in each frame, for disc-to-highlight continuity checks.
     """
     w, _ = diff.size
     candidates = []
@@ -112,11 +118,17 @@ def _mask_pointer_highlights(before: bytes, after: bytes, diff: Image.Image,
             continue
         candidates.append((points, ((x0 + x1) / 2, (y0 + y1) / 2)))
     if not candidates or len(candidates) > 2:
-        return
+        return (), ()
     draw = ImageDraw.Draw(diff)
-    for jpeg in (before, after):
-        with Image.open(io.BytesIO(jpeg)) as original:
-            image = original.convert("RGB").resize(diff.size, Image.Resampling.BILINEAR)
+    recognized = [[], []]
+    for index, frame in enumerate((before, after)):
+        if isinstance(frame, Image.Image):
+            image = frame
+        else:
+            with Image.open(io.BytesIO(frame)) as original:
+                image = original.convert("RGB")
+        if image.size != diff.size:
+            image = image.resize(diff.size, Image.Resampling.BILINEAR)
         for points, (cx, cy) in candidates:
             colors = [image.getpixel(point) for point in points]
             levels = sorted(sum(color) / 3 for color in colors)
@@ -135,40 +147,29 @@ def _mask_pointer_highlights(before: bytes, after: bytes, diff: Image.Image,
                         contrast[side] += abs(sum(image.getpixel((nx, ny))) - sum(color)) / 3 >= 12
             if min(contrast) < len(points) * .65:
                 continue  # gray background alone is not a visible outline
+            recognized[index].append((cx, cy))
             for x, y in points:
                 draw.rectangle((x - 1, y - 1, x + 1, y + 1), fill=0)
+    return tuple(recognized[0]), tuple(recognized[1])
 
 
 def observation_changed(before: bytes | None, after: bytes | None) -> bool:
-    """Reject a different screen while tolerating clock and up to two pointer-sized changes.
+    """Reject content edits while tolerating clock and recognized pointer shapes.
 
     Recognized hover outlines and small compact discs may fade or move. Other larger
     regions, several edits, scrolling and broad low-contrast changes invalidate it.
     """
     if before and before == after:
         return False
-    diff = _difference(before, after, 180)
+    diff = _difference(before, after, 360)
     if diff is None:
         return True
-    values = diff.tobytes()
-    if sum(values) / len(values) > 3:
-        return True  # broad transitions need no outline search
-    _mask_pointer_highlights(before, after, diff)
+    mask_pointer_highlights(before, after, diff)
+    _mask_pointer_discs(before, after, diff, max_discs=2)
     values = diff.tobytes()
     if sum(values) / len(values) > 0.8:
         return True
-    w, _ = diff.size
-    regions = 0
-    for points in _regions(diff, 24):
-        if len(points) < 3:
-            continue  # isolated compression noise
-        xs, ys = zip(*points, strict=True)
-        if max(xs) - min(xs) + 1 > 0.08 * w or max(ys) - min(ys) + 1 > 0.08 * w:
-            return True
-        regions += 1
-        if regions > 2:
-            return True
-    return False
+    return any(len(points) >= 6 for points in _regions(diff, 24))
 
 
 def effect_changed(before: bytes | None, after: bytes | None, ignore: tuple = (), *, hover: tuple = ()) -> bool:
@@ -189,7 +190,7 @@ def effect_changed(before: bytes | None, after: bytes | None, ignore: tuple = ()
     if sum(values) / len(values) > 3:  # a screen transition cannot be just a pair of small discs
         return True
     # A known target can overlap an unknown old hover; recognize the complete outline.
-    _mask_pointer_highlights(before, after, diff, unmasked)
+    mask_pointer_highlights(before, after, diff, unmasked)
     _mask_pointer_discs(before, after, diff)
     values = diff.tobytes()
     return sum(values) / len(values) > 0.8 or any(len(region) >= 6 for region in _regions(diff, 25))

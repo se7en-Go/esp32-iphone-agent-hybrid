@@ -21,11 +21,23 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class FrameSnapshot:
-    """One published image and its clocks; readers retain this object across awaits."""
+    """One published image and its clocks; readers retain this object across awaits.
 
-    frame: bytes
+    Calling the snapshot returns the shared observation record (wall-clock updated,
+    board timestamp, generation). Attribute access stays the monotonic arrival record.
+    """
+
+    frame: bytes | None
     board_ts: int | None
     arrived: float  # host monotonic seconds, never wall-clock time
+    updated: float = 0.0
+    generation: int = 0
+    observed_live: bool = False
+
+    def __call__(self):
+        from .freshness import FrameSnapshot as ObservedFrame
+
+        return ObservedFrame(self.frame, self.updated, self.board_ts, self.generation, self.observed_live)
 
 
 class Screen:
@@ -42,6 +54,8 @@ class Screen:
         self.frame_ts: int | None = None
         self._next_ts: int | None = None
         self._snapshot: FrameSnapshot | None = None
+        self._frame_lock = threading.RLock()
+        self.generation = 0
         # one decoder for the whole stream from this board, so a reconnect can go on from its last AU
         self._decoder = None
         self._decoder_for: tuple[str, str] | None = None
@@ -113,7 +127,14 @@ class Screen:
                 time.sleep(1)
 
     def _on_ready(self) -> None:
-        self._session_ok = True
+        with self._frame_lock:
+            self.generation += 1
+            self.frame = None
+            self.updated = 0.0
+            self.frame_ts = None
+            self._next_ts = None
+            self._session_ok = True
+            self._snapshot = FrameSnapshot(None, None, time.monotonic(), 0.0, self.generation, False)
         self.last_error = ""
 
     def _on_stall(self) -> None:
@@ -123,12 +144,16 @@ class Screen:
         self._next_ts = ts
 
     def _on_jpeg(self, jpeg: bytes) -> None:
-        snapshot = FrameSnapshot(jpeg, self._next_ts, time.monotonic())
-        self.frame_ts, self._next_ts = snapshot.board_ts, None
+        arrived = time.monotonic()
+        board_ts = self._next_ts
+        # Legacy fields update before the wall clock is read. A concurrent reader can
+        # still be holding the previous immutable snapshot during that window.
+        self.frame_ts, self._next_ts = board_ts, None
         self.frame = jpeg
-        self.updated = time.time()
-        # Publish one immutable object: the decoder thread may run between any two reader bytecodes.
-        self._snapshot = snapshot
+        updated = time.time()
+        self.updated = updated
+        self._snapshot = FrameSnapshot(
+            jpeg, board_ts, arrived, updated, self.generation, self._session_ok and jpeg is not None)
         if self.last_error.startswith("画面停住了"):
             self.last_error = ""
 

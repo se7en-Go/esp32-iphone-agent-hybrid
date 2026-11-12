@@ -57,7 +57,7 @@ def _circle(gray: Image.Image, x: float, y: float, radius: float) -> list[int]:
             for a in range(12)]
 
 
-def find_button(frame: bytes, near: Point | None = None) -> Point | None:
+def find_button_target(frame: bytes, near: Point | None = None) -> tuple[Point, Box] | None:
     """Find an edge button by its concentric rings; `near` only ranks real candidates.
 
     iOS 26 captures use a pale centre with two grey rings. Older appearances use a
@@ -107,24 +107,49 @@ def find_button(frame: bytes, near: Point | None = None) -> Point | None:
             point = x/w, y/h
             distance = math.dist(point, near) if near is not None else 0
             contrast = max(median(rim)-core, core-median(outside))
-            candidates.append((contrast - distance*80, point))
-    return max(candidates)[1] if candidates else None
+            candidates.append((contrast - distance*80, point, (left/w, top/h, right/w, bottom/h)))
+    return max(candidates)[1:] if candidates else None
 
 
-def _menu_icons(image: Image.Image, box: tuple[int, int, int, int]) -> bool:
+def find_button(frame: bytes, near: Point | None = None) -> Point | None:
+    target = find_button_target(frame, near)
+    return target[0] if target is not None else None
+
+
+def _icon_boxes(image: Image.Image, box: tuple[int, int, int, int]):
     panel = image.crop(box)
     w, h = panel.size
     data = panel.tobytes()
     threshold = max(140, median(data) + 55)
     mask = bytearray(value >= threshold for value in data)
-    centres = []
+    boxes = []
     for left, top, right, bottom, count in _components(mask, w, h):
         bw, bh = right-left, bottom-top
         if (.045*w <= bw <= .24*w and .045*h <= bh <= .24*h
                 and .4 <= bw/bh <= 2.4 and count >= .001*w*h):
-            centres.append(((left+right)/(2*w), (top+bottom)/(2*h)))
+            boxes.append((left/w, top/h, right/w, bottom/h))
+    return boxes
+
+
+def _menu_icons(image: Image.Image, box: tuple[int, int, int, int]) -> bool:
+    centres = [((left+right)/2, (top+bottom)/2) for left, top, right, bottom in _icon_boxes(image, box)]
     return all(any(left < x < right and top < y < bottom for x, y in centres)
                for left, top, right, bottom in MENU_ICON_REGIONS)
+
+
+
+def find_icon_box(frame: bytes, panel: Box, point: Point) -> Box | None:
+    """Return a visible menu icon's bounds only when it contains the chosen target."""
+    image = _small(frame).convert("L")
+    left, top, right, bottom = panel
+    pixels = (round(left*image.width), round(top*image.height),
+              round(right*image.width), round(bottom*image.height))
+    for x0, y0, x1, y1 in _icon_boxes(image, pixels):
+        box = (left+x0*(right-left), top+y0*(bottom-top),
+               left+x1*(right-left), top+y1*(bottom-top))
+        if box[0] < point[0] < box[2] and box[1] < point[1] < box[3]:
+            return box
+    return None
 
 
 def find_panel(frame: bytes, before: bytes | None = None) -> Box | None:
@@ -173,3 +198,57 @@ def find_panel(frame: bytes, before: bytes | None = None) -> Box | None:
                     continue
             candidates.append((fill*bw*bh, (left/w, top/h, right/w, bottom/h)))
     return max(candidates)[1] if candidates else None
+
+
+def is_home_screen(frame: bytes) -> bool:
+    """Conservative portrait Home signature: aligned app icons and a separate dock.
+
+    This recognizes a conventional icon page, not arbitrary wallpapers/widgets or
+    App Library. Unknown layouts fail closed. A dismissed menu or a changed app
+    alone supplies none of this evidence.
+    """
+    from PIL import ImageFilter
+
+    image = _small(frame).convert("L")
+    w, h = image.size
+    if not 1.4 < h/w < 2.5:
+        return False
+    edges = image.filter(ImageFilter.FIND_EDGES)
+    data = edges.tobytes()
+    # A full-width toolbar separator below the status bar is application chrome.
+    if any(sum(data[y*w+x] > 45 for x in range(round(.05*w), round(.95*w))) > .72*w
+           for y in range(round(.075*h), round(.16*h))):
+        return False
+    mask = bytearray(value > 18 for value in data)
+    icons, docks = [], []
+    for left, top, right, bottom, count in _components(mask, w, h):
+        bw, bh = right-left, bottom-top
+        x, y = (left+right)/(2*w), (top+bottom)/(2*h)
+        if (.09*w <= bw <= .19*w and .8 <= bw/bh <= 1.25
+                and count > .08*bw*bh and .07 < x < .93):
+            icons.append((x, y, bw/w))
+        if (.8*w < bw < .98*w and .09*h < bh < .19*h
+                and .81 < top/h < .89 and .94 < bottom/h < .995):
+            docks.append((left/w, top/h, right/w, bottom/h))
+    if not docks:
+        return False
+    dock = max(docks, key=lambda box: box[2]-box[0])
+    dock_icons = [icon for icon in icons if dock[0] < icon[0] < dock[2] and dock[1] < icon[1] < dock[3]]
+    if len(dock_icons) < 3 or max(icon[1] for icon in dock_icons)-min(icon[1] for icon in dock_icons) > .025:
+        return False
+    grid = [icon for icon in icons if .13 < icon[1] < .76]
+    rows = []
+    for icon in sorted(grid, key=lambda item: item[1]):
+        if not rows or abs(icon[1]-rows[-1][0][1]) > .025:
+            rows.append([])
+        rows[-1].append(icon)
+    rows = [sorted(row) for row in rows if 3 <= len(row) <= 4]
+    for index, row in enumerate(rows):
+        for other in rows[index+1:]:
+            if len(row) != len(other) or not .08 < other[0][1]-row[0][1] < .22:
+                continue
+            if (all(abs(a[0]-b[0]) < .025 for a, b in zip(row, other, strict=True))
+                    and max(icon[2] for icon in row+other+dock_icons)
+                    / min(icon[2] for icon in row+other+dock_icons) < 1.35):
+                return True
+    return False

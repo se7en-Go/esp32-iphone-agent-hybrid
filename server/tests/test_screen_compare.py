@@ -1,4 +1,5 @@
 import io
+import time
 from pathlib import Path
 
 import pytest
@@ -143,7 +144,7 @@ def test_observation_token_survives_untracked_highlight_appearance_and_departure
 
     frames = (KEYPAD, keypad_edit(highlight=True))
     before, after = frames[::-1] if departing else frames
-    screen = SimpleNamespace(live=True, frame=before, updated=1)
+    screen = SimpleNamespace(live=True, frame=before, updated=time.time())
     control = Controls(None, screen)
     token = control.observation()["screen_id"]
     screen.frame = after
@@ -199,3 +200,14 @@ def test_missing_or_resized_frame_is_changed(compare):
     buffer = io.BytesIO()
     image.save(buffer, "JPEG")
     assert compare(picture(), buffer.getvalue())
+
+
+@pytest.mark.parametrize("xy", [(300, 180), (300, 1300), (500, 700)])
+def test_single_character_change_in_header_composer_or_target_invalidates_token(xy):
+    before = picture()
+    image = Image.open(io.BytesIO(before))
+    x, y = xy
+    ImageDraw.Draw(image).rectangle((x, y, x + 14, y + 24), fill="white")
+    out = io.BytesIO()
+    image.save(out, "PNG")
+    assert observation_changed(before, out.getvalue())

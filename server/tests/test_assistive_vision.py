@@ -131,3 +131,39 @@ def test_unrelated_dialog_with_text_and_buttons_is_not_a_menu():
     for x in (125, 235):
         draw.rounded_rectangle((x-30, 435, x+30, 470), radius=8, outline="white", width=3)
     assert find_panel(encoded(image)) is None
+
+
+def test_home_requires_grid_dock_and_no_application_chrome():
+    from home_scene import draw_home
+
+    from hidagent.assistive_vision import is_home_screen
+
+    for dock, chrome, expected in ((True, False, True), (False, False, False), (True, True, False)):
+        image = Image.new("RGB", (360, 780), "#a9bdcf")
+        draw_home(image, dock=dock, chrome=chrome)
+        assert is_home_screen(encoded(image)) is expected
+    assert not is_home_screen(encoded(Image.new("RGB", (360, 780), "#a9bdcf")))
+    assert not is_home_screen(panel_frame())
+
+
+@pytest.mark.parametrize("name", ["00_home_1500ms", "dial_final", "airplay_receiver_button"])
+def test_real_apps_are_not_home(name):
+    from hidagent.assistive_vision import is_home_screen
+    assert not is_home_screen((FIXTURES / f"{name}.jpg").read_bytes())
+
+
+def test_targets_expose_detected_bounds_and_reject_menu_whitespace():
+    from hidagent.assistive_vision import find_button_target, find_icon_box
+
+    center, bounds = find_button_target(button_frame())
+    assert bounds[0] < center[0] < bounds[2]
+    assert bounds[1] < center[1] < bounds[3]
+    assert 0 < bounds[2]-bounds[0] < .14
+    frame = panel_frame()
+    panel = find_panel(frame)
+    left, top, right, bottom = panel
+    point = (left + .5*(right-left), top + .8*(bottom-top))
+    bounds = find_icon_box(frame, panel, point)
+    assert bounds is not None
+    assert bounds[0] < point[0] < bounds[2] and bounds[1] < point[1] < bounds[3]
+    assert find_icon_box(frame, panel, (.5, (top+bottom)/2)) is None

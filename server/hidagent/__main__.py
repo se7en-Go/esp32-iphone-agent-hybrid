@@ -34,6 +34,8 @@ logging.getLogger("hidagent").setLevel(logging.DEBUG if debug else logging.INFO)
 
 host = os.environ.get("HOST", "127.0.0.1")
 port = int(os.environ.get("PORT", "8890"))
+if os.environ.get("HIDAGENT_CLIPBOARD_KEY") and host not in ("127.0.0.1", "localhost", "::1"):
+    raise SystemExit("剪贴板模式的控制 API 必须监听 127.0.0.1；手机端请使用 hidagent.clipboard_proxy。")
 print(f"网页控制台：http://{host}:{port}")
 print("三个灯 device / screen / calibrated 都绿，才算通。")
 print("若系统询问是否允许 Python 访问网络：7201 是连板子的出站连接，选择允许专用网络即可。")

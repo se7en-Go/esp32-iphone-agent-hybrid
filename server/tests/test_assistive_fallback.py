@@ -3,6 +3,7 @@ import io
 import time
 
 import pytest
+from home_scene import draw_home
 from PIL import Image, ImageDraw
 
 from hidagent import assistive
@@ -13,6 +14,8 @@ from hidagent.phone import Phone
 def app_frame(*, home=False, clock=False, pointer=False):
     image = Image.new("RGB", (360, 780), "#a6c6dc" if home else "#e5dbc5")
     draw = ImageDraw.Draw(image)
+    if home:
+        draw_home(image)
     draw.text((15, 12), "12:01" if clock else "12:00", fill="black")
     if pointer:
         draw.ellipse((172, 460, 188, 476), fill="#969696")
@@ -57,6 +60,7 @@ class Device:
 
 @pytest.fixture(autouse=True)
 def short_waits(monkeypatch):
+    monkeypatch.setattr("hidagent.freshness.MIRROR_LAG_SECONDS", 0)
     monkeypatch.setattr(assistive, "MENU_WAIT", .04)
     monkeypatch.setattr(assistive, "RESULT_WAIT", .3)
     monkeypatch.setattr(assistive, "STABLE_QUIET", .02)
@@ -70,25 +74,22 @@ def make_phone(tmp_path, device, screen=None, *, calibrated=True):
     return phone
 
 
-def test_without_screen_tries_swipe_consumer_and_keyboard(tmp_path, caplog):
+def test_without_screen_refuses_all_recovery_commands(tmp_path):
     device = Device()
     phone = make_phone(tmp_path, device)
 
-    with caplog.at_level("INFO"):
+    with pytest.raises(RuntimeError, match="新鲜|重放"):
         asyncio.run(phone.go_home())
 
-    assert device.sent.index("press") < device.sent.index("release")
-    assert device.sent.index("release") < device.sent.index("homescreen") < device.sent.index("key cmd+h")
-    assert "click" not in device.sent
-    assert "退路" in caplog.text
-    assert "无法确认主屏幕" in caplog.text
+    assert device.sent == []
 
 
 def test_without_calibration_keyboard_fallback_still_runs(tmp_path):
     device = Device()
-    phone = make_phone(tmp_path, device, calibrated=False)
+    phone = make_phone(tmp_path, device, Screen(), calibrated=False)
 
-    asyncio.run(phone.go_home())
+    with pytest.raises(RuntimeError, match="未确认主屏幕"):
+        asyncio.run(phone.go_home())
 
     assert device.sent == ["homescreen", "key cmd+h"]
 
@@ -99,20 +100,21 @@ def test_unsupported_consumer_home_continues_to_keyboard(tmp_path):
             raise DeviceError("err unknown command")
 
     device = Device(reject_consumer)
-    phone = make_phone(tmp_path, device)
+    phone = make_phone(tmp_path, device, Screen())
 
-    asyncio.run(phone.go_home())
+    with pytest.raises(RuntimeError, match="未确认主屏幕"):
+        asyncio.run(phone.go_home())
 
     assert device.sent[-2:] == ["homescreen", "key cmd+h"]
 
 
 @pytest.mark.parametrize("successful_command", ["release", "homescreen", "key cmd+h"])
-def test_live_fallback_stops_after_observed_change(tmp_path, successful_command):
+def test_live_fallback_stops_after_home_signature(tmp_path, successful_command):
     screen = Screen()
 
     def change_screen(command):
         if command == successful_command:
-            screen.show(app_frame(home=True))
+            asyncio.get_running_loop().call_soon(screen.show, app_frame(home=True))
 
     device = Device(change_screen)
     phone = make_phone(tmp_path, device, screen)
@@ -148,7 +150,7 @@ def test_abort_after_swipe_prevents_remaining_fallbacks(tmp_path):
             device.abort_epoch += 1
 
     device.on_send = stop_after_swipe
-    phone = make_phone(tmp_path, device)
+    phone = make_phone(tmp_path, device, Screen())
 
     with pytest.raises(DeviceError):
         asyncio.run(phone.go_home())
@@ -166,7 +168,7 @@ def test_abort_error_is_not_swallowed_as_unsupported_consumer(tmp_path):
             raise DeviceError("已紧急停止")
 
     device.on_send = stop_on_consumer
-    phone = make_phone(tmp_path, device, calibrated=False)
+    phone = make_phone(tmp_path, device, Screen(), calibrated=False)
 
     with pytest.raises(DeviceError):
         asyncio.run(phone.go_home())
@@ -180,7 +182,7 @@ def test_cancellation_does_not_trigger_another_fallback(tmp_path):
             raise asyncio.CancelledError
 
     device = Device(cancel_consumer)
-    phone = make_phone(tmp_path, device, calibrated=False)
+    phone = make_phone(tmp_path, device, Screen(), calibrated=False)
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(phone.go_home())

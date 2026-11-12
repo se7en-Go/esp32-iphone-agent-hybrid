@@ -198,6 +198,12 @@ class LatestFrameGate:
         self.last = now
         return ready
 
+    def wait_timeout(self, now: float, maximum: float = 0.5) -> float:
+        """Wake a quiet receiver when its pending frame can be published."""
+        if self.pending is None or self.last is None:
+            return maximum
+        return max(0.001, min(maximum, self.last + self.gap - now))
+
 
 def frame_to_jpeg(frame, quality: int = 75) -> bytes:
     image = frame.to_image()
@@ -265,11 +271,18 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
 
         while not stop.is_set():
             now = time.monotonic()
+            ready = gate.flush(now)
+            if ready is not None:
+                emit(ready)
+                if stop.is_set():
+                    break
+                now = time.monotonic()
             send_keepalive(now)
             if authed and not stalled and stream_is_dead(now, last_frame, last_ack) and on_stall:
                 stalled = True
                 on_stall()
             try:
+                sock.settimeout(gate.wait_timeout(time.monotonic()))
                 data = sock.recv(65536)
             except TimeoutError:
                 ready = gate.flush(time.monotonic())

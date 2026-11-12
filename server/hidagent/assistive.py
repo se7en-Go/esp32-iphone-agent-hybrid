@@ -12,10 +12,11 @@ import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw, ImageStat
+from PIL import Image, ImageChops, ImageStat
 
 from . import assistive_vision
 from .device import DeviceError
+from .freshness import fresh_frame, require_fresh, snapshot
 
 log = logging.getLogger(__name__)
 
@@ -40,20 +41,6 @@ def _point(value) -> Point:
 def _aspect(frame: bytes) -> float:
     with Image.open(io.BytesIO(frame)) as image:
         return image.width / image.height
-
-
-def _changed(before: bytes, after: bytes, ignore=()) -> bool:
-    """Ignore the clock, floating button and pointer when checking navigation."""
-    images = []
-    for frame in (before, after):
-        with Image.open(io.BytesIO(frame)) as image:
-            image = image.convert("L").resize((96, 208))
-        draw = ImageDraw.Draw(image)
-        draw.rectangle((0, 0, 96, 17), fill=0)
-        for x, y in ignore:
-            draw.ellipse((x * 96 - 10, y * 208 - 10, x * 96 + 10, y * 208 + 10), fill=0)
-        images.append(image)
-    return ImageStat.Stat(ImageChops.difference(*images)).mean[0] > 2.0
 
 
 def _quiet_view(frame: bytes, result):
@@ -84,6 +71,7 @@ class AssistiveTouch:
         self.last_position = None
         self.last_aspect = None
         self._clock = None
+        self._generation = None
         saved = {}
         try:
             if path.exists():
@@ -109,12 +97,15 @@ class AssistiveTouch:
         if self.phone._stopped(epoch):
             raise DeviceError("已紧急停止，后面的内容没有发出。")
 
-    def _frame(self) -> bytes | None:
-        screen = self.phone.screen
-        if screen is None or not screen.live:
-            return None
-        age = self.phone._frame_age(self._clock)
-        return screen.frame if age is None or age <= 5 else None
+    def _frame(self, *, since=None) -> bytes | None:
+        observation = fresh_frame(self.phone.screen, clock=self._clock, since=since)
+        return observation.frame if observation is not None else None
+
+    def _require_frame(self):
+        observation = require_fresh(self.phone.screen, clock=self._clock)
+        if self._generation is not None and observation.generation != self._generation:
+            raise RuntimeError("返回主屏幕期间画面连接已变化，请重新观察。")
+        return observation
 
     def _remember(self, position: Point, frame: bytes) -> None:
         self.last_position, self.last_aspect = position, _aspect(frame)
@@ -126,18 +117,24 @@ class AssistiveTouch:
 
     async def _wait(self, epoch: int, since: float, timeout: float, accept, *, stable=False):
         deadline = time.monotonic() + timeout
+        action_since = since
         candidate = reference = previous = None
         quiet_since = None
         while time.monotonic() < deadline:
             self._check(epoch)
+            if (self._generation is not None
+                    and snapshot(self.phone.screen).generation != self._generation):
+                raise RuntimeError("返回主屏幕期间画面连接已变化，请重新观察。")
             if self.phone.screen is None or not self.phone.screen.live:
                 return None
             await self.phone.screen.fresh(since, min(0.05, max(0, deadline - time.monotonic())))
             self._check(epoch)
-            updated = self.phone.screen.updated
-            current = self._frame()
-            if current is None:
-                return None
+            observation = fresh_frame(self.phone.screen, clock=self._clock, since=action_since)
+            if observation is None:
+                candidate = reference = quiet_since = None
+                await asyncio.sleep(0.02)
+                continue
+            current, updated = observation.frame, observation.updated
             # A decoder update can race fresh()'s timeout; inspect the latest frame.
             if updated > since:
                 frame = current
@@ -186,7 +183,8 @@ class AssistiveTouch:
         hint = self.position
         if hint is None and self.last_aspect and abs(_aspect(before) / self.last_aspect - 1) < 0.1:
             hint = self.last_position
-        button = assistive_vision.find_button(before, near=hint)
+        detected = assistive_vision.find_button_target(before, near=hint)
+        button, button_box = detected if detected is not None else (None, None)
         if self.position is not None:
             if button is None or math.dist(button, self.position) > .025:
                 log.info("go_home: 配置位置没有可见的 AssistiveTouch 悬浮按钮")
@@ -196,8 +194,7 @@ class AssistiveTouch:
             log.info("go_home: 没找到 AssistiveTouch 悬浮按钮")
             return False
         self._check(epoch)
-        since = time.time()
-        await self.phone.tap(*button)
+        since = await self.phone.tap(*button, target_box=button_box, target_frame=before)
         opened = await self._wait(epoch, since, MENU_WAIT,
                                   lambda frame: assistive_vision.find_panel(frame, before=before), stable=True)
         if opened is None:
@@ -206,18 +203,20 @@ class AssistiveTouch:
         menu, panel = opened
         self._remember(button, before)
         target = self._home_slot(menu, panel)
+        target_box = assistive_vision.find_icon_box(menu, panel, target)
+        if target_box is None:
+            log.warning("go_home: 主屏幕目标没有可见图标边界，未发送点击")
+            return False
         self._check(epoch)
-        since = time.time()
-        await self.phone.tap(*target)
-        ignore = tuple(point for point in (button, self.last_position, target) if point is not None)
+        since = await self.phone.tap(*target, target_box=target_box, target_frame=menu)
 
         def arrived(frame):
             return (assistive_vision.find_panel(frame) is None
-                    and _changed(before, frame, ignore))
+                    and assistive_vision.is_home_screen(frame))
 
         verified = await self._wait(epoch, since, RESULT_WAIT, arrived, stable=True)
         if verified:
-            log.info("go_home: AssistiveTouch 主屏幕已点击，菜单消失且画面已变化")
+            log.info("go_home: AssistiveTouch 主屏幕已确认：菜单消失、图标网格及 Dock 可见")
             return True
         log.warning("go_home: AssistiveTouch 返回主屏幕未确认，尝试 HID 退路")
         return False
@@ -226,45 +225,49 @@ class AssistiveTouch:
         epoch = getattr(self.phone.device, "abort_epoch", 0)
         self._check(epoch)
         self._clock = None
-        reference = None
-        try:
-            if self._frame() is not None:
-                self._clock = await self.phone._catch_up(epoch)
-            reference = self._frame()
-            if await self._assistive_home(epoch):
-                return
-        except (RuntimeError, OSError, ValueError) as exc:
-            self._check(epoch)
-            log.warning("go_home: AssistiveTouch 失败，尝试 HID 退路：%s", exc)
+        self._generation = None
+        ensure = getattr(self.phone, "ensure_observation", None)
+        if ensure is not None:
+            await ensure()
+        self._generation = self._require_frame().generation
+        self._clock = await self.phone._catch_up(epoch)
+        self._require_frame()
+        # An unavailable route returns False. Eligibility/context exceptions
+        # abort recovery instead of authorizing a different physical action.
+        if await self._assistive_home(epoch):
+            return
         acknowledged = False
         last_error = None
         for route in ("swipe-up", "homescreen", "cmd+h"):
             self._check(epoch)
-            before, since = reference or self._frame(), time.time()
+            self._require_frame()
+            if route == "swipe-up" and not self.phone.calibrated:
+                log.info("go_home: 指针未校准，跳过上滑退路")
+                continue
             log.warning("go_home: HID 退路 %s", route)
             try:
                 if route == "swipe-up":
                     await self.phone.swipe(0.5, 0.995, 0.5, 0.6, hold=False)
                 else:
-                    await self.phone._send(epoch, "homescreen" if route == "homescreen" else "key cmd+h")
+                    await self.phone._send(epoch, "homescreen" if route == "homescreen" else "key cmd+h",
+                                           before_write=self._require_frame)
+                since = time.time()
                 acknowledged = True
-            except (RuntimeError, OSError) as exc:
+            except (DeviceError, OSError) as exc:
                 self._check(epoch)
                 last_error = exc
                 log.warning("go_home: %s 失败：%s", route, exc)
                 continue
             self._check(epoch)
-            if before is not None:
-                ignore = tuple(point for point in (self.position, self.last_position, (0.5, 0.6)) if point)
-                verified = await self._wait(
-                    epoch, since, RESULT_WAIT,
-                    lambda frame, before=before, ignore=ignore:
-                        assistive_vision.find_panel(frame) is None and _changed(before, frame, ignore), stable=True)
-                if verified:
-                    log.info("go_home: %s 后画面已变化，HID 结果仍需观察确认主屏幕", route)
-                    return
+            verified = await self._wait(
+                epoch, since, RESULT_WAIT,
+                lambda frame: assistive_vision.find_panel(frame) is None
+                and assistive_vision.is_home_screen(frame), stable=True)
+            if verified:
+                log.info("go_home: %s 后已确认主屏幕图标网格及 Dock", route)
+                return
         if not acknowledged and last_error is not None:
             raise last_error
         if self._frame() is not None:
-            raise RuntimeError("已尝试返回主屏幕，但画面未确认变化；请观察屏幕。")
-        log.warning("go_home: HID 命令已发送；没有实时画面，无法确认主屏幕")
+            raise RuntimeError("已尝试返回主屏幕，但未确认主屏幕图标网格及 Dock；请观察屏幕。")
+        raise RuntimeError("HID 命令已发送；没有实时画面，无法确认主屏幕。")

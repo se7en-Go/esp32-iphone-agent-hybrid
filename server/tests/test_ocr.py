@@ -47,7 +47,9 @@ def test_ranked_matches_prefer_exact_then_shorter_labels_and_confidence():
              box("设置项", .99), box("设备", .99)]
     ocr.set_backend(SimpleNamespace(read_text=lambda frame: items))
     assert [item.text for item in ocr.find_matches(b"frame", "设置")] == ["设 置", "设置", "设置项", "关于本机 设置"]
-    assert ocr.find_text(b"frame", "设置", exact=True) == items[2]
+    with pytest.raises(ValueError, match="歧义"):
+        ocr.find_text(b"frame", "设置", exact=True)
+    assert ocr.find_text(b"frame", "设置", exact=True, nth=1) == items[2]
     assert len(ocr.find_matches(b"frame", "设置", exact=True)) == 2
     assert ocr.find_text(b"frame", "missing") is None
     assert ocr.find_text(b"frame", "设备置") is None
@@ -103,7 +105,11 @@ def test_recent_frame_cache_is_bounded_and_returns_independent_lists():
     ocr.read_text(b"two")
     ocr.read_text(b"three")
     ocr.read_text(b"one")
-    assert calls == [b"one", b"two", b"three", b"one"]
+    assert calls == [b"one", b"two", b"three"]
+    for index in range(8):
+        ocr.read_text(str(index).encode())
+    ocr.read_text(b"one")
+    assert calls.count(b"one") == 2
     ocr.set_backend(SimpleNamespace(read_text=lambda frame: [box("新内容")]))
     assert ocr.read_text(b"one")[0].text == "新内容"
 

@@ -183,7 +183,10 @@ def send_routes(tmp_path, monkeypatch):
     Image.new("RGB", (100, 200), "white").save(image, format="JPEG")
 
     class Screen:
-        live, frame, updated = True, image.getvalue(), 0.0
+        live, frame = True, image.getvalue()
+
+        def __init__(self):
+            self.updated = time.time()
 
         async def fresh(self, *_args):
             return self.frame
@@ -200,6 +203,7 @@ def send_routes(tmp_path, monkeypatch):
     controls = Controls(phone, screen)
 
     async def positioned(x, y):
+        phone._pointer_confirmed = True
         return x, y
 
     monkeypatch.setattr(phone, "point_verified", positioned)
@@ -207,6 +211,7 @@ def send_routes(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "guard", guard)
     monkeypatch.setattr(module, "device", device)
     monkeypatch.setattr(module, "phone", phone)
+    monkeypatch.setattr(module, "screen", screen)
     monkeypatch.setattr(module, "controls", controls)
     monkeypatch.setattr(module, "resolve_point", lambda *_args: (0.9, 0.9))
     yield clock, guard, link, phone
@@ -273,6 +278,7 @@ def test_send_button_records_time_after_pointer_positioning(send_routes, monkeyp
 
     async def delayed_position(x, y):
         clock[0] += 9
+        phone._pointer_confirmed = True
         return x, y
 
     monkeypatch.setattr(phone, "point_verified", delayed_position)
@@ -317,8 +323,11 @@ def test_send_button_rate_limit_returns_409_without_second_click(send_routes):
                 "layout": "demo", "point": "send", "screen_id": observed.json()["screen_id"],
             })
             assert first.status_code == 200 and first.json()["command_acknowledged"]
+            # A stale action result no longer grants a token; observe again to test the send quota.
+            assert first.json()["screen_id"] is None
+            observed = await client.get("/api/control/observe")
             second = await client.post("/api/control/layout-tap", json={
-                "layout": "demo", "point": "send", "screen_id": first.json()["screen_id"],
+                "layout": "demo", "point": "send", "screen_id": observed.json()["screen_id"],
             })
             assert second.status_code == 409
             assert "8 秒" in second.json()["detail"]

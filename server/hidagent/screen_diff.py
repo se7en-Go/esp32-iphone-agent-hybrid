@@ -6,7 +6,7 @@ import io
 import math
 import threading
 import time
-from collections import Counter, OrderedDict
+from collections import Counter
 from dataclasses import dataclass, field
 
 from PIL import Image, ImageChops
@@ -91,35 +91,19 @@ class _TextWorker:
     def __init__(self):
         self._lock = threading.Lock()
         self._active: _Job | None = None
-        self._cache: OrderedDict = OrderedDict()
 
     def submit(self, before: bytes, after: bytes) -> _Job | None:
         keys = hashlib.sha256(before).digest(), hashlib.sha256(after).digest()
         with self._lock:
-            if all(key in self._cache for key in keys):
-                job = _Job(keys, result=_text_changes(*(self._cache[key] for key in keys)))
-                job.done.set()
-                return job
             if self._active:
                 return self._active if self._active.keys == keys else None
             job = self._active = _Job(keys)
         threading.Thread(target=self._run, args=(job, before, after), name="screen-diff-ocr", daemon=True).start()
         return job
 
-    def _read(self, key, frame):
-        with self._lock:
-            if key in self._cache:
-                return self._cache[key]
-        boxes = ocr.read_text(frame)
-        with self._lock:
-            self._cache[key] = boxes
-            while len(self._cache) > 2:
-                self._cache.popitem(last=False)
-        return boxes
-
     def _run(self, job, before, after):
         try:
-            job.result = _text_changes(self._read(job.keys[0], before), self._read(job.keys[1], after))
+            job.result = _text_changes(ocr.read_text(before), ocr.read_text(after))
         except Exception:
             # Optional OCR must not turn an acknowledged action into a failed request.
             job.result = {"texts_appeared": None, "texts_disappeared": None, "text_status": "error"}

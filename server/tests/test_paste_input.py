@@ -42,9 +42,8 @@ class Clipboard:
 
 class Screen:
     live = True
-    updated = time.time()
-
     def __init__(self):
+        self.updated = time.time()
         data = io.BytesIO()
         Image.new("RGB", (101, 201), "white").save(data, "JPEG")
         self.frame = data.getvalue()
@@ -194,7 +193,7 @@ def test_typing_serializes_until_first_paste_is_completed(tmp_path):
     asyncio.run(scenario())
 
 
-def test_control_batch_supports_paste_and_preserves_pinyin_keys(tmp_path):
+def test_control_batch_stops_before_more_input_and_preserves_separate_pinyin_keys(tmp_path):
     from hidagent.app import ControlAction
     from hidagent.control import Controls
 
@@ -208,7 +207,12 @@ def test_control_batch_supports_paste_and_preserves_pinyin_keys(tmp_path):
                     ControlAction(action="type", screen_id=token, text="123", mode="keys"),
                     ControlAction(action="compose_chinese", screen_id=token, text="你好", input_mode="pinyin")]
         result = await control.perform_batch(token, requests)
-        assert result["command_acknowledged"] and result["completed"] == 3
+        assert result["completed"] == 1 and "new observation" in result["error"]
+        assert device.sent == ["key cmd+v"]
+        # The steering deliberately requires another observation for each input step.
+        for request in requests[1:]:
+            request.screen_id = control.observation()["screen_id"]
+            assert (await control.perform(request))["command_acknowledged"]
 
     asyncio.run(scenario())
     assert clipboard.copied == ["中文"]

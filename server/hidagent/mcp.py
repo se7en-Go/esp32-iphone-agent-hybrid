@@ -76,32 +76,43 @@ def create_server(url: str | None = None):
 
     @mcp.tool()
     def iphone_tap(x: float, y: float, screen_id: str,
-                   coordinate_space: Literal["normalized", "pixels"] = "normalized"
+                   coordinate_space: Literal["normalized", "pixels"] = "normalized",
+                   target_box: tuple[float, float, float, float] | None = None
                    ) -> list[TextContent | ImageContent]:
-        """Click once using calibration; report pointer_seen, screen_changed and latency. Never auto-retry."""
-        return action("tap", screen_id, x=x, y=y, coordinate_space=coordinate_space)
+        """Click once with a visible pointer or measured error within an observed normalized target_box.
+
+        Screen changes are evidence only. No blind click without target size and bounded error; never retry.
+        """
+        fields = {"x": x, "y": y, "coordinate_space": coordinate_space}
+        if target_box is not None:
+            fields["target_box"] = target_box
+        return action("tap", screen_id, **fields)
 
     @mcp.tool()
     def iphone_find_text(text: str, screen_id: str, nth: int = 1,
-                         exact: bool = False) -> list[TextContent | ImageContent]:
+                         exact: bool = False, region: list[float] | None = None) -> list[TextContent | ImageContent]:
         """Find visible text with optional OCR; retain screen_id. nth is 1-based in ranked matches.
 
         Match boxes and centers are normalized 0..1. Width, spaces and case are normalized;
         exact=True requires the complete normalized text. Inspect matches before choosing duplicates.
+        region=[left,top,right,bottom] scopes complete boxes to normalized screen coordinates.
         """
         with IPhoneClient(url) as client:
             return content(client.request("POST", "/api/control/find_text",
-                                          {"screen_id": screen_id, "text": text, "nth": nth, "exact": exact}).json())
+                                          {"screen_id": screen_id, "text": text, "nth": nth, "exact": exact,
+                                           **({"region": region} if region is not None else {})}).json())
 
     @mcp.tool()
-    def iphone_tap_text(text: str, screen_id: str, nth: int = 1,
-                        exact: bool = False) -> list[TextContent | ImageContent]:
+    def iphone_tap_text(text: str, screen_id: str, nth: int | None = None,
+                        exact: bool = False, region: list[float] | None = None) -> list[TextContent | ImageContent]:
         """Locate visible text with optional OCR, verify pointer and tap once. nth is 1-based.
 
         Inspect the returned image and screen_diff; OCR text and changed pixels do not prove success.
-        Missing text or an unavailable OCR backend sends no HID command.
+        Duplicates require explicit nth or region=[left,top,right,bottom] from the current image.
+        Send labels and substring-only targets require region. Missing or ambiguous text sends no HID.
         """
-        return action("tap_text", screen_id, text=text, nth=nth, exact=exact)
+        return action("tap_text", screen_id, text=text, nth=nth, exact=exact,
+                      **({"region": region} if region is not None else {}))
 
     @mcp.tool()
     def iphone_swipe(x1: float, y1: float, x2: float, y2: float, screen_id: str,
@@ -139,12 +150,17 @@ def create_server(url: str | None = None):
         return action("compose_chinese", screen_id, text=text, input_mode=input_mode)
 
     @mcp.tool()
-    def iphone_key(combo: str, screen_id: str, repeat: int = 1) -> list[TextContent | ImageContent]:
+    def iphone_key(combo: str, screen_id: str, repeat: int = 1,
+                   enter_intent: Literal["navigation", "editing"] | None = None) -> list[TextContent | ImageContent]:
         """Press a combination. repeat=1..50; >1 only for backspace/left/right, with one final screenshot.
 
         Enter MAY SEND: first verify recipient and final text. Never repeats Enter or retries failed sends.
+        enter_intent requires server-verified visible keyboard evidence; unknown contexts retain send limits.
         """
-        return action("key", screen_id, text=combo, repeat=repeat)
+        fields = {"text": combo, "repeat": repeat}
+        if enter_intent is not None:
+            fields["enter_intent"] = enter_intent
+        return action("key", screen_id, **fields)
 
     @mcp.tool()
     def iphone_home(screen_id: str) -> list[TextContent | ImageContent]:
@@ -166,8 +182,9 @@ def create_server(url: str | None = None):
     def iphone_batch(screen_id: str, steps: list[dict]) -> list[TextContent | ImageContent]:
         """Run 1..8 actions on one screen_id, then return a single new screenshot.
 
-        Use when the next actions do not need a fresh look (tap a known field, type pinyin).
-        Do not put candidate selection or send in the same batch as compose_chinese.
+        Stops after unverified taps, missing fresh evidence, or changed context.
+        Typing and keys (including Enter) must be the first step on a new observation;
+        observe and inspect focus after tapping before submitting a separate input action.
         Each step is an object: action, and the same fields as the single-action tool
         (x, y, x1, y1, x2, y2, lines, text, input_mode, repeat, coordinate_space).
         """

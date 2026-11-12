@@ -7,10 +7,12 @@ import math
 import os
 import re
 import time
+from types import SimpleNamespace
 
-from . import feedback, ocr, screen_diff, vision
+from . import feedback, ocr, screen_compare, screen_diff, vision
 from .debug import Trace
 from .device import DeviceError
+from .freshness import FrameSnapshot, fresh_frame
 from .llm import LLM
 from .phone import Phone
 from .screen import Screen
@@ -32,7 +34,8 @@ THINK: <plain English a non-technical user understands: first check your last ac
 DO: <action>
 
 Give several DO lines (up to 6, run in order) whenever the next actions do not depend on seeing the
-result: e.g. ticking several visible checkboxes or days, several drawing strokes, typing then pressing enter.
+result: e.g. several drawing strokes or editing keys. A tap ends the round; inspect its result before
+typing or pressing Enter.
 Give ONE DO line when the next action depends on what this one opens or changes.
 Use find_text and tap_text alone, then inspect the result before continuing.
 
@@ -56,8 +59,13 @@ If you are unsure what an element does, tap it alone (one DO line) and check the
 Actions:
   tap X Y [precise]         (precise: the pointer is located and corrected before tapping, about 1 s slower;
                              use it for small or tightly packed targets: list rows, checkmarks, toggles, small icons)
-  find_text TEXT            (optional OCR: read the best visible text match, then look at the result before acting)
+  find_text TEXT            (optional OCR: list visible text matches, then inspect their boxes before acting)
   tap_text TEXT             (optional OCR: locate visible text and tap its center with pointer verification)
+  find_text {"text":"发送","region":[0.7,0.6,1,0.9],"exact":true}
+  tap_text {"text":"发送","region":[0.7,0.6,1,0.9],"nth":1,"exact":true}
+                            (OCR regions are normalized left,top,right,bottom, chosen from this screenshot;
+                             duplicate matches require explicit nth, starting at 1. Send labels and substring
+                             matches require a region that excludes message content. Never guess a region.)
   swipe X1 Y1 X2 Y2         (finger moves from X1,Y1 to X2,Y2: "swipe down" means Y2 > Y1)
   path X1 Y1 X2 Y2 X3 Y3 …  (one continuous stroke through 2-20 points, for drawing)
   circle X Y R              (draw a circle centered at X Y; R is the radius in x units)
@@ -71,9 +79,6 @@ Actions:
 Example:
 THINK: My last tap opened the home screen as intended. The App Store icon is visible, so I tap it.
 DO: tap 152 362"""
-
-META = ("t", "thought", "thought_zh", "think_s", "act_s", "shot", "_shot", "changed",
-        "text_match", "screen_diff")  # not part of the action
 
 # action name -> argument names; numeric arguments are 0-1000 screen coordinates
 ACTIONS = {"tap": ("x", "y"), "swipe": ("x1", "y1", "x2", "y2"), "circle": ("x", "y", "r"), "path": ("points",),
@@ -89,6 +94,23 @@ def parse_command(line: str) -> dict:
     name = name.lower()
     if name not in ACTIONS:
         raise ValueError(f"unknown action: {line[:100]}")
+    if name in ("find_text", "tap_text") and rest.lstrip().startswith("{"):
+        selector = json.loads(rest)
+        if (not isinstance(selector, dict) or not isinstance(selector.get("text"), str)
+                or not selector["text"].strip()
+                or set(selector) - {"text", "region", "nth", "exact"}):
+            raise ValueError("OCR selector needs text and optional region, nth, exact")
+        region = selector.get("region")
+        if region is not None and (not isinstance(region, list) or len(region) != 4
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or not math.isfinite(v) or not 0 <= v <= 1 for v in region)
+                or region[0] >= region[2] or region[1] >= region[3]):
+            raise ValueError("OCR region must be normalized left,top,right,bottom")
+        if "nth" in selector and (type(selector["nth"]) is not int or selector["nth"] < 1):
+            raise ValueError("OCR nth must be a positive integer")
+        if "exact" in selector and type(selector["exact"]) is not bool:
+            raise ValueError("OCR exact must be true or false")
+        return {"action": name, **selector}
     keys = ACTIONS[name]
     if keys and keys[0] in TEXT_ARGS:
         return {"action": name, keys[0]: rest.strip().strip('"')}
@@ -123,8 +145,14 @@ def parse_plan(text: str) -> tuple[str, str]:
 
 
 def _key(step: dict) -> dict:
-    """The action itself, without thoughts, timings and other bookkeeping."""
-    return {k: v for k, v in step.items() if k not in META}
+    """Identity contains only declared arguments, regardless of new feedback fields."""
+    name = step.get("action")
+    keys = ("action", *ACTIONS.get(name, ()))
+    if name == "tap":
+        keys += ("precise",)
+    elif name in ("find_text", "tap_text"):
+        keys += ("region", "nth", "exact")
+    return {key: step[key] for key in keys if key in step}
 
 
 def _diff_feedback(step: dict) -> str:
@@ -189,15 +217,20 @@ class Agent:
             log.info("agent: %s", step.get("action", "step"))
 
     async def _ask(self, role: str, llm: LLM, system: str, prompt: str,
-                   temperature: float = 0) -> tuple[str, float, bytes | None]:
-        if not self.screen.live:  # never let the model act blind
+                   temperature: float = 0) -> tuple[str, float, FrameSnapshot]:
+        ensure = getattr(self.phone, "ensure_observation", None)
+        try:
+            accepted = await ensure() if ensure is not None else fresh_frame(self.screen)
+        except RuntimeError as exc:
+            raise BlindError("lost the phone screen: reconnect Screen Mirroring") from exc
+        if accepted is None:  # never let the model act on stale video
             raise BlindError("lost the phone screen: reconnect Screen Mirroring")
-        frame, started = self.screen.frame, time.time()
+        frame, started = accepted.frame, time.time()
         reply = await llm.chat(system, prompt, frame, temperature=temperature)
         seconds = round(time.time() - started, 2)
         self.trace.write(frame, kind="llm", role=role, model=llm.model, prompt=prompt,
                          reply=reply, seconds=seconds)
-        return reply, seconds, frame
+        return reply, seconds, accepted
 
     async def _run(self) -> None:
         failures = 0
@@ -231,9 +264,11 @@ class Agent:
         seen = acts[0]["_shot"]
         spots = [self._pointer]  # where the pointer was and goes: pointer moves are not screen changes
         stuck = self._repeating(acts[0])
-        for i, act in enumerate(acts):
+        for act in acts:
+            self._validate_context(act)
             name = act["action"]
             if name == "replan" or stuck:
+                act.pop("_observation", None)
                 self._record(act.pop("_shot"), **act)
                 await self._replan(stuck=stuck)
                 return False
@@ -245,21 +280,23 @@ class Agent:
                 spots += _pointer_path(act)
                 self._pointer = spots[-1]
                 if name in ("tap", "tap_text"):
-                    fresh = await feedback.wait_after_action(self.screen, tap_completed or time.time(), 1.5)
-                    await self.screen.settled()
-                    after = self.screen.frame
-                    usable = bool(fresh) and self.screen.live and bool(after)
-                    act["screen_diff"] = await screen_diff.summarize(before, after, fresh=usable)
+                    if isinstance(tap_completed, dict):
+                        after = tap_completed.pop("_after_frame", None)
+                        tap_completed.pop("_after_snapshot", None)
+                        usable = tap_completed.get("fresh", False) and after is not None
+                        act.update(tap_completed)
+                    else:
+                        after = await feedback.wait_after_action(self.screen, tap_completed or time.time(), 1.5)
+                        usable = after is not None
+                    act["screen_diff"] = await screen_diff.summarize(before, after, fresh=usable, ocr_enabled=False)
                     act["changed"] = vision.changed(before, after, ignore=tuple(spots)) if usable else None
+                    act["effect_verified"] = False
+            act.pop("_observation", None)
             self._record(act.pop("_shot"), **act)
             if name in ("done", "fail"):
                 return True
-            if name in ("find_text", "tap_text"):
-                return False  # text targets and their results need a new actor observation
-            following = acts[i + 1]["action"] if i < len(acts) - 1 else None
-            if name in ("tap", "tap_text") and following in ("type", "key"):
-                if act.get("changed") is not True:  # a missed tap may not have opened the input field
-                    return False  # skip the rest; the actor looks again
+            if name in ("find_text", "tap", "tap_text"):
+                return False  # pixel changes alone never establish focus for queued type/key actions
         # feedback for the next round
         if self.steps[-1]["action"] not in ("tap", "tap_text"):
             await self.screen.settled()
@@ -285,9 +322,9 @@ class Agent:
             last = self.steps[-1] if self.steps else {}
             prompt += (f"\n\nThe previous plan got stuck (last event: {last.get('action')} {last.get('reason', '')}):"
                        f"\n{self.plan}\nLook at the current screen and plan from here, another way if needed.")
-        reply, seconds, frame = await self._ask("planner", self.planner, PLANNER_PROMPT, prompt)
+        reply, seconds, observation = await self._ask("planner", self.planner, PLANNER_PROMPT, prompt)
         self.plan, plan_zh = parse_plan(reply)
-        self._record(frame, action="replan (stuck)" if stuck else "plan", plan=self.plan, plan_zh=plan_zh,
+        self._record(observation.frame, action="replan (stuck)" if stuck else "plan", plan=self.plan, plan_zh=plan_zh,
                      think_s=seconds)
 
     async def _next_actions(self) -> list[dict]:
@@ -299,7 +336,7 @@ class Agent:
                             for s in self.steps[-8:] if "plan" not in s) or "(none)"
         prompt = f"Goal: {self.task}\n\nPlan:\n{self.plan}\n\nRecent actions:\n{history}\n\nNext action?"
         for attempt in range(3):  # retry unparseable replies, a little less deterministically
-            reply, seconds, frame = await self._ask("actor", self.actor, ACTOR_PROMPT, prompt, 0.4 * attempt)
+            reply, seconds, observation = await self._ask("actor", self.actor, ACTOR_PROMPT, prompt, 0.4 * attempt)
             try:
                 acts = parse_actions(reply)
             except ValueError as e:
@@ -311,43 +348,57 @@ class Agent:
                            "time. Choose a different action (another position, a shorter swipe, or another way).")
                 continue
             acts[0]["think_s"] = seconds
-            return [{**a, "_shot": frame} for a in acts]  # every action is drawn on the same screenshot
+            return [{**a, "_shot": observation.frame, "_observation": observation} for a in acts]
         raise ValueError(f"actor gave no valid action: {reply[:200]}")
 
-    async def _do(self, a: dict) -> float | None:
+    def _validate_context(self, action: dict) -> FrameSnapshot:
+        """Every queued action still belongs to the coherent observation given to the model."""
+        original = action.get("_observation")
+        current = fresh_frame(self.screen)
+        if current is None:
+            raise BlindError("lost the phone screen: reconnect Screen Mirroring")
+        if (not isinstance(original, FrameSnapshot) or original.frame != action.get("_shot")
+                or current.generation != original.generation
+                or screen_compare.observation_changed(original.frame, current.frame)):
+            raise ValueError("screen changed since the original observation; discard queued actions and observe again")
+        return original
+
+    async def _do(self, a: dict) -> dict | float | None:
+        observation = self._validate_context(a)
         p = lambda k: a[k] / 1000  # noqa: E731
         match a["action"]:
             case "tap":
-                return await self.phone.tap(p("x"), p("y"), aim=a.get("precise", False) or self._missed())
+                target = SimpleNamespace(center=(p("x"), p("y")))
+                guard = TextTargetGuard(self.screen, observation.frame, target, observation=observation)
+                return await self.phone.tap_verified(*target.center, before_click=guard)
             case "find_text" | "tap_text": return await self._text_action(a)
             case "swipe": await self.phone.swipe(p("x1"), p("y1"), p("x2"), p("y2"))
             case "path": await self.phone.drag([(x / 1000, y / 1000) for x, y in a["points"]])
             case "circle": await self.phone.drag(circle(p("x"), p("y"), p("r"), self.screen.aspect))
-            case "type": await self.phone.type(a["text"])
-            case "key": await self.phone.key(a["combo"])
+            case "type": await self.phone.type(a["text"], before_action=lambda: self._validate_context(a))
+            case "key": await self.phone.key(a["combo"], before_action=lambda: self._validate_context(a))
             case "home": await self.phone.go_home()
             case "back": await self.phone.go_back()
             case "wait": pass
             case other: raise ValueError(f"unknown action {other!r}")
 
-    async def _text_action(self, action: dict) -> float | None:
-        seen = action.get("_shot")
-        if not self.screen.live or not seen:
-            raise BlindError("lost the phone screen: reconnect Screen Mirroring")
-        if vision.changed(seen, self.screen.frame):
-            raise ValueError("screen changed before OCR; observe again")
-        match = await ocr.find_text_async(seen, action["text"])
-        if not self.screen.live or not self.screen.frame:
-            raise BlindError("lost the phone screen: reconnect Screen Mirroring")
-        if vision.changed(seen, self.screen.frame):
-            raise ValueError("screen changed during OCR; observe again")
+    async def _text_action(self, action: dict) -> dict | float | None:
+        observation = self._validate_context(action)
+        seen, region = observation.frame, action.get("region")
+        matches = await ocr.find_matches_async(seen, action["text"], action.get("exact", False), region=region)
+        self._validate_context(action)
+        action["text_matches"] = [{"text": item.text, "box": item.box, "center": item.center, "conf": item.conf}
+                                  for item in matches]
+        match = (ocr.select_match(matches, action["text"], nth=action.get("nth"), region=region)
+                 if action["action"] == "tap_text" else (matches[0] if len(matches) == 1 else None))
         action["text_match"] = None if match is None else {
             "text": match.text, "box": match.box, "center": match.center, "conf": match.conf}
         if action["action"] == "tap_text":
             if match is None:
                 raise ValueError("未找到屏幕文字，请重新观察")
-            guard = TextTargetGuard(self.screen, seen, match)
-            return await self.phone.tap_verified(*match.center, before_click=guard)
+            guard = TextTargetGuard(self.screen, seen, match, observation=observation)
+            return await self.phone.tap_verified(*match.center, before_click=guard,
+                                                  target_box=match.box, target_frame=seen)
 
 
 def _pointer_path(act: dict) -> list[tuple[float, float]]:

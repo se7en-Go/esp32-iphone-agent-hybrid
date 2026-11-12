@@ -10,8 +10,10 @@ pytest.importorskip("mcp")
 from hidagent import mcp as module  # noqa: E402
 
 
-def test_ocr_tools_forward_queries_and_preserve_image_and_diff(monkeypatch):
+@pytest.mark.parametrize("region", [None, [.1, .2, .9, .8]])
+def test_ocr_tools_forward_queries_and_preserve_image_and_diff(monkeypatch, region):
     calls = []
+    scope = {"region": region} if region is not None else {}
 
     class Client:
         def __init__(self, *_):
@@ -42,8 +44,8 @@ def test_ocr_tools_forward_queries_and_preserve_image_and_diff(monkeypatch):
         for name in ("iphone_find_text", "iphone_tap_text"):
             assert set(tools[name].inputSchema["required"]) == {"screen_id", "text"}
         found = await server.call_tool("iphone_find_text", {
-            "screen_id": "observed", "text": "通用", "nth": 2, "exact": True})
-        tapped = await server.call_tool("iphone_tap_text", {"screen_id": "observed", "text": "通用"})
+            "screen_id": "observed", "text": "通用", "nth": 2, "exact": True, **scope})
+        tapped = await server.call_tool("iphone_tap_text", {"screen_id": "observed", "text": "通用", **scope})
         # FastMCP versions may return (content, structured_content).
         found = found[0] if isinstance(found, tuple) else found
         tapped = tapped[0] if isinstance(tapped, tuple) else tapped
@@ -55,5 +57,5 @@ def test_ocr_tools_forward_queries_and_preserve_image_and_diff(monkeypatch):
 
     asyncio.run(scenario())
     assert calls == [("POST", "/api/control/find_text", {
-        "screen_id": "observed", "text": "通用", "nth": 2, "exact": True}),
-        ("tap_text", "observed", {"text": "通用", "nth": 1, "exact": False})]
+        "screen_id": "observed", "text": "通用", "nth": 2, "exact": True, **scope}),
+        ("tap_text", "observed", {"text": "通用", "nth": None, "exact": False, **scope})]

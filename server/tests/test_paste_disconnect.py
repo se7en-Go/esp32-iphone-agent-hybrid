@@ -27,9 +27,8 @@ class Device:
 
 class Screen:
     live = True
-    updated = time.time()
-
     def __init__(self):
+        self.updated = time.time()
         data = io.BytesIO()
         Image.new("RGB", (101, 201), "white").save(data, "JPEG")
         self.frame = data.getvalue()

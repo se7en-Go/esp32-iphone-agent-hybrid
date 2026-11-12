@@ -5,6 +5,8 @@ import io
 from PIL import Image, ImageChops, ImageDraw
 
 from . import vision
+from .freshness import require_fresh, snapshot
+from .screen_compare import mask_pointer_highlights
 
 
 def _image(frame):
@@ -23,18 +25,20 @@ def _discs(image):
 
 
 class TextTargetGuard:
-    """Ignore recognized cursor discs, never the entire OCR target rectangle."""
+    """Ignore recognized cursor discs/outlines, never the entire target rectangle."""
 
-    def __init__(self, screen, before: bytes, target):
+    def __init__(self, screen, before: bytes, target, *, observation=None):
         self.screen, self.target = screen, target
+        self.generation = (observation if observation is not None else snapshot(screen)).generation
         self.before = _image(before)
         self.discs = _discs(self.before)
 
     def __call__(self):
-        if not self.screen.live or not self.screen.frame:
-            raise RuntimeError("点击前屏幕已断开，未发送点击。")
+        current = require_fresh(self.screen)
+        if current.generation != self.generation:
+            raise RuntimeError("目标观察后画面连接已变化，未发送点击；请重新观察。")
         try:
-            after = _image(self.screen.frame)
+            after = _image(current.frame)
         except (OSError, ValueError) as exc:
             raise RuntimeError("点击前画面无效，未发送点击。") from exc
         if after.size != self.before.size or self._changed(after):
@@ -45,6 +49,7 @@ class TextTargetGuard:
         delta = ImageChops.difference(self.before, after)
         red, green, blue = delta.split()
         mask = ImageChops.lighter(ImageChops.lighter(red, green), blue)
+        _, highlights = mask_pointer_highlights(self.before, after, mask)
         mask = mask.point(lambda value: 255 if value > 28 else 0)
         draw = ImageDraw.Draw(mask)
         target_top = getattr(self.target, "box", (0, self.target.center[1]))[1]
@@ -73,7 +78,11 @@ class TextTargetGuard:
                and 90 <= min(color) <= max(color) <= 210 and max(color) - min(color) <= 25]
         if len(new) > 1:
             return True
-        if old and (not new or abs(old[0][2] - new[0][2]) > .35 * old[0][2]):
+        morphed = (len(highlights) == 1 and abs(highlights[0][0] - tx) <= reach
+                   and abs(highlights[0][1] - ty) <= reach)
+        if old and not (new or morphed):
+            return True
+        if old and new and abs(old[0][2] - new[0][2]) > .35 * old[0][2]:
             return True
         for x, y, diameter in old + new:
             radius = diameter / 2 + max(2, width / 180)
