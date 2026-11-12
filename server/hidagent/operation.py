@@ -22,9 +22,12 @@ class OperationDeadline(RuntimeError):
 class Operation:
     deadline: float
     cancelled: bool = False
+    # The loop timer can fire while time.monotonic() is still on the previous
+    # Windows tick (~15.6 ms). That callback is the deadline, not a disconnect.
+    expired: bool = False
 
     def check(self):
-        if time.monotonic() >= self.deadline:
+        if self.expired or time.monotonic() >= self.deadline:
             raise OperationDeadline(DEADLINE_ERROR)
         if self.cancelled:
             raise asyncio.CancelledError
@@ -71,6 +74,7 @@ async def operation_scope(timeout: float):
     owner = asyncio.current_task()
 
     def expire():
+        current.expired = True
         current.cancelled = True
         owner.cancel()
 
@@ -79,9 +83,9 @@ async def operation_scope(timeout: float):
         yield current
         current.check()
     except asyncio.CancelledError:
-        current.cancelled = True
-        if time.monotonic() >= current.deadline:
+        if current.expired or time.monotonic() >= current.deadline:
             raise OperationDeadline(DEADLINE_ERROR) from None
+        current.cancelled = True
         raise
     finally:
         timer.cancel()

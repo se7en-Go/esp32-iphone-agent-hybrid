@@ -6,6 +6,7 @@ are needed. Only hardware and vision are replaced.
 
 import asyncio
 import io
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -304,6 +305,26 @@ def test_deadline_is_checked_after_synchronous_pointer_recognition(tmp_path):
         with pytest.raises(RuntimeError, match="deadline"):
             await phone.tap_verified(0.5, 0.5)
         assert "click" not in sent
+
+    asyncio.run(scenario())
+
+
+def test_loop_timer_is_a_deadline_even_when_monotonic_lags():
+    """Windows can deliver the loop timer while time.monotonic() is still one tick behind."""
+    from hidagent import operation
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        origin = time.monotonic()
+
+        def fast():
+            # The scheduler runs ahead of the monotonic read, as a coarse tick can.
+            return origin + (time.monotonic() - origin) * 20
+
+        loop.time = fast
+        with pytest.raises(operation.OperationDeadline):
+            async with operation.operation_scope(0.05):
+                await asyncio.sleep(1)
 
     asyncio.run(scenario())
 

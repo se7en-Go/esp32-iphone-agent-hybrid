@@ -3,6 +3,7 @@
 import asyncio
 import io
 import json
+import math
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -331,6 +332,13 @@ def test_nudge_candidate_must_be_newer_than_the_command_even_across_wrap(
     clock = board_at_nudge - sent * 1000
     screen._on_ts((board_at_nudge + delta) % 2**32)
     screen._on_jpeg(frame("live_tap_corrected_nudged"))
+    # Windows often returns the same monotonic reading for both calls above.
+    # The frame was still published after the command. fresh_snapshot requires
+    # a strictly later arrival, so step it past that reading without changing
+    # the board timestamp the assertion is about.
+    snap = screen.snapshot
+    if snap.arrived <= sent:
+        screen._snapshot = FrameSnapshot(snap.frame, snap.board_ts, math.nextafter(sent, math.inf))
     found = asyncio.run(phone._watch(0, [frame("live_tap_corrected")], (.75, .4),
                                     12 / 678, sent, False, True, clock))
     if delta <= 0:
