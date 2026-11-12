@@ -63,11 +63,19 @@ def test_trip_cannot_be_overwritten_by_inflight_send(tmp_path, monkeypatch, app_
     snapshot_taken = threading.Event()
     observer_reached = threading.Event()
     trip_done = threading.Event()
+    state_at_write = []
+    original_write = link.write
+
+    def write(data):
+        state_at_write.append((guard.tripped, trip_done.is_set()))
+        original_write(data)
+
+    monkeypatch.setattr(link, "write", write)
     role = threading.local()
     original_lock = guard._lock
 
     class OrderedLock:
-        """Keep the real lock; schedule the observer before the next write lock.
+        """Keep the real lock; schedule the observer during send persistence.
 
         Old observe never acquires it: it can persist true while the false snapshot
         is paused. Fixed observe blocks on it, then trips after the sender unlocks.
@@ -116,10 +124,14 @@ def test_trip_cannot_be_overwritten_by_inflight_send(tmp_path, monkeypatch, app_
     persisted = json.loads(path.read_text(encoding="utf-8"))["tripped"]
     reloaded = Guard(path=path).tripped
     assert guard.tripped
-    assert (persisted, reloaded, link.writes) == (True, True, []), (
+    # Accounting and HID now share one final-write critical section. The waiting
+    # observer trips after that eligible write, and its persisted trip must win.
+    assert (persisted, reloaded, link.writes) == (True, True, ["1 key enter"]), (
         f"persisted.tripped={persisted}, reloaded.tripped={reloaded}, serial={link.writes}"
     )
-    assert "熔断" in outcome
+    assert state_at_write == [(False, False)] and outcome == "ok"
+    assert "熔断" in send(device, "key enter")
+    assert link.writes == ["1 key enter"]
 
 
 @pytest.mark.parametrize("command", [

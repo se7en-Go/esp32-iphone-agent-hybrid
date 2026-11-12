@@ -95,6 +95,7 @@ TAP_EFFECT_WAIT = 1.75  # one mirror-lag window after the click; no automatic re
 WAKE_NUDGE = 2
 POINTER_FADE_SECONDS = 3.0
 OBSERVATION_REFRESH_WAIT = 3.5
+PASTE_CONTEXT_WAIT = 3.5  # bounded allowance for a dismissed Shortcut alert to leave the mirror
 
 
 def _serialized(method):
@@ -435,7 +436,8 @@ class Phone:
         width, height = before.size
         bounds = (max(0, round((near[0] - .1) * width)), max(0, round((near[1] - .08) * height)),
                   min(width, round((near[0] + .1) * width)), min(height, round((near[1] + .08) * height)))
-        old = vision._discs(before.crop(bounds), width)
+        old = [(px + bounds[0], py + bounds[1], diameter, color)
+               for px, py, diameter, color in vision._discs(before.crop(bounds), width)]
         ox, oy = self._position_from
         source_bounds = (max(0, round((ox - .08) * width)), max(0, round((oy - .06) * height)),
                          min(width, round((ox + .08) * width)), min(height, round((oy + .06) * height)))
@@ -446,6 +448,14 @@ class Phone:
         if len(source) != 1:
             return None  # no observed starting disc: a new round UI element is not pointer evidence
         sx, sy, size, shade = source[0]
+
+        def same_disc(candidate, previous):
+            px, py, diameter, color = candidate
+            x, y, old_size, old_color = previous
+            return (math.hypot(px - x, py - y) <= max(2, old_size * .15)
+                    and abs(diameter - old_size) <= .3 * old_size
+                    and max(abs(a - b) for a, b in zip(color, old_color, strict=True)) <= 40)
+
         while time.monotonic() < deadline:
             if self._stopped(epoch):
                 raise DeviceError("已紧急停止，后面的内容没有发出。")
@@ -460,16 +470,17 @@ class Phone:
                 current = image.convert("RGB")
             if current.size != before.size or screen_compare.observation_changed(self._position_before, snap.frame):
                 return None
-            remaining = vision._discs(current.crop(source_bounds), width)
-            if any(math.hypot(px + source_bounds[0] - sx, py + source_bounds[1] - sy) <= max(2, size * .15)
-                   and abs(diameter - size) <= .3 * size
-                   and max(abs(a - b) for a, b in zip(color, shade, strict=True)) <= 40
-                   for px, py, diameter, color in remaining):
+            remaining = [(px + source_bounds[0], py + source_bounds[1], diameter, color)
+                         for px, py, diameter, color in vision._discs(current.crop(source_bounds), width)]
+            if any(same_disc(candidate, source[0]) for candidate in remaining):
                 continue  # a static source plus a newly appeared circle does not prove pointer motion
             candidates = [(px, py) for px, py, diameter, color in vision._discs(current.crop(bounds), width)
                           if .025 * width <= diameter <= .065 * width
                           and 90 <= min(color) <= max(color) <= 210 and max(color) - min(color) <= 25
-                          and not any(math.hypot(px - ox, py - oy) < diameter for ox, oy, *_ in old)
+                          # Reject unchanged circles, not the departed source's whole diameter:
+                          # a legitimate small correction overlaps the old pointer footprint.
+                          and not any(same_disc((px + bounds[0], py + bounds[1], diameter, color), previous)
+                                      for previous in old)
                           and abs(diameter - size) <= .3 * size
                           and max(abs(a - b) for a, b in zip(color, shade, strict=True)) <= 40
                           and abs((px + bounds[0] - sx) / width - (near[0] - ox)) <= MAX_MISS
@@ -981,19 +992,36 @@ class Phone:
         return result["completed_at"]
 
     @_serialized
-    async def swipe(self, x1: float, y1: float, x2: float, y2: float, hold: bool = True) -> None:
-        await self.drag([(x1, y1), (x2, y2)], hold)
+    async def swipe(self, x1: float, y1: float, x2: float, y2: float, hold: bool = True, *,
+                    before_action: Callable[[], None] | None = None) -> None:
+        await self.drag([(x1, y1), (x2, y2)], hold, before_action=before_action)
+
+    def _gesture_guard(self, point, before_action):
+        if before_action is not None:
+            before_action()
+        observed = freshness.require_fresh(self.screen)
+        guard = TextTargetGuard(self.screen, observed.frame, SimpleNamespace(center=point), observation=observed)
+
+        def validate():
+            guard()
+            if before_action is not None:
+                before_action()
+
+        return validate
 
     @_serialized
-    async def drag(self, points: list[tuple[float, float]], hold: bool = True) -> None:
+    async def drag(self, points: list[tuple[float, float]], hold: bool = True, *,
+                   before_action: Callable[[], None] | None = None) -> None:
         """Press at the first point, move through the rest, release: one continuous stroke.
 
         hold=True rests at the end first, so lists and pickers stop exactly there instead of flinging on.
         System gestures (home, back) need the flick, so they pass hold=False.
         """
+        epoch = getattr(self.device, "abort_epoch", 0)
+        validate = self._gesture_guard(points[0], before_action)
         await self.point(*points[0])
-        await self.device.send("press")
         try:
+            await self._send(epoch, "press", before_write=validate)
             for x, y in points[1:]:
                 await self._move_to(self._dx(x), self._dy(y), rehome=False)  # never home mid-drag
             if hold:
@@ -1002,9 +1030,12 @@ class Phone:
             await self.device.send("release")
 
     @_serialized
-    async def scroll(self, x: float, y: float, lines: int) -> None:
+    async def scroll(self, x: float, y: float, lines: int, *,
+                     before_action: Callable[[], None] | None = None) -> None:
+        epoch = getattr(self.device, "abort_epoch", 0)
+        validate = self._gesture_guard((x, y), before_action)
         await self.point(x, y)
-        await self.device.send(f"scroll {lines} 0")
+        await self._send(epoch, f"scroll {lines} 0", before_write=validate)
 
     @_serialized
     async def type(self, text: str, mode: TypeMode = "auto", *,
@@ -1024,7 +1055,37 @@ class Phone:
 
             async def send_input(command):
                 nonlocal first_write
-                await self._send(epoch, command, before_write=first_write)
+                paste_command = selected == "paste" and command == "key cmd+v"
+                validate_paste = getattr(self.clipboard, "validate_paste", None) if paste_command else None
+                if paste_command and first_write is not None:
+                    # In manual mode Cmd+V is the first write. Copy/focus can be
+                    # confirmed before the mirror shows the original context again.
+                    deadline = time.monotonic() + PASTE_CONTEXT_WAIT
+                    while True:
+                        if self._stopped(epoch):
+                            raise DeviceError("已紧急停止，后面的内容没有发出。")
+                        if validate_paste is not None:
+                            validate_paste()
+                        try:
+                            first_write()
+                            break
+                        except (RuntimeError, ValueError) as exc:
+                            if time.monotonic() >= deadline:
+                                raise DeviceError("等待原输入画面恢复超时，没有粘贴；"
+                                                  "请重新观察并核对快捷指令。") from exc
+                        await asyncio.sleep(.05)
+
+                def validate_input():
+                    if first_write is not None:
+                        first_write()
+                    if self._stopped(epoch):
+                        raise DeviceError("已紧急停止，后面的内容没有发出。")
+                    # Context validation can itself span the deadline while the
+                    # event loop cannot run its expiry/cancellation callbacks.
+                    validate_paste()
+
+                await self._send(epoch, command,
+                                 before_write=validate_input if validate_paste is not None else first_write)
                 first_write = None  # later chunks/Shortcut stages intentionally alter the screen
 
             if selected == "paste":
@@ -1045,8 +1106,8 @@ class Phone:
         await self.assistive_touch.go_home()
 
     @_serialized
-    async def go_back(self) -> None:
-        await self.swipe(0.005, 0.45, 0.6, 0.45, hold=False)
+    async def go_back(self, *, before_action: Callable[[], None] | None = None) -> None:
+        await self.swipe(0.005, 0.45, 0.6, 0.45, hold=False, before_action=before_action)
 
     def _dx(self, x: float) -> int:
         return round((self._fix(x, "x") - self.origin["x"]) * self.span["w"])

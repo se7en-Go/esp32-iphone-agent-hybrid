@@ -106,24 +106,44 @@ def tap_result(screen):
             "warning": "Effect unknown", "_after_frame": screen.frame, "_after_snapshot": snapshot(screen)}
 
 
-def test_full_tap_feedback_does_not_disable_duplicate_suppression(monkeypatch):
+@pytest.mark.parametrize("fresh", [True, False])
+@pytest.mark.parametrize("command", ["tap 200 350", "tap_text 通用"])
+@pytest.mark.parametrize("intervening", [None, "find_text", "replan"])
+def test_full_tap_feedback_does_not_disable_duplicate_suppression(monkeypatch, fresh, command, intervening):
     agent, phone, screen = setup()
-    agent.actor = Model(["DO: tap 200 350", "DO: tap 200 350", "DO: done stop"])
+    replies = [f"DO: {command}"]
+    if intervening == "find_text":
+        replies.append("DO: find_text 通用")
+    replies += [f"DO: {command}", "DO: done stop"]
+    agent.actor = Model(replies)
+    agent.planner = Model(["Inspect the previous action's result"])
+    monkeypatch.setattr(module.ocr, "find_matches", lambda *_, **__: [match()])
 
     async def tap(*point, **_kwargs):
         phone.calls.append(("tap", *point))
-        return tap_result(screen)
+        result = tap_result(screen)
+        if not fresh:
+            result.update(fresh=False, screen_changed=None, effect_observed=None,
+                          _after_frame=None, _after_snapshot=None)
+        return result
 
     monkeypatch.setattr(phone, "tap_verified", tap)
 
     async def scenario():
         await agent._step()
-        assert agent.steps[-1]["changed"] is False
+        assert agent.steps[-1]["changed"] is (False if fresh else None)
+        # A new observation can still contain the same screenshot; it does not
+        # establish that the first tap failed or authorize a duplicate write.
+        screen.updated = time.time()
+        if intervening == "find_text":
+            await agent._step()
+        elif intervening == "replan":
+            await agent._replan(stuck=True)
         await agent._step()
 
     asyncio.run(scenario())
     assert phone.calls == [("tap", .2, .35)]
-    assert "changed nothing" in agent.actor.prompts[-1]
+    assert ("changed nothing" if fresh else "outcome is unknown") in agent.actor.prompts[-1]
 
 
 def test_action_identity_uses_arguments_not_result_fields():
@@ -134,6 +154,25 @@ def test_action_identity_uses_arguments_not_result_fields():
     agent.steps = [recorded, recorded]
     assert agent._repeating(action)
     assert not agent._repeating({**action, "x": 201})
+
+
+def test_unknown_tap_cannot_repeat_after_queued_wait(monkeypatch):
+    agent, phone, screen = setup()
+    agent.actor = Model(["DO: tap 200 350", "DO: wait\nDO: tap 200 350"])
+
+    async def tap(*point, **_kwargs):
+        phone.calls.append(("tap", *point))
+        return {**tap_result(screen), "fresh": False, "_after_frame": None, "_after_snapshot": None}
+
+    monkeypatch.setattr(phone, "tap_verified", tap)
+
+    async def scenario():
+        await agent._step()
+        with pytest.raises(ValueError, match="repeat"):
+            await agent._step()
+
+    asyncio.run(scenario())
+    assert phone.calls == [("tap", .2, .35)]
 
 
 @pytest.mark.parametrize("name", ["type", "key"])

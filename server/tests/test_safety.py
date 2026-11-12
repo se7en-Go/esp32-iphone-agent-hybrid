@@ -66,7 +66,8 @@ def test_enter_modifiers_and_trailing_space_match(tmp_path):
     try:
         for command in ("key enter", "key enter ", "key Enter", "key enter+shift", "key shift+enter"):
             with pytest.raises(DeviceError, match="静默"):
-                module._hid_gate(command)
+                with module._hid_gate(command) as commit_write:
+                    commit_write()
         module._hid_gate("key a")
         assert module.guard.sends == []
     finally:

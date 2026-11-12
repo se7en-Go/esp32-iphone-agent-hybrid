@@ -28,11 +28,11 @@ def _keyboard_return(boxes, intent):
     return space and mode and not send
 
 
-async def verify_enter_context(screen, before: bytes, intent: str, combo: str = "enter"):
+async def verify_enter_context(screen, before: bytes, intent: str, combo: str = "enter", *, observation=None):
     """Return a synchronous final-write validator; an intent string alone proves nothing."""
     if intent not in {"navigation", "editing"} or combo.strip().lower() != "enter":
         raise ValueError("非发送 Enter 只支持单独的 enter 和已观察的导航/换行键。")
-    observed = require_fresh(screen)
+    observed = observation or require_fresh(screen)
     expires = time.monotonic() + ENTER_EVIDENCE_TTL
     if observed.frame != before:
         raise ValueError("键盘画面已变化，请重新观察后再按 Enter。")
@@ -43,6 +43,7 @@ async def verify_enter_context(screen, before: bytes, intent: str, combo: str = 
                 or current.frame != before):
             raise RuntimeError("Enter 的键盘或焦点证据已变化/过期，未发送按键。")
 
+    validate()
     boxes = await ocr.read_text_async(before)
     validate()
     if not _keyboard_return(boxes, intent):

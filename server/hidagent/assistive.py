@@ -247,7 +247,8 @@ class AssistiveTouch:
             log.warning("go_home: HID 退路 %s", route)
             try:
                 if route == "swipe-up":
-                    await self.phone.swipe(0.5, 0.995, 0.5, 0.6, hold=False)
+                    await self.phone.swipe(0.5, 0.995, 0.5, 0.6, hold=False,
+                                           before_action=self._require_frame)
                 else:
                     await self.phone._send(epoch, "homescreen" if route == "homescreen" else "key cmd+h",
                                            before_write=self._require_frame)

@@ -169,7 +169,7 @@ def select_match(matches: list[TextBox], query: str, nth: int | None = None, reg
         raise ValueError("未找到指定的 nth 匹配文字，请重新观察。")
     match = matches[(nth or 1) - 1]
     needle = normalize_text(query)
-    if region is None and (needle in {"发送", "send"} or normalize_text(match.text) != needle):
+    if region is None and (needle in {"发送", "發送", "send"} or normalize_text(match.text) != needle):
         raise ValueError("发送标签或包含匹配需要显式 region 区域，避免点击消息正文；请先查看当前画面。")
     return match
 

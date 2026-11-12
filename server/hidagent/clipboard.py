@@ -165,6 +165,15 @@ class CompanionClipboard:
         item.completed = True
         item.changed.set()
 
+    def validate_paste(self) -> None:
+        """Recheck the transaction synchronously at the actual Cmd+V write."""
+        item = self._active()
+        if item is None or not self._operation_active or item.expired:
+            raise DeviceError("剪贴板请求已过期或结束，没有粘贴；请核对旧快捷指令后重新发起。")
+        if (not item.fetched or not item.acknowledged or not item.paste_started
+                or item.paste_sent or item.completed):
+            raise DeviceError("剪贴板尚未确认或粘贴已发送，没有再次发送粘贴键。")
+
     def resolve(self, *, paste_finished: bool) -> None:
         if self._operation_active or paste_finished is not True:
             raise HTTPException(409, "请等待请求结束并确认上一次快捷指令和粘贴都已结束，再解除阻止。", headers=NO_STORE)

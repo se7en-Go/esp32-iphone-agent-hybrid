@@ -16,6 +16,7 @@ from .freshness import FrameSnapshot, fresh_frame
 from .llm import LLM
 from .phone import Phone
 from .screen import Screen
+from .send_context import is_send_target, send_target_scope
 from .text_target import TextTargetGuard
 
 log = logging.getLogger(__name__)
@@ -44,7 +45,8 @@ Aim at the visual center of the element you want, not its edge or its label.
 Look before you act: describe what is really on the screen now, not what you expect.
 Each recent action says whether the screen changed after it. If it did NOT change, the action
 missed or had no effect: do not assume it worked; aim again more precisely or try another way.
-If feedback is stale, the tap outcome is unknown; inspect a new screen before continuing.
+If feedback is stale, the tap outcome is unknown; do not repeat it automatically. A new observation
+of the same screenshot does not prove failure. Inspect the result or stop for the user to check.
 Only type when a text field is visibly focused (the keyboard is showing).
 Swipes have no momentum: content moves exactly as far as the finger and stops. Prefer short swipes
 (100-250 units) and check the result; repeat if needed rather than one big swipe.
@@ -273,9 +275,22 @@ class Agent:
                 await self._replan(stuck=stuck)
                 return False
             if name not in ("done", "fail"):
+                if self._missed() and _key(act) == _key(self._last_input()):
+                    raise ValueError("automatic repeat blocked: the previous input outcome is unchanged or unknown")
                 started = time.time()
                 before = self.screen.frame
-                tap_completed = await self._do(act)
+                try:
+                    tap_completed = await self._do(act)
+                except (Exception, asyncio.CancelledError):
+                    if name in ("tap", "tap_text"):
+                        # The click may have been written before its ACK was lost.
+                        # Keep its identity before recovery/replanning can propose it again.
+                        attempted = {key: value for key, value in act.items()
+                                     if key not in {"_shot", "_observation"}}
+                        attempted.update(outcome="unknown", changed=None, fresh=False, clicked=None,
+                                         effect_verified=False, act_s=round(time.time() - started, 2))
+                        self._record(act["_shot"], **attempted)
+                    raise
                 act["act_s"] = round(time.time() - started, 2)
                 spots += _pointer_path(act)
                 self._pointer = spots[-1]
@@ -303,9 +318,18 @@ class Agent:
             self.steps[-1]["changed"] = vision.changed(seen, self.screen.frame, ignore=tuple(spots))
         return False
 
+    def _last_input(self) -> dict:
+        """Reading the screen or revising a plan does not resolve an input's outcome."""
+        return next((step for step in reversed(self.steps)
+                     if step.get("action") in ACTIONS
+                     and step["action"] not in {"find_text", "wait", "replan", "done", "fail"}), {})
+
     def _missed(self) -> bool:
-        """The previous round changed nothing on screen, so a tap may have landed off target."""
-        return bool(self.steps) and self.steps[-1].get("changed") is False
+        """Unchanged or unknown tap evidence cannot authorize an automatic retry."""
+        previous = self._last_input()
+        return (previous.get("changed") is False
+                or (previous.get("action") in ("tap", "tap_text")
+                    and (previous.get("changed") is not True or previous.get("fresh") is False)))
 
     def _repeating(self, act: dict, limit: int = 3) -> bool:
         """True when the actor picks the same action as its last limit-1 moves and the last one did nothing.
@@ -342,10 +366,14 @@ class Agent:
             except ValueError as e:
                 log.warning("unparseable actor reply (%s): %s", e, reply[:200])
                 continue
-            if self._missed() and _key(acts[0]) == _key(self.steps[-1]):  # same move that just did nothing
-                log.info("actor repeated an action that changed nothing; asking for another")
-                prompt += (f"\n\nYou just proposed {json.dumps(_key(acts[0]))} again, but it changed nothing last "
-                           "time. Choose a different action (another position, a shorter swipe, or another way).")
+            previous = self._last_input()
+            if self._missed() and _key(acts[0]) == _key(previous):
+                log.info("actor repeated an action without confirmed progress; asking for another")
+                reason = ("it changed nothing last time" if previous.get("changed") is False
+                          else "its outcome is unknown; the first tap may already have executed")
+                prompt += (f"\n\nYou just proposed {json.dumps(_key(acts[0]))} again, but {reason}. "
+                           "Do not repeat it automatically. Inspect the result, choose a different action, "
+                           "or stop for the user to check.")
                 continue
             acts[0]["think_s"] = seconds
             return [{**a, "_shot": observation.frame, "_observation": observation} for a in acts]
@@ -372,13 +400,19 @@ class Agent:
                 guard = TextTargetGuard(self.screen, observation.frame, target, observation=observation)
                 return await self.phone.tap_verified(*target.center, before_click=guard)
             case "find_text" | "tap_text": return await self._text_action(a)
-            case "swipe": await self.phone.swipe(p("x1"), p("y1"), p("x2"), p("y2"))
-            case "path": await self.phone.drag([(x / 1000, y / 1000) for x, y in a["points"]])
-            case "circle": await self.phone.drag(circle(p("x"), p("y"), p("r"), self.screen.aspect))
+            case "swipe":
+                await self.phone.swipe(p("x1"), p("y1"), p("x2"), p("y2"),
+                                       before_action=lambda: self._validate_context(a))
+            case "path":
+                await self.phone.drag([(x / 1000, y / 1000) for x, y in a["points"]],
+                                      before_action=lambda: self._validate_context(a))
+            case "circle":
+                await self.phone.drag(circle(p("x"), p("y"), p("r"), self.screen.aspect),
+                                      before_action=lambda: self._validate_context(a))
             case "type": await self.phone.type(a["text"], before_action=lambda: self._validate_context(a))
             case "key": await self.phone.key(a["combo"], before_action=lambda: self._validate_context(a))
             case "home": await self.phone.go_home()
-            case "back": await self.phone.go_back()
+            case "back": await self.phone.go_back(before_action=lambda: self._validate_context(a))
             case "wait": pass
             case other: raise ValueError(f"unknown action {other!r}")
 
@@ -397,8 +431,9 @@ class Agent:
             if match is None:
                 raise ValueError("未找到屏幕文字，请重新观察")
             guard = TextTargetGuard(self.screen, seen, match, observation=observation)
-            return await self.phone.tap_verified(*match.center, before_click=guard,
-                                                  target_box=match.box, target_frame=seen)
+            with send_target_scope(is_send_target(action["text"], match.text)):
+                return await self.phone.tap_verified(*match.center, before_click=guard,
+                                                      target_box=match.box, target_frame=seen)
 
 
 def _pointer_path(act: dict) -> list[tuple[float, float]]:

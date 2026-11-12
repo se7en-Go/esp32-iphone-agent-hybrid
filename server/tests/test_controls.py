@@ -52,8 +52,14 @@ class FakePhone:
         if before_click is not None:
             before_click()
         self.calls.append(("tap", x, y))
-    async def type(self, text, mode="auto"): self.calls.append(("type", text))
-    async def key(self, text): self.calls.append(("key", text))
+    async def type(self, text, mode="auto", *, before_action=None):
+        if before_action is not None:
+            before_action()
+        self.calls.append(("type", text))
+    async def key(self, text, *, before_action=None):
+        if before_action is not None:
+            before_action()
+        self.calls.append(("key", text))
 
 
 def test_long_ascii_is_split_under_the_firmware_line_limit(tmp_path):
@@ -167,7 +173,7 @@ def test_uncertain_input_is_not_retried_and_unchanged_frame_is_not_verified():
     phone, screen = FakePhone(), Screen()
     screen.new_frame = False
 
-    async def failing(text):
+    async def failing(text, **kwargs):
         phone.calls.append(("key", text))
         raise RuntimeError("connection lost after write")
 
@@ -207,7 +213,7 @@ def test_repeat_cannot_batch_sends_or_other_actions(key):
 def test_partial_repeat_failure_stops_without_replaying():
     phone = FakePhone()
 
-    async def fail_second(key):
+    async def fail_second(key, **kwargs):
         phone.calls.append(("key", key))
         if len(phone.calls) == 2:
             raise RuntimeError("lost ACK; key may have executed")

@@ -324,6 +324,7 @@ class Device:
             req_id = self._request_id(command)
             try:
                 # 板子收到这一行之后才选 USB 或 BLE。两条路都先经过这把锁里的熔断复查，没有第二条写手机的路。
+                # 在 guard 的同一把锁内复查并写入；先释放它，再 await 应答。
                 with write_guard if write_guard is not None else nullcontext() as commit_write:
                     with write_lock if write_lock is not None else nullcontext():
                         if name in HID_COMMANDS and name != "release":
@@ -331,6 +332,7 @@ class Device:
                         if before_write is not None:
                             before_write()
                         # A gate may defer accounting until all evidence checks pass.
+                        # Its callback and the write share the same locks, with no await.
                         if commit_write is not None:
                             commit_write()
                         timing = _exchange_timing.get()

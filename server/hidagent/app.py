@@ -3,7 +3,6 @@
 import asyncio
 import os
 from contextlib import asynccontextmanager, contextmanager, nullcontext
-from contextvars import ContextVar
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -30,6 +29,7 @@ from .phone import Phone
 from .request_lifetime import while_connected
 from .screen import Screen
 from .screen_uxplay import UxPlayScreen
+from .send_context import named_send as _named_send
 from .text_input import TypeMode, select_type_mode
 
 DATA_DIR = Path(os.environ.get("HIDAGENT_DATA", Path.home() / ".hidagent"))
@@ -104,9 +104,6 @@ def is_enter_key(command: str) -> bool:
     return "enter" in parts
 
 
-_named_send: ContextVar[bool] = ContextVar("named_send", default=False)
-
-
 def _check_hid_trip(current: Guard, name: str) -> None:
     """调用方持有 current._lock；release/home 保留紧急停止的清理语义。"""
     if current.tripped and name not in {"release", "home"}:
@@ -116,7 +113,7 @@ def _check_hid_trip(current: Guard, name: str) -> None:
 
 
 @contextmanager
-def _hid_write_guard(current: Guard, name: str, enter_evidence=None):
+def _hid_write_guard(current: Guard, name: str, enter_evidence=None, *, count_send=False, named_send=False):
     # 与 observe/trip 同锁，复查到实际串口写入之间不能有线程插入，也不能 await。
     with current._lock:
         _check_hid_trip(current, name)
@@ -133,7 +130,16 @@ def _hid_write_guard(current: Guard, name: str, enter_evidence=None):
                     raise DeviceError(str(exc)) from exc
                 yield
         else:
-            yield
+            def consume_send():
+                decision = current.consume_reservation("")
+                if not decision["allowed"]:
+                    if named_send:
+                        raise HTTPException(409, decision["reason"])
+                    raise DeviceError(decision["reason"])
+
+            # Device invokes this after final observation validation, immediately
+            # before write, while both the Guard and publication locks remain held.
+            yield consume_send if count_send else None
 
 
 def _hid_gate(command: str):
@@ -149,13 +155,9 @@ def _hid_gate(command: str):
                 enter_evidence = current.enter_evidence()
             except RuntimeError as exc:
                 raise DeviceError(str(exc)) from exc
-        if (is_enter_key(command) and enter_evidence is None) or (name == "click" and _named_send.get()):
-            decision = current.consume_reservation("")
-            if not decision["allowed"]:
-                if _named_send.get():
-                    raise HTTPException(409, decision["reason"])
-                raise DeviceError(decision["reason"])
-    return _hid_write_guard(current, name, enter_evidence)
+    named_send = _named_send.get()
+    count_send = (is_enter_key(command) and enter_evidence is None) or (name == "click" and named_send)
+    return _hid_write_guard(current, name, enter_evidence, count_send=count_send, named_send=named_send)
 
 
 device.gate = _hid_gate
@@ -420,8 +422,10 @@ async def control_action(request: ControlAction, http_request: Request):
             if request.enter_intent is not None:
                 if request.action != "key" or request.repeat != 1:
                     raise ValueError("Enter 用途只适用于单独的一次 key 动作。")
+                observation = getattr(controls, "_observation", None)
                 before, _, _ = controls._validate_ticket(controls.ticket, request.screen_id)
-                validate = await verify_enter_context(screen, before, request.enter_intent, request.text)
+                validate = await verify_enter_context(screen, before, request.enter_intent, request.text,
+                                                      observation=observation)
                 scope = guard.verified_enter(request.enter_intent, validate)
             with scope:
                 return await while_connected(http_request, controls.perform(request))
@@ -599,10 +603,12 @@ async def key(t: KeyText):
     async with manual_lock:
         controls.job = asyncio.current_task()
         try:
+            observation = getattr(controls, "_observation", None)
             before, _, _ = controls.consume(t.screen_id)
-            validate = await verify_enter_context(screen, before, t.enter_intent, t.text)
+            validate = await verify_enter_context(screen, before, t.enter_intent, t.text,
+                                                  observation=observation)
             with guard.verified_enter(t.enter_intent, validate):
-                await phone.key(t.text.strip().lower())
+                await phone.key(t.text.strip().lower(), before_action=validate)
             return {"ok": True, "enter_intent": t.enter_intent, "send_counted": False}
         except OCRUnavailable as exc:
             raise HTTPException(503, str(exc)) from exc

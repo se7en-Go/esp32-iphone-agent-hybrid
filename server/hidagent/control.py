@@ -17,6 +17,7 @@ from pypinyin import lazy_pinyin
 
 from . import feedback, ocr, screen_compare, screen_diff, vision
 from .freshness import fresh_frame, require_fresh
+from .send_context import is_send_target, send_target_scope
 from .text_input import select_type_mode
 from .text_target import TextTargetGuard
 
@@ -103,7 +104,7 @@ class Controls:
             target = SimpleNamespace(center=plan["xy"])
             if "target_box" in plan:
                 target.box = plan["target_box"]
-            plan["before_click"] = TextTargetGuard(self.screen, before, target, observation=self._observation)
+            plan["before_click"] = TextTargetGuard(self.screen, before, target, observation=plan["observation"])
         if plan["name"] != "tap_text":
             return
         matches = await ocr.find_matches_async(before, plan["text"], plan["exact"], plan["region"])
@@ -111,14 +112,15 @@ class Controls:
             current = require_fresh(self.screen)
         except RuntimeError as exc:
             raise ValueError(str(exc)) from exc
-        if (time.monotonic() - observed_at > 30 or current.generation != self._generation
+        if (time.monotonic() - observed_at > 30 or current.generation != plan["observation"].generation
                 or screen_compare.observation_changed(before, current.frame)):
             raise ValueError("OCR 期间屏幕已变化或观察已过期，请重新观察再点击。")
         match = ocr.select_match(matches, plan["text"], plan["nth"], plan["region"])
         if match is None:
             raise ValueError("未找到匹配文字，请重新观察。")
         plan["xy"] = match.center
-        plan["before_click"] = TextTargetGuard(self.screen, before, match, observation=self._observation)
+        plan["is_send"] = is_send_target(plan["text"], match.text)
+        plan["before_click"] = TextTargetGuard(self.screen, before, match, observation=plan["observation"])
         plan["target_box"], plan["target_frame"] = match.box, before
         plan["extra"]["text_match"] = asdict(match)
 
@@ -185,6 +187,13 @@ class Controls:
             raise ValueError(f"unknown action {name}")
         return planned
 
+    def _validate_context(self, planned):
+        original = planned["observation"]
+        current = require_fresh(self.screen)
+        if (current.generation != original.generation
+                or screen_compare.observation_changed(original.frame, current.frame)):
+            raise RuntimeError("screen changed since the original observation; observe again before acting")
+
     async def _execute(self, planned: dict) -> float | None:
         name = planned["name"]
         extra = planned["extra"]
@@ -194,7 +203,8 @@ class Controls:
                 kwargs.update(target_box=planned["target_box"], target_frame=planned["target_frame"])
             if "before_click" in planned:
                 kwargs["before_click"] = planned["before_click"]
-            result = await self.phone.tap_verified(*planned["xy"], **kwargs)
+            with send_target_scope(planned.get("is_send", False)):
+                result = await self.phone.tap_verified(*planned["xy"], **kwargs)
             if isinstance(result, dict):
                 result = dict(result)
                 completed_at = result.pop("completed_at", None)
@@ -207,24 +217,25 @@ class Controls:
             extra["pointer_seen"] = getattr(self.phone, "_pointer_seen", False)
         elif name == "swipe":
             x1, y1, x2, y2 = planned["swipe"]
-            await self.phone.swipe(x1, y1, x2, y2)
+            await self.phone.swipe(x1, y1, x2, y2, before_action=lambda: self._validate_context(planned))
         elif name == "scroll":
-            await self.phone.scroll(*planned["xy"], planned["lines"])
+            await self.phone.scroll(*planned["xy"], planned["lines"],
+                                    before_action=lambda: self._validate_context(planned))
         elif name == "type":
-            if planned["mode"] == "auto":
-                await self.phone.type(planned["text"])
-            else:
-                await self.phone.type(planned["text"], mode=planned["mode"])
+            await self.phone.type(planned["text"], mode=planned["mode"],
+                                  before_action=lambda: self._validate_context(planned))
         elif name == "compose_chinese":
-            await self.phone.type(planned["text"], mode="keys")
+            await self.phone.type(planned["text"], mode="keys",
+                                  before_action=lambda: self._validate_context(planned))
         elif name == "key":
             for _ in range(planned["repeat"]):
-                await self.phone.key(planned["text"].lower())
+                await self.phone.key(planned["text"].lower(),
+                                     before_action=lambda: self._validate_context(planned))
                 extra["repeat_completed"] += 1
         elif name == "home":
             await self.phone.go_home()
         elif name == "back":
-            await self.phone.go_back()
+            await self.phone.go_back(before_action=lambda: self._validate_context(planned))
         else:
             raise ValueError(f"unknown action {name}")
 
@@ -284,6 +295,7 @@ class Controls:
         before, width, height = self.consume(request.screen_id)
         plan = self._plan(request, width, height)
         plan["target_frame"] = before
+        plan["observation"] = self._observation
         await self._resolve_text(plan, before, observed_at)
         ready = time.perf_counter()
         completed_at, acknowledged, error = None, False, None
@@ -304,6 +316,7 @@ class Controls:
         plans = [self._plan(request, width, height) for request in requests]
         for plan in plans:
             plan["target_frame"] = before
+            plan["observation"] = self._observation
         if sum(plan.get("selected_mode") == "paste" for plan in plans) > 1:
             raise ValueError("一次 batch 只允许一次粘贴；请确认输入完成后重新观察再输入。")
         if len(plans) > 1 and any(plan["name"] == "tap_text" for plan in plans):
@@ -317,7 +330,7 @@ class Controls:
         stopped_before = None
         for index, plan in enumerate(plans):
             current = fresh_frame(self.screen)
-            if (current is None or current.generation != self._generation
+            if (current is None or current.generation != plan["observation"].generation
                     or screen_compare.observation_changed(before, current.frame)):
                 error = "batch context changed or is stale; observe again before continuing"
                 stopped_before = index + 1
@@ -357,7 +370,7 @@ class Controls:
         if not await feedback.wait_after_action(self.screen, completed_at):
             return "batch outcome has no fresh evidence; observe again before continuing"
         current = fresh_frame(self.screen, since=completed_at)
-        if (current is None or current.generation != self._generation
+        if (current is None or current.generation != previous["observation"].generation
                 or screen_compare.observation_changed(before, current.frame)):
             return "batch context changed or is stale; observe again before continuing"
         return None

@@ -59,7 +59,9 @@ def setup(tmp_path, monkeypatch):
             pass
 
     class Phone:
-        async def key(self, combo):
+        async def key(self, combo, *, before_action=None):
+            if before_action is not None:
+                before_action()
             await device.send("key " + combo)
 
     now = datetime(2023, 11, 14, 12).timestamp()
@@ -260,24 +262,22 @@ def test_proof_is_one_use_and_does_not_exempt_modified_enter(setup):
     module, guard, link, _screen, _boxes = setup
     with guard.verified_enter("navigation", lambda: None):
         with pytest.raises(DeviceError):
-            module._hid_gate("key shift+enter")
-        with module._hid_gate("key enter"):
-            link.write(b"1 key enter\n")
+            asyncio.run(module.device.send("key shift+enter"))
+        asyncio.run(module.device.send("key enter"))
         with pytest.raises(DeviceError, match="已使用"):
-            module._hid_gate("key enter")
+            asyncio.run(module.device.send("key enter"))
     with pytest.raises(DeviceError):
-        module._hid_gate("key enter")
+        asyncio.run(module.device.send("key enter"))
     assert len(link.written) == 1 and len(guard.sends) == 20
 
 
 def test_navigation_proof_does_not_bypass_trip_or_real_send_confirmation(setup):
     module, guard, _link, _screen, _boxes = setup
     guard.sends.clear()
-    module._hid_gate("key enter")
+    asyncio.run(module.device.send("key enter"))
     assert guard._pending == 1 and len(guard.sends) == 1
     with guard.verified_enter("editing", lambda: None):
-        with module._hid_gate("key enter"):
-            pass
+        asyncio.run(module.device.send("key enter"))
     assert guard._pending == 1 and len(guard.sends) == 1
     assert guard.confirm_send(bubble_visible=True, observed_text="")["counted"]
     assert guard._pending == 0 and len(guard.sends) == 1
