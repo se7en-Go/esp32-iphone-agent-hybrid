@@ -96,7 +96,7 @@ STA 的限制也写清楚：路由器要有 2.4GHz；不能开 AP 隔离或访�
 
 电脑仍然只走 COM 串口。板子收到 `home`、`move`、`click`、`type`、`key` 之后，再决定从 USB 还是 BLE HID 发给手机。两条路都先经过服务端同一把熔断锁，没有第二条写手机的入口。
 
-默认 `auto`：USB 已挂载且没休眠就走 USB，否则走已经连上的蓝牙 HID。`0 hid usb`、`0 hid ble`、`0 hid auto` 写入 NVS，重启仍有效。`0 hid pair` 打开 60 秒配对窗口，iPhone 在设置 → 蓝牙里选择名字以 ESP32 Agent 开头的设备。`0 hid unpair` 只忘掉 HID 绑定。绑定存在 NVS 的 `hid` 命名空间，重启后 iPhone 可以自己连回来。
+默认 `auto`：USB 已挂载且没休眠就走 USB，否则走已经连上的蓝牙 HID。`0 hid usb`、`0 hid ble`、`0 hid auto` 写入 NVS，重启仍有效。`0 hid pair` 打开 60 秒配对窗口，iPhone 在设置 → 蓝牙里选择名字以 ESP32 Agent 开头的设备。`0 hid unpair` 删掉 HID 名单里的绑定。这些地址和配套 App 存在同一处 NimBLE 绑定里，所以配套 App 的绑定也会一起删掉。名单存在 NVS 的 `hid` 命名空间，重启后 iPhone 可以自己连回来。
 
 鼠标、键盘、地球键（切换输入法，用量 0x029D）是同一个 HID 服务，和原来的 GATT 共用一个广播。Wi-Fi、AirPlay 和 BLE 共用一块射频。连接间隔保持在建链时的 15 ms，不再为手势改短或改长，避免把同一条链上的画面拖慢。蓝牙报告比 USB 少、步子更大（pace 4，USB 仍是 pace 3），并且要等上一包 HID 归还缓冲、同时给视频留出 16 块 mbuf。电脑发现 pace 数字变了会丢掉旧校准。
 
