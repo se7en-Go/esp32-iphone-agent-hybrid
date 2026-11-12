@@ -12,7 +12,7 @@ typedef struct {
   long dx, dy, n, i;
 } pace_t;
 
-enum { PACE_VERSION = 3 };  // answered by "pace"; 1: x and y capped apart; 2: one speed; 3: + "move dx dy speed"
+enum { PACE_VERSION = 3 };  // USB schedule. "pace" answers hid_pace_version(): 3 on USB, 4 on BLE.
 
 void pace_start(pace_t *p, long dx, long dy, int step);
 int pace_next(pace_t *p, int *sx, int *sy);  // 0 when the move is done

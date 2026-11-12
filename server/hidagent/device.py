@@ -173,6 +173,8 @@ class Device:
         self.ssid = ""
         self.vtok = ""
         self.last_error = ""
+        self.board_status: dict = {}
+        self.pace_version: int | None = None
         self._abort = False
         self._abort_epoch = 0
         self._closing = False
@@ -270,7 +272,7 @@ class Device:
                 raise DeviceError(messages.BOARD_NOT_CONNECTED)
             req_id = self._request_id(command)
             try:
-                # 在 guard 的同一把锁内复查并写入；先释放它，再 await 应答。
+                # 板子收到这一行之后才选 USB 或 BLE。两条路都先经过这把锁里的熔断复查，没有第二条写手机的路。
                 with write_guard if write_guard is not None else nullcontext():
                     link.write(f"{req_id} {command}\n".encode())
                 reply = await self._read_reply(link, req_id, timeout)
@@ -337,6 +339,20 @@ class Device:
         self.vtok = str(data.get("vtok") or "")
         return {key: value for key, value in data.items() if key != "pass"}
 
+    async def refresh_hid_status(self) -> None:
+        """Read `status`. The hid object carries the active transport and the pace number."""
+        try:
+            data = json.loads(await self.query("status"))
+        except (DeviceError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        self.board_status = data
+        hid = data.get("hid")
+        pace = hid.get("pace") if isinstance(hid, dict) else None
+        if type(pace) is int:
+            self.pace_version = pace
+
     async def configure_network(self, mode: str, ssid: str = "", password: str = "") -> None:
         if mode == "ap":
             payload: dict = {"mode": "ap"}
@@ -384,6 +400,7 @@ class Device:
                 if not self.connected:
                     await self.connect()
                 await self.refresh_netinfo()
+                await self.refresh_hid_status()
                 self.last_error = ""
             except asyncio.CancelledError:
                 raise

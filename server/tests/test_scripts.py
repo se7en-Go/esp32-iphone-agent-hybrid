@@ -10,7 +10,8 @@ BANNED = ("请先装 WSL", "请先安装 WSL", "install WSL", "先装 WSL2", "Wi
 
 
 def test_help_exits_cleanly():
-    for script in ("scripts/setup.py", "scripts/flash.py", "scripts/wifi_config.py", "scripts/mcp_config.py"):
+    for script in ("scripts/setup.py", "scripts/flash.py", "scripts/wifi_config.py", "scripts/mcp_config.py",
+                   "scripts/hid_mode.py"):
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
         result = subprocess.run(

@@ -25,6 +25,13 @@ TYPE_PREFIX_MAX = len("100000 type ")
 TYPE_LIMIT = SERIAL_LINE_MAX - TYPE_PREFIX_MAX
 
 
+def _pace_version(reply: str) -> int | None:
+    parts = reply.strip().split()
+    if len(parts) == 2 and parts[0] == "ok" and parts[1].isdigit():
+        return int(parts[1])
+    return None
+
+
 def type_chunks(text: str, limit: int = TYPE_LIMIT) -> list[str]:
     """按串口行长上限分块，尽量不在一段空格中间切开；固件保留每块的完整内容。"""
     if len(text) <= limit:
@@ -63,6 +70,7 @@ NUDGE = 12              # mouse units the pointer is wiggled by to find it on sc
 POINTER_WAIT = 2.5      # seconds per direction (nudge, then the way back), never more
 AIM_TOLERANCE = 0.008   # screen fraction; a bigger miss is corrected before pressing
 MAX_MISS = 0.06         # bigger misses are still corrected, but not learned from (they may be misreadings)
+USB_PACE = 3            # firmware HID_PACE_USB. A saved file with no pace number is this schedule.
 
 
 class Phone:
@@ -70,21 +78,41 @@ class Phone:
         self.device, self._file, self.screen = device, calibration_file, screen
         # mouse units needed to cross the full screen width / height
         saved = json.loads(calibration_file.read_text()) if calibration_file.exists() else None
-        self.span = {"w": saved["w"], "h": saved["h"]} if saved else None
+        body = saved if isinstance(saved, dict) else {}
+        has_span = "w" in body and "h" in body
+        self.span = {"w": body["w"], "h": body["h"]} if has_span else None
         # where `home` leaves the pointer, as a screen fraction: not the corner itself on iPhones with rounded
         # corners (the 15 Pro Max stops 91 of 720 px right of it), so every move is counted from there
-        self.origin = {"x": (saved or {}).get("x0", 0.0), "y": (saved or {}).get("y0", 0.0)}
+        self.origin = {"x": body.get("x0", 0.0), "y": body.get("y0", 0.0)}
+        pace = body.get("pace")
+        self._pace = pace if type(pace) is int else None
         self._pos = None  # pointer position in mouse units; None = unknown
         self._moves = 0
         self._link = 0  # device.links when the pointer was last homed
         # where the pointer really landed (seen on screen) for the screen fraction we aimed at, per axis;
         # a straight-line fit through them corrects every later move, so taps get better as the agent works
-        self._seen = {axis: deque(map(tuple, (saved or {}).get("seen", {}).get(axis, [])), maxlen=12)
-                      for axis in ("x", "y")}
+        seen = body.get("seen", {})
+        self._seen = {axis: deque(map(tuple, seen.get(axis, [])), maxlen=12) for axis in ("x", "y")}
 
     @property
     def calibrated(self) -> bool:
         return self.span is not None
+
+    async def _pull_pace(self) -> None:
+        """Ask the board which schedule it is on, right before measuring a new span."""
+        query = getattr(self.device, "query", None)
+        version = getattr(self.device, "pace_version", None)
+        if query is not None:
+            try:
+                reply = await query("pace")
+            except DeviceError:
+                reply = ""
+            parsed = _pace_version(reply)
+            if parsed is not None:
+                version = parsed
+                if hasattr(self.device, "pace_version"):
+                    self.device.pace_version = parsed
+        self.adopt_pace(version)
 
     def _stopped(self, epoch: int) -> bool:
         return getattr(self.device, "abort_epoch", 0) != epoch
@@ -103,6 +131,7 @@ class Phone:
         """
         self._pos = None
         epoch = getattr(self.device, "abort_epoch", 0)
+        await self._pull_pace()
         await self._send(epoch, "home")
         seen = []
         for units in CALIBRATION_STOPS:
@@ -239,12 +268,39 @@ class Phone:
             samples.clear()
         self._save()
 
+    def adopt_pace(self, version: int | None) -> None:
+        """Drop the span when the board's pace number changes. USB files with no number stay valid."""
+        if type(version) is not int:
+            return
+        if self._pace == version:
+            return
+        if self._pace is None and version == USB_PACE:
+            self._pace = version
+            if self.span is not None:
+                self._save()
+            return
+        log.info("calibration cleared: pace %s -> %s", self._pace, version)
+        self._pace = version
+        self.span = None
+        self.origin = {"x": 0.0, "y": 0.0}
+        self._pos = None
+        self._moves = 0
+        for samples in self._seen.values():
+            samples.clear()
+        self._save()
+
     def _save(self) -> None:
         """Calibration plus the observed landings, so the correction survives a restart."""
-        self._file.write_text(json.dumps({**self.span, "x0": self.origin["x"], "y0": self.origin["y"],
-                                          "seen": {k: list(v) for k, v in self._seen.items()}}))
+        body = {"x0": self.origin["x"], "y0": self.origin["y"],
+                "seen": {k: list(v) for k, v in self._seen.items()}}
+        if self.span:
+            body.update(self.span)
+        if self._pace is not None:
+            body["pace"] = self._pace
+        self._file.write_text(json.dumps(body))
 
     async def point(self, x: float, y: float, aim: bool = False) -> None:
+        self.adopt_pace(getattr(self.device, "pace_version", None))
         if not self.calibrated:
             raise RuntimeError("pointer not calibrated")
         await self._move_to(self._dx(x), self._dy(y))

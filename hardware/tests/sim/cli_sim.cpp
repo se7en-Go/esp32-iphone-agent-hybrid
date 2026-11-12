@@ -17,6 +17,7 @@
 #include "cli_link.h"
 #include "src/video/gop.h"
 #include "src/log/logring.h"
+#include "src/hid/transport.h"
 #include <stdarg.h>
 
 SerialStub Serial;
@@ -149,6 +150,88 @@ static bool sendAu(const std::vector<uint8_t> &d, uint8_t flags) {
 }
 
 static void reply(const std::string &line) { cli_send_ctrl('r', line.data(), line.size(), 1000); }
+
+// The real transport rules (transport.c). USB defaults to mounted so older sim cases stay "ok".
+static int simPref = -1;
+static int simUnpaired, simPair;
+
+static int loadPref() {
+  if (simPref >= 0) return simPref;
+  Preferences prefs;
+  prefs.begin("hid", false);
+  int saved = prefs.getUChar("hidmode", HID_PREF_AUTO);
+  simPref = saved > HID_PREF_AUTO ? HID_PREF_AUTO : saved;
+  return simPref;
+}
+
+static void storePref(int value) {
+  simPref = value;
+  Preferences prefs;
+  prefs.begin("hid", false);
+  prefs.putUChar("hidmode", (uint8_t)value);
+}
+
+static hid_link_t simFacts() {
+  hid_link_t link = {};
+  const char *usb = getenv("CLI_SIM_USB");
+  const char *ble = getenv("CLI_SIM_BLE");
+  if (!usb || !strcmp(usb, "ok")) link.usb_mounted = 1;
+  else if (!strcmp(usb, "asleep")) {
+    link.usb_mounted = 1;
+    link.usb_suspended = 1;
+  }
+  if (!simUnpaired && ble && !strcmp(ble, "conn")) {
+    link.ble_connected = 1;
+    link.ble_bonded = 1;
+  } else if (!simUnpaired && ble && !strcmp(ble, "bond")) {
+    link.ble_bonded = 1;
+  }
+  link.ble_advertising = 1;
+  link.ble_pairing = simPair;
+  return link;
+}
+
+static bool simHidAction(const std::string &rest) {
+  return rest == "home" || rest == "press" || rest == "release" || rest == "click" || rest == "homescreen" ||
+         rest.rfind("move", 0) == 0 || rest.rfind("scroll", 0) == 0 || rest.rfind("type", 0) == 0 ||
+         rest.rfind("key", 0) == 0;
+}
+
+static std::string simTransport(const std::string &rest) {
+  if (rest == "pace" || rest.rfind("pace ", 0) == 0) {
+    hid_link_t link = simFacts();
+    int pref = loadPref();
+    return std::string("ok ") + std::to_string(hid_pace_version(pref, hid_select(pref, &link)));
+  }
+  if (rest == "hid" || rest.rfind("hid ", 0) == 0) {
+    std::string arg = rest == "hid" ? "" : rest.substr(4);
+    hid_cmd_t cmd;
+    if (hid_parse_cmd(arg.c_str(), &cmd) != 0) return "err usage: hid usb|ble|auto|pair|unpair";
+    if (cmd.kind == HID_CMD_QUERY) return std::string("ok ") + hid_pref_name(loadPref());
+    if (cmd.kind == HID_CMD_SET) {
+      storePref(cmd.pref);
+      return "ok";
+    }
+    if (cmd.kind == HID_CMD_PAIR) {
+      simPair = 1;
+      return "ok";
+    }
+    if (cmd.kind == HID_CMD_PAIR_OFF) {
+      simPair = 0;
+      return "ok";
+    }
+    if (cmd.kind == HID_CMD_UNPAIR) {
+      simUnpaired = 1;
+      simPair = 0;
+      return "ok";
+    }
+    return "err usage: hid usb|ble|auto|pair|unpair";
+  }
+  if (!simHidAction(rest)) return "";
+  hid_link_t link = simFacts();
+  const char *err = hid_ready_error(loadPref(), &link);
+  return err ? err : "ok";
+}
 static char ringBuf[2048];
 static logring ring = {ringBuf, sizeof ringBuf, 0, 0};
 // logbuf.cpp's board_log: cli_link.cpp's lines go to stderr and the simulated RAM log.
@@ -197,9 +280,12 @@ int main(int argc, char **argv) {
       fprintf(stderr, "cmd: %s\n", line.c_str());
       size_t sp = line.find(' ');
       std::string id = line.substr(0, sp), rest = sp == std::string::npos ? "" : line.substr(sp + 1);
-      if (rest == "stream on") { streaming = true; sent = 0; seq++; }  // resend the GOP from the IDR
-      if (rest == "stream off") streaming = false;
-      if (rest == "snap") {
+      std::string via = simTransport(rest);
+      if (!via.empty()) {
+        reply(id + " " + via);
+      } else if (rest == "stream on") { streaming = true; sent = 0; seq++; }  // resend the GOP from the IDR
+      else if (rest == "stream off") streaming = false;
+      else if (rest == "snap") {
         // Mirror firmware doSnap: frozen → freeze err; wait_idr only while AP streaming → keyframe;
         // otherwise empty GOP (boot / no mirror) → no video.
         bool ap_streaming = ap_state ? !strcmp(ap_state, "streaming") : false;
@@ -236,10 +322,16 @@ int main(int argc, char **argv) {
     }
     if (now - lastStatus >= 1000) {
       lastStatus = now;
-      char s[200];
+      char s[480];
       const char *ap = ap_state ? ap_state : (aus.empty() ? "idle" : "streaming");
-      int n = snprintf(s, sizeof s, "{\"fw\":\"0.2.1\",\"up\":%u,\"usb\":\"ok\",\"net\":\"ap\",\"ap\":\"%s\",\"w\":480,\"h\":1040,\"fz\":%d}",
-                       now, ap, frozen);
+      hid_link_t facts = simFacts();
+      int pref = loadPref();
+      int path = hid_select(pref, &facts);
+      char frag[180];
+      hid_status_fragment(frag, sizeof frag, pref, path, &facts);
+      int n = snprintf(s, sizeof s,
+                       "{\"fw\":\"0.2.1\",\"up\":%u,\"usb\":\"ok\",\"net\":\"ap\",\"ap\":\"%s\",\"w\":480,\"h\":1040,\"fz\":%d,%s}",
+                       now, ap, frozen, frag);
       cli_send_ctrl('s', s, n, 1000);
     }
   }

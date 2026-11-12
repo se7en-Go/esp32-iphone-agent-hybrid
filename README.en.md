@@ -2,7 +2,7 @@
 
 An ESP32-S3 N16R8, an iPhone, and a computer. Any MCP agent (Codex, Pi, Claude Code, Cursor, …) can click, swipe, and type on the real phone. The host runs natively on macOS and on Windows 10/11.
 
-The COM port (USB-UART: CH343, FTDI, or CP210x) stays on the computer: flash, commands, the video token, and Wi-Fi stored in NVS. The USB port (GPIO19/20) is the iPhone's mouse and keyboard. Video is the board's own AirPlay receiver, TCP port 7201, decoded with PyAV. No UxPlay, GStreamer, or Bonjour install. Default network is STA on a 2.4 GHz LAN. The board's access point is only for a computer that also has ethernet, because that hotspot has no internet.
+The COM port (USB-UART: CH343, FTDI, or CP210x) stays on the computer: flash, commands, the video token, and Wi-Fi stored in NVS. The USB port (GPIO19/20) is the iPhone's mouse and keyboard. The same reports can go out over BLE HID when the iPhone pairs to the name that starts with ESP32 Agent (`scripts/hid-mode.sh`, or `hid-mode.ps1` on Windows). Default is auto: USB when the cable is up, otherwise a connected BLE HID central. BLE HID has not been verified on a real iPhone. Video is the board's own AirPlay receiver, TCP port 7201, decoded with PyAV. No UxPlay, GStreamer, or Bonjour install. Default network is STA on a 2.4 GHz LAN. The board's access point is only for a computer that also has ethernet, because that hotspot has no internet.
 
 This tree has not been run on a real iPhone or a real board. See `docs/hardware-test.md`. iOS 16 and 17 mirroring to the on-board receiver is untested upstream and is the first hardware gate.
 

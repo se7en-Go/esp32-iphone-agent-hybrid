@@ -55,6 +55,24 @@ def link_lost(command: str) -> str:
 
 
 def explain_reply(command: str, reply: str) -> str:
+    # "usb/ble" contains the shorter phrases, so it has to be matched first.
+    if "not connected over usb/ble" in reply:
+        return (
+            "手机既没有 USB 连接，也没有蓝牙 HID 连接。"
+            "有线：把标着 USB 的口接到 iPhone（Lightning 需要相机转换器）。"
+            "蓝牙：iPhone 设置 → 蓝牙 → 选 ESP32 Agent，打开辅助触控。"
+            "电脑上可运行 scripts/hid-mode 的 pair 打开配对。原始回复：" + reply
+        )
+    if "not connected over ble" in reply:
+        return (
+            "手机没有通过蓝牙连上。请打开 iPhone 设置 → 蓝牙 → 选 ESP32 Agent，并打开辅助触控。"
+            "若列表里没有它，先在电脑上运行 scripts/hid-mode 的 pair。原始回复：" + reply
+        )
+    if "not connected over usb" in reply:
+        return (
+            "手机没有通过 USB 连上。请把标着 USB 的口接到 iPhone（Lightning 需要相机转换器），"
+            "解锁并打开辅助触控。也可以改用蓝牙：scripts/hid-mode ble。原始回复：" + reply
+        )
     if "asleep" in reply:
         return "手机 USB 休眠了：解锁 iPhone，保持屏幕亮着，辅助触控保持打开，然后再试。原始回复：" + reply
     head = "net" if command.startswith("net ") else command.split(" ", 1)[0][:24]
@@ -79,8 +97,37 @@ def for_user(text: str) -> str:
     return text
 
 
+def hid_hints(hid: dict | None) -> dict:
+    """配对提示。通道已经通（path 是 usb 或 ble）时两句都是空的。"""
+    if not isinstance(hid, dict):
+        return {"zh": "", "en": ""}
+    path = hid.get("path")
+    mode = hid.get("mode")
+    if path in ("usb", "ble"):
+        return {"zh": "", "en": ""}
+    if mode == "usb":
+        return {
+            "zh": "手机没有通过 USB 连上。请把标着 USB 的口接到 iPhone，解锁，并打开辅助触控。",
+            "en": (
+                "The phone is not on USB. Plug the port labelled USB into the iPhone, "
+                "unlock it, and turn on AssistiveTouch."
+            ),
+        }
+    return {
+        "zh": (
+            "还没有控制通道。有线请把 USB 口接上手机。蓝牙：iPhone 设置 → 蓝牙 → 选 ESP32 Agent，打开辅助触控。"
+            "电脑上运行 scripts/hid-mode.sh pair（Windows 用 hid-mode.ps1）打开 60 秒配对。"
+        ),
+        "en": (
+            "No HID link yet. Plug the USB port into the phone, or on the iPhone open "
+            "Settings → Bluetooth → ESP32 Agent and turn on AssistiveTouch. "
+            "Run scripts/hid-mode.sh pair to open the 60 second window."
+        ),
+    }
+
+
 def hints(device: bool, screen: bool, calibrated: bool, last_error: str = "",
-          screen_error: str = "") -> dict:
+          screen_error: str = "", hid: dict | None = None) -> dict:
     """三个状态灯各自的中英提示。灯亮时提示为空。"""
     device_zh = last_error or BOARD_NOT_CONNECTED
     device_en = last_error or "Board serial is not connected. Plug the COM port into the computer."
@@ -104,4 +151,5 @@ def hints(device: bool, screen: bool, calibrated: bool, last_error: str = "",
             "en": "" if screen and not screen_error else screen_en,
         },
         "calibrated": {"zh": "" if calibrated else cal_zh, "en": "" if calibrated else cal_en},
+        "hid": hid_hints(hid),
     }

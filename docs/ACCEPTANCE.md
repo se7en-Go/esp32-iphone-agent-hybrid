@@ -106,9 +106,9 @@
   **失败记录：** `0 status` 原文，重点是 `rst` 和 `up`；手机提示截图。刚上电时显示一次 power-on 不算故障，要结合是否反复重启一起看。
   **出处：** `docs/troubleshooting.md:23–25`；`docs/hardware-test.md:16`。
 
-- [ ] **蓝牙配对：本次验收不做。** BLE 和 7202 是实验功能，这一阶段不交付。只有做实验时才在串口发 `0 ble pair on`，配对窗口只开 60 秒；平时不要打开。
-  **通过标准：** 不开蓝牙也能完成后面所有章节。
-  **出处：** `ARCHITECTURE.md:31`；`hardware/hid_bridge/hid_bridge.ino:466–467`；`docs/hardware-test.md:15`。
+- [ ] **配套 App 的 BLE / 7202：本次验收不做。** 只有做实验时才在串口发 `0 ble pair on`，配对窗口只开 60 秒；平时不要打开。控制手机的蓝牙 HID 是另一条命令（`hid pair`），见第 6 节，同样还没有真机记录。
+  **通过标准：** 不开配套 App 的蓝牙也能完成第 1 到第 5 节。
+  **出处：** `ARCHITECTURE.md` 里「控制通道为什么是串口」；`docs/hardware-test.md`。
 
 ## 1．第一关：iPhone 画面投到电脑
 
@@ -406,6 +406,34 @@
   **失败记录：**每台电脑的系统、Python、端口、转接器驱动、工具返回和截图。  
   **出处：**`docs/hardware-test.md:24`；`scripts/runtime.py:26–29`；`.github/workflows/ci.yml:39–64、68–109`；`hardware/hid_bridge/wifi_video_tcp.cpp:126–129`。
 
+## 6．蓝牙 HID（还没有在真机上验证）
+
+这一节全部未测。CI 只证明固件能编译、选择逻辑和提示文字在假设备上成立。不要因为前面的 USB 章节通过，就勾这里。
+
+- [ ] **配对。** COM 口接电脑。macOS 运行 `./scripts/hid-mode.sh pair`，Windows 运行 `powershell -ExecutionPolicy Bypass -File scripts\hid-mode.ps1 pair`。60 秒内在 iPhone 打开设置 → 蓝牙，选择名字以 **ESP32 Agent** 开头的设备（后面可能有四位字母，和屏幕镜像里的 ESP32 Agent 是同一块板）。打开辅助触控。
+  **通过标准：** 网页 `/api/status` 的 `hid.path` 是 `ble`，`hid.ble.conn` 和 `hid.ble.bond` 都是 1。手机出现指针。
+  **失败记录：** 脚本打印的 mode/path/adv/conn/bond、手机蓝牙列表截图、串口 `0 status` 里的 `hid`。
+
+- [ ] **校准。** 配对成功后在网页点校准，点中圆点。
+  **通过标准：** `calibrated` 变绿，指针能移到屏幕中央。`hid.pace` 在蓝牙上是 4。从 USB（pace 3）改到蓝牙后，旧校准会被清掉，需要重新点一次。
+  **失败记录：** 校准前后的 `calibration.json`、点偏的截图、`hid.pace`。
+
+- [ ] **中文输入。** 在蓝牙 HID 上走和 USB 相同的拼音流程，输入「谢谢分享」，核对候选和输入框。切换输入法仍是 ctrl+space。
+  **通过标准：** 候选里能选出汉字。标点和 emoji 的限制与 USB 相同。
+  **失败记录：** 每一轮候选截图。不要把没在真机上打过字写成已经通过。
+
+- [ ] **重启后重连。** 配对成功后给板子断电再上电，不要重新 pair。
+  **通过标准：** iPhone 自己连回这块板，`hid.ble.bond` 仍是 1，指针还能动。绑定存在板子的 NVS 里。
+  **失败记录：** 重启前后的 `0 status`。若必须重新配对才动，这一项不算通过。
+
+- [ ] **和 AirPlay / Wi-Fi 同时用。** 屏幕镜像保持打开，用蓝牙 HID 做几次点击，同时看画面是否还在更新。
+  **通过标准：** 画面继续更新，点击仍然落到屏幕上。Wi-Fi、投屏和蓝牙共用同一块射频，HID 只在手势期间把连接间隔收到 7.5–15 ms，手势结束后回到 15–30 ms。
+  **失败记录：** 卡顿或花屏的时间、`0 status` 的 `ap` 和 `hid`。画面明显变差时，改回 `hid-mode.sh usb`。
+
+- [ ] **忘掉绑定。** 运行 `hid-mode.sh unpair`（Windows 用 `hid-mode.ps1 unpair`），并在 iPhone 系统蓝牙里忽略此设备。
+  **通过标准：** `hid.ble.bond` 变为 0。配套 App 用的 `0 ble unpair` 也会清掉这份 HID 名单，因为控制器里的绑定已经没了。
+  **失败记录：** unpair 前后的 status。
+
 ## 失败时保存什么：真实路径与取证入口
 
 以下是本清单前面各项引用的证据位置。保存到哪里由 seven 自行选择；仓库没有统一的“验收截图目录”。
@@ -437,6 +465,7 @@
 | **中文输入准确率与速度** | 拼音逐字符经键盘输入，选词依赖截图；无中文剪贴板、Unicode 直输和 emoji 方案 | 输入法配置、候选准确率、多音字、标点、长句与速度全部待真机验证 | `control.py:84–96`；`phone.py:318–324`；`README.md:52` |
 | **iOS 版本兼容性** | 目标版本不等于本仓库已实测；16/17 与文档列出的 iOS 27 均有未验证说明 | seven 的具体型号和版本必须单独过投屏第一关 | `README.md:46`；`docs/hardware-test.md:5、15` |
 | **USB-C 直连、Lightning 与供电** | 手机识别 HID、线材、配件权限、转换器耗电、焊盘倒灌，本仓库都没有真机证明 | 每种连接方式单独记录；USB-OTG / IN-OUT 焊盘必须断开 | `docs/hardware-test.md:9–20`；`README.md:18` |
+| **蓝牙 HID** | 配对、Just Works 绑定、重启重连、指针加速、中文输入、与 AirPlay 共用射频，都没有真机记录 | 按第 6 节逐项做。CI 绿灯不能代替 iPhone 蓝牙列表里的一次配对 | `docs/ACCEPTANCE.md` 第 6 节；`scripts/hid-mode.sh` |
 | **原生 Windows／Mac 真机运行** | 有原生脚本和跨平台 CI 配置，但配置文件本身不证明 seven 的电脑已通过，更不证明真实板子可用 | 两种系统分别完成完整流程；Windows 无 UxPlay 退路 | `.github/workflows/ci.yml:39–109`；`screen_uxplay.py:31–33`；`README.md:7` |
 | **静止旧画面可能暂时仍为绿色** | `screen.live` 允许最近 90 秒内的帧；视频心跳继续时，即使没有新视频帧，也不按完全断流提示 | 人工改变页面核对新鲜度；绿灯不是最新画面的充分证据 | `screen.py:109–116`；`video7201.py:104–106、236–257` |
 | **长时间运行、重连、锁屏** | 有维护、保活、重连与 asleep 处理，但锁屏后文档要求重新镜像 | 长测、断线恢复、令牌更新、急停、重启保留熔断均待真机验证；不能承诺全天无人值守 | `device.py:345–385`；`docs/hardware-test.md:26` |

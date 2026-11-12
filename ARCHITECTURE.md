@@ -28,7 +28,7 @@ iPhone（Lightning 或 USB-C，目标 iOS 16.7+）
 ## 已批准、并覆盖原 spec 的偏差
 
 1. **默认 STA，不是 AP。** 家里或办公室的 2.4GHz 路由器上，板子、手机、电脑在同一局域网。电脑经 COM 口发 `0 net {"mode":"sta","ssid","pass"}`，配置写入板子 NVS。换地方就再跑一次配网脚本，不重烧、不提交 `secrets.h`。AP 只留给“电脑另有网线”的人：板子热点不下发网关（`netcfg.cpp` 的 `noDefaultRoute`），只连热点的电脑会失去互联网和云端模型。
-2. **拓扑固定成双 Type-C。** 标着 USB 的口接手机（HID）。标着 COM 的口接电脑（命令、`0 netinfo` 读 vtok、配网）。视频只走 Wi-Fi 7201。不要求蓝牙。7202 + BLE 配对留作实验，本阶段不交付。
+2. **拓扑固定成双 Type-C。** 标着 USB 的口接手机（USB HID）。标着 COM 的口接电脑（命令、`0 netinfo` 读 vtok、配网）。视频只走 Wi-Fi 7201。电脑这一侧不要求蓝牙。7202 + 配套 App 的 BLE 配对留作实验，本阶段不交付。手机这一侧可以改用蓝牙 HID，见后面的「蓝牙 HID」一节；那一步还没有真机验证。
 3. **iOS 目标 16.7+。** 不装 Handsy iOS App，不用 TestFlight，不越狱，不开开发者模式。板载接收器代码里没有 iOS 版本判断，但 Handsy 作者的记录是 iOS 18/26/27；Kz-Aven 在 iOS 16.7.16 上测通的是电脑上的 UxPlay，不是这块板子。**iOS 16/17 镜像到板载接收器是第一道硬件关，本仓库没有测过。** 失败时的退路：把手机升到 iOS 18，或仅在 Mac 上把 `SCREEN_BACKEND=uxplay` 打开（要自己装 UxPlay 和 GStreamer，Windows 不走这条）。
 4. **许可证拆开。** `hardware/` 里的固件链接了 GPL-3.0 的 AirPlay 代码，固件源码与固件二进制按 GPL-3.0 分发，保留 `src/airplay/LICENSE-GPL.md` 和各文件头。`server/`、`scripts/`、`skills/`、`docs/` 是独立程序，只通过串口和 TCP 与固件说话，按 MIT 分发，保留 Kz-Aven 与 Henry Yuan 的版权声明。根目录 `NOTICE` 说明边界。
 5. **小白不装 arduino-cli。** GitHub Actions 用报告里已编译通过的 FQBN 打出 N16R8 的 `merged.bin`。日常刷机是 `esptool`（pip）一键脚本，按 VID 自动找 COM 口：沁恒 `0x1A86`、FTDI `0x0403`、CP210x `0x10C4`；不会去认乐鑫原生 USB（`0x303A`）。想改固件的人仍可从源码编译。
@@ -91,6 +91,16 @@ STA 的限制也写清楚：路由器要有 2.4GHz；不能开 AP 隔离或访�
 3. **BLE GATT。** 给 Handsy App 用，`net` 特征还要求加密绑定。本阶段不依赖 App，也不走 BLE。
 
 串口速率 115200，只传命令。视频不能走这根线。
+
+### 蓝牙 HID
+
+电脑仍然只走 COM 串口。板子收到 `home`、`move`、`click`、`type`、`key` 之后，再决定从 USB 还是 BLE HID 发给手机。两条路都先经过服务端同一把熔断锁，没有第二条写手机的入口。
+
+默认 `auto`：USB 已挂载且没休眠就走 USB，否则走已经连上的蓝牙 HID。`0 hid usb`、`0 hid ble`、`0 hid auto` 写入 NVS，重启仍有效。`0 hid pair` 打开 60 秒配对窗口，iPhone 在设置 → 蓝牙里选择名字以 ESP32 Agent 开头的设备。`0 hid unpair` 只忘掉 HID 绑定。绑定存在 NVS 的 `hid` 命名空间，重启后 iPhone 可以自己连回来。
+
+鼠标、键盘、地球键（切换输入法）是同一个 HID 服务，和原来的 GATT 共用一个广播。Wi-Fi、AirPlay 和 BLE 共用一块射频。HID 只在一次手势期间把连接间隔收到 7.5–15 ms，并发的报告比 USB 少、步子更大（pace 4，USB 仍是 pace 3）。手势结束回到 15–30 ms，避免把投屏卡在最短间隔上。电脑发现 pace 数字变了会丢掉旧校准。
+
+这一节描述的是固件和电脑端的行为。蓝牙 HID 还没有在真 iPhone 上验证。
 
 蓝牙配对默认关闭。固件不再在每次上电后的 3 分钟里接受没有密码的 Just Works 配对，否则旁边的设备可以读到 Wi-Fi 密码、vtok，并发 HID 或用 vtok 做 OTA。需要实验 BLE / 7202 时，在 COM 口发送 `0 ble pair on`，窗口 60 秒，`0 ble pair off` 可以提前关掉。已经绑定过的设备仍可重连。日常控制不需要这一步。
 
@@ -177,7 +187,7 @@ docs/                    中文。macOS 与 Windows 分开写
 
 ## 已知做不到或还没测的
 
-- 没有在真 iPhone、真 N16R8、真 Windows 桌面上跑通过。CI 能证明的是：固件能编译、PyAV 能解我们自己生成的 7201 分帧、串口协议能在假串口上往返、MCP stdio 能列出并调用工具、PowerShell 脚本能在 `windows-latest` 上解析并跑到 `--help`。
+- 没有在真 iPhone、真 N16R8、真 Windows 桌面上跑通过。蓝牙 HID 同样没有真机记录：配对、重启重连、指针加速、中文输入、和 AirPlay 共用射频，都要在真 iPhone 上再做一遍。CI 能证明的是：固件能编译、PyAV 能解我们自己生成的 7201 分帧、串口协议能在假串口上往返、传输选择和错误字符串能在主机测试里跑通、MCP stdio 能列出并调用工具、PowerShell 脚本能在 `windows-latest` 上解析并跑到 `--help`。
 - 锁屏、密码、Apple Pay、DRM 画面不会出现在镜像里。镜像停止后要解锁并重新选一次屏幕镜像。
 - `type` 只接受可打印 ASCII。中文走拼音和候选词，emoji 打不了。
 - 横屏不支持。指针是相对坐标，靠校准和偶尔 `home` 消除漂移；Home 键机型的底部上滑不一定回主屏幕，需要辅助触控。

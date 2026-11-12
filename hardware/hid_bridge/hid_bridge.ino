@@ -32,14 +32,15 @@
 #include "src/airplay/airplay.h"
 #include "src/hid/arbiter.h"
 #include "src/hid/pace.h"
+#include "src/hid/transport.h"
+#include "src/hid/keys.h"
 #include "src/hid/command_line.h"
+#include "ble_hid.h"
 #include "src/heard/heard.h"
 #include "src/cli/cli_proto.h"
 #include "logbuf.h"
 
-const int STEP = 10;      // pointer speed per report while moving (any direction, see pace.h)
-const int STEP_MS = 8;    // report interval; constant pace keeps iOS acceleration predictable
-const int HOME_REPORTS = 25;  // per axis
+const int HOME_REPORTS = 25;  // per axis. The gap and the default step come from hid_pace_profile.
 #ifndef DEBUG_SERIAL
 #define DEBUG_SERIAL 0  // 1: echo commands and the AirPlay handshake over USB serial
 #endif
@@ -52,14 +53,79 @@ USBHIDConsumerControl consumer;
 const uint16_t AC_HOME = 0x0223;  // HID consumer page: AC Home
 static String receiverName = "ESP32 Agent";
 
-void movePaced(long dx, long dy, int step = STEP) {
+static int8_t clamp8(long v) {
+  if (v > 127) return 127;
+  if (v < -127) return -127;
+  return (int8_t)v;
+}
+
+static hid_link_t hidFacts() {
+  hid_link_t link = {};
+  link.usb_mounted = tud_mounted() ? 1 : 0;
+  link.usb_suspended = tud_suspended() ? 1 : 0;
+  link.ble_connected = ble_hid_connected() ? 1 : 0;
+  link.ble_bonded = ble_hid_bonded() ? 1 : 0;
+  link.ble_advertising = ble_app_advertising() ? 1 : 0;
+  link.ble_pairing = ble_hid_pair_window_open() ? 1 : 0;
+  return link;
+}
+
+static int activePath() {
+  hid_link_t link = hidFacts();
+  return hid_select(ble_hid_pref(), &link);
+}
+
+// Wake a suspended USB phone, then accept USB or BLE per the saved preference.
+// The error string is the whole reply ("err ...").
+static bool phoneReady(const char **why) {
+  if (tud_suspended()) {
+    tud_remote_wakeup();
+    for (int i = 0; i < 50 && tud_suspended(); i++) delay(10);
+  }
+  hid_link_t link = hidFacts();
+  const char *err = hid_ready_error(ble_hid_pref(), &link);
+  if (err) {
+    if (why) *why = err;
+    return false;
+  }
+  return true;
+}
+
+static bool movePaced(long dx, long dy, int step) {
+  int path = activePath();
+  hid_pace_t prof;
+  hid_pace_profile(path, &prof);
+  if (path == HID_PATH_BLE) ble_hid_arm_interval(1);
   pace_t p;
   pace_start(&p, dx, dy, step);
   int sx, sy;
-  while (pace_next(&p, &sx, &sy)) {
-    mouse.move(sx, sy);
-    delay(STEP_MS);
+  bool ok = true;
+  while (ok && pace_next(&p, &sx, &sy)) {
+    if (path == HID_PATH_BLE) ok = ble_hid_mouse(clamp8(sx), clamp8(sy), 0, 0);
+    else mouse.move(sx, sy);
+    delay(prof.gap_ms);
   }
+  if (path == HID_PATH_BLE) ble_hid_arm_interval(0);
+  return ok;
+}
+
+static bool slamHome() {
+  int path = activePath();
+  hid_pace_t prof;
+  hid_pace_profile(path, &prof);
+  if (path == HID_PATH_BLE) ble_hid_arm_interval(1);
+  bool ok = true;
+  for (int axis = 0; axis < 2 && ok; axis++) {
+    for (int i = 0; i < HOME_REPORTS && ok; i++) {
+      int8_t x = axis == 0 ? -127 : 0;
+      int8_t y = axis == 0 ? 0 : -127;
+      if (path == HID_PATH_BLE) ok = ble_hid_mouse(x, y, 0, 0);
+      else mouse.move(x, y);
+      delay(prof.home_gap_ms);
+    }
+  }
+  if (path == HID_PATH_BLE) ble_hid_arm_interval(0);
+  return ok;
 }
 
 uint8_t keyCode(const String &k) {
@@ -79,52 +145,148 @@ uint8_t keyCode(const String &k) {
   return k.length() == 1 ? k[0] : 0;
 }
 
-bool pressCombo(String combo) {
+// 1 ok, 0 unknown key, -1 the BLE notify was not accepted.
+static int pressCombo(String combo) {
+  uint8_t mod = 0, keys[6] = {};
+  int n = 0;
+  uint16_t cons = 0;
+  if (!hid_fill_combo(combo.c_str(), &mod, keys, &n, &cons)) {
+    keyboard.releaseAll();
+    return 0;
+  }
+  int path = activePath();
+  if (path == HID_PATH_BLE) {
+    ble_hid_arm_interval(1);
+    bool ok = cons ? ble_hid_consumer(cons) : ble_hid_keyboard(mod, keys, n);
+    delay(30);
+    if (cons) ble_hid_consumer(0);
+    else ble_hid_keyboard(0, NULL, 0);
+    ble_hid_arm_interval(0);
+    return ok ? 1 : -1;
+  }
+  if (cons) {
+    consumer.press(cons);
+    delay(30);
+    consumer.release();
+    return 1;
+  }
+  // USB keeps the Arduino keymap. The tokens hid_fill_combo accepted are the same names keyCode maps.
   combo += '+';
   for (int i; (i = combo.indexOf('+')) >= 0; combo = combo.substring(i + 1)) {
     uint8_t c = keyCode(combo.substring(0, i));
-    if (!c) { keyboard.releaseAll(); return false; }
+    if (!c) { keyboard.releaseAll(); return 0; }
     keyboard.press(c);
   }
   delay(30);
   keyboard.releaseAll();
-  return true;
+  return 1;
+}
+
+static int bleType(const String &text) {
+  ble_hid_arm_interval(1);
+  for (unsigned i = 0; i < text.length(); i++) {
+    uint8_t usage = 0;
+    int shift = 0;
+    if (!hid_ascii(text[i], &usage, &shift)) {
+      ble_hid_keyboard(0, NULL, 0);
+      ble_hid_arm_interval(0);
+      return 0;
+    }
+    uint8_t one[6] = {usage};
+    if (!ble_hid_keyboard(shift ? 0x02 : 0, one, 1)) {
+      ble_hid_arm_interval(0);
+      return -1;
+    }
+    delay(12);
+    ble_hid_keyboard(0, NULL, 0);
+    delay(8);
+  }
+  ble_hid_arm_interval(0);
+  return 1;
 }
 
 // A locked or sleeping phone suspends USB; sending HID reports then can stall. Ask it to wake up instead,
 // and report "asleep" right away if it does not, so the board never hangs.
-bool usbReady() {
-  if (tud_suspended()) {
-    tud_remote_wakeup();
-    for (int i = 0; i < 50 && tud_suspended(); i++) delay(10);
-  }
-  return tud_mounted() && !tud_suspended();
-}
-
 String run(const String &line) {
   int sp = line.indexOf(' ');
   String cmd = sp < 0 ? line : line.substring(0, sp);
   String arg = sp < 0 ? "" : line.substring(sp + 1);
-  long a = 0, b = 0, c = STEP;
-  sscanf(arg.c_str(), "%ld %ld %ld", &a, &b, &c);
+  long a = 0, b = 0, c = 0;
+  int got = sscanf(arg.c_str(), "%ld %ld %ld", &a, &b, &c);
 
   if (cmd == "ping") return "ok";
-  if (cmd == "pace") return "ok " + String(PACE_VERSION);  // how moves are paced: the app recalibrates on a change
-  if (!usbReady()) return "err phone usb asleep (unlock the phone)";
-  if (cmd == "home") {  // slam the pointer into the top-left corner: left first, then up along the left edge,
-    // so it never rides the top edge from the right (that opened Control Center, 2026-11-06)
-    for (int i = 0; i < HOME_REPORTS; i++) { mouse.move(-127, 0); delay(2); }
-    for (int i = 0; i < HOME_REPORTS; i++) { mouse.move(0, -127); delay(2); }
+  if (cmd == "pace") {  // per transport, so the host recalibrates when the pipe changes
+    hid_link_t link = hidFacts();
+    int pref = ble_hid_pref();
+    return String("ok ") + hid_pace_version(pref, hid_select(pref, &link));
+  }
+  const char *why = NULL;
+  if (!phoneReady(&why)) return why ? why : "err phone not connected over usb/ble";
+  int path = activePath();
+  const char *down = path == HID_PATH_BLE ? "err phone not connected over ble" : "err phone not connected over usb";
+  if (cmd == "home") {  // left first, then up the left edge: riding the top edge opened Control Center (2026-11-06)
+    return slamHome() ? "ok" : down;
+  }
+  if (cmd == "move") {
+    hid_pace_t prof;
+    hid_pace_profile(path, &prof);
+    int step = got >= 3 ? (int)c : prof.step;
+    if (step < 1) step = 1;
+    if (step > 40) step = 40;
+    return movePaced(a, b, step) ? "ok" : down;
+  }
+  if (cmd == "press") {
+    if (path == HID_PATH_BLE) return ble_hid_button(true) ? "ok" : down;
+    mouse.press(MOUSE_LEFT);
     return "ok";
   }
-  if (cmd == "move") { movePaced(a, b, constrain(c, 1, 40)); return "ok"; }  // c: speed per report (calibration)
-  if (cmd == "press") { mouse.press(MOUSE_LEFT); return "ok"; }
-  if (cmd == "release") { mouse.release(MOUSE_LEFT); return "ok"; }
-  if (cmd == "click") { mouse.press(MOUSE_LEFT); delay(60); mouse.release(MOUSE_LEFT); return "ok"; }
-  if (cmd == "scroll") { mouse.move(0, 0, a, b); return "ok"; }
-  if (cmd == "type") { keyboard.print(arg); return "ok"; }
-  if (cmd == "key") return pressCombo(arg) ? "ok" : "err unknown key";
-  if (cmd == "homescreen") { consumer.press(AC_HOME); delay(40); consumer.release(); return "ok"; }
+  if (cmd == "release") {
+    if (path == HID_PATH_BLE) return ble_hid_button(false) ? "ok" : down;
+    mouse.release(MOUSE_LEFT);
+    return "ok";
+  }
+  if (cmd == "click") {
+    if (path == HID_PATH_BLE) {
+      if (!ble_hid_button(true)) return down;
+      delay(60);
+      return ble_hid_button(false) ? "ok" : down;
+    }
+    mouse.press(MOUSE_LEFT);
+    delay(60);
+    mouse.release(MOUSE_LEFT);
+    return "ok";
+  }
+  if (cmd == "scroll") {
+    if (path == HID_PATH_BLE) return ble_hid_mouse(0, 0, clamp8(a), clamp8(b)) ? "ok" : down;
+    mouse.move(0, 0, a, b);
+    return "ok";
+  }
+  if (cmd == "type") {
+    if (path != HID_PATH_BLE) {
+      keyboard.print(arg);
+      return "ok";
+    }
+    int typed = bleType(arg);
+    if (typed < 0) return down;
+    return typed ? "ok" : "err unknown key";
+  }
+  if (cmd == "key") {
+    int pressed = pressCombo(arg);
+    if (pressed < 0) return down;
+    return pressed ? "ok" : "err unknown key";
+  }
+  if (cmd == "homescreen") {
+    if (path == HID_PATH_BLE) {
+      if (!ble_hid_consumer(AC_HOME)) return down;
+      delay(40);
+      ble_hid_consumer(0);
+      return "ok";
+    }
+    consumer.press(AC_HOME);
+    delay(40);
+    consumer.release();
+    return "ok";
+  }
   return "err unknown command";
 }
 
@@ -270,13 +432,14 @@ String board(const String &line, const String &id, char who) {
     ble_unpair();
     return "";
   }
+  if (cmd == "hid") return ble_hid_command(arg.c_str()); // usb|ble|auto, pair, unpair; not a pointer report
   return drive(line, who);
 }
 
 String statusJson(bool full, char who) {
   static const char *apStates[] = {"idle", "connected", "streaming"};
   VideoStats v = video_stats(who);
-  char s[704];
+  char s[1280];
   snprintf(s, sizeof s,
            "{\"fw\":\"%s\",\"up\":%lu,\"rst\":\"%s\",\"heap\":%u,\"psram\":%u,\"usb\":\"%s\",\"net\":\"%s\",\"ip\":\"%s\",\"sta\":%d,"
            "\"ap\":\"%s\",\"w\":%u,\"h\":%u,\"kbps\":%lu,\"fps\":%.1f,\"idr\":%lu,\"gop\":%lu,\"vage\":%lu,\"ovf\":%lu,\"fz\":%d,"
@@ -308,6 +471,15 @@ String statusJson(bool full, char who) {
     len = strlen(s);
     snprintf(s + len - 1, sizeof s - len + 1, ",\"busy\":%d}", app);
   }
+  {
+    char frag[180];
+    hid_link_t facts = hidFacts();
+    int prefNow = ble_hid_pref();
+    int path = hid_select(prefNow, &facts);
+    hid_status_fragment(frag, sizeof frag, prefNow, path, &facts);
+    len = strlen(s);
+    snprintf(s + len - 1, sizeof s - len + 1, ",%s}", frag);
+  }
   if (full) return s;
   // MTU below ~250 (before the MTU exchange): keep only the fields the app needs to stay alive
   snprintf(s, sizeof s, "{\"fw\":\"%s\",\"up\":%lu,\"rst\":\"%s\",\"usb\":\"%s\",\"net\":\"%s\",\"ap\":\"%s\",\"fz\":%d,\"ble\":{\"mtu\":%u}",
@@ -316,6 +488,12 @@ String statusJson(bool full, char who) {
   if (who == FROM_CLI)
     snprintf(s + strlen(s), sizeof s - strlen(s), ",\"busy\":%d,\"ip\":\"%s\",\"link\":{\"via\":\"%s\",\"mtu\":%u}", app,
              net_ip().c_str(), cli_wifi() ? "wifi" : "ble", cli_mtu());
+  {
+    char frag[24];
+    hid_link_t facts = hidFacts();
+    hid_status_compact(frag, sizeof frag, hid_select(ble_hid_pref(), &facts));
+    snprintf(s + strlen(s), sizeof s - strlen(s), ",%s", frag);
+  }
   strlcat(s, "}", sizeof s);
   return s;
 }
@@ -402,7 +580,8 @@ void setup() {
   if (!cli_tcp_begin()) board_log("cli: Wi-Fi link failed to start");
   ble_begin("ESP32 Agent " + board_suffix());
   startAirplay();
-  xTaskCreatePinnedToCore(statusTask, "status", 4096, NULL, 1, NULL, 1);
+  // statusJson keeps a 1280-byte buffer on this task. 4096 was tight once the hid object was added.
+  xTaskCreatePinnedToCore(statusTask, "status", 6144, NULL, 1, NULL, 1);
   board_log("boot %s fw %s: free internal heap %u (largest %u), PSRAM %u, reset %s\n", receiverName.c_str(), FW_VERSION,
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
@@ -417,13 +596,22 @@ void loop() {
   // A gesture cut off mid-way must not leave the button held (long press); only the side that went holds it.
   bool app = ble_app_connected(), appActive = ble_app_active();
   if (linked && !app) {
-    if (arb_gone(&arb, ARB_APP)) mouse.release(MOUSE_LEFT);
+    if (arb_gone(&arb, ARB_APP)) {
+      mouse.release(MOUSE_LEFT);
+      ble_hid_button(false);
+    }
     keyboard.releaseAll();
+    ble_hid_keyboard(0, NULL, 0);
+    consumer.release();
+    ble_hid_consumer(0);
     video_stream(false, FROM_APP);
     appHears = false;  // until the app says so again
   }
   if (cliLinked && !cli) {
-    if (arb_gone(&arb, ARB_CLI)) mouse.release(MOUSE_LEFT);
+    if (arb_gone(&arb, ARB_CLI)) {
+      mouse.release(MOUSE_LEFT);
+      ble_hid_button(false);
+    }
     video_stream(false, FROM_CLI);
   }
   // The app wins: a CLI session up alongside it stops at once and is dropped shortly after, once its status
@@ -431,7 +619,10 @@ void loop() {
   static uint32_t cliDropAt = 0;
   if (appActive && cli) {
     if (!cliDropAt) {
-      if (arb_gone(&arb, ARB_CLI)) mouse.release(MOUSE_LEFT);
+      if (arb_gone(&arb, ARB_CLI)) {
+        mouse.release(MOUSE_LEFT);
+        ble_hid_button(false);
+      }
       video_stream(false, FROM_CLI);
       ble_cli_status(statusJson(true, FROM_CLI), statusJson(false, FROM_CLI));
       cliDropAt = millis() + 300;

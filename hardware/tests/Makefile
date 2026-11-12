@@ -8,7 +8,7 @@ MBEDTLS := $(firstword $(wildcard $(BREW)/opt/mbedtls@3 $(BREW)/opt/mbedtls) /us
 
 HOST_CFLAGS = -std=c11 -Wall -Wextra -g -fsanitize=address,undefined -I../hid_bridge
 
-test: test_main.c $(SRC)/bplist/bplist.c $(SRC)/video/gop.c $(SRC)/airplay/keystream.c $(SRC)/cli/cli_proto.c $(SRC)/hid/arbiter.c $(SRC)/hid/pace.c $(SRC)/log/logring.c $(SRC)/airplay/mdns.c $(SRC)/airplay/audio.c $(SRC)/heard/heard.c plain_bound pair_window ble_ingress video_recovery command_line
+test: test_main.c $(SRC)/bplist/bplist.c $(SRC)/video/gop.c $(SRC)/airplay/keystream.c $(SRC)/cli/cli_proto.c $(SRC)/hid/arbiter.c $(SRC)/hid/pace.c $(SRC)/log/logring.c $(SRC)/airplay/mdns.c $(SRC)/airplay/audio.c $(SRC)/heard/heard.c plain_bound pair_window ble_ingress video_recovery command_line hid_transport
 	$(CC) $(CFLAGS) -Istubs -I$(MBEDTLS)/include -o $@ $(filter %.c,$^) -L$(MBEDTLS)/lib -lmbedcrypto -lm
 	./test
 	./plain_bound
@@ -16,6 +16,7 @@ test: test_main.c $(SRC)/bplist/bplist.c $(SRC)/video/gop.c $(SRC)/airplay/keyst
 	./ble_ingress
 	./video_recovery
 	./command_line
+	./hid_transport
 
 plain_bound: test_plain_bound.c
 	$(CC) $(HOST_CFLAGS) -o $@ $<
@@ -33,7 +34,14 @@ video_recovery: test_video_recovery.cpp ../hid_bridge/video_link.cpp $(SRC)/vide
 command_line: test_command_line.c $(SRC)/hid/command_line.h
 	$(CC) $(HOST_CFLAGS) -o $@ $<
 
-clean:
-	rm -f test plain_bound pair_window ble_ingress video_recovery video_gop.o command_line
+hid_transport: test_transport.c $(SRC)/hid/transport.c $(SRC)/hid/keys.c
+	$(CC) $(HOST_CFLAGS) -o $@ test_transport.c $(SRC)/hid/transport.c $(SRC)/hid/keys.c
 
-.PHONY: clean
+sim_board:
+	$(MAKE) -C sim cli_sim
+
+clean:
+	rm -f test plain_bound pair_window ble_ingress video_recovery video_gop.o command_line hid_transport
+	$(MAKE) -C sim clean
+
+.PHONY: clean sim_board

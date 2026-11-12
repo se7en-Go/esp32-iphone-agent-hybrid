@@ -36,3 +36,5 @@ bool ble_cli_subscribed(int slot);
 bool ble_cli_notify(int slot, const uint8_t *p, size_t n, bool video, uint32_t timeout_ms);
 void ble_cli_drop(int slot);
 void ble_cli_push_cmd(const char *line, size_t n);
+void ble_forget_addr(uint8_t type, const uint8_t addr[6]); // drop one address from the in-RAM known list
+bool ble_app_advertising();                                // public identity, the one that carries HID, is on air

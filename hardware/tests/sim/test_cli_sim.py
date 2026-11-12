@@ -211,5 +211,25 @@ got = frames(b, c, 1.3)
 check(any(p and b"err waiting for keyframe" in p for s, _, p in got if s == "B"), "snap wait_idr + ap streaming → waiting for keyframe")
 b.close()
 
+# Transport: nothing attached, auto names both links; forcing ble changes the pace number.
+b = Board(nvs, CLI_SIM_USB="off", CLI_SIM_BLE="off")
+c.hello(b)
+c.cmd(b, "1 move 3 4")
+c.cmd(b, "2 hid ble")
+c.cmd(b, "3 pace")
+c.cmd(b, "4 hid")
+got = frames(b, c, 1.6)
+text = [p for s, _, p in got if s == "B" and p and p[:1] == b"r"]
+check(b"r1 err phone not connected over usb/ble" in text, f"auto with nothing connected ({text})")
+check(b"r2 ok" in text, "hid ble is accepted")
+check(b"r3 ok 4" in text, "ble preference reports pace 4 before a central connects")
+check(b"r4 ok ble" in text, "hid query returns the saved mode")
+status = [p for s, _, p in got if s == "B" and p and p[:1] == b"s"]
+body = json.loads(status[-1][1:]) if status else {}
+hid = body.get("hid") or {}
+check(hid.get("mode") == "ble" and hid.get("path") == "none", f"status hid fields {hid}")
+check((hid.get("ble") or {}).get("adv") == 1, "status says the HID identity is advertising")
+b.close()
+
 print("all passed" if not fails else f"{fails} FAILED")
 sys.exit(fails != 0)
