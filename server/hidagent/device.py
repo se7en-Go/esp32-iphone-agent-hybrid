@@ -14,12 +14,15 @@ import os
 import sys
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
+from dataclasses import dataclass
 
 import serial
 from serial.tools import list_ports
 
 from . import messages
+from .operation import check_operation, shield_cleanup
 
 log = logging.getLogger(__name__)
 
@@ -41,12 +44,32 @@ COM_BRIDGES = {
 # 打开串口后有的克隆板会复位，setup() 要几秒。同一句柄上每隔 300ms 再问一次，不要反复开关口。
 PING_EVERY = 0.3
 PING_WINDOW = 8.0
+RELEASE_TIMEOUT = 1.0
 HID_COMMANDS = {"home", "move", "press", "release", "click", "scroll", "type", "key", "homescreen"}
 FIXED_ID = {"netinfo", "status", "net"}
 
 
 class DeviceError(RuntimeError):
     pass
+
+
+@dataclass
+class ExchangeTiming:
+    sent_at: float | None = None
+
+
+_exchange_timing: ContextVar[ExchangeTiming | None] = ContextVar("exchange_timing", default=None)
+
+
+@contextmanager
+def exchange_timing():
+    """Capture the monotonic write boundary after any wait for the serial lock."""
+    timing = ExchangeTiming()
+    token = _exchange_timing.set(timing)
+    try:
+        yield timing
+    finally:
+        _exchange_timing.reset(token)
 
 
 def open_serial(port: str, baud: int = 115200, impl=None, platform: str | None = None):
@@ -163,6 +186,7 @@ class Device:
 
     def __init__(self):
         self._link = None
+        self._pressed_link = None
         self._lock = asyncio.Lock()
         self._seq = 0
         self._last = self._beat = 0.0
@@ -256,6 +280,30 @@ class Device:
     def clear_abort(self) -> None:
         self._abort = False
 
+    def _write_release(self, link) -> str:
+        req_id = self._request_id("release")
+        # Emergency cleanup must bypass both the operation deadline and the gate.
+        link.write(f"{req_id} release\n".encode())
+        self._pressed_link = None
+        return req_id
+
+    async def _release_held(self, link) -> None:
+        """Called with the serial lock held and the previous reply reader stopped."""
+        if self._pressed_link is not link:
+            return
+
+        async def release():
+            req_id = self._write_release(link)
+            await self._read_reply(link, req_id, RELEASE_TIMEOUT)
+
+        try:
+            await shield_cleanup(release())
+        except (OSError, asyncio.TimeoutError):
+            # A reset is only allowed after attempting release on the original link.
+            link.close()
+            if self._link is link:
+                self._link = None
+
     async def exchange(self, command: str) -> str:
         if not self.connected:
             raise DeviceError(messages.BOARD_NOT_CONNECTED)
@@ -274,15 +322,28 @@ class Device:
             try:
                 # 板子收到这一行之后才选 USB 或 BLE。两条路都先经过这把锁里的熔断复查，没有第二条写手机的路。
                 with write_guard if write_guard is not None else nullcontext():
+                    if name in HID_COMMANDS and name != "release":
+                        check_operation()
+                    timing = _exchange_timing.get()
+                    if timing is not None:
+                        timing.sent_at = time.monotonic()
+                    if name == "press":
+                        self._pressed_link = link  # the write may succeed before its ACK arrives
                     link.write(f"{req_id} {command}\n".encode())
+                    if name == "release" and self._pressed_link is link:
+                        self._pressed_link = None
                 reply = await self._read_reply(link, req_id, timeout)
             except asyncio.CancelledError:
-                if not self._abort:
+                await self._release_held(link)
+                # HID IDs are unique, so late ACKs can be ignored without closing UART.
+                # Fixed-ID queries still need a reset to avoid consuming a stale reply.
+                if name in FIXED_ID and not self._abort:
                     link.close()
                     if self._link is link:
                         self._link = None
                 raise
             except (OSError, asyncio.TimeoutError) as exc:
+                await self._release_held(link)
                 link.close()
                 if self._link is link:
                     self._link = None
@@ -302,14 +363,23 @@ class Device:
         try:
             await asyncio.wait({task})
         except asyncio.CancelledError:
-            # 3.10 不会跟着把子任务取消掉。这里自己关掉串口，下一句才不会读到半截回复。
+            # Stop the reply reader, then let its shielded release finish before
+            # returning to the caller. Never close UART ahead of that cleanup.
             task.cancel()
-            if not self._abort:
-                link = self._link
+            try:
+                await shield_cleanup(asyncio.gather(task, return_exceptions=True))
+            finally:
+                link = self._pressed_link
                 if link is not None:
-                    link.close()
-                    if self._link is link:
-                        self._link = None
+                    # Cancellation may have happened while queued behind a background
+                    # query. Only emergency release may bypass the serial lock. Do not
+                    # start another reader; its unique ACK can be ignored by that query.
+                    try:
+                        self._write_release(link)
+                    except OSError:
+                        link.close()
+                        if self._link is link:
+                            self._link = None
             raise
         finally:
             self._exchanges.discard(task)

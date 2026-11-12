@@ -14,7 +14,9 @@ from collections import deque
 from pathlib import Path
 
 from . import vision
-from .device import Device, DeviceError
+from .device import RELEASE_TIMEOUT, Device, DeviceError, exchange_timing
+from .operation import OPERATION_TIMEOUT, bounded_operation, check_operation, shield_cleanup
+from .screen import FrameSnapshot
 
 log = logging.getLogger(__name__)
 
@@ -68,12 +70,19 @@ NUDGE = 12              # mouse units the pointer is wiggled by to find it on sc
 # How long to watch for a nudge to show up. The AirPlay mirror lags: on an iPhone 15 Pro Max (iOS 26.3.1) a
 # 12 unit nudge appeared 0.15 to 1.5 s after it was sent, so the old fixed 1.2 s window missed some.
 POINTER_WAIT = 2.5      # seconds per direction (nudge, then the way back), never more
+# A first connection or an expired resume point can replay video since the last IDR (26 minutes of frames
+# and 45 s to catch up on the test phone). Arrival lag above REPLAY_LAG signals replay; shorter lag still
+# needs the per-nudge timestamp check. Normal mirror lag is 0.15–1.5 s; a still screen keeps its last frame.
+REPLAY_LAG = 5          # seconds
+CATCH_UP_WAIT = 15      # leave time for verification and a response inside the total operation budget
 AIM_TOLERANCE = 0.008   # screen fraction; a bigger miss is corrected before pressing
 MAX_MISS = 0.06         # bigger misses are still corrected, but not learned from (they may be misreadings)
 USB_PACE = 3            # firmware HID_PACE_USB. A saved file with no pace number is this schedule.
 
 
 class Phone:
+    operation_timeout = OPERATION_TIMEOUT
+
     def __init__(self, device: Device, calibration_file: Path, screen=None):
         self.device, self._file, self.screen = device, calibration_file, screen
         # mouse units needed to cross the full screen width / height
@@ -117,11 +126,24 @@ class Phone:
     def _stopped(self, epoch: int) -> bool:
         return getattr(self.device, "abort_epoch", 0) != epoch
 
-    async def _send(self, epoch: int, command: str) -> None:
-        if self._stopped(epoch):
-            raise DeviceError("已紧急停止，后面的内容没有发出。")
+    @staticmethod
+    def _check_operation() -> None:
+        check_operation()
+
+    async def _command(self, command: str) -> None:
+        if command != "release":
+            self._check_operation()
         await self.device.send(command)
 
+    async def _send(self, epoch: int, command: str) -> float:
+        if self._stopped(epoch):
+            raise DeviceError("已紧急停止，后面的内容没有发出。")
+        started = time.monotonic()
+        with exchange_timing() as timing:
+            await self._command(command)
+        return timing.sent_at if timing.sent_at is not None else started
+
+    @bounded_operation
     async def start_calibration(self) -> bool:
         """Find the pointer on screen at two known distances from the corner and fit the mapping from both.
 
@@ -184,55 +206,148 @@ class Phone:
         """
         if epoch is None:
             epoch = getattr(self.device, "abort_epoch", 0)
+        clock = await self._catch_up(epoch)
         await self._wait_screen(epoch, self.screen.settled(
             quiet=0.2, least=0.3, most=1.5, transport=conservative))
         if self._stopped(epoch):
             raise DeviceError("已紧急停止，后面的内容没有发出。")
         nudge = NUDGE if near is None or near[0] < 0.9 else -NUDGE  # stay clear of the right edge
         shift = nudge / self.span["w"] if self.span else 0.025 * (1 if nudge > 0 else -1)
-        history = [self.screen.frame] if self.screen.frame else []
-        sent = time.time()
-        found, back = None, time.time()
-        await self._send(epoch, f"move {nudge} 0")
-        try:
-            found = await self._watch(epoch, history, near, shift, sent, conservative, at_start=True)
-        finally:
-            if not self._stopped(epoch):
-                back = time.time()
-                await self.device.send(f"move {-nudge} 0")
+        # Rebuild the baseline after catching up and settling, from one coherent publication.
+        baseline = self._snapshot()
+        history = [baseline.frame] if baseline else []
+        sent = await self._send(epoch, f"move {nudge} 0")
+        found = await self._watch(epoch, history, near, shift, sent, conservative, True, clock)
+        # An interrupted/expired search must never issue a cleanup HID movement.
+        back = await self._send(epoch, f"move {-nudge} 0")
         if found is None and not self._stopped(epoch):
             # the nudge was not seen: the pointer rests where the way back leaves it
-            found = await self._watch(epoch, history, near, -shift, back, conservative, at_start=False)
+            found = await self._watch(epoch, history, near, -shift, back, conservative, False, clock)
         return found if found and 0.03 < found[0] < 0.97 and 0.03 < found[1] < 0.97 else None
 
     async def _watch(self, epoch: int, history: list, near, shift: float, since: float,
-                     conservative: bool, at_start: bool) -> tuple[float, float] | None:
+                     conservative: bool, at_start: bool, clock: float | None = None) -> tuple[float, float] | None:
         """Watch new frames until one shows the pointer nudged by `shift` from an earlier frame.
 
         Returns where the pointer was before the nudge (at_start) or after it.
         """
         deadline = time.monotonic() + POINTER_WAIT + (0.5 if conservative else 0)
+        sent = since  # fixed command boundary; `since` advances as publications are consumed
         searches = ([(near, (0.12, 0.08))] if near else []) + [((0.5, 0.5), (0.5, 0.5))]
         while time.monotonic() < deadline:
+            self._check_operation()
             if self._stopped(epoch):
                 raise DeviceError("已紧急停止，后面的内容没有发出。")
-            after = await self.screen.fresh(since, min(.2, max(0, deadline - time.monotonic())))
-            if after:
-                since = self.screen.updated
+            snapshot = await self._fresh_snapshot(since, min(.2, max(0, deadline - time.monotonic())))
+            if snapshot:
+                after, since = snapshot.frame, snapshot.arrived
+                age = self._frame_age(clock, snapshot)
+                if age is not None and age > REPLAY_LAG:  # replayed old video, not the nudge
+                    history.clear()
+                    await asyncio.sleep(.02)
+                    continue
+                if (clock is not None and snapshot.board_ts is not None
+                        and self._board_delta(snapshot.board_ts, sent * 1000 + clock) <= 0):
+                    # A delayed pre-nudge landing can establish the baseline (normal AirPlay lag),
+                    # but it cannot be evidence of this nudge, even within the last five seconds.
+                    history[:] = [after]
+                    await asyncio.sleep(.02)
+                    continue
                 if not history or after != history[-1]:
-                    for before in reversed(history[-6:]):
+                    # the frame before the nudge, and the latest one (the before frame may predate the last move);
+                    # each comparison is tens of ms of pure Python, and hogging the GIL starves the video thread
+                    for before in dict.fromkeys(history[:1] + history[-1:]):
                         for look, reach in searches:
                             moved = vision.pointer_move(before, after, look, shift, reach)
                             if moved:
                                 return moved[0] if at_start else moved[1]
+                            await asyncio.sleep(0)
                     history.append(after)
             await asyncio.sleep(.02)
         return None
+
+    async def _board_clock(self) -> float | None:
+        """Board millis() minus monotonic ms; None for mirrors without board timestamps.
+
+        Use the query's actual write time, giving an upper bound on the board clock at each HID send. A midpoint
+        estimate can underestimate it by half an RTT and accidentally admit frames preceding the command.
+        """
+        query = getattr(self.device, "query", None)
+        snapshot = self._snapshot()
+        if query is None or snapshot is None or snapshot.board_ts is None:
+            return None
+        try:
+            sent = time.monotonic()
+            with exchange_timing() as timing:
+                up = json.loads(await query("status"))["up"]
+            sent = timing.sent_at if timing.sent_at is not None else sent
+            return up + 1 - sent * 1000  # millis() truncates: include its sub-millisecond uncertainty
+        except (DeviceError, OSError, ValueError, KeyError, TypeError) as exc:
+            raise DeviceError("无法确认画面对应的板子时间；没有继续验证或点击，请重试。") from exc
+
+    @staticmethod
+    def _board_delta(later: float, earlier: float) -> float:
+        """Signed u32 millis distance, including a wrap (timestamps within half the 49.7 day period)."""
+        return (later - earlier + 2**31) % 2**32 - 2**31
+
+    def _snapshot(self) -> FrameSnapshot | None:
+        if hasattr(self.screen, "snapshot"):
+            return self.screen.snapshot
+        # Compatibility for legacy, untimestamped screen providers. Production mirrors publish snapshots.
+        frame = self.screen.frame
+        if frame is None:
+            return None
+        arrived = time.monotonic() - max(0, time.time() - self.screen.updated)
+        return FrameSnapshot(frame, getattr(self.screen, "frame_ts", None), arrived)
+
+    async def _fresh_snapshot(self, since: float, timeout: float) -> FrameSnapshot | None:
+        if hasattr(self.screen, "fresh_snapshot"):
+            return await self.screen.fresh_snapshot(since, timeout)
+        after = await self.screen.fresh(time.time() - (time.monotonic() - since), timeout)
+        return self._snapshot() if after else None
+
+    def _frame_age(self, clock: float | None, snapshot: FrameSnapshot | None = None) -> float | None:
+        """Seconds the shown frame was already behind the board's clock when it arrived; None when unknown.
+
+        Not its age now: a still screen keeps its last live frame for minutes, and that is the screen as it is.
+        """
+        snapshot = snapshot or self._snapshot()
+        if clock is None or snapshot is None or snapshot.board_ts is None:
+            return None
+        return self._board_delta(snapshot.arrived * 1000 + clock, snapshot.board_ts) / 1000
+
+    async def _catch_up(self, epoch: int) -> float | None:
+        """Wait (bounded) until the mirror shows the phone as it is now, not the board's replay of old video.
+
+        While frames keep arriving far behind the board's clock the replay is running. A pause of 2 s ends the
+        wait (the screen may simply be still); frames that come late after that are still ignored by _watch.
+        Returns the board clock offset.
+        """
+        clock = await self._board_clock()
+        if clock is None:
+            return None
+        deadline, logged = time.monotonic() + CATCH_UP_WAIT, False
+        while time.monotonic() < deadline:
+            self._check_operation()
+            if self._stopped(epoch):
+                raise DeviceError("已紧急停止，后面的内容没有发出。")
+            snapshot = self._snapshot()
+            age = self._frame_age(clock, snapshot)
+            if age is None or age < REPLAY_LAG or (snapshot and time.monotonic() - snapshot.arrived > 2):
+                if logged:
+                    log.info("screen: replay finished")
+                return clock
+            if not logged:
+                log.info("screen: board is replaying old video (frame %.0f s behind on arrival), waiting", age)
+                logged = True
+            await asyncio.sleep(0.2)
+        raise DeviceError("画面还在重放旧视频（重连后板子从上一个关键帧重放），请稍后再试。")
 
     async def _wait_screen(self, epoch: int, awaitable) -> None:
         task = asyncio.create_task(awaitable)
         try:
             while not task.done():
+                self._check_operation()
                 if self._stopped(epoch):
                     break
                 await asyncio.sleep(0.02)
@@ -307,6 +422,7 @@ class Phone:
         if aim and self.screen is not None:
             await self._aim(x, y)
 
+    @bounded_operation
     async def point_verified(self, x: float, y: float) -> tuple[float, float]:
         """Locate and correct the real pointer; never silently accept a blind move."""
         if self.screen is None or not self.screen.live:
@@ -320,16 +436,23 @@ class Phone:
             if found is None:
                 continue
             fx, fy = found
+            if attempt == 0 and self.span and max(abs(fx - x), abs(fy - y)) <= MAX_MISS:
+                # long moves go further than the calibration stops (iOS accelerates): 422 units across landed
+                # 30 px right of the fit on the 15 Pro Max; learn it so the next move starts closer
+                self._seen["x"].append((self._fix(x, "x"), fx))
+                self._seen["y"].append((self._fix(y, "y"), fy))
+                self._save()
             if abs(fx - x) <= AIM_TOLERANCE and abs(fy - y) <= AIM_TOLERANCE:
                 return found
             dx, dy = round((x - fx) * self.span["w"]), round((y - fy) * self.span["h"])
-            await self.device.send(f"move {dx} {dy}")
+            await self._command(f"move {dx} {dy}")
             self._pos = (self._pos[0] + dx, self._pos[1] + dy)
         raise RuntimeError("pointer could not be verified; no click sent; observe or recalibrate")
 
+    @bounded_operation
     async def tap_verified(self, x: float, y: float) -> None:
         await self.point_verified(x, y)
-        await self.device.send("click")
+        await self._command("click")
         await asyncio.sleep(TAP_GAP)
 
     async def _aim(self, x: float, y: float) -> None:
@@ -347,7 +470,7 @@ class Phone:
         if abs(fx - x) <= AIM_TOLERANCE and abs(fy - y) <= AIM_TOLERANCE:
             return
         dx, dy = round((x - fx) * self.span["w"]), round((y - fy) * self.span["h"])  # fix this miss right away
-        await self.device.send(f"move {dx} {dy}")
+        await self._command(f"move {dx} {dy}")
         self._pos = (self._pos[0] + dx, self._pos[1] + dy)
 
     def _fix(self, t: float, axis: str) -> float:
@@ -365,27 +488,27 @@ class Phone:
 
     async def _move_to(self, tx: int, ty: int, rehome: bool = True) -> None:
         if self._link != self.device.links:  # new link: a dropped gesture may have left the button down
-            await self.device.send("release")
+            await self._command("release")
             self._pos, self._link = None, self.device.links
         if self._pos is None or (rehome and self._moves >= REHOME_EVERY):
-            await self.device.send("home")
+            await self._command("home")
             self._pos, self._moves = (0, 0), 0
         x, y = self._pos
         self._pos = None  # unknown until the move succeeds
-        await self.device.send(f"move {tx - x} {ty - y}")
+        await self._command(f"move {tx - x} {ty - y}")
         self._pos, self._moves = (tx, ty), self._moves + 1
 
     async def reset(self) -> None:
         """Let go of the button and re-home the pointer, whatever state a gesture left."""
         self._pos = None
-        await self.device.send("release")
-        await self.device.send("home")
+        await self._command("release")
+        await self._command("home")
         self._pos, self._moves = (0, 0), 0
 
     async def tap(self, x: float, y: float, aim: bool = False) -> None:
         """aim=True finds the pointer on screen first (slower); worth it when a tap just missed."""
         await self.point(x, y, aim)
-        await self.device.send("click")
+        await self._command("click")
         await asyncio.sleep(TAP_GAP)
 
     async def swipe(self, x1: float, y1: float, x2: float, y2: float, hold: bool = True) -> None:
@@ -398,18 +521,21 @@ class Phone:
         System gestures (home, back) need the flick, so they pass hold=False.
         """
         await self.point(*points[0])
-        await self.device.send("press")
         try:
+            await self._command("press")
             for x, y in points[1:]:
                 await self._move_to(self._dx(x), self._dy(y), rehome=False)  # never home mid-drag
             if hold:
                 await asyncio.sleep(HOLD)
         finally:
-            await self.device.send("release")
+            try:
+                await shield_cleanup(asyncio.wait_for(self._command("release"), RELEASE_TIMEOUT))
+            except asyncio.TimeoutError as exc:
+                raise DeviceError("release cleanup timed out") from exc
 
     async def scroll(self, x: float, y: float, lines: int) -> None:
         await self.point(x, y)
-        await self.device.send(f"scroll {lines} 0")
+        await self._command(f"scroll {lines} 0")
 
     async def type(self, text: str) -> None:
         # 固件串口一行最多 512 字节，含 "<id> type "。超长就切开，每段都要等到 ok。
@@ -417,10 +543,10 @@ class Phone:
         for part in type_chunks(text):
             if getattr(self.device, "abort_epoch", 0) != epoch:
                 raise DeviceError("已紧急停止，后面的内容没有发出。")
-            await self.device.send(f"type {part}")
+            await self._command(f"type {part}")
 
     async def key(self, combo: str) -> None:
-        await self.device.send(f"key {combo}")
+        await self._command(f"key {combo}")
 
     async def go_home(self) -> None:
         await self.swipe(0.5, 0.995, 0.5, 0.6, hold=False)  # resting here would open the app switcher
