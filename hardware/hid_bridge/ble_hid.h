@@ -11,6 +11,7 @@ void ble_hid_begin(NimBLEServer *server);
 String ble_hid_command(const char *arg); // "ok" / "ok <mode>" / "err ..."
 
 bool ble_hid_connected(); // encrypted and subscribed to an input report
+bool ble_hid_session_active(); // owning ACL still exists, even while reports are unavailable
 bool ble_hid_using(uint16_t handle); // this connection is the one holding an input subscription
 bool ble_hid_bonded();    // a HID bond is stored
 bool ble_hid_pair_window_open();

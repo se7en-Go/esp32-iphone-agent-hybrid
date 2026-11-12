@@ -16,6 +16,7 @@
 #include <esp_mac.h>
 #include <esp_wifi.h>
 #include <esp_core_dump.h>
+#include <atomic>
 #include "USB.h"
 #include "USBHIDMouse.h"
 #include "USBHIDKeyboard.h"
@@ -71,19 +72,63 @@ static hid_link_t hidFacts() {
 }
 
 // Only the command/loop task touches this state. Keep the report's originating
-// path until its release is accepted, even if USB resumes or the preference changes.
+// path until its release is accepted or that connection ends. A failed release
+// quarantines only its own route after a short grace period, never the other host.
 enum { HELD_MOUSE = 1, HELD_KEYS = 2, HELD_CONSUMER = 4, HELD_ALL = 7 };
 static uint8_t heldReports[3];
 static bool releasePending[3];
+static uint32_t releaseStarted[3], releaseLastTry[3];
+// statusTask only reads the quarantine flags; release bookkeeping stays on loop().
+static std::atomic<bool> releaseDeferred[3];
+static std::atomic<bool> usbSessionEnded;
+static const uint32_t HID_RELEASE_WAIT_MS = 250, HID_RELEASE_RETRY_MS = 50;
+
+static void usbHidStopped(void *, esp_event_base_t, int32_t, void *) {
+  // Do not touch report state from the USB event task. Remember even a disconnect
+  // followed by a reconnect before the next loop observes tud_mounted().
+  usbSessionEnded = true;
+}
+
+static void clearReleaseState(int path) {
+  heldReports[path] = 0;
+  releasePending[path] = releaseDeferred[path] = false;
+}
+
+static void markReleasePending(int path) {
+  if (!releasePending[path]) releaseStarted[path] = millis();
+  releasePending[path] = true;
+}
+
+static bool releaseIsDeferred(int path) {
+  if (releasePending[path] && (uint32_t)(millis() - releaseStarted[path]) >= HID_RELEASE_WAIT_MS)
+    releaseDeferred[path] = true;
+  return releasePending[path] && releaseDeferred[path];
+}
 
 static bool releaseReports(int path, uint8_t reports) {
-  if (!reports) {
-    if (!heldReports[path]) releasePending[path] = false;
+  // A detached USB device / ended BLE ACL no longer owns host key state.
+  // Suspend, lost encryption and lost subscriptions do not end that session.
+  bool ended = path == HID_PATH_USB && usbSessionEnded.exchange(false);
+  bool alive = path == HID_PATH_USB ? tud_mounted() : ble_hid_session_active();
+  if (ended || !alive) {
+    if (path == HID_PATH_USB && heldReports[path]) {
+      // Arduino caches down reports even when USB cannot send. Clear those too,
+      // otherwise the next move after reattachment can resurrect a held button.
+      mouse.release(MOUSE_LEFT);
+      keyboard.releaseAll();
+    }
+    clearReleaseState(path);
     return true;
   }
+  if (!reports) {
+    if (!heldReports[path]) clearReleaseState(path);
+    return true;
+  }
+  releaseLastTry[path] = millis();
   bool ready = path == HID_PATH_USB ? tud_mounted() && !tud_suspended() : ble_hid_connected();
   if (!ready) {
-    releasePending[path] = true;
+    heldReports[path] |= reports;
+    markReleasePending(path);
     return false;
   }
   bool ok = true;
@@ -95,9 +140,13 @@ static bool releaseReports(int path, uint8_t reports) {
       else if (bit == HELD_KEYS) sent = ble_hid_keyboard(0, NULL, 0);
       else sent = ble_hid_consumer(0);
     } else {
-      // Mouse/keyboard release have no return value in the Arduino USB API.
-      // Never discard a pending release while USB is suspended or detached.
-      if (bit == HELD_MOUSE) mouse.release(MOUSE_LEFT);
+      if (bit == HELD_MOUSE) {
+        // release() clears Arduino's cache even when its void send fails. Always
+        // force a zero report and check acceptance, including on later retries.
+        mouse.release(MOUSE_LEFT);
+        hid_mouse_report_t zero = {};
+        sent = mouse.sendReport(zero);
+      }
       else if (bit == HELD_KEYS) keyboard.releaseAll();
       else sent = consumer.release() != 0;
       sent = sent && tud_mounted() && !tud_suspended();
@@ -105,7 +154,8 @@ static bool releaseReports(int path, uint8_t reports) {
     if (sent) heldReports[path] &= ~bit;
     else { heldReports[path] |= bit; ok = false; }
   }
-  releasePending[path] = !ok || (releasePending[path] && heldReports[path]);
+  if (!ok) markReleasePending(path);
+  else if (!heldReports[path]) clearReleaseState(path);
   return ok;
 }
 
@@ -129,21 +179,53 @@ static bool releaseHid() { return releaseHidReports(HELD_ALL); }
 static bool syncHidPath(int next) {
   bool ok = true;
   for (int path = HID_PATH_USB; path <= HID_PATH_BLE; path++) {
-    if ((path != next || releasePending[path]) && !releasePath(path, false, HELD_ALL)) ok = false;
+    if (path == next && !releasePending[path]) continue;
+    // Only background retries are throttled; explicit release always attempts
+    // both routes. Keep the pending bits even after allowing an alternate route.
+    bool deferred = releaseIsDeferred(path);
+    bool alive = path == HID_PATH_USB ? tud_mounted() : ble_hid_session_active();
+    if (!deferred || !alive || (uint32_t)(millis() - releaseLastTry[path]) >= HID_RELEASE_RETRY_MS)
+      releasePath(path, false, HELD_ALL);
+    if (releasePending[path] && (path == next || !releaseIsDeferred(path))) ok = false;
   }
   return ok;
+}
+
+static int selectHidPath(int pref, hid_link_t link) {
+  // AUTO can continue on the healthy route while the preferred one is waiting
+  // for a release. Never send new input on the route whose zero report failed.
+  if (pref == HID_PREF_AUTO) {
+    if (releaseDeferred[HID_PATH_USB]) link.usb_mounted = 0;
+    if (releaseDeferred[HID_PATH_BLE]) link.ble_connected = 0;
+  }
+  return hid_select(pref, &link);
+}
+
+static bool prepareHidPath(int pref, const hid_link_t &link, int &next) {
+  if (usbSessionEnded) releaseReports(HID_PATH_USB, 0);
+  for (int path = HID_PATH_USB; path <= HID_PATH_BLE; path++) releaseIsDeferred(path);
+  next = selectHidPath(pref, link);
+  bool ok = syncHidPath(next);
+  // A send attempt may have exhausted the grace period. Reconsider AUTO once.
+  int after = selectHidPath(pref, link);
+  if (after != next) {
+    next = after;
+    ok = syncHidPath(next);
+  }
+  return ok && !(next == HID_PATH_NONE && hid_select(pref, &link) != HID_PATH_NONE);
 }
 
 // Called by ble_hid_set_pref before saving or acknowledging an explicit switch.
 bool hid_prepare_pref(int next) {
   hid_link_t link = hidFacts();
-  return syncHidPath(hid_select(next, &link));
+  int path;
+  return prepareHidPath(next, link, path);
 }
 
 static int activePath() {
   hid_link_t link = hidFacts();
-  int next = hid_select(ble_hid_pref(), &link);
-  return syncHidPath(next) ? next : HID_PATH_NONE;
+  int next;
+  return prepareHidPath(ble_hid_pref(), link, next) ? next : HID_PATH_NONE;
 }
 
 static bool buttonOn(int path, bool down) {
@@ -184,7 +266,8 @@ static bool phoneReady(const char **why) {
     for (int i = 0; i < 50 && tud_suspended(); i++) delay(10);
     link = hidFacts();
   }
-  if (!syncHidPath(hid_select(pref, &link))) {
+  int next;
+  if (!prepareHidPath(pref, link, next)) {
     if (why) *why = "err hid release pending";
     return false;
   }
@@ -333,7 +416,7 @@ String run(const String &line) {
   if (cmd == "pace") {  // per transport, so the host recalibrates when the pipe changes
     hid_link_t link = hidFacts();
     int pref = ble_hid_pref();
-    return String("ok ") + hid_pace_version(pref, hid_select(pref, &link));
+    return String("ok ") + hid_pace_version(pref, selectHidPath(pref, link));
   }
   if (cmd == "release") return releaseHid() ? "ok" : "err hid release pending";
   const char *why = NULL;
@@ -581,7 +664,7 @@ String statusJson(bool full, char who) {
     char frag[180];
     hid_link_t facts = hidFacts();
     int prefNow = ble_hid_pref();
-    int path = hid_select(prefNow, &facts);
+    int path = selectHidPath(prefNow, facts);
     hid_status_fragment(frag, sizeof frag, prefNow, path, &facts);
     len = strlen(s);
     snprintf(s + len - 1, sizeof s - len + 1, ",%s}", frag);
@@ -597,7 +680,7 @@ String statusJson(bool full, char who) {
   {
     char frag[24];
     hid_link_t facts = hidFacts();
-    hid_status_compact(frag, sizeof frag, hid_select(ble_hid_pref(), &facts));
+    hid_status_compact(frag, sizeof frag, selectHidPath(ble_hid_pref(), facts));
     snprintf(s + strlen(s), sizeof s - strlen(s), ",%s", frag);
   }
   strlcat(s, "}", sizeof s);
@@ -671,6 +754,7 @@ void setup() {
   keyboard.begin();
   consumer.begin();
   USB.productName("HID Bridge");
+  USB.onEvent(ARDUINO_USB_STOPPED_EVENT, usbHidStopped);
   USB.begin();
   esp_task_wdt_config_t wdt = {.timeout_ms = WATCHDOG_MS, .idle_core_mask = 0, .trigger_panic = true};
   esp_task_wdt_reconfigure(&wdt);

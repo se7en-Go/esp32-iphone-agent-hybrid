@@ -16,11 +16,11 @@ struct ble_gap_conn_desc {
   struct { bool encrypted; } sec_state;
   struct { uint8_t type; uint8_t val[6]; } peer_id_addr;
 };
-inline bool connected = true;
+inline bool connected = true, link_encrypted = true;
 inline int ble_gap_conn_find(uint16_t h, ble_gap_conn_desc *d) {
   if (!connected || h != 1) return 1;
   *d = {};
-  d->sec_state.encrypted = true;
+  d->sec_state.encrypted = link_encrypted;
   d->peer_id_addr.val[5] = (uint8_t)h;
   return 0;
 }

@@ -47,6 +47,7 @@ static uint8_t buttons;
 static uint8_t lastMod, lastKeys[6];
 static uint16_t lastConsumer;
 static std::atomic<bool> unpairing;
+static std::atomic<uint32_t> sessionEpoch;
 
 static int blocksFor(size_t n) {
   const int data = MYNEWT_VAL(MSYS_1_BLOCK_SIZE) - 16;
@@ -59,6 +60,10 @@ static bool encrypted(uint16_t h) {
 }
 
 bool ble_hid_connected() { return (mouseOn || keyOn || consOn) && encrypted(connHandle); }
+bool ble_hid_session_active() {
+  ble_gap_conn_desc d;
+  return haveConn && ble_gap_conn_find(connHandle, &d) == 0;
+}
 bool ble_hid_bonded() { return bondCount > 0; }
 int ble_hid_pref() { return pref; }
 
@@ -113,6 +118,8 @@ void ble_hid_remember(uint8_t type, const uint8_t addr[6]) {
 }
 
 static void clearLatch() {
+  // Invalidate reports waiting for mbufs, even if NimBLE reuses the ACL handle.
+  sessionEpoch++;
   buttons = 0;
   lastMod = 0;
   memset(lastKeys, 0, sizeof lastKeys);
@@ -205,26 +212,28 @@ class HidCb : public NimBLECharacteristicCallbacks {
         NimBLEAddress id = ci.getIdAddress();
         ble_hid_remember(id.getType(), id.getVal());
       }
-    } else if (!mouseOn && !keyOn && !consOn) {
-      haveConn = false;
     }
+    // Losing CCCD subscriptions is not a disconnect. Keep the owner and latch
+    // until onDisconnect so a temporarily unavailable release stays retryable.
   }
 };
 
 static HidCb hidCb;
 
 static bool emit(NimBLECharacteristic *chr, const uint8_t *data, size_t n) {
+  uint32_t epoch = sessionEpoch;
+  uint16_t handle = connHandle;
   if (!chr || !ble_hid_connected()) return false;
   chr->setValue(data, n);
   const int reserve = 16; // same MBUF_RESERVE video refuses to enter
   int blocks = blocksFor(n);
   uint32_t start = millis();
   while ((int32_t)(millis() - start) < 40) {
-    if (!ble_hid_connected()) return false;
+    if (epoch != sessionEpoch || !ble_hid_connected()) return false;
     if (os_msys_num_free() >= blocks + reserve) {
       os_mbuf *om = ble_hs_mbuf_from_flat(data, n);
-      int rc = om ? ble_gatts_notify_custom(connHandle, chr->getHandle(), om) : BLE_HS_ENOMEM;
-      if (rc == 0) return true; // host accepted it; this is not an over-the-air acknowledgement
+      int rc = om ? ble_gatts_notify_custom(handle, chr->getHandle(), om) : BLE_HS_ENOMEM;
+      if (rc == 0) return epoch == sessionEpoch; // accepted by this session, not an air acknowledgement
       if (rc != BLE_HS_ENOMEM) return false;
     }
     delay(2);
@@ -240,11 +249,12 @@ bool ble_hid_mouse(int8_t x, int8_t y, int8_t wheel, int8_t pan) {
 bool ble_hid_button(bool left_down) {
   uint8_t next = left_down ? 0x01 : 0x00;
   if (next == buttons) return true;
-  uint8_t prev = buttons;
+  uint8_t report[5] = {next, 0, 0, 0, 0};
+  // Commit only accepted state. A disconnect while emit waits clears the latch;
+  // rolling back a failed release would resurrect that ended session's button.
+  if (!emit(mouseIn, report, sizeof report)) return false;
   buttons = next;
-  if (ble_hid_mouse(0, 0, 0, 0)) return true;
-  buttons = prev;
-  return false;
+  return true;
 }
 
 bool ble_hid_keyboard(uint8_t modifier, const uint8_t *keys, int nkeys) {

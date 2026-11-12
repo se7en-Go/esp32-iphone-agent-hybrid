@@ -2,6 +2,7 @@
 // the USB/BLE boundaries replaced. No copied command or route implementation.
 #include "route_stubs/Arduino.h"
 #include <cassert>
+#include <atomic>
 #include <cstdio>
 #include <vector>
 #include "../hid_bridge/src/hid/transport.h"
@@ -9,17 +10,24 @@
 #include "../hid_bridge/src/hid/pace.h"
 
 static int pref = HID_PREF_AUTO;
-static bool usbMounted, usbSuspended, bleConnected;
+static bool usbMounted, usbSuspended, bleConnected, bleSession;
 static bool bleButton, bleKey, bleConsumerHeld, usbButton, usbKey, usbConsumer;
 static int wakeups, usbMoves;
 static bool failBleRelease;
+static bool failUsbReport;
+static uint32_t nowMs;
+static int usbReportAttempts;
+static std::vector<uint8_t> usbAcceptedButtons;
 static bool suspendUsbDuringDelay;
 static std::vector<std::string> events;
-void delay(int) { if (suspendUsbDuringDelay) usbSuspended = true; }
+using esp_event_base_t = const char *;
+unsigned long millis() { return nowMs; }
+void delay(int ms) { nowMs += ms; if (suspendUsbDuringDelay) usbSuspended = true; }
 bool tud_mounted() { return usbMounted; }
 bool tud_suspended() { return usbSuspended; }
 void tud_remote_wakeup() { wakeups++; usbSuspended = false; }
 bool ble_hid_connected() { return bleConnected; }
+bool ble_hid_session_active() { return bleSession; }
 bool ble_hid_bonded() { return bleConnected; }
 bool ble_app_advertising() { return true; }
 bool ble_hid_pair_window_open() { return false; }
@@ -45,10 +53,35 @@ bool ble_hid_consumer(uint16_t usage) {
   events.push_back(usage ? "ble consumer down" : "ble consumer up");
   return true;
 }
+// Match Arduino USBHIDRelativeMouse: changing buttons updates the local cache
+// before attempting the report; repeating release() with a zero cache sends nothing.
+// sendReport() returns the endpoint result and deliberately leaves the cache alone.
+struct hid_mouse_report_t { uint8_t buttons; int8_t x, y, wheel, pan; };
+const int MOUSE_LEFT = 1;
 struct Mouse {
-  void move(int, int, int = 0, int = 0) { usbMoves++; events.push_back("usb move"); }
-  void press(int) { usbButton = true; events.push_back("usb mouse down"); }
-  void release(int) { if (!usbMounted || usbSuspended) return; usbButton = false; events.push_back("usb mouse up"); }
+  uint8_t cachedButtons = 0;
+  bool sendReport(hid_mouse_report_t report) {
+    usbReportAttempts++;
+    if (failUsbReport || !usbMounted || usbSuspended) return false;
+    usbAcceptedButtons.push_back(report.buttons);
+    usbButton = (report.buttons & MOUSE_LEFT) != 0;
+    if (report.x || report.y || report.wheel || report.pan) {
+      usbMoves++;
+      events.push_back("usb move");
+    } else {
+      events.push_back(usbButton ? "usb mouse down" : "usb mouse up");
+    }
+    return true;
+  }
+  void move(int8_t x, int8_t y, int8_t wheel = 0, int8_t pan = 0) {
+    sendReport({cachedButtons, x, y, wheel, pan});
+  }
+  void buttons(uint8_t b) {
+    if (b != cachedButtons) { cachedButtons = b; move(0, 0); }
+  }
+  void press(uint8_t b = MOUSE_LEFT) { buttons(cachedButtons | b); }
+  void release(uint8_t b = MOUSE_LEFT) { buttons(cachedButtons & ~b); }
+  bool isPressed(uint8_t b = MOUSE_LEFT) { return (cachedButtons & b) != 0; }
 } mouse;
 struct Keyboard {
   void releaseAll() { if (!usbMounted || usbSuspended) return; usbKey = false; events.push_back("usb key up"); }
@@ -59,7 +92,7 @@ struct Consumer {
   void press(int) { usbConsumer = true; }
   size_t release() { if (!usbMounted || usbSuspended) return 0; usbConsumer = false; events.push_back("usb consumer up"); return 1; }
 } consumer;
-const int HOME_REPORTS = 25, MOUSE_LEFT = 1;
+const int HOME_REPORTS = 25;
 const uint16_t AC_HOME = 0x0223;
 enum { KEY_RETURN = 0x80, KEY_ESC, KEY_TAB, KEY_BACKSPACE, KEY_UP_ARROW, KEY_DOWN_ARROW,
        KEY_LEFT_ARROW, KEY_RIGHT_ARROW, KEY_LEFT_GUI, KEY_LEFT_CTRL, KEY_LEFT_ALT, KEY_LEFT_SHIFT };
@@ -67,13 +100,21 @@ enum { KEY_RETURN = 0x80, KEY_ESC, KEY_TAB, KEY_BACKSPACE, KEY_UP_ARROW, KEY_DOW
 
 static void reset() {
   pref = HID_PREF_AUTO;
-  usbMounted = bleConnected = true;
+  usbMounted = bleConnected = bleSession = true;
   usbSuspended = false;
   bleButton = bleKey = bleConsumerHeld = usbButton = usbKey = usbConsumer = false;
-  failBleRelease = suspendUsbDuringDelay = false;
+  failBleRelease = failUsbReport = suspendUsbDuringDelay = false;
+  nowMs = 0;
+  usbReportAttempts = 0;
+  mouse.cachedButtons = 0;
+  usbAcceptedButtons.clear();
   wakeups = usbMoves = 0;
   memset(heldReports, 0, sizeof heldReports);
   memset(releasePending, 0, sizeof releasePending);
+  memset(releaseStarted, 0, sizeof releaseStarted);
+  memset(releaseLastTry, 0, sizeof releaseLastTry);
+  for (auto &deferred : releaseDeferred) deferred = false;
+  usbSessionEnded = false;
   events.clear();
 }
 
@@ -201,7 +242,209 @@ static void accepted_behaviors() {
   puts("ok BLE never wakes USB; NONE never sends USB mouse movement");
 }
 
-int main() {
+static void detached_routes_stop_blocking() {
+  reset();
+  assert(run("press") == "ok" && usbButton);
+  usbMounted = false;
+  usbButton = false;  // the detached host has discarded this HID device
+  assert(activePath() == HID_PATH_BLE);
+  assert(heldReports[HID_PATH_USB] == 0 && !releasePending[HID_PATH_USB]);
+  assert(run("move 1 0") == "ok");
+  assert(run("release") == "ok");
+  assert(hid_prepare_pref(HID_PREF_BLE));
+  // A USB reconnect must not re-send the cached down bit from the old session.
+  usbMounted = true;
+  assert(run("move 1 0") == "ok" && !usbButton);
+  assert(!mouse.isPressed());
+  puts("ok detached USB clears old held state and cached buttons");
+
+  reset();
+  pref = HID_PREF_BLE;
+  assert(run("press") == "ok" && bleButton);
+  uint8_t key = 4;
+  assert(bleKeyboard(0, &key, 1) && bleConsumer(AC_HOME));
+  bleConnected = bleSession = bleButton = bleKey = bleConsumerHeld = false;
+  assert(hid_prepare_pref(HID_PREF_USB));
+  pref = HID_PREF_USB;
+  assert(activePath() == HID_PATH_USB);
+  assert(heldReports[HID_PATH_BLE] == 0 && !releasePending[HID_PATH_BLE]);
+  assert(run("move 1 0") == "ok");
+  assert(run("release") == "ok");
+  puts("ok disconnected BLE clears all old reports and permits USB");
+}
+
+static void failed_usb_release_retries_zero_report() {
+  reset();
+  pref = HID_PREF_USB;
+  assert(run("press") == "ok" && usbButton);
+  failUsbReport = true;  // endpoint failure while mounted and awake
+  assert(!hid_prepare_pref(HID_PREF_BLE));
+  assert(usbButton && heldReports[HID_PATH_USB] == HELD_MOUSE);
+  assert(releasePending[HID_PATH_USB]);
+  int attempts = usbReportAttempts;
+  assert(run("release") == "err hid release pending");
+  assert(usbReportAttempts > attempts && usbButton);
+  failUsbReport = false;
+  attempts = usbReportAttempts;
+  assert(run("release") == "ok");
+  assert(usbReportAttempts > attempts && !usbButton);
+  assert(usbAcceptedButtons.back() == 0);
+  assert(!heldReports[HID_PATH_USB] && !releasePending[HID_PATH_USB]);
+  assert(run("move 1 0") == "ok" && !usbButton);
+  assert(run("press") == "ok" && usbButton);
+  assert(run("release") == "ok" && !usbButton);
+  puts("ok failed USB zero report is retried despite Arduino's cleared cache");
+}
+
+static void usb_reconnect_between_polls() {
+  reset();
+  assert(run("press") == "ok" && usbButton);
+  usbMounted = false;
+  usbButton = false;
+  usbHidStopped(nullptr, nullptr, 0, nullptr);
+  usbMounted = true; // the loop never observed tud_mounted() == false
+  assert(run("move 1 0") == "ok");
+  assert(!usbButton && !mouse.isPressed() && !heldReports[HID_PATH_USB]);
+  assert(!releasePending[HID_PATH_USB]);
+  assert(run("press") == "ok" && usbButton);
+  assert(run("release") == "ok" && !usbButton);
+  puts("ok USB disconnect event clears old buttons even after reconnect between polls");
+}
+
+static void suspended_usb_has_bounded_blocking() {
+  reset();
+  assert(run("press") == "ok" && usbButton);
+  usbSuspended = true;
+  assert(activePath() == HID_PATH_NONE);
+  assert(heldReports[HID_PATH_USB] == HELD_MOUSE && releasePending[HID_PATH_USB]);
+  int path = HID_PATH_NONE;
+  for (int i = 0; i < 100 && path != HID_PATH_BLE; i++) {
+    delay(50);
+    path = activePath();
+  }
+  assert(path == HID_PATH_BLE && "suspended USB must not block BLE indefinitely");
+  assert(heldReports[HID_PATH_USB] == HELD_MOUSE && usbButton);
+  assert(run("move 1 0") == "ok" && wakeups == 0);
+  assert(run("release") == "err hid release pending");
+  assert(heldReports[HID_PATH_USB] == HELD_MOUSE);
+  usbSuspended = false;
+  delay(50);
+  events.clear();
+  assert(run("move 1 0") == "ok");
+  assert(!usbButton && !heldReports[HID_PATH_USB]);
+  assert(events.size() >= 2 && events.front() == "usb mouse up" && events.back() == "usb move");
+  assert(wakeups == 0);
+  puts("ok suspended USB retains release while BLE proceeds within a bounded wait");
+}
+
+static void failed_ble_release_has_bounded_blocking() {
+  reset();
+  usbSuspended = true;
+  assert(run("press") == "ok" && bleButton);
+  usbSuspended = false;
+  failBleRelease = true;
+  assert(run("move 1 0") == "err hid release pending");
+  int path = HID_PATH_NONE;
+  for (int i = 0; i < 100 && path != HID_PATH_USB; i++) {
+    delay(50);
+    path = activePath();
+  }
+  assert(path == HID_PATH_USB && "failed BLE release must not block USB indefinitely");
+  assert(bleButton && heldReports[HID_PATH_BLE] == HELD_MOUSE);
+  assert(releasePending[HID_PATH_BLE]);
+  assert(run("move 1 0") == "ok");
+  assert(hid_prepare_pref(HID_PREF_USB));
+  assert(!hid_prepare_pref(HID_PREF_BLE)); // cannot send new input on the failed route
+  assert(run("release") == "err hid release pending");
+  failBleRelease = false;
+  delay(50);
+  assert(activePath() == HID_PATH_USB && !bleButton);
+  assert(!heldReports[HID_PATH_BLE] && !releasePending[HID_PATH_BLE]);
+  puts("ok failed BLE release permits healthy USB after bounded wait and keeps retrying");
+}
+
+static void failed_usb_release_defers_to_ble() {
+  reset();
+  assert(run("press") == "ok" && usbButton);
+  failUsbReport = true;
+  assert(!hid_prepare_pref(HID_PREF_BLE));
+  bool changed = false;
+  for (int i = 0; i < 100 && !changed; i++) {
+    delay(50);
+    changed = hid_prepare_pref(HID_PREF_BLE);
+  }
+  assert(changed && "failed USB release must not block an explicit BLE switch indefinitely");
+  assert(heldReports[HID_PATH_USB] == HELD_MOUSE && releasePending[HID_PATH_USB]);
+  pref = HID_PREF_AUTO;
+  assert(activePath() == HID_PATH_BLE); // AUTO must also skip the unresolved route
+  assert(run("pace") == String("ok ") + HID_PACE_BLE);
+  hid_link_t facts = hidFacts();
+  assert(selectHidPath(pref, facts) == HID_PATH_BLE); // status uses the same route
+  int deferredAttempts = usbReportAttempts;
+  for (int i = 0; i < 1000; i++) assert(activePath() == HID_PATH_BLE);
+  assert(usbReportAttempts == deferredAttempts); // no busy-loop retry flood
+  assert(run("move 1 0") == "ok" && usbButton);
+  assert(!hid_prepare_pref(HID_PREF_USB));
+  assert(run("release") == "err hid release pending");
+  failUsbReport = false;
+  delay(50);
+  int attempts = usbReportAttempts;
+  assert(activePath() == HID_PATH_USB && !usbButton);
+  assert(usbReportAttempts > attempts && usbAcceptedButtons.back() == 0);
+  assert(run("pace") == String("ok ") + HID_PACE_USB);
+  puts("ok failed USB release permits BLE after bounded wait without forgetting the zero report");
+}
+
+static void unready_ble_session_is_not_a_disconnect() {
+  reset();
+  pref = HID_PREF_BLE;
+  assert(run("press") == "ok" && bleButton);
+  bleConnected = false; // live ACL but HID subscription/security is temporarily unavailable
+  assert(bleSession);
+  assert(!hid_prepare_pref(HID_PREF_USB));
+  assert(heldReports[HID_PATH_BLE] == HELD_MOUSE && releasePending[HID_PATH_BLE]);
+  delay(500);
+  assert(hid_prepare_pref(HID_PREF_USB));
+  assert(bleButton && heldReports[HID_PATH_BLE] == HELD_MOUSE);
+  bleConnected = true;
+  delay(50);
+  assert(hid_prepare_pref(HID_PREF_USB) && !bleButton);
+  assert(!heldReports[HID_PATH_BLE] && !releasePending[HID_PATH_BLE]);
+  puts("ok temporarily unready BLE session keeps release pending until it recovers");
+}
+
+static void release_timeout_survives_millis_wrap() {
+  reset();
+  nowMs = UINT32_MAX - 100;
+  assert(run("press") == "ok" && usbButton);
+  usbSuspended = true;
+  assert(activePath() == HID_PATH_NONE);
+  delay(500); // cross the device's 32-bit millisecond wrap
+  assert(activePath() == HID_PATH_BLE);
+  assert(usbButton && heldReports[HID_PATH_USB] == HELD_MOUSE);
+  usbSuspended = false;
+  delay(50);
+  assert(activePath() == HID_PATH_USB && !usbButton);
+  puts("ok release wait and retry deadlines survive millis wraparound");
+}
+
+int main(int argc, char **argv) {
+  // Individual cases allow recording both regressions against the old sketch.
+  if (argc == 2 && std::string(argv[1]) == "detach") { detached_routes_stop_blocking(); return 0; }
+  if (argc == 2 && std::string(argv[1]) == "usb_release") { failed_usb_release_retries_zero_report(); return 0; }
+  if (argc == 2 && std::string(argv[1]) == "usb_reconnect") { usb_reconnect_between_polls(); return 0; }
+  if (argc == 2 && std::string(argv[1]) == "suspend") { suspended_usb_has_bounded_blocking(); return 0; }
+  if (argc == 2 && std::string(argv[1]) == "ble_bound") { failed_ble_release_has_bounded_blocking(); return 0; }
+  if (argc == 2 && std::string(argv[1]) == "usb_bound") { failed_usb_release_defers_to_ble(); return 0; }
+  if (argc == 2 && std::string(argv[1]) == "ble_unready") { unready_ble_session_is_not_a_disconnect(); return 0; }
+  detached_routes_stop_blocking();
+  failed_usb_release_retries_zero_report();
+  usb_reconnect_between_polls();
+  suspended_usb_has_bounded_blocking();
+  failed_ble_release_has_bounded_blocking();
+  failed_usb_release_defers_to_ble();
+  unready_ble_session_is_not_a_disconnect();
+  release_timeout_survives_millis_wrap();
   auto_switch_release();
   explicit_switch_release();
   auto_switch_failure();

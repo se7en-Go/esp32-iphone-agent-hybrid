@@ -48,7 +48,7 @@ static void reset() {
   ble_hid_bonds_cleared();
   clock_ms = 0;
   delay_hook = nullptr;
-  connected = true;
+  connected = link_encrypted = true;
   free_blocks = 64;
   allocation_failures = notify_failures = notify_rc = allocations = 0;
   sent.clear();
@@ -175,6 +175,90 @@ static void test_mode_change_release_failure() {
   puts("ok failed path release preserves preferred and persisted mode");
 }
 
+static void test_session_survives_unsubscribe() {
+  reset();
+  assert(ble_hid_session_active() && ble_hid_connected());
+  uint8_t key = 4;
+  assert(ble_hid_button(true));
+  assert(ble_hid_keyboard(2, &key, 1));
+  assert(ble_hid_consumer(0x029D));
+  NimBLEConnInfo ci(1);
+  mouseIn->cb->onSubscribe(mouseIn, ci, 0);
+  keyIn->cb->onSubscribe(keyIn, ci, 0);
+  consIn->cb->onSubscribe(consIn, ci, 0);
+  assert(!ble_hid_connected());
+  assert(haveConn && "unsubscribing must retain the session until the ACL disconnects");
+  assert(ble_hid_session_active());
+  assert(buttons == 1 && lastMod == 2 && lastKeys[0] == key && lastConsumer == 0x029D);
+  // A companion central disconnect must not clear the HID owner's latches.
+  ble_hid_on_disconnect(2);
+  assert(ble_hid_session_active() && buttons == 1);
+  connected = false;
+  assert(!ble_hid_session_active());
+  ble_hid_on_disconnect(1);
+  assert(!haveConn && !buttons && !lastMod && !lastConsumer);
+  for (uint8_t held : lastKeys) assert(held == 0);
+  connected = true;
+  mouseIn->cb->onSubscribe(mouseIn, ci, 1);
+  assert(ble_hid_button(true));
+  assert(sent.back().data[0] == 1 && "a new session must send a fresh down report");
+  puts("ok BLE unsubscribe retains the session; disconnect clears all report latches");
+}
+
+static void test_session_survives_lost_encryption() {
+  reset();
+  assert(ble_hid_button(true));
+  link_encrypted = false;
+  assert(!ble_hid_connected() && ble_hid_session_active());
+  assert(!ble_hid_button(false) && buttons == 1);
+  link_encrypted = true;
+  assert(ble_hid_connected() && ble_hid_session_active());
+  assert(ble_hid_button(false) && sent.back().data[0] == 0);
+  connected = false; // ACL disappearance is a session end even before its callback.
+  assert(!ble_hid_connected() && !ble_hid_session_active());
+  connected = true;
+  ble_hid_bonds_cleared();
+  assert(!ble_hid_connected() && !ble_hid_session_active());
+  puts("ok BLE encryption loss preserves the session; absent ACL and unpair end it");
+}
+
+static void test_disconnect_during_report_retry() {
+  reset();
+  assert(ble_hid_button(true));
+  free_blocks = 0;
+  delay_hook = [] {
+    connected = false;
+    ble_hid_on_disconnect(1);
+    delay_hook = nullptr;
+  };
+  assert(!ble_hid_button(false));
+  assert(!buttons && !ble_hid_session_active());
+  connected = true;
+  free_blocks = 64;
+  NimBLEConnInfo ci(1);
+  mouseIn->cb->onSubscribe(mouseIn, ci, 1);
+  size_t reports = sent.size();
+  assert(ble_hid_button(true));
+  assert(sent.size() == reports + 1 && sent.back().data[0] == 1);
+  puts("ok disconnect during failed release cannot restore the old button latch");
+
+  reset();
+  free_blocks = 0;
+  delay_hook = [] {
+    connected = false;
+    ble_hid_on_disconnect(1);
+    connected = true;
+    NimBLEConnInfo reconnected(1); // NimBLE may reuse an ACL handle.
+    mouseIn->cb->onSubscribe(mouseIn, reconnected, 1);
+    free_blocks = 64;
+    delay_hook = nullptr;
+  };
+  assert(!ble_hid_button(true));
+  assert(sent.empty() && !buttons);
+  assert(ble_hid_button(true) && sent.size() == 1 && sent.back().data[0] == 1);
+  puts("ok a pending report cannot cross into a new BLE session with the same handle");
+}
+
 int main(int argc, char **argv) {
   gate.begin();
   ble_hid_begin(NimBLEDevice::getServer());
@@ -189,4 +273,9 @@ int main(int argc, char **argv) {
     test_partial_unpair();
   }
   if (argc == 1) test_mode_change_release_failure();
+  if (argc == 1 || strcmp(argv[1], "session") == 0) {
+    test_session_survives_unsubscribe();
+    test_session_survives_lost_encryption();
+  }
+  if (argc == 1 || strcmp(argv[1], "disconnect_retry") == 0) test_disconnect_during_report_retry();
 }
