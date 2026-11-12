@@ -14,6 +14,7 @@ from collections import deque
 from pathlib import Path
 
 from . import screen_compare, vision
+from .assistive import AssistiveTouch
 from .device import RELEASE_TIMEOUT, Device, DeviceError, exchange_timing
 from .operation import OPERATION_TIMEOUT, bounded_operation, check_operation, shield_cleanup
 from .screen import FrameSnapshot
@@ -86,7 +87,8 @@ WAKE_NUDGE = 2
 class Phone:
     operation_timeout = OPERATION_TIMEOUT
 
-    def __init__(self, device: Device, calibration_file: Path, screen=None):
+    def __init__(self, device: Device, calibration_file: Path, screen=None, *,
+                 assistive_touch_position=None, assistive_touch_layout=None, find_text=None):
         self.device, self._file, self.screen = device, calibration_file, screen
         # mouse units needed to cross the full screen width / height
         saved = json.loads(calibration_file.read_text()) if calibration_file.exists() else None
@@ -110,6 +112,9 @@ class Phone:
         self._clock = None  # board millis minus monotonic millis
         self._clock_link = None
         self.last_tap = None
+        self.assistive_touch = AssistiveTouch(
+            self, calibration_file.with_suffix(".assistive-touch.json"), position=assistive_touch_position,
+            layout=assistive_touch_layout, find_text=find_text)
 
     @property
     def calibrated(self) -> bool:
@@ -668,7 +673,7 @@ class Phone:
         await self._command(f"key {combo}")
 
     async def go_home(self) -> None:
-        await self.swipe(0.5, 0.995, 0.5, 0.6, hold=False)  # resting here would open the app switcher
+        await self.assistive_touch.go_home()
 
     async def go_back(self) -> None:
         await self.swipe(0.005, 0.45, 0.6, 0.45, hold=False)

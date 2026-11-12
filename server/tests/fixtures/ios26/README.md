@@ -24,3 +24,9 @@ origin (0.127, -0.001):
 Real Phone keypad showing the completed dial test; no visible pointer disc. Tests draw explicit
 synthetic highlights, clock changes and digit changes on this image; the capture alone does not
 establish whether the missing disc was faded or morphed into a control highlight.
+
+`airplay_receiver_button.jpg` is a 360x780 downsample of
+`/workspace/hybrid-ptr/live/cal-144728/1794466059.430_n+0.0254.jpg` (about 16 KB).
+It preserves the receiver icons and the AssistiveTouch button at normalized
+`(655/720, 1220/1560)` for button detection without cached coordinates. The
+receiver glyphs must not be mistaken for the button's concentric rings.
