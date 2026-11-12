@@ -39,6 +39,25 @@ def check_operation():
         current.check()
 
 
+async def shield_cleanup(awaitable):
+    """Finish bounded cleanup before propagating even repeated cancellation.
+
+    The cleanup supplies its own timeout, independent of the operation deadline.
+    """
+    task = asyncio.ensure_future(awaitable)
+    cancelled = False
+    try:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        return task.result()
+    finally:
+        if cancelled:
+            raise asyncio.CancelledError
+
+
 @asynccontextmanager
 async def operation_scope(timeout: float):
     current = _current.get()

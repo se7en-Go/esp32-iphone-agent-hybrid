@@ -210,29 +210,122 @@ def test_failed_command_closes_only_the_link_it_used():
     asyncio.run(scenario())
 
 
-def test_cancelled_command_closes_the_link_before_the_next_command():
+def test_cancelled_raw_press_releases_and_ignores_late_ack():
     async def scenario():
         device = Device()
         link = MemoryLink()
-        started = asyncio.Event()
-
-        async def stall():
-            await link.commands.get()
-            started.set()
-            await asyncio.Event().wait()
-
-        asyncio.create_task(stall())
         device.attach(link)
         job = asyncio.create_task(device.send("press"))
-        await started.wait()
-        queued = asyncio.create_task(device.send("click"))
-        await asyncio.sleep(0)  # 下一条已经在等锁
+        press = await asyncio.wait_for(link.commands.get(), 1)
         job.cancel()
+        release = await asyncio.wait_for(link.commands.get(), 1)
+        assert release.endswith(b" release\n")
+        assert device._lock.locked() and not link.closed
+        # Neither the caller nor a repeated emergency stop may abandon cleanup.
+        job.cancel()
+        device.request_abort()
+        link.replies.put_nowait((firmware_reply(press.decode().strip()) + "\n").encode())
+        done, _ = await asyncio.wait({job}, timeout=0.02)
+        assert not done, "the old press ACK completed release cleanup"
+        assert device._lock.locked() and not link.closed
+        link.replies.put_nowait((firmware_reply(release.decode().strip()) + "\n").encode())
         with pytest.raises(asyncio.CancelledError):
-            await job
-        assert not device.connected
-        with pytest.raises(DeviceError, match="没连上"):
-            await asyncio.wait_for(queued, 0.5)
+            await asyncio.wait_for(job, 1)
+        assert device.connected and not device._lock.locked()
+        assert not device._exchanges
+        assert link.written == [press, release]
+
+        device.clear_abort()
+        # A stale ACK must also not make a subsequent HID command succeed early.
+        following = asyncio.create_task(device.send("move 1 0"))
+        command = await asyncio.wait_for(link.commands.get(), 1)
+        link.replies.put_nowait((firmware_reply(press.decode().strip()) + "\n").encode())
+        done, _ = await asyncio.wait({following}, timeout=0.02)
+        assert not done
+        link.replies.put_nowait((firmware_reply(command.decode().strip()) + "\n").encode())
+        await asyncio.wait_for(following, 1)
+        assert device.connected
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_press_release_without_ack_has_its_own_timeout(monkeypatch):
+    from hidagent import device as module
+
+    monkeypatch.setattr(module, "RELEASE_TIMEOUT", 0.03)
+
+    async def scenario():
+        device = Device()
+        link = MemoryLink()
+        device.attach(link)
+        job = asyncio.create_task(device.send("press"))
+        press = await asyncio.wait_for(link.commands.get(), 1)
+        job.cancel()
+        release = await asyncio.wait_for(link.commands.get(), 1)
+        assert release.endswith(b" release\n")
+        assert not link.closed, "UART closed before release was written"
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(job, 0.5)
+        assert link.written == [press, release]
+        assert not device._lock.locked()
+        assert not device._exchanges
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_drag_releases_while_background_query_holds_serial_lock(tmp_path, monkeypatch):
+    from hidagent import phone as module
+
+    monkeypatch.setattr(module, "HOLD", 60)
+    monkeypatch.setattr(module, "RELEASE_TIMEOUT", 0.03)
+
+    class ButtonLink(MemoryLink):
+        pressed = False
+
+        def write(self, data):
+            super().write(data)
+            command = data.decode().strip().split(" ", 1)[1]
+            if command == "press":
+                self.pressed = True
+            elif command == "release":
+                self.pressed = False
+
+    async def scenario():
+        device, link = Device(), ButtonLink()
+        device.attach(link)
+        phone = Phone(device, tmp_path / "calibration.json")
+        phone.span = {"w": 500, "h": 1000}
+        drag = asyncio.create_task(phone.drag([(.5, .5), (.7, .7)]))
+        for expected in ["release", "home", "move 250 500", "press", "move 100 200"]:
+            wire = await asyncio.wait_for(link.commands.get(), 1)
+            assert wire.decode().strip().split(" ", 1)[1] == expected
+            link.replies.put_nowait((firmware_reply(wire.decode().strip()) + "\n").encode())
+
+        async def wait_for_hold():
+            while phone._pos != (350, 700):
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_hold(), 1)
+        assert link.pressed
+        query = asyncio.create_task(device.query("ping"))
+        ping = await asyncio.wait_for(link.commands.get(), 1)
+        assert ping.endswith(b" ping\n")
+        assert device._lock.locked()
+        before_cancel = len(link.written)
+        drag.cancel()
+        await asyncio.wait_for(asyncio.gather(drag, return_exceptions=True), 0.5)
+        assert not link.pressed, "release was lost while queued behind a background query"
+        assert not link.closed
+        assert len(link.written) == before_cancel + 1
+        release = await asyncio.wait_for(link.commands.get(), 1)
+        assert release.endswith(b" release\n")
+        # The existing query reader must ignore the emergency release's distinct ACK.
+        link.replies.put_nowait((firmware_reply(release.decode().strip()) + "\n").encode())
+        done, _ = await asyncio.wait({query}, timeout=0.02)
+        assert not done
+        link.replies.put_nowait((firmware_reply(ping.decode().strip()) + "\n").encode())
+        assert await asyncio.wait_for(query, 1) == "ok"
+        assert device.connected and not device._lock.locked()
 
     asyncio.run(scenario())
 

@@ -14,8 +14,8 @@ from collections import deque
 from pathlib import Path
 
 from . import vision
-from .device import Device, DeviceError, exchange_timing
-from .operation import OPERATION_TIMEOUT, bounded_operation, check_operation
+from .device import RELEASE_TIMEOUT, Device, DeviceError, exchange_timing
+from .operation import OPERATION_TIMEOUT, bounded_operation, check_operation, shield_cleanup
 from .screen import FrameSnapshot
 
 log = logging.getLogger(__name__)
@@ -465,14 +465,17 @@ class Phone:
         System gestures (home, back) need the flick, so they pass hold=False.
         """
         await self.point(*points[0])
-        await self._command("press")
         try:
+            await self._command("press")
             for x, y in points[1:]:
                 await self._move_to(self._dx(x), self._dy(y), rehome=False)  # never home mid-drag
             if hold:
                 await asyncio.sleep(HOLD)
         finally:
-            await self._command("release")
+            try:
+                await shield_cleanup(asyncio.wait_for(self._command("release"), RELEASE_TIMEOUT))
+            except asyncio.TimeoutError as exc:
+                raise DeviceError("release cleanup timed out") from exc
 
     async def scroll(self, x: float, y: float, lines: int) -> None:
         await self.point(x, y)

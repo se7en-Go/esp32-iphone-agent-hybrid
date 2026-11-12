@@ -18,6 +18,7 @@ from uvicorn.server import ServerState
 from hidagent import app as app_module
 from hidagent import phone as phone_module
 from hidagent.control import Controls
+from hidagent.device import Device
 from hidagent.phone import Phone
 
 
@@ -165,6 +166,123 @@ def test_http_disconnect_cancels_catch_up_before_any_later_hid(tmp_path, monkeyp
         assert "click" not in sent
         assert app_module.controls.job is None
         assert not app_module.manual_lock.locked()
+
+    asyncio.run(scenario())
+
+
+class HeldButtonLink:
+    """Model USB HID independently of UART, as in pr4-r2-cancel-held.py."""
+
+    def __init__(self, pause, hold_release=False):
+        self.pause = pause
+        self.hold_release = hold_release
+        self.closed = False
+        self.pressed = False
+        self.writes = []
+        self.events = []
+        self.replies = asyncio.Queue()
+        self.waiting = asyncio.Event()
+        self.delayed = None
+        self.release_waiting = asyncio.Event()
+        self.release_reply = None
+
+    def is_open(self):
+        return not self.closed
+
+    def close(self):
+        self.events.append("close")
+        self.closed = True  # Closing UART does not release the iPhone's USB button.
+
+    def write(self, wire):
+        if self.closed:
+            raise OSError("serial closed")
+        ident, command = wire.decode().strip().split(" ", 1)
+        self.writes.append(command)
+        self.events.append(command)
+        if command == "press":
+            self.pressed = True
+        elif command == "release":
+            self.pressed = False
+        reply = f"{ident} ok\n".encode()
+        if (self.pause == "press" and command == "press") or (
+            self.pause == "drag" and self.pressed and command.startswith("move ")
+        ):
+            self.delayed = reply
+            self.waiting.set()
+        elif command == "release" and self.hold_release and self.delayed is not None:
+            self.hold_release = False
+            self.release_reply = reply
+            self.release_waiting.set()
+        else:
+            self.replies.put_nowait(reply)
+
+    async def readline(self):
+        return await self.replies.get()
+
+
+@pytest.mark.parametrize("pause,disconnect,repeat_cancel", [
+    ("press", True, False), ("drag", True, False), ("drag", False, False), ("press", True, True),
+], ids=["press-disconnect", "drag-disconnect", "drag-deadline", "press-repeated-cancel"])
+def test_cancelled_gesture_releases_before_serial_close(tmp_path, monkeypatch, pause, disconnect, repeat_cancel):
+    from hidagent import operation
+
+    if not disconnect:
+        monkeypatch.setattr(operation, "OPERATION_TIMEOUT", 0.04)
+
+    async def scenario():
+        device, link = Device(), HeldButtonLink(pause, hold_release=repeat_cancel)
+        device.attach(link)
+        phone = Phone(device, tmp_path / "calibration.json")
+        phone.span = {"w": 500, "h": 1000}
+        monkeypatch.setattr(app_module, "device", device)
+        monkeypatch.setattr(app_module, "phone", phone)
+        monkeypatch.setattr(app_module, "agent", SimpleNamespace(running=False, stop=lambda: None))
+        monkeypatch.setattr(app_module, "manual_lock", asyncio.Lock())
+        config = uvicorn.Config(app_module.app, lifespan="off", log_level="critical", http="h11")
+        state = ServerState()
+        protocol = H11Protocol(config, state, {})
+        transport = MemoryTransport()
+        protocol.connection_made(transport)
+        request = httpx.Request("POST", "http://127.0.0.1:8890/api/swipe",
+                                json={"x1": .5, "y1": .5, "x2": .7, "y2": .7})
+        wire = (b"POST /api/swipe HTTP/1.1\r\n"
+                + b"".join(k + b": " + v + b"\r\n" for k, v in request.headers.raw)
+                + b"\r\n" + request.read())
+        protocol.data_received(wire)
+        try:
+            await asyncio.wait_for(link.waiting.wait(), 1)
+            assert link.pressed, "cancellation must interrupt an actually held button"
+            before_cancel = len(link.writes)
+            if disconnect:
+                protocol.connection_lost(None)
+            if repeat_cancel:
+                await asyncio.wait_for(link.release_waiting.wait(), 1)
+                assert app_module.manual_lock.locked()
+                device.request_abort()
+                for task in list(state.tasks):
+                    task.cancel()
+                await asyncio.sleep(0.01)
+                assert app_module.manual_lock.locked(), "cleanup released the route lock before its ACK"
+                assert state.tasks and all(not task.done() for task in state.tasks)
+                assert not link.closed
+                link.replies.put_nowait(link.release_reply)
+            await asyncio.sleep(0.08)
+            # A late command ACK must not resume the gesture after cancellation.
+            link.replies.put_nowait(link.delayed)
+            if state.tasks:
+                await asyncio.wait_for(asyncio.gather(*state.tasks), 2)
+            assert not app_module.manual_lock.locked()
+            assert not link.pressed, link.events
+            assert link.writes[before_cancel:], "cancelled gesture omitted release"
+            assert set(link.writes[before_cancel:]) == {"release"}, "new HID after cancellation"
+            if "close" in link.events:
+                press = link.events.index("press")
+                release = link.events.index("release", press)
+                assert release < link.events.index("close"), link.events
+            assert not link.closed, "cancelling an ACK must not abandon the serial link"
+        finally:
+            if not disconnect:
+                protocol.connection_lost(None)
 
     asyncio.run(scenario())
 
