@@ -4,6 +4,7 @@ import json
 import time
 
 import pytest
+from fake_clock import ManualClock
 from home_scene import draw_home
 from PIL import Image, ImageDraw
 
@@ -39,7 +40,7 @@ class Mirror:
     links = 0
     abort_epoch = 0
 
-    def __init__(self, delay=0):
+    def __init__(self, delay=.001):
         self.frame, self.updated = frame(), time.time()
         self.sent = []
         self.clicks = []
@@ -68,7 +69,7 @@ class Mirror:
             if len(self.clicks) == 1 and not self.menu_opens:
                 return
             image = frame(menu=True) if len(self.clicks) == 1 else frame(home=self.return_home)
-            asyncio.get_running_loop().call_later(self.delay, self.show, image)
+            self.clock.call_later(self.delay, self.show, image)
 
     async def fresh(self, since, timeout=0.8):
         if self.updated > since:
@@ -82,6 +83,11 @@ class Mirror:
 
 @pytest.fixture(autouse=True)
 def short_waits(monkeypatch):
+    # Model frame delivery and firmware waits explicitly. Host clock resolution,
+    # timer scheduling and JPEG processing time must not change the evidence.
+    clock = ManualClock()
+    clock.install(monkeypatch)
+    monkeypatch.setattr(Mirror, "clock", clock, raising=False)
     monkeypatch.setattr("hidagent.freshness.MIRROR_LAG_SECONDS", 0)
     monkeypatch.setattr("hidagent.phone.TAP_GAP", 0)
     monkeypatch.setattr("hidagent.feedback.MIRROR_LAG_SECONDS", 0)
@@ -89,6 +95,7 @@ def short_waits(monkeypatch):
     monkeypatch.setattr(assistive, "MENU_WAIT", .4)
     monkeypatch.setattr(assistive, "RESULT_WAIT", .4)
     monkeypatch.setattr(assistive, "STABLE_QUIET", .04)
+    return clock
 
 
 def make_phone(tmp_path, mirror, **kwargs):
@@ -115,6 +122,51 @@ def test_go_home_opens_assistive_touch_then_taps_home(tmp_path, monkeypatch):
     assert mirror.frame == frame(home=True)
     assert mirror.clicks[0] == pytest.approx((333, 598), abs=3)
     assert mirror.clicks[1] == pytest.approx((180, 458), abs=3)
+
+
+def test_timestamped_screen_uses_wall_clock_offset_during_home(tmp_path):
+    """Home must retain the wall-domain bound established by a real board status."""
+    mirror = Mirror(delay=.01)
+    screen = Screen()
+    board_start, host_start = 123_456, time.monotonic()
+
+    def publish(image):
+        screen._on_ts(board_start + round((time.monotonic() - host_start) * 1000))
+        screen._on_jpeg(image)
+
+    async def query(command):
+        assert command == "status"
+        return json.dumps({"up": board_start + round((time.monotonic() - host_start) * 1000)})
+
+    mirror.show, mirror.query = publish, query
+    publish(frame())
+    phone = Phone(mirror, tmp_path / "calibration.json", screen)
+    phone.span = {"w": 360, "h": 780}
+    for samples in phone._seen.values():
+        samples.extend([(0., 0.), (.5, .5), (.99, .99)])
+
+    async def run():
+        await phone.ensure_observation()
+        assert phone._clock is not None and phone._mono_clock is not None
+        assert phone._clock != phone._mono_clock
+        await phone.go_home()
+
+    asyncio.run(run())
+    assert len(mirror.clicks) == 2
+    assert screen.frame == frame(home=True)
+
+
+@pytest.mark.parametrize("wall_tick", [.001, 1/64])
+def test_home_with_scheduled_frames_and_coarse_wall_clock(tmp_path, monkeypatch, short_waits, wall_tick):
+    clock = short_waits
+    monkeypatch.setattr(time, "time", lambda: clock.wall_origin + (clock.elapsed // wall_tick) * wall_tick)
+    # Each new image is delivered on a later clock tick; reading time alone
+    # cannot fabricate a later receipt or satisfy the menu's quiet interval.
+    mirror = Mirror(delay=wall_tick)
+    asyncio.run(make_phone(tmp_path, mirror).go_home())
+    assert len(mirror.clicks) == 2
+    assert mirror.frame == frame(home=True)
+    assert not {"homescreen", "key cmd+h"}.intersection(mirror.sent)
 
 
 def test_delayed_menu_and_home_then_silent_mirror(tmp_path):
@@ -264,31 +316,22 @@ def test_moving_menu_timeout_never_authorizes_home_click(tmp_path, monkeypatch, 
     original_send = mirror.send
     changes = []
 
+    def animate():
+        step = len(changes) % 2
+        mirror.show(frame(menu=True, menu_offset=step*18 if changing == "bounds" else 0,
+                          panel_color="#404040" if step and changing == "content" else "#252525"))
+        changes.append(time.monotonic())
+        mirror.clock.call_later(.07, animate)
+
+    async def send(command):
+        await original_send(command)
+        if command == "click" and len(mirror.clicks) == 1:
+            mirror.clock.call_later(.07, animate)
+
+    mirror.send = send
+
     async def run():
-        async def animate():
-            while True:
-                await asyncio.sleep(.07)
-                step = len(changes) % 2
-                mirror.show(frame(menu=True, menu_offset=step*18 if changing == "bounds" else 0,
-                                  panel_color="#404040" if step and changing == "content" else "#252525"))
-                changes.append(time.monotonic())
-
-        task = None
-
-        async def send(command):
-            nonlocal task
-            await original_send(command)
-            if command == "click" and len(mirror.clicks) == 1:
-                task = asyncio.create_task(animate())
-
-        mirror.send = send
-        try:
-            assert not await phone.assistive_touch._assistive_home(0)
-        finally:
-            if task:
-                task.cancel()
-                with pytest.raises(asyncio.CancelledError):
-                    await task
+        assert not await phone.assistive_touch._assistive_home(0)
 
     asyncio.run(run())
     assert len(changes) >= 5
@@ -412,7 +455,7 @@ def test_fallback_dismissing_stuck_menu_is_not_success(tmp_path, monkeypatch):
         if command == "release":
             mirror.show(frame())  # Swipe only closes the panel.
         elif command == "homescreen":
-            asyncio.get_running_loop().call_soon(mirror.show, frame(home=True))
+            mirror.clock.call_later(.001, mirror.show, frame(home=True))
 
     mirror.send = send
     monkeypatch.setattr(assistive, "RESULT_WAIT", .4)
@@ -428,11 +471,11 @@ def test_transient_frame_does_not_verify_home_before_settling(tmp_path, monkeypa
     async def send(command):
         await original_send(command)
         if command == "click" and len(mirror.clicks) == 2:
-            asyncio.get_running_loop().call_later(.02, mirror.show, frame(menu=True))
+            mirror.clock.call_later(.02, mirror.show, frame(menu=True))
         elif command == "release":
             mirror.show(frame())
         elif command == "homescreen":
-            asyncio.get_running_loop().call_soon(mirror.show, frame(home=True))
+            mirror.clock.call_later(.001, mirror.show, frame(home=True))
 
     mirror.send = send
     monkeypatch.setattr(assistive, "RESULT_WAIT", .4)

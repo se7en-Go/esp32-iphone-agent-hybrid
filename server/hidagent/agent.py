@@ -11,8 +11,9 @@ from types import SimpleNamespace
 
 from . import feedback, ocr, screen_compare, screen_diff, vision
 from .debug import Trace
-from .device import DeviceError
+from .device import DeviceError, input_attempt
 from .freshness import FrameSnapshot, fresh_frame
+from .input_context import InputContextGuard
 from .llm import LLM
 from .phone import Phone
 from .screen import Screen
@@ -152,7 +153,21 @@ def _key(step: dict) -> dict:
     keys = ("action", *ACTIONS.get(name, ()))
     if name in ("find_text", "tap_text"):
         keys += ("region", "nth", "exact")
-    return {key: step[key] for key in keys if key in step}
+    identity = {key: step[key] for key in keys if key in step}
+    if name in ("find_text", "tap_text"):
+        identity["text"] = ocr.normalize_text(identity.get("text", ""))
+        for key, default in (("exact", False), ("region", None), ("nth", None)):
+            if identity.get(key) == default:
+                identity.pop(key, None)
+    return identity
+
+
+def _same_text_target(previous: dict, current) -> bool:
+    """Different selectors can still resolve to the same observed OCR target."""
+    old = previous.get("text_match")
+    return bool(old and current is not None
+                and ocr.normalize_text(old["text"]) == ocr.normalize_text(current.text)
+                and tuple(old["box"]) == tuple(current.box))
 
 
 def _diff_feedback(step: dict) -> str:
@@ -206,6 +221,7 @@ class Agent:
         self.task, self.plan, self.steps, self.shots = "", "", [], {}
 
     def _record(self, shot: bytes | None = None, **step) -> None:
+        step = {key: value for key, value in step.items() if not key.startswith("_")}
         if shot:
             self.shots[len(self.steps)] = shot
         self.steps.append({"t": time.time(), "shot": bool(shot), **step})
@@ -278,15 +294,14 @@ class Agent:
                 started = time.time()
                 before = self.screen.frame
                 try:
-                    tap_completed = await self._do(act)
-                except (Exception, asyncio.CancelledError) as exc:
+                    with input_attempt() as attempted_input:
+                        tap_completed = await self._do(act)
+                except (Exception, asyncio.CancelledError):
                     # A click, key, or text write may already have left the host. Record that
                     # uncertain attempt before recovery can plan the same action again.
-                    written = isinstance(exc, DeviceError) and "串口断了" in str(exc)
-                    if name in ("tap", "tap_text") or (
-                            name in ("type", "key") and (written or isinstance(exc, asyncio.CancelledError))):
+                    if attempted_input.written:
                         attempted = {key: value for key, value in act.items()
-                                     if key not in {"_shot", "_observation", "_input_baseline"}}
+                                     if not key.startswith("_")}
                         attempted.update(outcome="unknown", changed=None, fresh=False, clicked=None,
                                          effect_verified=False, act_s=round(time.time() - started, 2))
                         self._record(act["_shot"], **attempted)
@@ -375,10 +390,19 @@ class Agent:
                 log.warning("unparseable actor reply (%s): %s", e, reply[:200])
                 continue
             previous = self._last_input()
-            if self._missed() and _key(acts[0]) == _key(previous):
+            duplicate = _key(acts[0]) == _key(previous)
+            if (self._missed() and not duplicate and acts[0]["action"] == "tap_text"
+                    and previous.get("action") == "tap_text"):
+                candidate = acts[0]
+                region = candidate.get("region")
+                matches = await ocr.find_matches_async(
+                    observation.frame, candidate["text"], candidate.get("exact", False), region=region)
+                target = ocr.select_match(matches, candidate["text"], nth=candidate.get("nth"), region=region)
+                duplicate = _same_text_target(previous, target)
+            if self._missed() and duplicate:
                 log.info("actor repeated an action without confirmed progress; asking for another")
                 reason = ("it changed nothing last time" if previous.get("changed") is False
-                          else "its outcome is unknown; the first tap may already have executed")
+                          else "its outcome is unknown; the first input may already have executed")
                 prompt += (f"\n\nYou just proposed {json.dumps(_key(acts[0]))} again, but {reason}. "
                            "Do not repeat it automatically. Inspect the result, choose a different action, "
                            "or stop for the user to check.")
@@ -390,8 +414,8 @@ class Agent:
     def _validate_context(self, action: dict, *, stage: str = "context") -> FrameSnapshot:
         """Every write still belongs to the observation, with a stage-specific pixel check.
 
-        ``context`` requires the original frame (paste and the first chunk). ``chunk`` allows the
-        text produced by earlier chunks of this same action. ``accept`` records that result.
+        ``context`` requires the original frame (paste and the first chunk). Later
+        stages allow field edits only within a region confirmed in that original.
         """
         original = action.get("_observation")
         current = fresh_frame(self.screen)
@@ -401,11 +425,14 @@ class Agent:
             raise ValueError("screen changed since the original observation; discard queued actions and observe again")
         if current.generation != original.generation:
             raise ValueError("screen changed since the original observation; discard queued actions and observe again")
-        if stage == "accept":
-            action["_input_baseline"] = current.frame
-            return current
-        reference = action.get("_input_baseline", original.frame) if stage == "chunk" else original.frame
-        if screen_compare.observation_changed(reference, current.frame):
+        if stage in {"accept", "chunk"}:
+            if "_input_guard" not in action:
+                action["_input_guard"] = InputContextGuard(self.screen, original)
+            try:
+                return action["_input_guard"](stage=stage)
+            except RuntimeError as exc:
+                raise ValueError(str(exc)) from exc
+        if screen_compare.observation_changed(original.frame, current.frame):
             raise ValueError("screen changed since the original observation; discard queued actions and observe again")
         return current
 
@@ -451,6 +478,9 @@ class Agent:
         if action["action"] == "tap_text":
             if match is None:
                 raise ValueError("未找到屏幕文字，请重新观察")
+            if (self._missed() and self._last_input().get("action") == "tap_text"
+                    and _same_text_target(self._last_input(), match)):
+                raise ValueError("automatic repeat blocked: the previous input outcome is unchanged or unknown")
             guard = TextTargetGuard(self.screen, seen, match, observation=observation)
             with send_target_scope(is_send_target(action["text"], match.text)):
                 return await self.phone.tap_verified(*match.center, before_click=guard,

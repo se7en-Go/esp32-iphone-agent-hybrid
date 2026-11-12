@@ -251,7 +251,10 @@ class AssistiveTouch:
         if ensure is not None:
             await ensure()
         self._generation = self._require_frame().generation
-        self._clock = await self.phone._catch_up(epoch)
+        await self.phone._catch_up(epoch)
+        # Freshness compares board timestamps with wall-clock screen.updated.
+        # Catch-up returns a monotonic offset for its own arrival snapshots.
+        self._clock = self.phone._clock
         self._require_frame()
         # An unavailable route returns False. Eligibility/context exceptions
         # abort recovery instead of authorizing a different physical action.

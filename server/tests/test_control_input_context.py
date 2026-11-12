@@ -161,14 +161,16 @@ def test_gesture_callers_keep_observation_while_waiting_for_phone(
 def test_input_checks_start_but_allows_its_own_screen_changes(tmp_path, monkeypatch, mode):
     from types import SimpleNamespace
 
+    from input_scene import input_frame
+
     screen = Screen()
-    screen._on_jpeg(jpeg())
+    screen._on_jpeg(input_frame() if mode == "chunks" else jpeg())
     original = screen.frame
     writes = []
 
     async def send(command):
         writes.append(command)
-        screen._on_jpeg(jpeg("black"))
+        screen._on_jpeg(input_frame(typed=True) if mode == "chunks" else jpeg("black"))
         if mode == "clipboard" and command == "key ctrl+alt+p":
             screen._on_jpeg(original)
 

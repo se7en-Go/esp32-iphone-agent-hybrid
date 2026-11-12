@@ -338,7 +338,21 @@ def test_send_button_rate_limit_returns_409_without_second_click(send_routes):
     assert len([line for line in link.written if b" click" in line]) == 1
 
 
-def test_stopped_type_returns_409_not_500():
+def test_stopped_type_returns_409_not_500(tmp_path, monkeypatch):
+    from hidagent.control import Controls
+    from hidagent.device import Device
+    from hidagent.phone import Phone
+    from hidagent.screen import Screen
+
+    screen, device = Screen(), Device()
+    image = io.BytesIO()
+    Image.new("RGB", (360, 780), "white").save(image, "JPEG")
+    screen._on_jpeg(image.getvalue())
+    phone = Phone(device, tmp_path / "cal.json", screen)
+    monkeypatch.setattr(module, "screen", screen)
+    monkeypatch.setattr(module, "device", device)
+    monkeypatch.setattr(module, "phone", phone)
+    monkeypatch.setattr(module, "controls", Controls(phone, screen))
     link = _HoldFirstType()
     module.device.attach(link)
     try:

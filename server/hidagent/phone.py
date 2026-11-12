@@ -1131,7 +1131,7 @@ class Phone:
                 guarded = before_action is not None or validate_paste is not None
                 await self._send(epoch, command, before_write=validate_input if guarded else None)
                 if command.startswith("type "):
-                    # Typing may change the field. Later chunks keep that result, not the pre-type pixels.
+                    # Confirm that only the original input field changed during the ACK wait.
                     invoke("accept")
                     chunks_sent = True
 

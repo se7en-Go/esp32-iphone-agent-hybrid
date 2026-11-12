@@ -17,6 +17,7 @@ from pypinyin import lazy_pinyin
 
 from . import feedback, ocr, screen_compare, screen_diff, vision
 from .freshness import fresh_frame, require_fresh
+from .input_context import InputContextGuard
 from .send_context import is_send_target, send_target_scope
 from .text_input import select_type_mode
 from .text_target import TextTargetGuard
@@ -192,11 +193,12 @@ class Controls:
         current = require_fresh(self.screen)
         if current.generation != original.generation:
             raise RuntimeError("screen changed since the original observation; observe again before acting")
-        if stage == "accept":
-            planned["_input_baseline"] = current.frame
+        if stage in {"accept", "chunk"}:
+            if "_input_guard" not in planned:
+                planned["_input_guard"] = InputContextGuard(self.screen, original)
+            planned["_input_guard"](stage=stage)
             return
-        reference = planned.get("_input_baseline", original.frame) if stage == "chunk" else original.frame
-        if screen_compare.observation_changed(reference, current.frame):
+        if screen_compare.observation_changed(original.frame, current.frame):
             raise RuntimeError("screen changed since the original observation; observe again before acting")
 
     async def _execute(self, planned: dict) -> float | None:

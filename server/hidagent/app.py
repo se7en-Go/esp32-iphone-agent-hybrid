@@ -18,7 +18,9 @@ from .control import Controls
 from .debug import Trace
 from .device import Device, DeviceError, supervise_maintain
 from .enter_context import verify_enter_context
+from .freshness import require_fresh
 from .guard import Guard, limits_for, skill_file
+from .input_context import InputContextGuard
 from .layouts import list_layouts, resolve_point
 from .llm import LLM
 from .messages import for_user, hints
@@ -589,8 +591,11 @@ async def type_text(t: TypeText, request: Request):
         select_type_mode(t.text, t.mode, clipboard_available=getattr(phone, "clipboard", None) is not None)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    return await while_connected(
-        request, act(lambda: phone.type(t.text) if t.mode == "auto" else phone.type(t.text, mode=t.mode)))
+    async def type_observed():
+        validate = InputContextGuard(screen, require_fresh(screen))
+        await phone.type(t.text, mode=t.mode, before_action=validate)
+
+    return await while_connected(request, act(type_observed))
 
 
 @app.post("/api/key")

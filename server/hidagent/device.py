@@ -61,6 +61,29 @@ class ExchangeTiming:
 _exchange_timing: ContextVar[ExchangeTiming | None] = ContextVar("exchange_timing", default=None)
 
 
+@dataclass
+class InputAttempt:
+    written: bool = False
+
+
+_input_attempt: ContextVar[InputAttempt | None] = ContextVar("input_attempt", default=None)
+
+
+@contextmanager
+def input_attempt():
+    """Retain an input's write boundary across exchanges and ACK failures.
+
+    Exchange tasks inherit this mutable observer. A later chunk, firmware error,
+    or cancellation cannot erase the fact that an earlier write may have executed.
+    """
+    attempt = InputAttempt()
+    token = _input_attempt.set(attempt)
+    try:
+        yield attempt
+    finally:
+        _input_attempt.reset(token)
+
+
 @contextmanager
 def exchange_timing():
     """Capture the monotonic write boundary after any wait for the serial lock."""
@@ -340,6 +363,9 @@ class Device:
                             timing.sent_at = time.monotonic()
                         if name == "press":
                             self._pressed_link = link  # the write may succeed before its ACK arrives
+                        attempt = _input_attempt.get()
+                        if attempt is not None and name in {"click", "key", "type"}:
+                            attempt.written = True  # even a failing write may have delivered bytes
                         link.write(f"{req_id} {command}\n".encode())
                         if name == "release" and self._pressed_link is link:
                             self._pressed_link = None

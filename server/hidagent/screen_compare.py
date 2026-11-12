@@ -153,7 +153,7 @@ def mask_pointer_highlights(before: bytes | Image.Image, after: bytes | Image.Im
     return tuple(recognized[0]), tuple(recognized[1])
 
 
-def observation_changed(before: bytes | None, after: bytes | None) -> bool:
+def observation_changed(before: bytes | None, after: bytes | None, *, input_region=None) -> bool:
     """Reject content edits while tolerating clock and recognized pointer shapes.
 
     Recognized hover outlines and small compact discs may fade or move. Other larger
@@ -164,6 +164,10 @@ def observation_changed(before: bytes | None, after: bytes | None) -> bool:
     diff = _difference(before, after, 360)
     if diff is None:
         return True
+    if input_region is not None:
+        w, h = diff.size
+        ImageDraw.Draw(diff).rectangle(tuple(round(v * (w if i % 2 == 0 else h))
+                                             for i, v in enumerate(input_region)), fill=0)
     mask_pointer_highlights(before, after, diff)
     _mask_pointer_discs(before, after, diff, max_discs=2)
     values = diff.tobytes()

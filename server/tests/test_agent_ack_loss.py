@@ -1,6 +1,7 @@
 """A lost click ACK must not become a second click after automatic recovery."""
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +18,7 @@ from hidagent.screen import Screen
 
 
 @pytest.mark.parametrize("command", ["tap 800 750", 'tap_text {"text":"发送","region":[0,0.6,1,0.9]}'])
-def test_click_ack_loss_is_retained_across_reconnect_and_replan(tmp_path, monkeypatch, command):
+def test_click_ack_loss_is_retained_across_reconnect_and_replan(tmp_path, monkeypatch, command, retry=None):
     async def scenario():
         class LostAck(Link):
             async def readline(self):
@@ -30,7 +31,7 @@ def test_click_ack_loss_is_retained_across_reconnect_and_replan(tmp_path, monkey
         screen._on_jpeg(jpeg())
         device.attach(original)
         phone = Phone(device, tmp_path / "calibration.json", screen)
-        actor = Model([f"DO: {command}", f"DO: {command}", "DO: done inspect outcome"])
+        actor = Model([f"DO: {command}", f"DO: {retry or command}", "DO: done inspect outcome"])
         planner = Model(["1. Tap the observed target", "1. Inspect after reconnect"])
         agent = Agent(phone, screen, actor, planner, Trace(None))
         recoveries = []
@@ -58,7 +59,8 @@ def test_click_ack_loss_is_retained_across_reconnect_and_replan(tmp_path, monkey
         monkeypatch.setattr(phone, "_tap_effect", effect)
         monkeypatch.setattr(screen, "settled", settled)
         ocr.set_backend(SimpleNamespace(read_text=lambda _frame: [
-            ocr.TextBox("发送", (.7, .7, .9, .8), (.8, .75), .99)]))
+            ocr.TextBox("发送", (.7, .7, .9, .8), (.8, .75), .99),
+            ocr.TextBox("设置", (.1, .3, .3, .4), (.2, .35), .99)]))
         try:
             await agent._run()
             writes = original.written + replacement.written
@@ -191,7 +193,8 @@ def test_lost_enter_ack_counts_once_through_the_production_gate(tmp_path, monkey
                     raise OSError("enter was written, but its ACK was lost")
                 return await super().readline()
 
-        guard = Guard(clock=lambda: 1_700_000_000.0)
+        local_noon = time.mktime((2024, 1, 15, 12, 0, 0, 0, 0, -1))
+        guard = Guard(clock=lambda: local_noon)
         screen, device = Screen(), Device()
         original, replacement = LostAck(), Link()
         screen._on_jpeg(jpeg())
@@ -225,3 +228,14 @@ def test_lost_enter_ack_counts_once_through_the_production_gate(tmp_path, monkey
             device.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("retry", [
+    'tap_text {"text":"设置","exact":false}',
+    'tap_text {"text":"设 置","exact":false,"region":null}',
+    'tap_text {"text":"设置","nth":1}',
+    'tap_text {"text":"设置","region":[0,0,1,1],"exact":true}',
+])
+def test_equivalent_ocr_selectors_do_not_replay_after_lost_click_ack(tmp_path, monkeypatch, retry):
+    test_click_ack_loss_is_retained_across_reconnect_and_replan(
+        tmp_path, monkeypatch, "tap_text 设置", retry=retry)

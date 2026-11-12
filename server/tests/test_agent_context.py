@@ -241,15 +241,19 @@ def test_agent_rechecks_context_after_waiting_for_action_locks(tmp_path, name, l
 
 @pytest.mark.parametrize("mode", ["chunks", "clipboard"])
 def test_input_validates_start_without_rejecting_its_own_screen_changes(tmp_path, mode):
+    from input_scene import input_frame
+
     from hidagent.phone import Phone
 
     agent, _, screen = setup()
+    if mode == "chunks":
+        screen.frame = input_frame()
     writes = []
     original = screen.frame
 
     async def send(command):
         writes.append(command)
-        screen.frame = frame("black")  # typing or opening the Shortcut changes the observed UI
+        screen.frame = input_frame(typed=True) if mode == "chunks" else frame("black")
         screen.updated = time.time()
         if mode == "clipboard" and command == "key ctrl+alt+p":
             screen.frame = original  # the Shortcut alert has left; Cmd+V still needs this field
