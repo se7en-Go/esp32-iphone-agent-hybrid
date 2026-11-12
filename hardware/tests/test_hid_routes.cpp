@@ -19,10 +19,16 @@ static uint32_t nowMs;
 static int usbReportAttempts;
 static std::vector<uint8_t> usbAcceptedButtons;
 static bool suspendUsbDuringDelay;
+static void (*delayHook)();
+static size_t usbReconnectReportStart;
 static std::vector<std::string> events;
 using esp_event_base_t = const char *;
 unsigned long millis() { return nowMs; }
-void delay(int ms) { nowMs += ms; if (suspendUsbDuringDelay) usbSuspended = true; }
+void delay(int ms) {
+  nowMs += ms;
+  if (suspendUsbDuringDelay) usbSuspended = true;
+  if (delayHook) delayHook();
+}
 bool tud_mounted() { return usbMounted; }
 bool tud_suspended() { return usbSuspended; }
 void tud_remote_wakeup() { wakeups++; usbSuspended = false; }
@@ -104,6 +110,8 @@ static void reset() {
   usbSuspended = false;
   bleButton = bleKey = bleConsumerHeld = usbButton = usbKey = usbConsumer = false;
   failBleRelease = failUsbReport = suspendUsbDuringDelay = false;
+  delayHook = nullptr;
+  usbReconnectReportStart = 0;
   nowMs = 0;
   usbReportAttempts = 0;
   mouse.cachedButtons = 0;
@@ -311,6 +319,69 @@ static void usb_reconnect_between_polls() {
   puts("ok USB disconnect event clears old buttons even after reconnect between polls");
 }
 
+static void reconnect_during_move() {
+  if (nowMs == 8) {
+    usbMounted = usbButton = false; // detached host discarded the old device
+    usbHidStopped(nullptr, nullptr, 0, nullptr);
+  } else if (nowMs == 808) {
+    usbMounted = true; // a new USB session while the command is still running
+    usbReconnectReportStart = usbAcceptedButtons.size();
+  }
+}
+
+static void press_and_reconnect_during_move() {
+  reset();
+  assert(run("press") == "ok" && usbButton);
+  delayHook = reconnect_during_move;
+  assert(run("move 2000 0 10") == "ok");
+  delayHook = nullptr;
+  assert(nowMs == 1600 && usbSessionEnded);
+  assert(usbAcceptedButtons.size() > usbReconnectReportStart);
+}
+
+static void usb_reconnect_does_not_replay_down() {
+  press_and_reconnect_during_move();
+  for (size_t i = usbReconnectReportStart; i < usbAcceptedButtons.size(); i++)
+    assert(usbAcceptedButtons[i] == 0 && "old mouse down must not cross USB sessions");
+  assert(!usbButton);
+  assert(activePath() == HID_PATH_USB);
+  assert(!mouse.isPressed() && !heldReports[HID_PATH_USB] && !releasePending[HID_PATH_USB]);
+  puts("ok long USB move never replays an old button down after reconnect");
+}
+
+static void failed_usb_reconnect_cleanup_retries() {
+  press_and_reconnect_during_move();
+  failUsbReport = true; // the next loop's reconnect cleanup cannot send its zero
+  assert(activePath() == HID_PATH_NONE);
+  assert(heldReports[HID_PATH_USB] == HELD_MOUSE && releasePending[HID_PATH_USB]);
+  delay(249);
+  assert(activePath() == HID_PATH_NONE);
+  delay(1);
+  assert(activePath() == HID_PATH_BLE);
+  assert(heldReports[HID_PATH_USB] == HELD_MOUSE && releasePending[HID_PATH_USB]);
+  int attempts = usbReportAttempts;
+  for (int i = 0; i < 1000; i++) assert(activePath() == HID_PATH_BLE);
+  assert(usbReportAttempts == attempts);
+  assert(run("press") == "ok" && bleButton);
+  assert(!hid_prepare_pref(HID_PREF_USB));
+  delay(48); // 49 ms since the last attempt at grace-period millisecond 249
+  assert(activePath() == HID_PATH_BLE && usbReportAttempts == attempts);
+  delay(1);
+  assert(activePath() == HID_PATH_BLE && usbReportAttempts > attempts);
+  assert(heldReports[HID_PATH_USB] == HELD_MOUSE && releasePending[HID_PATH_USB]);
+  attempts = usbReportAttempts;
+  failUsbReport = false;
+  delay(49);
+  assert(activePath() == HID_PATH_BLE && usbReportAttempts == attempts);
+  delay(1);
+  assert(activePath() == HID_PATH_USB && !usbButton);
+  assert(usbReportAttempts > attempts && usbAcceptedButtons.back() == 0);
+  assert(!heldReports[HID_PATH_USB] && !releasePending[HID_PATH_USB]);
+  assert(run("press") == "ok" && usbButton);
+  assert(run("release") == "ok" && !usbButton);
+  puts("ok failed USB reconnect cleanup retains the zero report and retries within bounds");
+}
+
 static void suspended_usb_has_bounded_blocking() {
   reset();
   assert(run("press") == "ok" && usbButton);
@@ -433,6 +504,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::string(argv[1]) == "detach") { detached_routes_stop_blocking(); return 0; }
   if (argc == 2 && std::string(argv[1]) == "usb_release") { failed_usb_release_retries_zero_report(); return 0; }
   if (argc == 2 && std::string(argv[1]) == "usb_reconnect") { usb_reconnect_between_polls(); return 0; }
+  if (argc == 2 && std::string(argv[1]) == "usb_reconnect_move") { usb_reconnect_does_not_replay_down(); return 0; }
+  if (argc == 2 && std::string(argv[1]) == "usb_reconnect_release") { failed_usb_reconnect_cleanup_retries(); return 0; }
   if (argc == 2 && std::string(argv[1]) == "suspend") { suspended_usb_has_bounded_blocking(); return 0; }
   if (argc == 2 && std::string(argv[1]) == "ble_bound") { failed_ble_release_has_bounded_blocking(); return 0; }
   if (argc == 2 && std::string(argv[1]) == "usb_bound") { failed_usb_release_defers_to_ble(); return 0; }
@@ -440,6 +513,8 @@ int main(int argc, char **argv) {
   detached_routes_stop_blocking();
   failed_usb_release_retries_zero_report();
   usb_reconnect_between_polls();
+  usb_reconnect_does_not_replay_down();
+  failed_usb_reconnect_cleanup_retries();
   suspended_usb_has_bounded_blocking();
   failed_ble_release_has_bounded_blocking();
   failed_usb_release_defers_to_ble();

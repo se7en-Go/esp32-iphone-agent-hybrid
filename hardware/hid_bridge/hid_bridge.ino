@@ -105,21 +105,40 @@ static bool releaseIsDeferred(int path) {
   return releasePending[path] && releaseDeferred[path];
 }
 
+static bool sendUsbMouseReport(uint8_t buttons, int8_t x = 0, int8_t y = 0,
+                               int8_t wheel = 0, int8_t pan = 0) {
+  // Keep button state in the route bookkeeping, never Arduino's mouse cache.
+  // A long move may outlive its USB session before loop() handles the stop event.
+  hid_mouse_report_t report = {};
+  report.buttons = usbSessionEnded ? 0 : buttons;
+  report.x = x;
+  report.y = y;
+  report.wheel = wheel;
+  report.pan = pan;
+  return mouse.sendReport(report);
+}
+
+static void moveUsbMouse(int8_t x, int8_t y, int8_t wheel = 0, int8_t pan = 0) {
+  sendUsbMouseReport(heldReports[HID_PATH_USB] & HELD_MOUSE ? MOUSE_LEFT : 0,
+                     x, y, wheel, pan);
+}
+
 static bool releaseReports(int path, uint8_t reports) {
   // A detached USB device / ended BLE ACL no longer owns host key state.
   // Suspend, lost encryption and lost subscriptions do not end that session.
   bool ended = path == HID_PATH_USB && usbSessionEnded.exchange(false);
   bool alive = path == HID_PATH_USB ? tud_mounted() : ble_hid_session_active();
-  if (ended || !alive) {
+  if (!alive) {
     if (path == HID_PATH_USB && heldReports[path]) {
-      // Arduino caches down reports even when USB cannot send. Clear those too,
-      // otherwise the next move after reattachment can resurrect a held button.
-      mouse.release(MOUSE_LEFT);
+      // Mouse reports have no Arduino cache; discard the old keyboard cache too.
       keyboard.releaseAll();
     }
     clearReleaseState(path);
     return true;
   }
+  // Reattachment still needs a checked zero report. Keep failed cleanup pending
+  // just like an ordinary release, even if the caller supplied no report mask.
+  if (ended) reports |= heldReports[path];
   if (!reports) {
     if (!heldReports[path]) clearReleaseState(path);
     return true;
@@ -141,11 +160,7 @@ static bool releaseReports(int path, uint8_t reports) {
       else sent = ble_hid_consumer(0);
     } else {
       if (bit == HELD_MOUSE) {
-        // release() clears Arduino's cache even when its void send fails. Always
-        // force a zero report and check acceptance, including on later retries.
-        mouse.release(MOUSE_LEFT);
-        hid_mouse_report_t zero = {};
-        sent = mouse.sendReport(zero);
+        sent = sendUsbMouseReport(0);
       }
       else if (bit == HELD_KEYS) keyboard.releaseAll();
       else sent = consumer.release() != 0;
@@ -234,7 +249,7 @@ static bool buttonOn(int path, bool down) {
   if (path == HID_PATH_BLE) {
     if (!ble_hid_button(true)) return false;
   } else {
-    mouse.press(MOUSE_LEFT);
+    sendUsbMouseReport(MOUSE_LEFT);
   }
   heldReports[path] |= HELD_MOUSE;
   return true;
@@ -290,7 +305,7 @@ static bool movePaced(long dx, long dy, int step) {
   bool ok = true;
   while (ok && pace_next(&p, &sx, &sy)) {
     if (path == HID_PATH_BLE) ok = ble_hid_mouse(clamp8(sx), clamp8(sy), 0, 0);
-    else if (path == HID_PATH_USB) mouse.move(sx, sy);
+    else if (path == HID_PATH_USB) moveUsbMouse(sx, sy);
     else ok = false;
     delay(prof.gap_ms);
   }
@@ -309,7 +324,7 @@ static bool slamHome() {
       int8_t x = axis == 0 ? -127 : 0;
       int8_t y = axis == 0 ? 0 : -127;
       if (path == HID_PATH_BLE) ok = ble_hid_mouse(x, y, 0, 0);
-      else if (path == HID_PATH_USB) mouse.move(x, y);
+      else if (path == HID_PATH_USB) moveUsbMouse(x, y);
       else ok = false;
       delay(prof.home_gap_ms);
     }
@@ -443,7 +458,7 @@ String run(const String &line) {
   if (cmd == "scroll") {
     if (path == HID_PATH_BLE) return ble_hid_mouse(0, 0, clamp8(a), clamp8(b)) ? "ok" : down;
     if (path != HID_PATH_USB) return down;
-    mouse.move(0, 0, a, b);
+    moveUsbMouse(0, 0, a, b);
     return "ok";
   }
   if (cmd == "type") {
