@@ -29,7 +29,10 @@ def parser() -> argparse.ArgumentParser:
         for key in keys:
             action.add_argument(key, type=int if key == "lines" else float)
     for name in ("type", "key"):
-        sub.add_parser(name).add_argument("text")
+        command = sub.add_parser(name)
+        command.add_argument("text")
+        if name == "type":
+            command.add_argument("--mode", choices=("auto", "paste", "keys"), default="auto")
     calibration = sub.add_parser("calibrate")
     calibration.add_argument("--pointer", nargs=2, type=float, metavar=("X", "Y"))
     sub.add_parser("task").add_argument("goal")
@@ -54,7 +57,8 @@ def main(argv=None) -> int:
                 case "tap": result = client.action("tap", x=args.x, y=args.y)
                 case "swipe": result = client.action("swipe", x1=args.x1, y1=args.y1, x2=args.x2, y2=args.y2)
                 case "scroll": result = client.action("scroll", x=args.x, y=args.y, lines=args.lines)
-                case "type" | "key": result = client.action(args.command, text=args.text)
+                case "type": result = client.action("type", text=args.text, mode=args.mode)
+                case "key": result = client.action("key", text=args.text)
                 case "home" | "back": result = client.action(args.command)
                 case "calibrate": result = client.calibrate(*(args.pointer or []))
                 case "task": result = client.delegate(args.goal)

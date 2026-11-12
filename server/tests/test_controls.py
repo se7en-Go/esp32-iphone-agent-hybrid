@@ -35,7 +35,7 @@ class FakePhone:
         self.calls.append(("point", x, y))
         return x, y
     async def tap_verified(self, x, y): self.calls.append(("tap", x, y))
-    async def type(self, text): self.calls.append(("type", text))
+    async def type(self, text, mode="auto"): self.calls.append(("type", text))
     async def key(self, text): self.calls.append(("key", text))
 
 

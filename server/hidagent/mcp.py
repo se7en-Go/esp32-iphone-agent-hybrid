@@ -23,8 +23,9 @@ def create_server(url: str | None = None):
         "Coordinates are normalized 0..1 unless coordinate_space=pixels; NEVER use 0..1000. "
         "A command acknowledgement or changed pixels is NOT verification of the user's goal. "
         "If an action fails, observe before deciding; never replay a message/send automatically. "
-        "For Chinese, first visibly focus a field and confirm Chinese Pinyin keyboard. Compose a short phrase, "
-        "select the correct candidates from the image, and verify the final text before a separate send. "
+        "For Chinese, use iphone_type with a configured clipboard companion (docs/PASTE_INPUT.md). "
+        "Otherwise confirm Chinese Pinyin keyboard, compose a short phrase and select candidates. "
+        "Always verify the final text before a separate send. "
         "If you cannot see images, tell the user to use a vision-capable host or explicitly opt into a configured "
         "fallback model; do not automatically delegate. One controller only. stop_task needs no screen_id. "
         "Prefer iphone_batch for several actions that do not need a new look between them; do not batch "
@@ -93,9 +94,13 @@ def create_server(url: str | None = None):
         return action("scroll", screen_id, x=x, y=y, lines=lines, coordinate_space=coordinate_space)
 
     @mcp.tool()
-    def iphone_type(text: str, screen_id: str) -> list[TextContent | ImageContent]:
-        """Type printable ASCII in a visibly focused field. Never submits or sends."""
-        return action("type", screen_id, text=text)
+    def iphone_type(text: str, screen_id: str, mode: Literal["auto", "paste", "keys"] = "auto"
+                    ) -> list[TextContent | ImageContent]:
+        """Enter one line in a focused field; never sends. Auto uses the configured clipboard companion,
+        otherwise ASCII keys. Paste needs docs/PASTE_INPUT.md setup, copy/focus acknowledgment,
+        and confirmation that the text appeared before the request completes.
+        """
+        return action("type", screen_id, text=text, mode=mode)
 
     @mcp.tool()
     def iphone_compose_chinese(text: str, screen_id: str,

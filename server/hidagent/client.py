@@ -11,7 +11,8 @@ class IPhoneClient:
         parsed = httpx.URL(url)
         if parsed.scheme not in ("http", "https") or not parsed.host or parsed.query or parsed.fragment:
             raise ValueError("server URL must be an HTTP(S) URL without a query or fragment")
-        self.http = httpx.Client(base_url=url.rstrip("/"), timeout=60, transport=transport, trust_env=False)
+        timeout = float(os.environ.get("IPHONE_AGENT_TIMEOUT", "60"))
+        self.http = httpx.Client(base_url=url.rstrip("/"), timeout=timeout, transport=transport, trust_env=False)
 
     def __enter__(self):
         return self

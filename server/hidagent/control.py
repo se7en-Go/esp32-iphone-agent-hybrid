@@ -13,6 +13,7 @@ from PIL import Image
 from pypinyin import lazy_pinyin
 
 from . import screen_compare, vision
+from .text_input import select_type_mode
 
 
 class Controls:
@@ -82,9 +83,9 @@ class Controls:
                 raise ValueError("both swipe points required")
             planned["swipe"] = (*point(request.x1, request.y1), *point(request.x2, request.y2))
         elif name == "type":
-            if (not request.text or not request.text.isascii()
-                    or any(ord(c) < 32 or ord(c) == 127 for c in request.text)):
-                raise ValueError("type requires printable ASCII; use compose_chinese for Chinese phrases")
+            planned["selected_mode"] = select_type_mode(
+                request.text, request.mode, clipboard_available=getattr(self.phone, "clipboard", None) is not None)
+            planned["mode"] = request.mode
         elif name == "compose_chinese":
             if not request.text or not all("\u4e00" <= c <= "\u9fff" for c in request.text) or len(request.text) > 60:
                 raise ValueError("compose_chinese needs 1..60 Chinese characters; type punctuation separately")
@@ -123,9 +124,12 @@ class Controls:
         elif name == "scroll":
             await self.phone.scroll(*planned["xy"], planned["lines"])
         elif name == "type":
-            await self.phone.type(planned["text"])
+            if planned["mode"] == "auto":
+                await self.phone.type(planned["text"])
+            else:
+                await self.phone.type(planned["text"], mode=planned["mode"])
         elif name == "compose_chinese":
-            await self.phone.type(planned["text"])
+            await self.phone.type(planned["text"], mode="keys")
         elif name == "key":
             for _ in range(planned["repeat"]):
                 await self.phone.key(planned["text"].lower())
@@ -180,6 +184,8 @@ class Controls:
         began = time.perf_counter()
         before, width, height = self.consume(screen_id)
         plans = [self._plan(request, width, height) for request in requests]
+        if sum(plan.get("selected_mode") == "paste" for plan in plans) > 1:
+            raise ValueError("一次 batch 只允许一次粘贴；请确认输入完成后重新观察再输入。")
         ready = time.perf_counter()
         started, acknowledged, error = time.time(), False, None
         done = []

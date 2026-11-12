@@ -18,6 +18,7 @@ from .assistive import AssistiveTouch
 from .device import RELEASE_TIMEOUT, Device, DeviceError, exchange_timing
 from .operation import OPERATION_TIMEOUT, bounded_operation, check_operation, shield_cleanup
 from .screen import FrameSnapshot
+from .text_input import ClipboardWriter, TypeMode, select_type_mode
 
 log = logging.getLogger(__name__)
 
@@ -88,8 +89,11 @@ class Phone:
     operation_timeout = OPERATION_TIMEOUT
 
     def __init__(self, device: Device, calibration_file: Path, screen=None, *,
-                 assistive_touch_position=None, assistive_touch_layout=None, find_text=None):
+                 assistive_touch_position=None, assistive_touch_layout=None, find_text=None,
+                 clipboard: ClipboardWriter | None = None):
         self.device, self._file, self.screen = device, calibration_file, screen
+        self.clipboard = clipboard
+        self._typing = asyncio.Lock()
         # mouse units needed to cross the full screen width / height
         saved = json.loads(calibration_file.read_text()) if calibration_file.exists() else None
         body = saved if isinstance(saved, dict) else {}
@@ -661,13 +665,22 @@ class Phone:
         await self.point(x, y)
         await self._command(f"scroll {lines} 0")
 
-    async def type(self, text: str) -> None:
-        # 固件串口一行最多 512 字节，含 "<id> type "。超长就切开，每段都要等到 ok。
+    async def type(self, text: str, mode: TypeMode = "auto") -> None:
+        """优先确认剪贴板后粘贴；未配置时仅 ASCII 可退回逐键输入。"""
+        try:
+            selected = select_type_mode(text, mode, clipboard_available=self.clipboard is not None)
+        except ValueError as exc:
+            raise DeviceError(str(exc)) from exc
         epoch = getattr(self.device, "abort_epoch", 0)
-        for part in type_chunks(text):
-            if getattr(self.device, "abort_epoch", 0) != epoch:
+        async with self._typing:
+            if self._stopped(epoch):
                 raise DeviceError("已紧急停止，后面的内容没有发出。")
-            await self._command(f"type {part}")
+            if selected == "paste":
+                await self.clipboard.paste(text, stopped=lambda: self._stopped(epoch),
+                                           send=lambda command: self._send(epoch, command))
+            else:
+                for part in type_chunks(text):
+                    await self._send(epoch, f"type {part}")
 
     async def key(self, combo: str) -> None:
         await self._command(f"key {combo}")

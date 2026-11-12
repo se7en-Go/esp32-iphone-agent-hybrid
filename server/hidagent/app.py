@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .agent import Agent
+from .clipboard import CompanionClipboard, create_router
 from .control import Controls
 from .debug import Trace
 from .device import Device, DeviceError, supervise_maintain
@@ -24,8 +25,10 @@ from .messages import for_user, hints
 from .operation import ActionLifetimeMiddleware
 from .paths import skill_roots
 from .phone import Phone
+from .request_lifetime import while_connected
 from .screen import Screen
 from .screen_uxplay import UxPlayScreen
+from .text_input import TypeMode, select_type_mode
 
 DATA_DIR = Path(os.environ.get("HIDAGENT_DATA", Path.home() / ".hidagent"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -46,7 +49,7 @@ def make_screen():
 
 device = Device()
 screen = make_screen()
-phone = Phone(device, DATA_DIR / "calibration.json", screen)
+phone = Phone(device, DATA_DIR / "calibration.json", screen, clipboard=CompanionClipboard.from_env())
 controls = Controls(phone, screen)
 agent = Agent(phone, screen, LLM.from_env("ACTOR"), LLM.from_env("PLANNER"),
               Trace(DATA_DIR / "traces" if DEBUG else None))
@@ -77,6 +80,7 @@ async def lifespan(_):
 
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(create_router(lambda: getattr(phone, "clipboard", None)))
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
@@ -196,6 +200,10 @@ class KeyboardText(Text):
     text: str = Field(min_length=1, max_length=4000)
 
 
+class TypeText(KeyboardText):
+    mode: TypeMode = "auto"
+
+
 class ActionStep(BaseModel):
     action: Literal["point", "tap", "swipe", "scroll", "type", "compose_chinese", "key", "home", "back"]
     coordinate_space: Literal["normalized", "pixels"] = "normalized"
@@ -208,6 +216,7 @@ class ActionStep(BaseModel):
     lines: int = Field(default=0, ge=-100, le=100)
     text: str = Field(default="", max_length=4000)
     input_mode: Literal["pinyin"] | None = None
+    mode: TypeMode = "auto"
     repeat: int = Field(default=1, ge=1, le=50)
 
 
@@ -241,6 +250,7 @@ class ControlAction(BaseModel):
     lines: int = Field(default=0, ge=-100, le=100)
     text: str = Field(default="", max_length=4000)
     input_mode: Literal["pinyin"] | None = None
+    mode: TypeMode = "auto"
     repeat: int = Field(default=1, ge=1, le=50)
 
 
@@ -326,13 +336,13 @@ async def control_observe():
 
 
 @app.post("/api/control/action")
-async def control_action(request: ControlAction):
+async def control_action(request: ControlAction, http_request: Request):
     refuse_if_tripped()
     check_manual()
     async with manual_lock:
         controls.job = asyncio.current_task()
         try:
-            return await controls.perform(request)
+            return await while_connected(http_request, controls.perform(request))
         except ValueError as e:
             raise HTTPException(409, str(e)) from e
         except asyncio.CancelledError as e:
@@ -346,14 +356,15 @@ def _steps(screen_id: str, steps: list[ActionStep]) -> list[ControlAction]:
 
 
 @app.post("/api/control/batch")
-async def control_batch(request: BatchBody):
+async def control_batch(request: BatchBody, http_request: Request):
     """一次观察、连续多步，最后只回一张图。"""
     refuse_if_tripped()
     check_manual()
     async with manual_lock:
         controls.job = asyncio.current_task()
         try:
-            return await controls.perform_batch(request.screen_id, _steps(request.screen_id, request.steps))
+            return await while_connected(
+                http_request, controls.perform_batch(request.screen_id, _steps(request.screen_id, request.steps)))
         except ValueError as e:
             raise HTTPException(409, str(e)) from e
         except asyncio.CancelledError as e:
@@ -474,9 +485,13 @@ async def scroll(s: Scroll):
 
 
 @app.post("/api/type")
-async def type_text(t: KeyboardText):
-    check_keyboard(t.text)
-    return await act(lambda: phone.type(t.text))
+async def type_text(t: TypeText, request: Request):
+    try:
+        select_type_mode(t.text, t.mode, clipboard_available=getattr(phone, "clipboard", None) is not None)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return await while_connected(
+        request, act(lambda: phone.type(t.text) if t.mode == "auto" else phone.type(t.text, mode=t.mode)))
 
 
 @app.post("/api/key")
