@@ -148,9 +148,12 @@ def test_search_query_ack_is_separate_from_result_page_verification(tmp_path, mo
         controls = Controls(phone, screen)
         after = spotlight(joined=True, extra=True, edit="sibling")
         send, write, timeout = phone._send, link.write, device._timeout
+        query_acked = False
 
         async def opened(*_args):
-            screen._on_jpeg(spotlight(joined=True, extra=True))
+            # This helper serves both opening Spotlight and the response's
+            # post-completion wait. Keep the source in its actual latest state.
+            screen._on_jpeg(after if query_acked else spotlight(joined=True, extra=True))
             return screen.frame
 
         async def labels(_frame):
@@ -167,10 +170,11 @@ def test_search_query_ack_is_separate_from_result_page_verification(tmp_path, mo
                 write(data)
 
         async def after_ack(epoch, command, **kwargs):
+            nonlocal query_acked
             result = await send(epoch, command, **kwargs)
             if command.startswith("type ") and outcome == "post_layout":
+                query_acked = True
                 screen._on_jpeg(after)  # result layout changes before field acceptance
-                asyncio.get_running_loop().call_soon(screen._on_jpeg, after)  # fresh post-completion receipt
             return result
 
         monkeypatch.setattr(feedback, "wait_after_action", opened)
