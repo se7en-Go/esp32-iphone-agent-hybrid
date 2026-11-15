@@ -170,7 +170,7 @@ def find_button(frame: bytes, near: Point | None = None) -> Point | None:
 def _icon_boxes(image: Image.Image, box: tuple[int, int, int, int]):
     panel = image.crop(box)
     w, h = panel.size
-    data = panel.tobytes()
+    data = panel.convert("L").tobytes()
     threshold = max(140, median(data) + 55)
     mask = bytearray(value >= threshold for value in data)
     boxes = []
@@ -179,7 +179,58 @@ def _icon_boxes(image: Image.Image, box: tuple[int, int, int, int]):
         if (.045*w <= bw <= .24*w and .045*h <= bh <= .24*h
                 and .4 <= bw/bh <= 2.4 and count >= .001*w*h):
             boxes.append((left/w, top/h, right/w, bottom/h))
+    if panel.mode == "RGB":
+        highlighted = _highlighted_home_box(panel, boxes)
+        if highlighted is not None:
+            boxes.append(highlighted)
     return boxes
+
+
+def _highlighted_home_box(panel, white_boxes):
+    """A hovered Home can turn blue, but never supplies the other five slots.
+
+    This is visible icon evidence only, not evidence of the pointer's location.
+    Keep the original white icons and require one compact Home-slot component.
+    """
+    centres = [((left+right)/2, (top+bottom)/2) for left, top, right, bottom in white_boxes]
+    present = [any(left < x < right and top < y < bottom for x, y in centres)
+               for left, top, right, bottom in MENU_ICON_REGIONS]
+    if not all(present[:-1]) or present[-1]:
+        return None
+    w, h = panel.size
+    pixels = zip(*[channel.tobytes() for channel in panel.split()], strict=True)
+    blue = bytes(b >= 140 and b-r >= 35 and b >= g for r, g, b in pixels)
+    home_left, home_top, home_right, home_bottom = MENU_ICON_REGIONS[-1]
+    candidates = []
+    for left, top, right, bottom, count in _components(bytearray(blue), w, h):
+        bw, bh = right-left, bottom-top
+        if not (.045*w <= bw <= .24*w and .045*h <= bh <= .24*h
+                and .75 <= bw/bh <= 1.33 and .35 <= count/(bw*bh) <= .85
+                and count >= .001*w*h):
+            continue
+        if not (home_left < left/w < right/w < home_right
+                and home_top < top/h < bottom/h < home_bottom):
+            continue
+        # Require the whole rounded body: hollow/pointed glyphs lack its interior,
+        # while a thick plus sign protrudes beyond its curved outer silhouette.
+        cx, cy = (left+right)/2, (top+bottom)/2
+        ellipse = outside = 0
+        for y in range(top, bottom):
+            for x in range(left, right):
+                inside = ((x+.5-cx)/(bw/2))**2 + ((y+.5-cy)/(bh/2))**2 <= 1
+                ellipse += inside
+                outside += bool(blue[y*w+x] and not inside)
+        if outside > .02*bw*bh or count-outside < .8*ellipse:
+            continue
+        # Rounded silhouettes change gradually on both axes. A narrower cross
+        # may fit inside the ellipse but still has abrupt, straight shoulders.
+        rows = [sum(blue[y*w+x] for x in range(left, right)) for y in range(top, bottom)]
+        columns = [sum(blue[y*w+x] for y in range(top, bottom)) for x in range(left, right)]
+        if (any(abs(a-b) > .35*bw for a, b in zip(rows, rows[1:], strict=False))
+                or any(abs(a-b) > .35*bh for a, b in zip(columns, columns[1:], strict=False))):
+            continue
+        candidates.append((left/w, top/h, right/w, bottom/h))
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _menu_icons(image: Image.Image, box: tuple[int, int, int, int]) -> bool:
@@ -191,7 +242,7 @@ def _menu_icons(image: Image.Image, box: tuple[int, int, int, int]) -> bool:
 
 def find_icon_box(frame: bytes, panel: Box, point: Point) -> Box | None:
     """Return a visible menu icon's bounds only when it contains the chosen target."""
-    image = _small(frame).convert("L")
+    image = _small(frame)
     left, top, right, bottom = panel
     pixels = (round(left*image.width), round(top*image.height),
               round(right*image.width), round(bottom*image.height))
@@ -209,7 +260,7 @@ def find_icon_target(frame: bytes, panel: Box, slot: Point) -> tuple[Point, Box]
     The six-icon panel is verified by find_panel before this lookup. A slot is not
     a click coordinate: missing or ambiguous icon bounds provide no target.
     """
-    image = _small(frame).convert("L")
+    image = _small(frame)
     left, top, right, bottom = panel
     pixels = (round(left*image.width), round(top*image.height),
               round(right*image.width), round(bottom*image.height))
@@ -230,7 +281,8 @@ def find_panel(frame: bytes, before: bytes | None = None) -> Box | None:
     Supplying `before` rejects unchanged app panels. Ambiguous/custom layouts are
     rejected; a dark rectangle alone must never authorize a Home click.
     """
-    image = _small(frame).convert("L")
+    rgb = _small(frame)
+    image = rgb.convert("L")
     w, h = image.size
     short = min(w, h)
     data = image.tobytes()
@@ -261,7 +313,7 @@ def find_panel(frame: bytes, before: bytes | None = None) -> Box | None:
                 continue
             box = left, top, right, bottom
             if box not in icons:
-                icons[box] = _menu_icons(image, box)
+                icons[box] = _menu_icons(rgb, box)
             if not icons[box]:
                 continue
             if difference:
