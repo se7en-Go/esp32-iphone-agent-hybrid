@@ -1353,7 +1353,55 @@ class Phone:
         alternate = 0 if normal_vertical else 1
         practical = [item for item in candidates if item[0] <= 1.35 * shortest]
         _, axis, units = min(practical, key=lambda item: (item[1] != alternate, item[0]))
-        return axis, units
+        return self._home_menu_probe_direction(near, box, dimensions, practical, (axis, units))
+
+    def _home_menu_probe_direction(self, near, box, dimensions, candidates, default):
+        """Rank existing same-axis candidates, never infer a landing from clear pixels."""
+        from .navigation_context import NavigationContext
+
+        context = getattr(self, "_navigation_context", None)
+        if (not isinstance(context, NavigationContext) or context.action != "home" or context.kind != "menu"
+                or tuple(box) != context.target.box or len(context.regions) != 1):
+            return default
+        options = [item for item in candidates if item[1] == default[0]]
+        if len(options) != 2 or options[0][2] * options[1][2] >= 0:
+            return default
+        try:
+            context.validate_target(getattr(self, "_tap_target_frame", None),
+                                    freshness.snapshot(self.screen).generation, near)
+            with Image.open(io.BytesIO(context.observation.frame)) as source:
+                image = source.convert("RGB")
+            if image.size != dimensions:
+                return default
+            width, height = dimensions
+            # Cover the existing maximum pointer diameter (.067 * width), with
+            # no extra search area. Both footprints must lie inside the menu.
+            radius = math.ceil(.034 * width)
+            panel = tuple(value * dimensions[index % 2] for index, value in enumerate(context.regions[0]))
+            scores = []
+            for _, axis, units in options:
+                point = [near[0] * width, near[1] * height]
+                point[axis] += units * dimensions[axis] / self.span["wh"[axis]]
+                x, y = map(round, point)
+                bounds = (x-radius, y-radius, x+radius+1, y+radius+1)
+                if not (0 <= panel[0] <= bounds[0] < bounds[2] <= panel[2] <= width
+                        and 0 <= panel[1] <= bounds[1] < bounds[3] <= panel[3] <= height):
+                    return default
+                patch = image.crop(bounds)
+                median = ImageStat.Stat(patch).median
+                pixels = patch.load()
+                textured = sum(max(abs(value-background)
+                                   for value, background in zip(pixels[x, y], median, strict=True)) > 12
+                               for y in range(patch.height) for x in range(patch.width)) / (patch.width * patch.height)
+                scores.append((textured, axis, units))
+            scores.sort()
+            # Only a clearly flat/label-textured contrast changes the old order.
+            # Similar backgrounds retain the original geometric tie-breaker.
+            if scores[0][0] <= .02 and scores[1][0] >= .10:
+                return scores[0][1], scores[0][2]
+        except (OSError, ValueError, RuntimeError):
+            pass
+        return default
 
     def _extend_escape_probe(self, near, axis, units):
         """One extra cursor clearance, keeping the entire outward leg within its original bound."""
