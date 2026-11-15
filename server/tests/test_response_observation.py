@@ -67,6 +67,25 @@ def test_superseded_effect_is_replaced_by_current_settled_evidence(rig):
     assert not any(key.startswith("_") for key in result)
 
 
+def test_async_ocr_timeout_keeps_ack_but_does_not_issue_continuation_ticket(rig, monkeypatch):
+    summarize = screen_diff.summarize
+    ocr_calls = []
+
+    async def expired(before, after, **kwargs):
+        if kwargs.get("ocr_enabled"):
+            ocr_calls.append((before, after))
+            # This is distinct from built-in TimeoutError on supported Python 3.10.
+            raise asyncio.TimeoutError()
+        return await summarize(before, after, **kwargs)
+
+    monkeypatch.setattr(screen_diff, "summarize", expired)
+    result = asyncio.run(rig.controls.perform(action(rig, ocr_diff=True)))
+    assert len(ocr_calls) == 1 and ocr_calls[0][1] == rig.final
+    assert result["command_acknowledged"] and result["effect_observed"]
+    assert not result["fresh"] and result["screen_id"] is None
+    assert rig.controls.ticket is None and rig.phone.calls == [("click",)]
+
+
 def test_page_keeps_changing_after_effect_gets_no_ticket(rig):
     original = rig.phone.tap_verified
 

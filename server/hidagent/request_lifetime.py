@@ -11,8 +11,10 @@ T = TypeVar("T")
 
 async def while_connected(request: Request, operation: Awaitable[T]) -> T:
     """请求正文已读取；取消后等待清理，不能留下可确认的粘贴。"""
+    finished = False
+
     async def disconnected():
-        while True:
+        while not finished:
             if (await request.receive())["type"] == "http.disconnect":
                 return
 
@@ -25,6 +27,10 @@ async def while_connected(request: Request, operation: Awaitable[T]) -> T:
             raise HTTPException(499, "调用方已断开，输入操作已取消；请重新观察后操作。")
         return await work
     finally:
+        # On Python 3.10 a middleware receive cancel scope can swallow our
+        # cancellation while returning a body message. Do not receive again:
+        # the next disconnect may depend on this very response completing.
+        finished = True
         for task in (work, watcher):
             if not task.done():
                 task.cancel()

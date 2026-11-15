@@ -146,11 +146,7 @@ def test_home_requires_grid_dock_and_no_application_chrome():
     assert not is_home_screen(panel_frame())
 
 
-@pytest.mark.parametrize("dock,chrome,expected", [(True, False, True), (False, False, False),
-                                                   (True, True, False)])
-def test_home_recognizes_a_fragmented_dock_over_colorful_wallpaper(dock, chrome, expected):
-    from hidagent.assistive_vision import is_home_screen
-
+def fragmented_dock_frame(*, dock=False, chrome=False, radius=12, quality=85):
     width, height = 360, 780
     wallpaper = "#2698d8"
     image = Image.new("RGB", (width, height), wallpaper)
@@ -162,11 +158,30 @@ def test_home_recognizes_a_fragmented_dock_over_colorful_wallpaper(dock, chrome,
     colors = ("#ffdf95", "#53107a", "#fafff9", "#1a2521")
     for y in (281, 370, 460, 723):
         for x, color in zip((54, 139, 221, 306), colors, strict=True):
-            draw.rounded_rectangle((x-27, y-27, x+27, y+27), radius=12, fill=color)
+            draw.rounded_rectangle((x-27, y-27, x+27, y+27), radius=radius, fill=color)
     if chrome:
         draw.line((0, 105, width, 105), fill="white", width=3)
 
-    assert is_home_screen(encoded(image)) is expected
+    output = io.BytesIO()
+    image.save(output, "JPEG", quality=quality)
+    return output.getvalue()
+
+
+@pytest.mark.parametrize("dock,chrome,expected", [(True, False, True), (False, False, False),
+                                                   (True, True, False)])
+@pytest.mark.parametrize("quality", [80, 85])
+def test_home_recognizes_a_fragmented_dock_over_colorful_wallpaper(dock, chrome, expected, quality):
+    from hidagent.assistive_vision import is_home_screen
+
+    assert is_home_screen(fragmented_dock_frame(dock=dock, chrome=chrome, quality=quality)) is expected
+
+
+@pytest.mark.parametrize("radius", [0, 4, 8])
+@pytest.mark.parametrize("quality", [80, 85])
+def test_bottom_icon_edges_are_not_a_separate_dock_rim(radius, quality):
+    from hidagent.assistive_vision import is_home_screen
+
+    assert not is_home_screen(fragmented_dock_frame(radius=radius, quality=quality))
 
 
 @pytest.mark.parametrize("name", ["00_home_1500ms", "dial_final", "airplay_receiver_button"])

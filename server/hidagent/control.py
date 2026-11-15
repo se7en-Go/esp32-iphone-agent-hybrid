@@ -571,7 +571,7 @@ class Controls:
                               remaining_operation_time() - quiet - reserve)
             try:
                 await asyncio.wait_for(feedback.wait_after_action(self.screen, completed_at), wait_budget)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 return None, time.perf_counter(), deadline
         fresh_done = time.perf_counter()
         if not self._response_session_valid(session):
@@ -624,7 +624,7 @@ class Controls:
                     try:
                         diff = await asyncio.wait_for(screen_diff.summarize(
                             before, after, fresh=True, ocr_enabled=True), budget)
-                    except TimeoutError:
+                    except asyncio.TimeoutError:
                         break
                 else:
                     # Pixel-only feedback does not yield to another task.

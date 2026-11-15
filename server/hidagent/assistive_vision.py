@@ -354,7 +354,10 @@ def _home_with_translucent_dock(image: Image.Image) -> bool:
         column = min(columns, key=lambda value: abs(x-value))
         if abs(x-column) > .045:
             continue
-        if .025 < y-dock_line < .09 and y < .96:
+        # The dock rim must be separate from its icons. Aligned icon top edges
+        # can themselves span both halves after JPEG decoding; their component
+        # bounds must clear the supposed rim and its two-pixel JPEG/resize halo.
+        if .025 < y-dock_line < .09 and y < .96 and top > round(dock_line*h) + 2:
             dock_columns.add(column)
         elif .13 < y < .76:
             row = next((row for center, row in rows if abs(y-center) < .025), None)
