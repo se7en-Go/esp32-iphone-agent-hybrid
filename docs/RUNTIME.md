@@ -45,6 +45,8 @@ Windows 的 `scripts/run-server.ps1` 保留原来的前台板载镜像路径。U
 
 Mac 本地已有 `server/.local-data/uxplay-runtime/bin/uxplay` 时，管理入口默认使用 UxPlay。显式的 `SCREEN_BACKEND=board` 或 `--backend board` 可以选择板载镜像。使用 UxPlay 时，入口自动补齐该 runtime 的 `bin`、GStreamer 插件和 scanner 路径。也可以用 `UXPLAY_RUNTIME` 指向另一套已安装 runtime，或让 `PATH` 中已有 `uxplay`。
 
+可选的 UxPlay 分帧模式会在 iPhone 快速断开再连接时废弃旧画面和旧操作凭证。构建兼容的二进制、选择依赖路径和启用 `HIDAGENT_UXPLAY_FRAMED=1` 的步骤见 [原生接收器构建说明](../native/uxplay/README.md)。启用设置在接收器启动时生效。
+
 推荐的非敏感运行设置如下。
 
 ```dotenv

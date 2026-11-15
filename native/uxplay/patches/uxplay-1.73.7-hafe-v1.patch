@@ -1,0 +1,418 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,6 +1,14 @@
+ cmake_minimum_required( VERSION 3.13 )
+ 
+ project( uxplay )
++
++option(HAFE_NATIVE "Enable native session-framed JPEG output (Unix only)" OFF)
++if(HAFE_NATIVE AND NOT UNIX)
++  message(FATAL_ERROR "HAFE_NATIVE requires a Unix platform; leave OFF for legacy builds")
++endif()
++if(HAFE_NATIVE)
++  add_compile_definitions(HAFE_NATIVE=1)
++endif()
+ 
+ message( STATUS "Project name: " ${PROJECT_NAME} )
+ 
+--- a/lib/raop.h
++++ b/lib/raop.h
+@@ -72,6 +72,8 @@
+     void* cls;
+ 
+     void  (*audio_process)(void *cls, raop_ntp_t *ntp, audio_decode_struct *data);
++    void *(*video_session_begin)(void *cls);
++    void  (*video_session_end)(void *cls, void *session);
+     void  (*video_process)(void *cls, raop_ntp_t *ntp, video_decode_struct *data);
+     void  (*video_pause)(void *cls);
+     void  (*video_resume)(void *cls);
+--- a/lib/raop_rtp_mirror.c
++++ b/lib/raop_rtp_mirror.c
+@@ -183,6 +183,7 @@
+     assert(raop_rtp_mirror);
+ 
+     int stream_fd = -1;
++    void *video_session = NULL;
+     unsigned char packet[128] = {0};
+     unsigned char* sps_pps = NULL;
+     bool prepend_sps_pps = false;
+@@ -295,6 +296,14 @@
+             }
+ #endif /* !__OpenBSD__ */
+             readstart = 0;
++            if (raop_rtp_mirror->callbacks.video_session_begin) {
++                video_session = raop_rtp_mirror->callbacks.video_session_begin(raop_rtp_mirror->callbacks.cls);
++                if (!video_session) break;
++                /* A new transport must not inherit an old compressed frame/config. */
++                free(sps_pps); sps_pps = NULL; sps_pps_len = 0; prepend_sps_pps = false;
++                codec = VIDEO_CODEC_UNKNOWN; h265_video = false; video_stream_suspended = false;
++                memset(packet, 0, sizeof(packet));
++            }
+         }
+ 
+         if (stream_fd != -1 && FD_ISSET(stream_fd, &rfds)) {
+@@ -310,6 +319,12 @@
+             if (payload == NULL && ret == 0) {
+                 logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG,
+                            "raop_rtp_mirror tcp socket was closed by client (recv returned 0); got %d bytes of 128 byte header",readstart);
++                if (video_session && raop_rtp_mirror->callbacks.video_session_end) {
++                    raop_rtp_mirror->callbacks.video_session_end(raop_rtp_mirror->callbacks.cls, video_session);
++                    video_session = NULL;
++                    /* Extra transport cleanup belongs only to the opted-in native session. */
++                    CLOSESOCKET(stream_fd);
++                }
+                 FD_CLR(stream_fd, &rfds);
+                 stream_fd = -1;
+                 continue;
+@@ -542,6 +557,7 @@
+ 		
+                 payload_decrypted = NULL;
+                 video_decode_struct video_data;
++                video_data.video_session = video_session;
+                 video_data.is_h265 = h265_video;
+                 video_data.ntp_time_local = ntp_timestamp_local;
+                 video_data.ntp_time_remote = ntp_timestamp_remote;
+@@ -835,6 +851,10 @@
+             }
+         }
+     }
++    if (video_session && raop_rtp_mirror->callbacks.video_session_end) {
++        raop_rtp_mirror->callbacks.video_session_end(raop_rtp_mirror->callbacks.cls, video_session);
++        video_session = NULL;
++    }
+     /* Close the stream file descriptor */
+     if (stream_fd != -1) {
+         CLOSESOCKET(stream_fd);
+--- a/lib/stream.h
++++ b/lib/stream.h
+@@ -22,6 +22,7 @@
+ #include <stdbool.h>
+ 
+ typedef struct {
++    void *video_session; /* immutable native producer context for this TCP accept */
+     bool is_h265;
+     int nal_count;
+     unsigned char *data;
+--- a/renderers/CMakeLists.txt
++++ b/renderers/CMakeLists.txt
+@@ -51,6 +51,10 @@
+              video_renderer.c
+              mux_renderer.c )
+ 
++if(HAFE_NATIVE)
++  target_sources(renderers PRIVATE hafe_stream.cpp hafe_renderer.cpp)
++endif()
++
+ target_link_libraries ( renderers PUBLIC airplay )
+ 
+ # hacks to fix cmake confusion due to links in path with macOS FrameWorks
+--- /dev/null
++++ b/renderers/hafe_renderer.cpp
+@@ -0,0 +1,101 @@
++#include "hafe_renderer.h"
++#include "hafe_stream.hpp"
++#include <gst/gst.h>
++#include <gst/app/gstappsrc.h>
++#include <gst/app/gstappsink.h>
++#include <climits>
++#include <cstdlib>
++#include <memory>
++#include <string>
++
++static std::unique_ptr<HafeWriter> writer;
++struct HafeSession {
++    /* Never overwrite this value. Every appsink owns this particular context. */
++    const uint64_t epoch;
++    GstElement *pipeline = nullptr, *source = nullptr;
++    bool h265 = false;
++    explicit HafeSession(uint64_t value): epoch(value) {}
++};
++static GstFlowReturn sample(GstAppSink *sink, gpointer opaque) {
++    HafeSession *session = static_cast<HafeSession *>(opaque);
++    GstSample *value = gst_app_sink_pull_sample(sink);
++    if (!value) return GST_FLOW_EOS;
++    GstBuffer *buffer = gst_sample_get_buffer(value);
++    GstMapInfo map;
++    bool written = false;
++    if (buffer && gst_buffer_map(buffer, &map, GST_MAP_READ)) {
++        written = writer->jpeg(session->epoch, map.data, map.size);
++        gst_buffer_unmap(buffer, &map);
++    }
++    gst_sample_unref(value);
++    return written ? GST_FLOW_OK : GST_FLOW_FLUSHING;
++}
++extern "C" int hafe_configure_from_env(void) {
++    const char *value = getenv("HIDAGENT_UXPLAY_FRAMED_FD");
++    if (!value) return 0;
++    if (!*value) return -1;
++    for (const char *p = value; *p; ++p) if (*p < '0' || *p > '9') return -1;
++    char *end; long fd = strtol(value, &end, 10);
++    if (*end || fd < 3 || fd > INT_MAX) return -1;
++    try { writer.reset(new HafeWriter(static_cast<int>(fd))); }
++    catch (...) { return -1; }
++    gst_init(nullptr, nullptr);
++    return 1;
++}
++extern "C" void *hafe_begin(void *) {
++    uint64_t epoch = writer->begin();
++    return epoch ? new HafeSession(epoch) : nullptr;
++}
++extern "C" void hafe_end(void *, void *opaque) {
++    HafeSession *session = static_cast<HafeSession *>(opaque);
++    if (!session) return;
++    /* Invalidate first, then wait for this pipeline's callbacks to finish. */
++    writer->end(session->epoch);
++    if (session->pipeline) {
++        gst_element_set_state(session->pipeline, GST_STATE_NULL);
++        gst_object_unref(session->source);
++        gst_object_unref(session->pipeline);
++    }
++    delete session;
++}
++extern "C" void hafe_process(void *opaque, video_decode_struct *data) {
++    HafeSession *session = static_cast<HafeSession *>(opaque);
++    if (!session || !writer->healthy() || data->data_len <= 0 || data->data_len > 8*1024*1024) return;
++    if (!session->pipeline) {
++        session->h265 = data->is_h265;
++        const std::string codec = session->h265 ? "h265" : "h264";
++        std::string pipeline = "appsrc name=hafe_source is-live=true format=time do-timestamp=true "
++            "max-bytes=8388608 block=false ! queue max-size-buffers=2 max-size-bytes=8388608 "
++            "max-size-time=0 leaky=downstream ! " + codec + "parse ! avdec_" + codec +
++            " ! videoconvert ! jpegenc quality=75 ! appsink name=hafe_sink "
++            "emit-signals=true sync=false max-buffers=1 drop=true";
++        GError *error = nullptr;
++        session->pipeline = gst_parse_launch(pipeline.c_str(), &error);
++        if (error || !session->pipeline) {
++            if (error) g_error_free(error);
++            if (session->pipeline) gst_object_unref(session->pipeline);
++            session->pipeline = nullptr; writer->end(session->epoch); return;
++        }
++        session->source = gst_bin_get_by_name(GST_BIN(session->pipeline), "hafe_source");
++        GstElement *sink = gst_bin_get_by_name(GST_BIN(session->pipeline), "hafe_sink");
++        GstCaps *caps = gst_caps_new_simple(("video/x-"+codec).c_str(),
++            "stream-format", G_TYPE_STRING, "byte-stream", "alignment", G_TYPE_STRING, "au", nullptr);
++        gst_app_src_set_caps(GST_APP_SRC(session->source), caps); gst_caps_unref(caps);
++        g_signal_connect(sink, "new-sample", G_CALLBACK(sample), session);
++        gst_object_unref(sink);
++        if (gst_element_set_state(session->pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
++            writer->end(session->epoch); return;
++        }
++    }
++    if (session->h265 != data->is_h265) { writer->end(session->epoch); return; }
++    /* appsrc max-bytes alone is advisory when block=false; check actual queue. */
++    guint64 queued = 0;
++    g_object_get(session->source, "current-level-bytes", &queued, nullptr);
++    if (queued + static_cast<guint64>(data->data_len) > 8*1024*1024) {
++        writer->end(session->epoch); return;
++    }
++    GstBuffer *buffer = gst_buffer_new_allocate(nullptr, data->data_len, nullptr);
++    gst_buffer_fill(buffer, 0, data->data, data->data_len);
++    if (gst_app_src_push_buffer(GST_APP_SRC(session->source), buffer) != GST_FLOW_OK)
++        writer->end(session->epoch);
++}
+--- /dev/null
++++ b/renderers/hafe_renderer.h
+@@ -0,0 +1,13 @@
++#pragma once
++#include "../lib/stream.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* 0 absent/stock; 1 enabled; -1 invalid configuration (fatal, no fallback). */
++int hafe_configure_from_env(void);
++void *hafe_begin(void *cls);
++void hafe_end(void *cls, void *session);
++void hafe_process(void *session, video_decode_struct *data);
++#ifdef __cplusplus
++}
++#endif
+--- /dev/null
++++ b/renderers/hafe_stream.cpp
+@@ -0,0 +1,83 @@
++#include "hafe_stream.hpp"
++#include <chrono>
++#include <cerrno>
++#include <cstring>
++#include <fcntl.h>
++#include <poll.h>
++#include <signal.h>
++#include <stdexcept>
++#include <sys/stat.h>
++#include <unistd.h>
++
++namespace {
++void be(unsigned char *out, uint64_t value, size_t bytes) {
++    for (size_t i = bytes; i; --i) { out[i-1] = value & 255; value >>= 8; }
++}
++}
++HafeWriter::HafeWriter(int fd): fd_(fd) {
++    struct stat st;
++    int flags = fcntl(fd_, F_GETFL);
++    if (fd_ < 3 || flags < 0 || (flags & O_ACCMODE) == O_RDONLY ||
++        fstat(fd_, &st) < 0 || !S_ISFIFO(st.st_mode) ||
++        fcntl(fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
++        throw std::runtime_error("invalid HAFE output descriptor");
++    }
++    /* This opt-in process owns the dedicated output pipe. Broken consumers
++       must invalidate it, never terminate midway and silently restart raw JPEG. */
++    signal(SIGPIPE, SIG_IGN);
++}
++HafeWriter::~HafeWriter() { if (fd_ >= 0) close(fd_); }
++void HafeWriter::fail() {
++    if (fd_ >= 0) close(fd_);
++    fd_ = -1; active_ = 0;
++}
++bool HafeWriter::record(unsigned char kind, uint64_t epoch, uint64_t seq,
++                        const unsigned char *data, size_t length) {
++    if (fd_ < 0) return false;
++    unsigned char header[32] = {'H','A','F','E',1,kind,0,0};
++    be(header+8, epoch, 8); be(header+16, seq, 8); be(header+24, length, 4);
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
++    for (int part = 0; part < 2; ++part) {
++        const unsigned char *bytes = part ? data : header;
++        size_t left = part ? length : sizeof(header);
++        while (left) {
++            auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
++                deadline - std::chrono::steady_clock::now()).count();
++            if (remaining <= 0) { fail(); return false; }
++            pollfd poller = {fd_, POLLOUT, 0};
++            int ready = poll(&poller, 1, static_cast<int>(remaining));
++            if (ready < 0 && errno == EINTR) continue;
++            if (ready <= 0 || !(poller.revents & POLLOUT) ||
++                (poller.revents & (POLLERR | POLLHUP | POLLNVAL))) { fail(); return false; }
++            ssize_t count = write(fd_, bytes, left);
++            if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
++            if (count <= 0) { fail(); return false; }
++            bytes += count; left -= count;
++        }
++    }
++    return true;
++}
++uint64_t HafeWriter::begin() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (fd_ < 0) return 0;
++    if (active_ && !record(3, active_, 0, nullptr, 0)) return 0;
++    if (next_ == UINT64_MAX) { fail(); return 0; }
++    active_ = ++next_; sequence_ = 0;
++    return record(1, active_, 0, nullptr, 0) ? active_ : 0;
++}
++bool HafeWriter::jpeg(uint64_t epoch, const unsigned char *data, size_t length) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!epoch || epoch != active_ || fd_ < 0) return false;
++    if (!data || length < 4 || length > MAX_JPEG || data[0] != 0xff ||
++        data[1] != 0xd8 || data[length-2] != 0xff || data[length-1] != 0xd9 ||
++        sequence_ == UINT64_MAX) { fail(); return false; }
++    return record(2, epoch, ++sequence_, data, length);
++}
++void HafeWriter::end(uint64_t epoch) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!epoch || epoch != active_) return;
++    record(3, epoch, 0, nullptr, 0); active_ = 0;
++}
++bool HafeWriter::healthy() {
++    std::lock_guard<std::mutex> lock(mutex_); return fd_ >= 0;
++}
+--- /dev/null
++++ b/renderers/hafe_stream.hpp
+@@ -0,0 +1,23 @@
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <mutex>
++
++/* HAFE v1: 32-byte network-order header, then bounded JPEG payload. */
++class HafeWriter {
++public:
++    static const size_t MAX_JPEG = 8 * 1024 * 1024;
++    explicit HafeWriter(int fd);
++    ~HafeWriter();
++    uint64_t begin();
++    bool jpeg(uint64_t immutable_epoch, const unsigned char *data, size_t length);
++    void end(uint64_t immutable_epoch);
++    bool healthy();
++private:
++    bool record(unsigned char kind, uint64_t epoch, uint64_t seq,
++                const unsigned char *data, size_t length);
++    void fail();
++    std::mutex mutex_;
++    int fd_;
++    uint64_t next_ = 0, active_ = 0, sequence_ = 0;
++};
+--- a/uxplay.cpp
++++ b/uxplay.cpp
+@@ -66,6 +66,10 @@
+ #include "lib/dnssd.h"
+ #include "lib/crypto.h"
+ #include "renderers/video_renderer.h"
++#ifdef HAFE_NATIVE
++#include "renderers/hafe_renderer.h"
++static bool hafe_enabled = false;
++#endif
+ #include "renderers/audio_renderer.h"
+ #include "renderers/mux_renderer.h"
+ #ifdef DBUS
+@@ -2328,6 +2332,9 @@
+ }
+ 
+ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *data) {
++#ifdef HAFE_NATIVE
++    if (hafe_enabled) { hafe_process(data->video_session, data); return; }
++#endif
+     if (dump_video) {
+         dump_video_to_file(data->data, data->data_len);
+     }
+@@ -2691,6 +2698,12 @@
+     raop_cbs.conn_feedback = conn_feedback;
+     raop_cbs.audio_process = audio_process;
+     raop_cbs.video_process = video_process;
++#ifdef HAFE_NATIVE
++    if (hafe_enabled) {
++        raop_cbs.video_session_begin = hafe_begin;
++        raop_cbs.video_session_end = hafe_end;
++    }
++#endif
+     raop_cbs.audio_flush = audio_flush;
+     raop_cbs.video_flush = video_flush;
+     raop_cbs.video_pause = video_pause;
+@@ -2868,6 +2881,13 @@
+ void real_main (int argc, char *argv[]);
+ 
+ int main (int argc, char *argv[]) {
++    if (argc == 2 && !strcmp(argv[1], "--hafe-protocol")) {
++#ifdef HAFE_NATIVE
++        puts("HAFE/1"); return 0;
++#else
++        puts("HAFE/0"); return 2;
++#endif
++    }
+     LOGI("*=== Using gst_macos_main wrapper for GStreamer >= 1.22 on macOS ===*");
+     return  gst_macos_main ((GstMainFunc) real_main, argc, argv , NULL);
+ }
+@@ -2875,6 +2895,13 @@
+ void real_main (int argc, char *argv[]) {
+ #else
+ int main (int argc, char *argv[]) {
++    if (argc == 2 && !strcmp(argv[1], "--hafe-protocol")) {
++#ifdef HAFE_NATIVE
++        puts("HAFE/1"); return 0;
++#else
++        puts("HAFE/0"); return 2;
++#endif
++    }
+ #endif
+     std::vector<char> server_hw_addr;
+     std::string config_file = "";
+@@ -2937,6 +2964,13 @@
+         read_config_file(config_file.c_str(), argv[0]);
+     }
+     parse_arguments (argc, argv);
++
++#ifdef HAFE_NATIVE
++    int framed_mode = hafe_configure_from_env();
++    if (framed_mode < 0) { fprintf(stderr, "invalid HAFE configuration\n"); exit(1); }
++    hafe_enabled = framed_mode == 1;
++    if (hafe_enabled) use_video = false;
++#endif
+ 
+     log_level = (debug_log ? LOGGER_DEBUG_DATA : LOGGER_INFO);
+     if (debug_log && suppress_packet_debug_data) {

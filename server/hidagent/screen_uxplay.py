@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import freshness, messages, vision
 from .screen import PREVIEW_HOLD_S, FrameSnapshot, PreviewStatus, RecentFrameHistory
+from .uxplay_frames import BEGIN, END, FrameProtocolError, FrameStreamParser
 
 log = logging.getLogger(__name__)
 
@@ -40,13 +41,32 @@ class UxPlayScreen(RecentFrameHistory):
         self._ipc_received = 0.0
         self._ipc_source = None
         self._stop_event = threading.Event()
+        mode = os.environ.get("HIDAGENT_UXPLAY_FRAMED", "0")
+        if mode not in {"0", "1"}:
+            raise ValueError("HIDAGENT_UXPLAY_FRAMED must be 0 (stock) or 1 (native framed)")
+        self._framed = mode == "1"
+        self._native_epoch = 0
+        self._native_active = False
         self.last_error = ""
 
     def start(self) -> None:
         if sys.platform == "win32":
             raise RuntimeError(messages.UXPLAY_WINDOWS)
+        if self._framed and not self.socket_path:
+            self._check_native_protocol()
         target = self._subscribe if self.socket_path else self._supervise
         threading.Thread(target=target, daemon=True).start()
+
+    def _check_native_protocol(self) -> None:
+        env = os.environ.copy()
+        env.pop("HIDAGENT_UXPLAY_FRAMED_FD", None)
+        try:
+            result = subprocess.run(["uxplay", "--hafe-protocol"], env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, timeout=2, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("Native UxPlay HAFE/1 support could not be verified") from exc
+        if result.returncode != 0 or result.stdout.strip() != b"HAFE/1":
+            raise RuntimeError("Selected UxPlay does not support native HAFE/1; framed mode was not started")
 
     def stop(self) -> None:
         # A guarded HID write holds this same lock until it finishes validating.
@@ -115,11 +135,16 @@ class UxPlayScreen(RecentFrameHistory):
                 # With UxPlay video sync disabled, frames may have no timestamps.
                 # Negotiate the frame rate with the sender so the sink can accept those frames.
                 sink = f"jpegenc quality={self.quality} ! fdsink fd={write_fd}"
+                command = ["uxplay", "-n", self.name, "-nh", "-a", "-reset", "0", "-fps", str(self.fps)]
+                env = os.environ.copy()
+                env.pop("HIDAGENT_UXPLAY_FRAMED_FD", None)
+                if self._framed:
+                    env["HIDAGENT_UXPLAY_FRAMED_FD"] = str(write_fd)
+                else:
+                    command += ["-vs", sink]
                 try:
                     proc = subprocess.Popen(
-                        ["uxplay", "-n", self.name, "-nh", "-a", "-reset", "0",
-                         "-fps", str(self.fps), "-vs", sink],
-                        pass_fds=(write_fd,))  # UxPlay logs to stdout: keep them in ours
+                        command, env=env, pass_fds=(write_fd,))  # logs remain separate from the frame pipe
                 except OSError:
                     os.close(read_fd)
                     raise
@@ -127,16 +152,48 @@ class UxPlayScreen(RecentFrameHistory):
                     os.close(write_fd)
                 self._proc = proc
                 self.generation += 1
+                self._native_epoch, self._native_active = 0, False
                 self._clients_at, self._clients_n = 0.0, None
             log.info("AirPlay receiver '%s' started (pid %d)", self.name, proc.pid)
-            self._read(read_fd)  # returns when UxPlay closes the pipe
+            try:
+                self._read(read_fd)  # returns when UxPlay closes the pipe
+            except (OSError, FrameProtocolError) as exc:
+                if not self._framed:
+                    raise
+                log.warning("AirPlay frame stream rejected: %s", exc)
             with self._frame_lock:
                 self.frame, self.updated, self._snapshot = None, 0.0, None
-            code = proc.wait()
+            if self._framed:
+                try:
+                    code = self._reap_native(proc)
+                except (OSError, subprocess.TimeoutExpired):
+                    self.last_error = "Native UxPlay did not stop after its frame stream closed."
+                    log.error(self.last_error)
+                    return  # Never start a second owner while the failed child may still exist.
+            else:
+                code = proc.wait()
             if self._stopping:
                 return
             log.warning("AirPlay receiver exited (code %s), restarting", code)
             time.sleep(1)
+
+    @staticmethod
+    def _reap_native(proc):
+        # Even a clean EOF can leave the RAOP server alive after its writer
+        # failed. Reap it before restarting; do not wait forever on a closed pipe.
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            return proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return proc.wait(timeout=2)
 
     @property
     def live(self) -> bool:
@@ -149,6 +206,8 @@ class UxPlayScreen(RecentFrameHistory):
             running = self._proc is not None and self._proc.poll() is None
             if self._stopping or not running or self._snapshot is None:
                 return False
+            if self._framed:
+                return self._native_active and time.monotonic() - self._snapshot.arrived < 90
             clients = self._clients()
             if clients is not None:  # Linux: is a phone connected to UxPlay right now?
                 return clients > 0
@@ -170,7 +229,12 @@ class UxPlayScreen(RecentFrameHistory):
                 return PreviewStatus(state, *details, snapshot.frame)
             if self._proc is None:
                 return PreviewStatus("connecting", *details)
-            if self._proc.poll() is not None or self._clients() == 0:
+            if self._proc.poll() is not None:
+                return PreviewStatus("disconnected", *details)
+            if self._framed:
+                if not self._native_active:
+                    return PreviewStatus("disconnected" if self._native_epoch else "waiting", *details)
+            elif self._clients() == 0:
                 return PreviewStatus("disconnected", *details)
             if age is None or age > PREVIEW_HOLD_S:
                 return PreviewStatus("waiting", *details)
@@ -259,13 +323,58 @@ class UxPlayScreen(RecentFrameHistory):
     def _on_jpeg(self, jpeg: bytes) -> None:
         arrived, updated = time.monotonic(), time.time()
         with self._frame_lock:
-            if self._stopping or self._proc is None or self._proc.poll() is not None:
+            if self._framed or self._stopping or self._proc is None or self._proc.poll() is not None:
                 return
             self.frame, self.updated = jpeg, updated
             self._snapshot = FrameSnapshot(jpeg, None, arrived, updated, self.generation, True)
             self._remember_snapshot(self._snapshot)
 
     def _read(self, fd: int) -> None:
+        if self._framed:
+            self._read_framed(fd)
+        else:
+            self._read_legacy(fd)
+
+    def _native_boundary(self):
+        self.generation += 1
+        self.frame, self.updated, self._snapshot = None, 0.0, None
+        self._recent_frames.clear()
+
+    def _on_native_record(self, record):
+        with self._frame_lock:
+            if self._stopping or self._proc is None or self._proc.poll() is not None:
+                return
+            if record.kind == BEGIN:
+                self._native_boundary()
+                self._native_epoch, self._native_active = record.epoch, True
+            elif record.epoch == self._native_epoch:
+                if record.kind == END:
+                    self._native_boundary()
+                    self._native_active = False
+                elif self._native_active:
+                    arrived, updated = time.monotonic(), time.time()
+                    self.frame, self.updated = record.payload, updated
+                    self._snapshot = FrameSnapshot(record.payload, None, arrived, updated, self.generation, True)
+                    self._remember_snapshot(self._snapshot)
+
+    def _read_framed(self, fd):
+        parser = FrameStreamParser()
+        try:
+            with os.fdopen(fd, "rb", buffering=0) as pipe:
+                while chunk := pipe.read(1 << 16):
+                    records = parser.feed(chunk)
+                    # A complete accepted END/BEGIN in this batch already retires
+                    # preceding JPEGs. Do not expose those with a renewed clock.
+                    with self._frame_lock:
+                        for record in records:
+                            self._on_native_record(record)
+                parser.finish()
+        finally:
+            with self._frame_lock:
+                self._native_boundary()
+                self._native_active = False
+
+    def _read_legacy(self, fd: int) -> None:
         buf = b""
         with os.fdopen(fd, "rb", buffering=0) as pipe:
             while chunk := pipe.read(1 << 16):
