@@ -70,8 +70,9 @@ def field_carets(image, *, allow_white=False, _white=False, regions=None):
         bw, bh = x1 - x0, y1 - y0
         if _white and .012 * w < bw <= .06 * w and max(6, .008 * h) <= bh <= .05 * h:
             # JPEG chroma can join a few adjacent placeholder pixels to a white
-            # caret. Require its solid vertical core, never expand into that text.
-            columns = {x for x in xs if xs.count(x) >= .65 * bh}
+            # caret. Require its nearly full-height core: a shorter adjacent
+            # letter stroke is not another core. Never expand into that text.
+            columns = {x for x in xs if xs.count(x) >= .95 * bh}
             if columns and max(columns) - min(columns) + 1 == len(columns):
                 x0, x1 = min(columns), max(columns) + 1
                 points = [(x, y) for x, y in points if x0 <= x < x1]
@@ -99,14 +100,21 @@ def field_carets(image, *, allow_white=False, _white=False, regions=None):
     return found
 
 
-def focused_region(frame, *, allow_white=False):
+def _field_region(caret, size):
+    left, top, right, bottom = caret.field
+    w, h = size
+    return left / w, top / h, (right - 1) / w, (bottom - 1) / h
+
+
+def focused_region(frame, *, allow_white=False, accept_field=None):
+    """Select a unique caret; optional same-frame evidence may exclude fields."""
     image = _image(frame)
-    w = image.width
     carets = field_carets(image, allow_white=allow_white)
+    if accept_field is not None:
+        carets = [caret for caret in carets if accept_field(_field_region(caret, image.size))]
     if len(carets) != 1:
         return None
-    left, top, right, bottom = carets[0].field
-    return left / w, top / image.height, (right - 1) / w, (bottom - 1) / image.height
+    return _field_region(carets[0], image.size)
 
 
 def _phase_errors(sample, off, on):
@@ -331,7 +339,7 @@ def _recent_evidence(frames):
     return tuple(frame for frame in frames if 0 <= newest - frame.arrived <= 4)
 
 
-def temporal_focused_region(frame, frames, *, allow_white=False):
+def temporal_focused_region(frame, frames, *, allow_white=False, accept_field=None):
     """Read-only field evidence from a same-text complete blink at the current frame.
 
     Callers still own freshness/session checks. This does not alter input scope or
@@ -365,10 +373,11 @@ def temporal_focused_region(frame, frames, *, allow_white=False):
     if not 1 <= len(regions) <= 4:
         return None
     found = _temporal_carets(current, current, frames, regions, images=images, allow_white=allow_white)
+    if accept_field is not None:
+        found = [caret for caret in found if accept_field(_field_region(caret, current.size))]
     if len(found) != 1:
         return None
-    left, top, right, bottom = found[0].field
-    return left / current.width, top / current.height, (right - 1) / current.width, (bottom - 1) / current.height
+    return _field_region(found[0], current.size)
 
 
 def _periodic(caret, bright, frames, current):

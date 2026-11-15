@@ -7,9 +7,9 @@ from .freshness import require_fresh
 
 
 class InputContextGuard:
-    def __init__(self, screen, observation, *, allow_white=False):
+    def __init__(self, screen, observation, *, allow_white=False, accept_field=None):
         self.screen, self.original = screen, observation
-        self.region = _focused_region(observation.frame, allow_white=allow_white)
+        self.region = _focused_region(observation.frame, allow_white=allow_white, accept_field=accept_field)
         # This guard may be created after the first chunk was acknowledged.
         # Only history from the original observation can establish its field;
         # newly typed text or a later connection must never supply that proof.
@@ -17,12 +17,13 @@ class InputContextGuard:
                        if frame.generation == observation.generation
                        and 0 <= observation.updated - frame.updated <= 4)
         if self.region is None:
-            self.region = temporal_focused_region(observation.frame, frames, allow_white=allow_white)
+            self.region = temporal_focused_region(observation.frame, frames, allow_white=allow_white,
+                                                 accept_field=accept_field)
         if self.region is None and allow_white:
             # Spotlight may be observed during the caret's dark phase. Only a
             # proven blink on otherwise identical pixels can recover its field.
             for recent in reversed(frames[-12:]):
-                candidate = _focused_region(recent.frame, allow_white=True)
+                candidate = _focused_region(recent.frame, allow_white=True, accept_field=accept_field)
                 if candidate is not None and not screen_compare.observation_changed(
                         recent.frame, observation.frame, caret_frames=frames):
                     self.region = candidate

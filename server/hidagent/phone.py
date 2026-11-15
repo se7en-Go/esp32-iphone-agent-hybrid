@@ -2045,16 +2045,20 @@ class Phone:
             # A white vertical stroke alone is not input-focus evidence. Only
             # consider it on an OCR-observed Spotlight, then require the search
             # placeholder inside that same bounded field before typing anything.
+            def search_field(region):
+                left, top, right, bottom = region
+                placeholder = any(label in SPOTLIGHT_PLACEHOLDERS and left <= x0 < x1 <= right
+                                  and top <= y0 < y1 <= bottom for label, (x0, y0, x1, y1) in labels)
+                marker = any(label in SPOTLIGHT_MARKERS and box[3] < top for label, box in labels)
+                return placeholder and marker
+
+            # Keyboard labels or unrelated cards can also contain thin white
+            # strokes. Exclude their fields using the original OCR evidence
+            # before requiring one unique, geometrically proven caret.
             field = InputContextGuard(self.screen, focused, allow_white=any(
-                label in SPOTLIGHT_MARKERS for label, _ in labels))
+                label in SPOTLIGHT_MARKERS for label, _ in labels), accept_field=search_field)
             if field.region is None:
                 raise AppSearchError("无法确认 Spotlight 搜索框获得焦点，未输入 App 名。")
-            left, top, right, bottom = field.region
-            placeholder = any(label in SPOTLIGHT_PLACEHOLDERS and left <= x0 < x1 <= right
-                              and top <= y0 < y1 <= bottom for label, (x0, y0, x1, y1) in labels)
-            marker = any(label in SPOTLIGHT_MARKERS and box[3] < top for label, box in labels)
-            if not placeholder or not marker:
-                raise AppSearchError("无法确认系统 Spotlight 搜索框，未输入 App 名。")
 
             def validate_field(*, stage="context"):
                 validate_session()
@@ -2062,7 +2066,7 @@ class Phone:
 
             await self.type(name, mode="keys", before_action=validate_field)
             return field.region
-        except AppSearchError:
+        except (AppSearchError, TypingVerificationError):
             raise
         except (RuntimeError, ValueError) as exc:
             raise AppSearchError(f"未能验证 App 搜索流程：{exc}") from exc
