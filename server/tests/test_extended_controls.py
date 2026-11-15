@@ -95,10 +95,31 @@ def test_long_press_releases_on_cancellation(tmp_path, monkeypatch):
 def test_double_tap_sends_exactly_two_clicks_without_reposition(tmp_path):
     mirror = LaggingMirror()
     phone = calibrated_phone(tmp_path, mirror)
+
+    async def delayed_landing(near, epoch, **kwargs):
+        await asyncio.sleep(1.8)
+        assert "click" not in mirror.commands
+        return near
+
+    phone._localize_pointer = delayed_landing
     result = asyncio.run(observed_tap(phone, .5, .44, click_count=2))
     first = mirror.commands.index("click")
     assert mirror.commands[first:] == ["click", "click"]
     assert result["click_count"] == 2
+    assert result["pointer_seen"] is True
+
+
+def test_double_tap_refuses_both_clicks_if_the_pointer_never_arrives(tmp_path):
+    mirror = LaggingMirror()
+    phone = calibrated_phone(tmp_path, mirror)
+
+    async def missing_landing(*args, **kwargs):
+        return None
+
+    phone._find_pointer = missing_landing
+    with pytest.raises(RuntimeError, match="没有观察到指针落在目标内"):
+        asyncio.run(observed_tap(phone, .5, .44, click_count=2))
+    assert "click" not in mirror.commands
 
 
 def test_invalid_contact_never_moves_pointer(tmp_path):

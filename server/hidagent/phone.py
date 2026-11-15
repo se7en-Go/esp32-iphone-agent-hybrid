@@ -1590,6 +1590,9 @@ class Phone:
                 or not math.isfinite(duration) or duration < 0 or duration > 3
                 or (duration and (duration < .3 or click_count != 1))):
             raise ValueError("contact requires one/two clicks or a single 0.3..3 second hold")
+        # Both contacts must reuse a measured landing. A calibration-only
+        # estimate can race a delayed frame from the positioning move.
+        allow_estimated_landing = allow_estimated_landing and click_count == 1
         began = time.monotonic()
         self._tap_timing = {"positioning": 0.0, "firmware": 0.0, "wait_for_frames": 0.0, "diff": 0.0}
         timing = self._tap_timing
