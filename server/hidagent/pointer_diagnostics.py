@@ -12,6 +12,12 @@ class PointerDiagnostics:
     def __init__(self, directory: Path, *, prefix="pointer"):
         if prefix not in {"pointer", "action-admission"}:
             raise ValueError("invalid diagnostic prefix")
+        # chmod on Windows does not establish a private ACL, and Windows lacks
+        # descriptor chmod / no-follow open. Disable this opt-in recorder before
+        # touching any files rather than weaken its screenshot privacy contract.
+        if (os.name != "posix" or not callable(getattr(os, "fchmod", None))
+                or not getattr(os, "O_NOFOLLOW", 0)):
+            raise OSError("private diagnostics require POSIX fchmod and O_NOFOLLOW")
         self.directory = directory
         self.prefix = prefix
         self.started = time.monotonic()
@@ -40,7 +46,7 @@ class PointerDiagnostics:
             return None  # Diagnostics must never change the physical operation.
 
     def _write(self, name: str, data: bytes):
-        flags = os.O_CREAT | os.O_TRUNC | os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0)
+        flags = os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW
         descriptor = os.open(self.directory / name, flags, 0o600)
         with os.fdopen(descriptor, 'wb') as file:
             os.fchmod(file.fileno(), 0o600)

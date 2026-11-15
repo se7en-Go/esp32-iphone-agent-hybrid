@@ -1,7 +1,14 @@
 import json
+import os
 import stat
 
+import pytest
+
 from hidagent.pointer_diagnostics import PointerDiagnostics
+
+private_files_only = pytest.mark.skipif(
+    os.name != "posix", reason="private diagnostic files require POSIX permissions and O_NOFOLLOW"
+)
 
 
 def mode(path):
@@ -13,6 +20,7 @@ def test_disabled_by_default(monkeypatch):
     assert PointerDiagnostics.from_env() is None
 
 
+@private_files_only
 def test_frames_are_bounded_private_and_new_attempt_replaces_old(tmp_path, monkeypatch):
     directory = tmp_path / 'evidence'
     monkeypatch.setenv('HIDAGENT_POINTER_DIAGNOSTICS', str(directory))
@@ -38,6 +46,7 @@ def test_frames_are_bounded_private_and_new_attempt_replaces_old(tmp_path, monke
     assert json.loads((directory / 'pointer-attempt.json').read_text())['events'] == []
 
 
+@private_files_only
 def test_rejects_symlink_directory_and_metadata(tmp_path, monkeypatch):
     target = tmp_path / 'target'
     target.mkdir()
@@ -53,6 +62,7 @@ def test_rejects_symlink_directory_and_metadata(tmp_path, monkeypatch):
     assert secret.read_bytes() == b'unchanged'
 
 
+@private_files_only
 def test_extended_probe_keeps_target_and_position_references(tmp_path):
     recorder = PointerDiagnostics(tmp_path / 'evidence')
     for phase in ('baseline', 'target_reference', 'position_reference'):
@@ -66,6 +76,7 @@ def test_extended_probe_keeps_target_and_position_references(tmp_path):
         assert (recorder.directory / record['file']).read_bytes() == record['phase'].encode()
 
 
+@private_files_only
 def test_admission_capture_is_private_bounded_and_preserves_pointer_evidence(tmp_path, monkeypatch):
     directory = tmp_path / 'evidence'
     monkeypatch.setenv('HIDAGENT_POINTER_DIAGNOSTICS', str(directory))
@@ -80,3 +91,23 @@ def test_admission_capture_is_private_bounded_and_preserves_pointer_evidence(tmp
     assert len(list(directory.glob('action-admission-frame-*.jpg'))) == 1
     assert mode(directory) == 0o700
     assert all(mode(path) == 0o600 for path in directory.iterdir())
+
+
+@pytest.mark.parametrize("missing", ["fchmod", "O_NOFOLLOW"])
+def test_without_private_file_primitives_diagnostics_create_nothing(tmp_path, monkeypatch, missing):
+    monkeypatch.delattr(os, missing, raising=False)
+    directory = tmp_path / "diagnostics"
+    monkeypatch.setenv("HIDAGENT_POINTER_DIAGNOSTICS", str(directory))
+    assert PointerDiagnostics.from_env() is None
+    assert not directory.exists()
+
+
+def test_unsupported_platform_keeps_existing_evidence_untouched(tmp_path, monkeypatch):
+    directory = tmp_path / "diagnostics"
+    directory.mkdir()
+    old = directory / "pointer-frame-00.jpg"
+    old.write_bytes(b"keep")
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    monkeypatch.setenv("HIDAGENT_POINTER_DIAGNOSTICS", str(directory))
+    assert PointerDiagnostics.from_env() is None
+    assert old.read_bytes() == b"keep"

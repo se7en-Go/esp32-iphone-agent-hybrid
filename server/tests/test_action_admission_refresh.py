@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import time
 from types import SimpleNamespace
 
@@ -31,19 +32,21 @@ def rig(tmp_path, monkeypatch):
     request = ControlAction(action="tap", screen_id=controls.observation()["screen_id"],
                             x=.5, y=.4, target_box=(.4, .3, .6, .5))
     original = controls._observation
-    write = link.write
+    send = phone._send
 
-    def deliver_after_wake(data):
-        write(data)
-        if b"move -2 0" in data:
+    async def deliver_after_wake(epoch, command, **kwargs):
+        result = await send(epoch, command, **kwargs)
+        if command == "move -2 0":
             def returned_source():
                 wall[0] += .1
                 screen._on_jpeg(screen.frame)
-            # New source evidence arrives after the return ACK and mirror lag,
-            # rather than stamping its already-queued image as later feedback.
-            asyncio.get_running_loop().call_later(.01, returned_source)
+            # Schedule only after the real return ACK completes, then publish
+            # when the caller yields after recording returned_at. A short timer
+            # from link.write can fire before ACK on a coarse Windows clock.
+            asyncio.get_running_loop().call_soon(returned_source)
+        return result
 
-    link.write = deliver_after_wake
+    phone._send = deliver_after_wake
 
     async def positioned(x, y, **_kwargs):
         phone._pointer_confirmed = True
@@ -61,7 +64,8 @@ def commands(rig):
     return [line.split(b" ", 1)[1].strip() for line in rig.link.written]
 
 
-def test_stale_single_tap_refreshes_once_then_clicks_under_original_target(rig, monkeypatch):
+@pytest.mark.parametrize("clock_resolution", [None, .02], ids=["host-clock", "coarse-clock"])
+def test_stale_single_tap_refreshes_once_then_clicks_under_original_target(rig, monkeypatch, clock_resolution):
     seen = []
     original_resolve = rig.controls._resolve_text
 
@@ -70,7 +74,13 @@ def test_stale_single_tap_refreshes_once_then_clicks_under_original_target(rig, 
         return await original_resolve(plan, before, observed_at)
 
     monkeypatch.setattr(rig.controls, "_resolve_text", resolve)
-    result = asyncio.run(rig.controls.perform(rig.request))
+    async def scenario():
+        if clock_resolution is not None:
+            # Windows may dispatch timers up to one coarse monotonic tick early.
+            asyncio.get_running_loop()._clock_resolution = clock_resolution
+        return await rig.controls.perform(rig.request)
+
+    result = asyncio.run(scenario())
     assert result["command_acknowledged"] is True
     assert seen == [(rig.original, rig.original.frame)]
     assert commands(rig) == [b"move 2 0", b"move -2 0", b"click"]
@@ -220,6 +230,7 @@ def test_original_action_session_follows_nested_input_until_actual_write(rig, mo
 
 
 @pytest.mark.parametrize("phase", ["before_refresh", "final_validation"])
+@pytest.mark.skipif(os.name != "posix", reason="private diagnostic files require POSIX permissions")
 def test_admission_diagnostics_keep_exact_rejected_frame_not_later_frame(rig, tmp_path, monkeypatch, phase):
     from hidagent import screen_compare
 
@@ -265,3 +276,14 @@ def test_admission_diagnostics_disabled_or_unwritable_do_not_change_rejection(ri
         asyncio.run(rig.controls.perform(rig.request))
     assert directory.read_text() == "not a directory"
     assert commands(rig) == []
+
+
+def test_missing_private_file_support_does_not_change_action_rejection(rig, tmp_path, monkeypatch):
+    directory = tmp_path / "diagnostics"
+    monkeypatch.setenv("HIDAGENT_POINTER_DIAGNOSTICS", str(directory))
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    rig.screen._on_jpeg(jpeg("black"))
+    with pytest.raises(ValueError, match="changed"):
+        asyncio.run(rig.controls.perform(rig.request))
+    assert not directory.exists()
+    assert commands(rig) == [] and rig.controls.ticket is None

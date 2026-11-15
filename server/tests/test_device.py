@@ -499,7 +499,7 @@ def test_stop_during_netinfo_leaves_maintain_alive_and_it_reconnects():
 class FakeSerial:
     """打开时吐一行启动日志，前几次 ping 不答，模拟克隆板一开串口就复位。"""
 
-    def __init__(self, replies_after: int = 3):
+    def __init__(self, replies_after: int = 3, *, read_delay: float = .01):
         self.port = ""
         self.baudrate = 115200
         self.timeout = 0.2
@@ -509,6 +509,7 @@ class FakeSerial:
         self.opens = 0
         self.pings = 0
         self.replies_after = replies_after
+        self.read_delay = read_delay
         self._buf = bytearray()
         self._lock = threading.Lock()
 
@@ -531,8 +532,16 @@ class FakeSerial:
     def flush(self) -> None:
         return None
 
+    @property
+    def in_waiting(self) -> int:
+        # Match pyserial: buffered boot logs/ACKs can be drained in one read.
+        # Without this, SerialLink's idle fallback incurs one scheduling delay
+        # per byte and can exhaust the handshake window on a loaded runner.
+        with self._lock:
+            return len(self._buf)
+
     def read(self, size: int) -> bytes:
-        time.sleep(0.01)
+        time.sleep(self.read_delay)
         with self._lock:
             if not self._buf:
                 return b""
@@ -541,8 +550,9 @@ class FakeSerial:
             return chunk
 
 
-def test_ping_stays_on_one_handle_and_skips_the_boot_log():
-    fake = FakeSerial(replies_after=3)
+@pytest.mark.parametrize("read_delay", [.01, .07])
+def test_ping_stays_on_one_handle_and_skips_the_boot_log(read_delay):
+    fake = FakeSerial(replies_after=3, read_delay=read_delay)
 
     async def scenario():
         opened = open_serial("COM9", impl=fake)

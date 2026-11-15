@@ -127,10 +127,24 @@ def test_unmanaged_worker_blocks_receiver_creation(tmp_path, monkeypatch):
         local_runtime.main(["start"])
 
 
-def test_launcher_dry_run_uses_repository_module():
+def test_launcher_dry_run_uses_repository_module(tmp_path):
     root = Path(__file__).resolve().parents[2]
-    result = subprocess.run([sys.executable, str(root / "scripts/run_server.py"), "start", "--dry-run"],
-                            cwd="/tmp", env={**os.environ, "SCREEN_BACKEND": "board"},
+    # CI installs into setup-python, not server/.venv. Supply only that
+    # environment dependency; retain the real launcher chdir/exec/module path.
+    bootstrap = """
+import runpy, sys
+from pathlib import Path
+launcher = Path(sys.argv[1])
+sys.path.insert(0, str(launcher.parent))
+import runtime
+runtime.require_venv = lambda: Path(sys.executable)
+sys.argv = sys.argv[1:]
+runpy.run_path(str(launcher), run_name="__main__")
+"""
+    result = subprocess.run([sys.executable, "-c", bootstrap, str(root / "scripts/run_server.py"),
+                             "start", "--dry-run"],
+                            cwd=tmp_path, env={**os.environ, "SCREEN_BACKEND": "board",
+                                              "HIDAGENT_DATA": str(tmp_path / "data")},
                             capture_output=True, text=True, timeout=5)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["action"] == "start"

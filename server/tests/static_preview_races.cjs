@@ -2,6 +2,15 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const diagnosticPath = process.argv[2];
+let phase = "starting";
+function record(next) {
+  phase = next;
+  if (diagnosticPath) fs.writeFileSync(diagnosticPath, JSON.stringify({
+    phase, node: process.version, resources: process.getActiveResourcesInfo(),
+  }));
+}
+record(phase);
 
 const source = fs.readFileSync(path.join(__dirname, "../hidagent/static/app.js"), "utf8");
 const liveStart = source.indexOf('const live = $("live");');
@@ -74,6 +83,7 @@ async function publish(h, generation) {
 async function main() {
   // The old request completes after a disconnect and a new live status.
   {
+    record("disconnect-response");
     const h = harness();
     await h.status(1, true);
     const done = h.refreshLive(), pending = h.take("/api/frame.jpg");
@@ -90,6 +100,7 @@ async function main() {
   }
   // Polling can miss the disconnected interval but still observe a new generation.
   {
+    record("generation-response");
     const h = harness();
     await h.status(1, true);
     await publish(h, 1);
@@ -103,6 +114,7 @@ async function main() {
   }
   // A generation can change while the response body, rather than its headers, arrives.
   {
+    record("late-response-body");
     const h = harness();
     await h.status(1, true);
     let finishBody;
@@ -117,6 +129,7 @@ async function main() {
   }
   // An old request's timeout must not undo a newer successful status response.
   {
+    record("late-request-failure");
     const h = harness();
     await h.status(1, true);
     const done = h.refreshLive(), pending = h.take("/api/frame.jpg");
@@ -130,4 +143,10 @@ async function main() {
   }
 }
 
-main().catch(error => { console.error(error); process.exitCode = 1; });
+// A pending Promise alone does not keep Node alive. Mark completion explicitly
+// so an accidentally unawaited scenario cannot pass by silently exiting early.
+main().then(() => record("complete")).catch(error => {
+  record(`failed:${phase}`);
+  console.error(error);
+  process.exitCode = 1;
+});

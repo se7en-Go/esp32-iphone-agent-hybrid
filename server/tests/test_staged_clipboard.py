@@ -459,11 +459,15 @@ def test_paste_requires_observed_frame_after_copy_and_mirror_pipeline(monkeypatc
 
 
 @pytest.mark.parametrize("phase", ["prepare", "paste"])
-def test_http_stage_deadline_clears_receipts_and_cannot_write_late(monkeypatch, phase):
+@pytest.mark.parametrize("clock_resolution", [None, .02], ids=["host-clock", "coarse-clock"])
+def test_http_stage_deadline_clears_receipts_and_cannot_write_late(monkeypatch, phase, clock_resolution):
     from hidagent import operation
     from hidagent.clipboard_control import create_control_router
 
     async def scenario():
+        loop = asyncio.get_running_loop()
+        if clock_resolution is not None:
+            loop._clock_resolution = clock_resolution
         _, provider, phone, control, _ = setup(monkeypatch)
         lock = asyncio.Lock()
 
@@ -477,9 +481,27 @@ def test_http_stage_deadline_clears_receipts_and_cannot_write_late(monkeypatch, 
         app.add_middleware(operation.ActionLifetimeMiddleware)
         held = []
         original_key = phone.key
+        deadline_clock = ManualClock()
+        deadline_timers = []
+        call_later = loop.call_later
+
+        def schedule_timer(delay, callback, *args, context=None):
+            if callback.__module__ == operation.__name__ and callback.__name__ == "expire":
+                assert delay == .01
+                # Keep the real middleware expiry callback, but dispatch it at
+                # the exact tested phase rather than racing ASGI setup against
+                # a 10ms timer (less than one Windows monotonic clock tick).
+                handle = asyncio.TimerHandle(loop.time() + delay, callback, args, loop, context=context)
+                deadline_timers.append(handle)
+                return handle
+            return call_later(delay, callback, *args, context=context)
 
         async def slow_key(*args, **kwargs):
             held.append(provider._pending)
+            assert len(deadline_timers) == 1
+            deadline_clock.advance(.01)
+            assert deadline_clock.monotonic() == operation._current.get().deadline
+            loop.call_soon(deadline_timers[0]._run)
             await asyncio.sleep(.08)
             await original_key(*args, **kwargs)
 
@@ -493,10 +515,13 @@ def test_http_stage_deadline_clears_receipts_and_cannot_write_late(monkeypatch, 
                         "screen_id": control.observation()["screen_id"], "focused": True}
             phone.key = slow_key
             monkeypatch.setattr(operation, "OPERATION_TIMEOUT", .01)
-            result = await client.post("/api/control/clipboard/" + phase, json=body)
+            monkeypatch.setattr(operation, "time", deadline_clock)
+            monkeypatch.setattr(loop, "call_later", schedule_timer)
+            result = await asyncio.wait_for(client.post("/api/control/clipboard/" + phase, json=body), 1)
             assert result.status_code == 504 and "deadline" in result.text
             await asyncio.sleep(.09)
             assert held and held[0].text is None and held[0].expired
+            assert deadline_timers[0].cancelled()
             assert provider._operation_active is False
             assert provider.current() == {"active": False, "needs_resolution": phase == "paste"}
             assert "cmd+v" not in phone.sent
