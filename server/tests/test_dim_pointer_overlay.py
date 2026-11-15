@@ -8,12 +8,22 @@ from PIL import Image, ImageDraw
 from hidagent.screen_compare import cursor_overlay_pair
 
 
-def frames(*, shape="disc", texture=False, edited=False):
+def frames(*, shape="disc", texture=False, edited=False, ring_marks=None):
     background = Image.new("RGB", (500, 1080), (39, 37, 40))
     ImageDraw.Draw(background).rectangle((270, 735, 325, 780), fill=(106, 201, 226))
     if texture:
         ImageDraw.Draw(background).line((290, 697, 301, 722), fill=(70, 70, 70), width=3)
+    marks = [(297, 694), (297, 726)]
+    if ring_marks in {"stationary", "changed"}:
+        for point in marks:
+            background.putpixel(point, (52, 50, 53))
     outward, returned = background.copy(), background.copy()
+    if ring_marks == "new":
+        for point in marks:
+            outward.putpixel(point, (47, 45, 48))
+    if ring_marks == "changed":
+        for point in marks:
+            outward.putpixel(point, (60, 58, 61))
     draw = ImageDraw.Draw(outward)
     if shape == "disc":
         draw.ellipse((285, 698, 309, 722), fill=(49, 47, 50))
@@ -48,9 +58,13 @@ def test_uniform_ten_level_gray_disc_pairs_with_return_over_blue_icon():
     assert result[1] == pytest.approx((297/500, 754/1080), abs=.003)
 
 
+def test_two_stationary_ring_marks_do_not_obscure_a_complete_dim_disc():
+    assert pair(frames(ring_marks="stationary")) == pair(frames())
+
+
 @pytest.mark.parametrize("changes", [
     {"shape": "ring"}, {"shape": "letter"}, {"shape": "plus"}, {"shape": "colored"},
-    {"texture": True}, {"edited": True},
+    {"texture": True}, {"edited": True}, {"ring_marks": "new"}, {"ring_marks": "changed"},
 ])
 def test_dim_shapes_or_content_changes_do_not_authorize_a_landing(changes):
     assert pair(frames(**changes)) is None

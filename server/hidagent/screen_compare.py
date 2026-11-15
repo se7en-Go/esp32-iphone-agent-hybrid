@@ -114,14 +114,27 @@ def _dim_overlay_disc(background, current, points, width):
              round(cy + 1.30 * radius * math.sin(i * math.tau / 24))) for i in range(24)]
     a, b = background.load(), current.load()
 
-    def flat(colors):
+    def flat(colors, original_colors=None):
         color = tuple(median(channel) for channel in zip(*colors, strict=True))
-        valid = (24 <= min(color) <= max(color) <= 90 and max(color) - min(color) <= 12
-                 and sum(max(abs(p - q) for p, q in zip(pixel, color, strict=True)) > 6
-                         for pixel in colors) <= .05 * len(colors))
-        return color if valid else None
+        if not (24 <= min(color) <= max(color) <= 90 and max(color) - min(color) <= 12):
+            return None
 
-    inside, original, outside = flat([b[p] for p in core]), flat([a[p] for p in core]), flat([b[p] for p in ring])
+        def distance(first, second):
+            return max(abs(p - q) for p, q in zip(first, second, strict=True))
+
+        outliers = [i for i, pixel in enumerate(colors) if distance(pixel, color) > 6]
+        if len(outliers) <= .05 * len(colors):
+            return color
+        if original_colors is not None and len(outliers) == 2 and all(
+                distance(original_colors[i], color) >= 4 and distance(original_colors[i], colors[i]) <= 4
+                for i in outliers):
+            # Two stationary ring specks do not interrupt the pointer silhouette.
+            # The unchanged center, contour and paired return are still required.
+            return color
+        return None
+
+    inside, original = flat([b[p] for p in core]), flat([a[p] for p in core])
+    outside = flat([b[p] for p in ring], [a[p] for p in ring])
     if inside is None or original is None or outside is None:
         return None
     if (not 8 <= sum(inside) / 3 - sum(outside) / 3 <= 26
