@@ -69,6 +69,31 @@ def test_home_keeps_full_control_or_menu_anchor(menu):
         context.validate_current(screen)
 
 
+def test_home_bubble_accepts_a_measured_cursor_beside_an_unchanged_round_control():
+    image = Image.open(io.BytesIO(home_frame())).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((308, 607, 320, 619), fill="#a1a1a1")
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    screen, context = setup("home", buffer.getvalue())
+    assert context.kind == "bubble"
+
+    point = context.target.center
+    x, y = round(point[0] * image.width), round(point[1] * image.height)
+    draw.ellipse((x - 9, y - 9, x + 9, y + 9), fill="#969696")
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    landing = buffer.getvalue()
+    screen._on_jpeg(landing)
+    with pytest.raises(TargetChangedError):
+        context.validate_current(screen)
+    context.validate_current(screen, cursor=(point, landing))
+
+    screen._on_jpeg(changed(landing, (.86, .732, .89, .747)))
+    with pytest.raises(TargetChangedError):
+        context.validate_current(screen, cursor=(point, landing))
+
+
 def test_original_generation_and_pixels_cannot_be_rebound():
     screen, context = setup("back", navigation_frame())
     with pytest.raises(RuntimeError):

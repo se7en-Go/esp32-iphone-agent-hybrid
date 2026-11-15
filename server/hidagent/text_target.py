@@ -104,6 +104,14 @@ class TextTargetGuard:
             if not _cursor_patch_matches(after, measured, point):
                 return True
             mask_cursor(point)
+            context = self.navigation_context
+            if context is not None and context.kind == "bubble" and mask.getbbox() is None:
+                left, top, right, bottom = context.target.box
+                x, y = point
+                if left < x < right and top < y < bottom:
+                    # The scoped anchor has no remaining change. A stationary
+                    # round control near the measured cursor needs no masking.
+                    return False
         if reference is not None:
             point, original, unoccluded = reference
             if (_cursor_patch_matches(self.before, original, point)
