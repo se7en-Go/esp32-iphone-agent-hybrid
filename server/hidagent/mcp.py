@@ -90,7 +90,11 @@ def create_server(url: str | None = None):
     def iphone_point(x: float, y: float, screen_id: str,
                      coordinate_space: Literal["normalized", "pixels"] = "normalized"
                      ) -> list[TextContent | ImageContent]:
-        """Move without clicking; pointer_seen says whether the calibrated landing was visually checked."""
+        """Move without clicking. pointer_seen is true only after confirming the final landing.
+
+        When false, pointer contains the requested coordinates in normalized units.
+        Read a fresh image to locate the pointer before attempting a stationary click.
+        """
         return action("point", screen_id, x=x, y=y, coordinate_space=coordinate_space)
 
     @mcp.tool()

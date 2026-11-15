@@ -335,6 +335,7 @@ class AssistiveTouch:
             routes.insert(0, preferred)
         acknowledged = False
         last_error = None
+        pointer_error = None
         pointer_rejected = False
         for route in routes:
             self._check(epoch)
@@ -353,6 +354,8 @@ class AssistiveTouch:
                     self._require_frame()
                     pointer_rejected = True
                     last_error = exc
+                    pointer_error = exc
+                    log.warning("go_home: %s 失败：%s", route, exc)
                 continue
             if route == "swipe-up" and not self.phone.calibrated:
                 log.info("go_home: 指针未校准，跳过上滑退路")
@@ -374,6 +377,7 @@ class AssistiveTouch:
                 last_error = exc
                 if isinstance(exc, (PointerLandingError, TargetChangedError)):
                     pointer_rejected = True
+                    pointer_error = exc
                 log.warning("go_home: %s 失败：%s", route, exc)
                 continue
             self._check(epoch)
@@ -387,5 +391,11 @@ class AssistiveTouch:
         if not acknowledged and last_error is not None:
             raise last_error
         if self._frame() is not None:
-            raise RuntimeError("已尝试返回主屏幕，但未确认主屏幕图标网格及 Dock；请观察屏幕。")
-        raise RuntimeError("HID 命令已发送；没有实时画面，无法确认主屏幕。")
+            message = "已尝试返回主屏幕，但未确认主屏幕图标网格及 Dock；请观察屏幕。"
+        else:
+            message = "HID 命令已发送；没有实时画面，无法确认主屏幕。"
+        if pointer_error is not None:
+            # A fallback ACK is not Home evidence. Keep the original actionable
+            # pointer rejection even if a later keyboard route failed as well.
+            raise RuntimeError(f"{message} 指针路径此前被拦截：{pointer_error}") from pointer_error
+        raise RuntimeError(message)

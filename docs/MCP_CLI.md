@@ -57,6 +57,8 @@ iphone-agent tap 0.5 0.4 --screen-id "实际返回的ID" \
 
 坐标默认是 `0..1` 的屏幕比例。CLI `--coordinate-space pixels` 和 MCP `coordinate_space="pixels"` 可以传观察图的像素坐标。禁止混用 `0..1000`；`target_box` 和 OCR `region` 始终是比例坐标 `[left, top, right, bottom]`。
 
+`point` / `iphone_point` 返回的 `pointer` 使用归一化坐标。`pointer_seen: true` 表示已确认最终落点。若为 `false`，`pointer` 表示请求坐标，请用新画面确认指针位置后再原地点击。
+
 ## MCP 与 CLI 对照
 
 表中的动作 CLI 都使用 `--screen-id`。完整参数用 `iphone-agent 命令 --help` 查看。

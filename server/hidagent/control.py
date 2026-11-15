@@ -495,7 +495,9 @@ class Controls:
         elif name == "point":
             located = await self.phone.point_verified(*planned["xy"])
             extra["pointer"] = {"x": located[0], "y": located[1]}
-            extra["pointer_seen"] = getattr(self.phone, "_pointer_seen", False)
+            # point_verified returns the request when its final correction is
+            # unconfirmed, even if it saw a pointer earlier in the movement.
+            extra["pointer_seen"] = getattr(self.phone, "_pointer_confirmed", False)
         elif name == "swipe":
             x1, y1, x2, y2 = planned["swipe"]
             await self.phone.swipe(x1, y1, x2, y2, hold=planned["hold"],

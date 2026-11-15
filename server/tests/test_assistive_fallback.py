@@ -118,11 +118,12 @@ def test_unsupported_consumer_home_continues_to_keyboard(tmp_path):
 
 
 @pytest.mark.parametrize("error", [PointerLandingError, TargetChangedError])
-def test_confirmed_no_pointer_click_can_use_consumer_home(tmp_path, monkeypatch, error):
+@pytest.mark.parametrize("successful_command", ["homescreen", "key cmd+h"])
+def test_confirmed_no_pointer_click_can_use_consumer_home(tmp_path, monkeypatch, error, successful_command):
     screen = Screen()
 
     def change_screen(command):
-        if command == "homescreen":
+        if command == successful_command:
             asyncio.get_running_loop().call_soon(screen.show, app_frame(home=True))
 
     device = Device(change_screen)
@@ -133,7 +134,44 @@ def test_confirmed_no_pointer_click_can_use_consumer_home(tmp_path, monkeypatch,
 
     monkeypatch.setattr(phone.assistive_touch, "_assistive_home", rejected)
     asyncio.run(phone.go_home())
-    assert device.sent == ["homescreen"]
+    assert device.sent == (["homescreen"] if successful_command == "homescreen" else ["homescreen", "key cmd+h"])
+
+
+@pytest.mark.parametrize("error", [PointerLandingError, TargetChangedError])
+@pytest.mark.parametrize("route", ["assistive-touch", "swipe-up"])
+@pytest.mark.parametrize("incidental_change,later_error", [(False, False), (True, False), (False, True)])
+def test_ack_without_home_preserves_prior_pointer_rejection(
+        tmp_path, monkeypatch, caplog, error, route, incidental_change, later_error):
+    screen = Screen()
+    rejection = error("observed Home target: measured pointer remains outside its bounds")
+
+    def change_screen(command):
+        screen.show(app_frame(clock=incidental_change, pointer=incidental_change))
+        if command == "key cmd+h" and later_error:
+            # A later transport failure must not erase the earlier visual reason
+            # after the consumer Home command was acknowledged without effect.
+            raise DeviceError("keyboard shortcut unavailable")
+
+    device = Device(change_screen)
+    phone = make_phone(tmp_path, device, screen)
+
+    async def rejected(*args, **kwargs):
+        raise rejection
+
+    if route == "assistive-touch":
+        monkeypatch.setattr(phone.assistive_touch, "_assistive_home", rejected)
+    else:
+        monkeypatch.setattr(phone, "swipe", rejected)
+
+    with pytest.raises(RuntimeError, match="未确认主屏幕") as caught:
+        asyncio.run(phone.go_home())
+
+    assert str(rejection) in str(caught.value)
+    assert caught.value.__cause__ is rejection
+    assert str(rejection) in caplog.text
+    assert device.sent == ["homescreen", "key cmd+h"]
+    assert not assistive.assistive_vision.is_home_screen(screen.frame)
+    assert "verified_route" not in phone.assistive_touch._saved
 
 
 @pytest.mark.parametrize("successful_command", ["release", "homescreen", "key cmd+h"])
