@@ -33,6 +33,27 @@ STABLE_QUIET = 0.2
 LATE_HOME_WAIT = 3.2
 
 
+class HomeUnconfirmed(RuntimeError):
+    """An opted-in, already-open menu contact was ACKed but Home is unconfirmed."""
+
+    def __init__(self, *, clicked_at, device, link, epoch, generation, sequence, last_input_at):
+        super().__init__("辅助触控菜单已打开，但未确认主屏幕图标或返回结果；请重新观察。")
+        self.clicked_at = clicked_at
+        self.device, self.link, self.epoch = device, link, epoch
+        self.generation, self.sequence, self.last_input_at = generation, sequence, last_input_at
+
+    def same_contact(self, phone, screen) -> bool:
+        current = snapshot(screen)
+        return (type(self.sequence) is int and self.sequence > 0
+                and isinstance(self.last_input_at, (int, float))
+                and math.isfinite(self.last_input_at) and self.last_input_at <= self.clicked_at
+                and phone.device is self.device and getattr(self.device, "links", None) == self.link
+                and getattr(self.device, "abort_epoch", None) == self.epoch
+                and getattr(self.device, "input_sequence", None) == self.sequence
+                and getattr(self.device, "last_input_at", None) == self.last_input_at
+                and current.live and current.generation == self.generation)
+
+
 def _point(value) -> Point:
     if not isinstance(value, (list, tuple)) or len(value) != 2:
         raise ValueError("辅助触控坐标需要 [x, y]，范围为 0 到 1。")
@@ -222,7 +243,7 @@ class AssistiveTouch:
             return None
         return context
 
-    async def _assistive_home(self, epoch: int, navigation_context=None) -> bool:
+    async def _assistive_home(self, epoch: int, navigation_context=None, *, report_unconfirmed=False) -> bool:
         if self._home_link is None:
             self._home_link, self._home_epoch = getattr(self.phone.device, "links", 0), epoch
         self._check(epoch)
@@ -235,7 +256,8 @@ class AssistiveTouch:
         panel = assistive_vision.find_panel(before)
         if panel is not None:
             return await self._menu_home(epoch, before, panel, observation=observation,
-                                         navigation_context=navigation_context)
+                                         navigation_context=navigation_context,
+                                         report_unconfirmed=report_unconfirmed)
         hint = self.position
         if hint is None and self.last_aspect and abs(_aspect(before) / self.last_aspect - 1) < 0.1:
             hint = self.last_position
@@ -267,7 +289,8 @@ class AssistiveTouch:
 
         return await self._menu_home(epoch, menu, panel, observation=self._last_wait_observation)
 
-    async def _menu_home(self, epoch: int, menu: bytes, panel, *, observation=None, navigation_context=None) -> bool:
+    async def _menu_home(self, epoch: int, menu: bytes, panel, *, observation=None,
+                         navigation_context=None, report_unconfirmed=False) -> bool:
         device = self.phone.device
         link = getattr(device, "links", 0)
         if self._home_link is None:
@@ -284,8 +307,20 @@ class AssistiveTouch:
             return False
         point, target_box = context.target.center, context.target.box
         context.validate_current(self.phone.screen)
+        contact_sequence = None
+        before_click = self._require_frame
+        if report_unconfirmed:
+            def before_click():
+                nonlocal contact_sequence
+                self._require_frame()
+                # validate_click invokes this inside Device's write lock. Its
+                # next synchronous step increments the sequence for this click.
+                sequence = getattr(device, "input_sequence", None)
+                contact_sequence = sequence + 1 if type(sequence) is int else None
+
         since = await self.phone.tap(*point, target_box=target_box, target_frame=menu,
-                                     before_click=self._require_frame, navigation_context=context)
+                                     before_click=before_click, navigation_context=context)
+        contact_input_at = getattr(device, "last_input_at", None)
 
         def arrived(frame):
             return (assistive_vision.find_panel(frame) is None
@@ -339,9 +374,13 @@ class AssistiveTouch:
             log.info("go_home: AssistiveTouch 主屏幕已确认：菜单消失、图标网格及 Dock 可见")
             return True
         log.warning("go_home: AssistiveTouch 返回主屏幕未确认，尝试 HID 退路")
+        if report_unconfirmed:
+            raise HomeUnconfirmed(clicked_at=since, device=device, link=link, epoch=epoch,
+                                  generation=observation.generation, sequence=contact_sequence,
+                                  last_input_at=contact_input_at)
         return False
 
-    async def go_home(self, *, navigation_context=None) -> None:
+    async def go_home(self, *, navigation_context=None, report_unconfirmed=False) -> None:
         epoch = getattr(self.phone.device, "abort_epoch", 0)
         self._home_link, self._home_epoch = getattr(self.phone.device, "links", 0), epoch
         self._check(epoch)
@@ -371,7 +410,8 @@ class AssistiveTouch:
         if assistive_vision.find_panel(self._require_frame().frame) is not None:
             # The user/host may already have opened the menu. Act on its visible
             # Home icon; do not reopen a bubble or run unrelated key/swipe routes.
-            if await self._assistive_home(epoch, **context_kwargs):
+            menu_options = {**context_kwargs, **({"report_unconfirmed": True} if report_unconfirmed else {})}
+            if await self._assistive_home(epoch, **menu_options):
                 self._set_verified_route("assistive-touch")
                 return
             raise RuntimeError("辅助触控菜单已打开，但未确认主屏幕图标或返回结果；请重新观察。")

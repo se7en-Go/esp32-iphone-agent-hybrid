@@ -16,7 +16,8 @@ from types import SimpleNamespace
 from PIL import Image
 from pypinyin import lazy_pinyin
 
-from . import feedback, freshness, ocr, screen_compare, screen_diff, vision
+from . import assistive_vision, feedback, freshness, ocr, screen_compare, screen_diff, vision
+from .assistive import HomeUnconfirmed
 from .device import InputAttempt, input_attempt
 from .freshness import fresh_frame, require_fresh
 from .input_context import InputContextGuard
@@ -526,6 +527,8 @@ class Controls:
                 extra["repeat_completed"] += 1
         elif name == "home":
             options = {"navigation_context": planned["navigation_context"]} if planned.get("navigation_context") else {}
+            if planned.get("_reconcile_home"):
+                options["report_unconfirmed"] = True
             self._validate_context(planned)
             await self.phone.go_home(**options)
         elif name == "back":
@@ -602,7 +605,7 @@ class Controls:
             await asyncio.sleep(min(.05, deadline - now))
 
     async def _respond(self, before, completed_at, began, ready, acknowledged, error, extra,
-                       include_diff=True, ocr_diff=False, response_session=None):
+                       include_diff=True, ocr_diff=False, response_session=None, home_unconfirmed=None):
         device_done = time.perf_counter()
         session = response_session or self._response_session()
         self.invalidate()
@@ -645,6 +648,21 @@ class Controls:
                         or time.monotonic() >= deadline):
                     break
                 if latest.frame == current.frame:
+                    home_verified = (home_unconfirmed is not None
+                                     and home_unconfirmed.clicked_at <= completed_at
+                                     and home_unconfirmed.same_contact(self.phone, self.screen)
+                                     and assistive_vision.find_panel(current.frame) is None
+                                     and assistive_vision.is_home_screen(current.frame))
+                    if home_verified:
+                        # Classification may run while the receiver publishes. A
+                        # late endpoint must still be the current settled source.
+                        latest = fresh_frame(self.screen, since=completed_at)
+                        if (not self._response_session_valid(session) or latest is None
+                                or latest.frame != current.frame or time.monotonic() >= deadline):
+                            break
+                        if home_unconfirmed.same_contact(self.phone, self.screen):
+                            error = None
+                            extra["effect_verified"] = True
                     usable = True
                     break
                 current = latest
@@ -685,19 +703,29 @@ class Controls:
         # Only Device's actual write boundary admits the already-consumed ticket.
         with input_attempt() as admission:
             plan, before, observed_at = await self._consume_action(request, admission)
+            if plan["name"] == "home":
+                plan["_reconcile_home"] = True
             await self._resolve_text(plan, before, observed_at)
             ready = time.perf_counter()
-            completed_at, acknowledged, error = None, False, None
+            completed_at, acknowledged, error, home_unconfirmed = None, False, None, None
             try:
                 completed_at = await self._execute(plan)
                 acknowledged = True
             except TypingVerificationError as exc:
                 completed_at, acknowledged, error = exc.completed_at, True, str(exc)
                 plan["extra"].update(exc.outcome)
+            except HomeUnconfirmed as exc:
+                error = str(exc)
+                if plan["name"] == "home" and plan.get("_reconcile_home"):
+                    acknowledged, home_unconfirmed = True, exc
+                # Preserve the existing failure-time response window. The
+                # original click timestamp is provenance, not an earlier cutoff.
+                completed_at = time.time()
             except (RuntimeError, OSError) as exc:
                 error = str(exc)
+        options = {"home_unconfirmed": home_unconfirmed} if home_unconfirmed is not None else {}
         return await self._respond(before, completed_at or time.time(), began, ready, acknowledged, error,
-                                   plan["extra"], request.include_diff, request.ocr_diff, response_session)
+                                   plan["extra"], request.include_diff, request.ocr_diff, response_session, **options)
 
     async def click_observed(self, request):
         """Consume a host's explicit pointer observation for one stationary click."""

@@ -2179,11 +2179,11 @@ class Phone:
             raise AppSearchError(f"未能验证 App 搜索流程：{exc}") from exc
 
     @_serialized
-    async def go_home(self, *, navigation_context=None) -> None:
-        if navigation_context is None:
-            await self.assistive_touch.go_home()
-        else:
-            await self.assistive_touch.go_home(navigation_context=navigation_context)
+    async def go_home(self, *, navigation_context=None, report_unconfirmed=False) -> None:
+        options = {"navigation_context": navigation_context} if navigation_context is not None else {}
+        if report_unconfirmed:
+            options["report_unconfirmed"] = True
+        await self.assistive_touch.go_home(**options)
 
     @_serialized
     async def go_back(self, *, before_action: Callable[[], None] | None = None, navigation_context=None) -> None:
