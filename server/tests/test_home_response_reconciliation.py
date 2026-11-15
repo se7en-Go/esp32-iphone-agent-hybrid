@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+from copy import copy
 from types import SimpleNamespace
 
 import pytest
@@ -61,6 +62,39 @@ def test_single_home_click_uses_late_settled_response_without_another_input(tmp_
     assert len(cutoffs) == 1 and cutoffs[0] > phone.last_tap["completed_at"] + 6
     assert result["frame_received_at"] > cutoffs[0] + MIRROR_LAG_SECONDS
     assert clock.elapsed < 15
+
+
+@pytest.mark.parametrize("replace_device", [False, True])
+def test_home_opened_from_bubble_keeps_the_original_device(tmp_path, monkeypatch, replace_device):
+    phone, device, screen, clock, _, controls, _ = rig(tmp_path, monkeypatch)
+    navigator = phone.assistive_touch
+    original_wait = navigator._wait
+    screen._on_jpeg(frame())
+
+    async def wait_for_menu_then_late_result(epoch, since, timeout, accept, *, stable=False):
+        if len(device.clicks) == 1:
+            clock.call_later(.35, screen._on_jpeg, frame(menu=True))
+            opened = await type(navigator)._wait(navigator, epoch, since, timeout, accept, stable=stable)
+            if replace_device:
+                phone.device = copy(device)
+            return opened
+        return await original_wait(epoch, since, timeout, accept, stable=stable)
+
+    monkeypatch.setattr(navigator, "_wait", wait_for_menu_then_late_result)
+    if replace_device:
+        # Exercise the direct Phone path without HTTP's original input lease.
+        with pytest.raises(DeviceError, match="打开辅助触控菜单期间设备连接已变化"):
+            asyncio.run(phone.go_home(report_unconfirmed=True))
+        assert len(device.clicks) == 1 and device.sent[-1] == "click"
+        return
+    request = ControlAction(action="home", screen_id=controls.observation()["screen_id"])
+    result = asyncio.run(controls.perform(request))
+
+    assert len(device.clicks) == 2  # opener and terminal Home contact
+    assert device.sent[-1] == "click"
+    assert result["command_acknowledged"] and result["effect_verified"]
+    assert result["error"] is None
+    assert base64.b64decode(result["image_base64"]) == frame(home=True)
 
 
 def test_direct_home_call_keeps_existing_failure_and_one_click(tmp_path, monkeypatch):

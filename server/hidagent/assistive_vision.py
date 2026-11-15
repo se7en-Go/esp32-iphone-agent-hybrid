@@ -324,6 +324,10 @@ def find_panel(frame: bytes, before: bytes | None = None) -> Box | None:
     return max(candidates)[1] if candidates else None
 
 
+def is_home_visible(frame: bytes) -> bool:
+    return find_panel(frame) is None and is_home_screen(frame)
+
+
 def is_home_screen(frame: bytes) -> bool:
     """Conservative portrait Home signature: aligned app icons and a separate dock.
 

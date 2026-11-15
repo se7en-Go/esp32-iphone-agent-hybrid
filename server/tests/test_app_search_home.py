@@ -1,14 +1,17 @@
 """The verified BLE search shortcut belongs to Home, not arbitrary app screens."""
 
 import asyncio
+import time
 
 import pytest
+from fake_clock import ManualClock
 from input_scene import input_frame
 from test_assistive_home import frame as home_frame
 from test_control_input_context import Link
 from test_controls import jpeg
 
 from hidagent import feedback, freshness, ocr
+from hidagent.assistive import HomeUnconfirmed
 from hidagent.device import Device
 from hidagent.phone import AppSearchError, Phone
 from hidagent.screen import Screen
@@ -25,6 +28,7 @@ def setup(tmp_path, monkeypatch, *, on_home=False):
     phone = Phone(device, tmp_path / "cal.json", screen)
 
     async def focused(*_args):
+        await asyncio.sleep(.01)
         screen._on_jpeg(input_frame())
         return screen.frame
 
@@ -47,7 +51,7 @@ def test_search_visually_confirms_home_and_consumes_original_callback_once(tmp_p
             assert screen.frame == original
             events.append("original")
 
-        async def home():
+        async def home(**_options):
             events.append("home")
             screen._on_jpeg(home_frame(home=True))
 
@@ -67,7 +71,7 @@ def test_home_failure_or_changed_original_session_never_sends_search_query(tmp_p
     async def scenario():
         phone, device, link, screen = setup(tmp_path, monkeypatch)
 
-        async def home():
+        async def home(**_options):
             if transition == "failure":
                 raise RuntimeError("home not verified")
             screen._on_jpeg(home_frame(home=transition != "not_home"))
@@ -84,6 +88,48 @@ def test_home_failure_or_changed_original_session_never_sends_search_query(tmp_p
             with pytest.raises(AppSearchError):
                 await phone.open_app_search("Freeform")
             assert link.written == []
+        finally:
+            device.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("extra_input", [False, True])
+def test_search_resumes_only_after_the_same_acknowledged_home_click(tmp_path, monkeypatch, extra_input):
+    async def scenario():
+        clock = ManualClock()
+        clock.install(monkeypatch)
+        phone, device, link, screen = setup(tmp_path, monkeypatch)
+
+        def publish():
+            screen._on_jpeg(home_frame(home=True))
+
+        async def home(**_options):
+            await device.send("click")
+            clock.call_later(.25, publish)
+            raise HomeUnconfirmed(clicked_at=time.time(), device=device, link=device.links,
+                                  epoch=device.abort_epoch, generation=screen.generation,
+                                  sequence=device.input_sequence, last_input_at=device.last_input_at)
+
+        phone.go_home = home
+        send_guarded = device.send_guarded
+
+        async def inject_at_write(command, before_write, **options):
+            if extra_input and command == "key cmd+space":
+                # The shortcut's initial validation already passed. Another
+                # input completes before the actual guarded serial write.
+                await device.send("move 1 0")
+            await send_guarded(command, before_write, **options)
+
+        monkeypatch.setattr(device, "send_guarded", inject_at_write)
+        try:
+            if extra_input:
+                with pytest.raises(AppSearchError):
+                    await phone.open_app_search("Freeform")
+                assert link.written == [b"1 click\n", b"2 move 1 0\n"]
+            else:
+                await phone.open_app_search("Freeform")
+                assert link.written == [b"1 click\n", b"2 key cmd+space\n", b"3 type Freeform\n"]
         finally:
             device.close()
 
@@ -123,7 +169,7 @@ def test_home_shortcut_revalidates_at_device_write_after_waiting(tmp_path, monke
     async def scenario():
         phone, device, link, screen = setup(tmp_path, monkeypatch)
 
-        async def home():
+        async def home(**_options):
             screen._on_jpeg(home_frame(home=True))
             await device._lock.acquire()
 

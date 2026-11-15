@@ -651,8 +651,7 @@ class Controls:
                     home_verified = (home_unconfirmed is not None
                                      and home_unconfirmed.clicked_at <= completed_at
                                      and home_unconfirmed.same_contact(self.phone, self.screen)
-                                     and assistive_vision.find_panel(current.frame) is None
-                                     and assistive_vision.is_home_screen(current.frame))
+                                     and assistive_vision.is_home_visible(current.frame))
                     if home_verified:
                         # Classification may run while the receiver publishes. A
                         # late endpoint must still be the current settled source.

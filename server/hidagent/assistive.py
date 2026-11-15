@@ -16,7 +16,7 @@ from PIL import Image, ImageChops, ImageStat
 
 from . import assistive_vision
 from .device import DeviceError
-from .freshness import fresh_frame, require_fresh, snapshot
+from .freshness import FrameSnapshot, fresh_frame, require_fresh, snapshot
 from .navigation_context import NavigationContext, from_navigation
 from .operation import remaining_operation_time
 from .text_target import PointerLandingError, TargetChangedError
@@ -34,7 +34,7 @@ LATE_HOME_WAIT = 3.2
 
 
 class HomeUnconfirmed(RuntimeError):
-    """An opted-in, already-open menu contact was ACKed but Home is unconfirmed."""
+    """An opted-in terminal menu contact was ACKed but Home is unconfirmed."""
 
     def __init__(self, *, clicked_at, device, link, epoch, generation, sequence, last_input_at):
         super().__init__("辅助触控菜单已打开，但未确认主屏幕图标或返回结果；请重新观察。")
@@ -244,8 +244,9 @@ class AssistiveTouch:
         return context
 
     async def _assistive_home(self, epoch: int, navigation_context=None, *, report_unconfirmed=False) -> bool:
+        device = self.phone.device
         if self._home_link is None:
-            self._home_link, self._home_epoch = getattr(self.phone.device, "links", 0), epoch
+            self._home_link, self._home_epoch = getattr(device, "links", 0), epoch
         self._check(epoch)
         observation = (navigation_context.observation if navigation_context is not None else
                        fresh_frame(self.phone.screen, clock=self._clock))
@@ -284,10 +285,13 @@ class AssistiveTouch:
         if opened is None:
             log.warning("go_home: AssistiveTouch 菜单未出现或未稳定")
             return False
+        if self.phone.device is not device:
+            raise DeviceError("打开辅助触控菜单期间设备连接已变化，未继续操作；请重新观察。")
         menu, panel = opened
         self._remember(button, before)
 
-        return await self._menu_home(epoch, menu, panel, observation=self._last_wait_observation)
+        return await self._menu_home(epoch, menu, panel, observation=self._last_wait_observation,
+                                     report_unconfirmed=report_unconfirmed)
 
     async def _menu_home(self, epoch: int, menu: bytes, panel, *, observation=None,
                          navigation_context=None, report_unconfirmed=False) -> bool:
@@ -322,10 +326,7 @@ class AssistiveTouch:
                                      before_click=before_click, navigation_context=context)
         contact_input_at = getattr(device, "last_input_at", None)
 
-        def arrived(frame):
-            return (assistive_vision.find_panel(frame) is None
-                    and assistive_vision.is_home_screen(frame))
-
+        arrived = assistive_vision.is_home_visible
         verified = await self._wait(epoch, since, RESULT_WAIT, arrived, stable=True)
         refreshed = False
         if not verified and fresh_frame(self.phone.screen, clock=self._clock, since=since) is None:
@@ -343,7 +344,7 @@ class AssistiveTouch:
                     if current.generation != observation.generation:
                         raise RuntimeError("返回主屏幕期间画面连接已变化，请重新观察。")
                     if not arrived(current.frame):
-                        raise TargetChangedError("等待主屏幕新画面时页面已变化，未继续唤醒；请重新观察。")
+                        raise RuntimeError("等待主屏幕新画面时页面已变化，未继续唤醒；请重新观察。")
 
                 # An early Home frame can arrive inside the mirror allowance
                 # and then stop updating. Reacquire once; never click it again.
@@ -373,12 +374,26 @@ class AssistiveTouch:
         if verified:
             log.info("go_home: AssistiveTouch 主屏幕已确认：菜单消失、图标网格及 Dock 可见")
             return True
-        log.warning("go_home: AssistiveTouch 返回主屏幕未确认，尝试 HID 退路")
         if report_unconfirmed:
             raise HomeUnconfirmed(clicked_at=since, device=device, link=link, epoch=epoch,
                                   generation=observation.generation, sequence=contact_sequence,
                                   last_input_at=contact_input_at)
+        log.warning("go_home: AssistiveTouch 返回主屏幕未确认，尝试 HID 退路")
         return False
+
+    async def confirm_late_home(self, contact: HomeUnconfirmed) -> FrameSnapshot | None:
+        """Wait passively for the terminal contact before a dependent shortcut."""
+        screen = self.phone.screen
+        budget = min(LATE_HOME_WAIT, remaining_operation_time() - .05)
+        if budget < STABLE_QUIET + .05 or not contact.same_contact(self.phone, screen):
+            return None
+        arrived = await self._wait(contact.epoch, contact.clicked_at, budget,
+                                   assistive_vision.is_home_visible, stable=True)
+        current = fresh_frame(screen, clock=self._clock, since=contact.clicked_at)
+        if (arrived is not None and current is not None and current.frame == arrived[0]
+                and contact.same_contact(self.phone, screen)):
+            return current
+        return None
 
     async def go_home(self, *, navigation_context=None, report_unconfirmed=False) -> None:
         epoch = getattr(self.phone.device, "abort_epoch", 0)
@@ -400,18 +415,15 @@ class AssistiveTouch:
         # Freshness compares board timestamps with wall-clock screen.updated.
         # Catch-up returns a monotonic offset for its own arrival snapshots.
         self._clock = self.phone._clock
-        def arrived(frame):
-            return (assistive_vision.find_panel(frame) is None
-                    and assistive_vision.is_home_screen(frame))
-
-        if arrived(self._require_frame().frame):
+        if assistive_vision.is_home_visible(self._require_frame().frame):
             return  # Home is idempotent; do not reopen its AssistiveTouch menu.
         context_kwargs = {} if navigation_context is None else {"navigation_context": navigation_context}
+        if report_unconfirmed:
+            context_kwargs["report_unconfirmed"] = True
         if assistive_vision.find_panel(self._require_frame().frame) is not None:
             # The user/host may already have opened the menu. Act on its visible
             # Home icon; do not reopen a bubble or run unrelated key/swipe routes.
-            menu_options = {**context_kwargs, **({"report_unconfirmed": True} if report_unconfirmed else {})}
-            if await self._assistive_home(epoch, **menu_options):
+            if await self._assistive_home(epoch, **context_kwargs):
                 self._set_verified_route("assistive-touch")
                 return
             raise RuntimeError("辅助触控菜单已打开，但未确认主屏幕图标或返回结果；请重新观察。")
@@ -470,7 +482,7 @@ class AssistiveTouch:
             self._check(epoch)
             verified = await self._wait(
                 epoch, since, RESULT_WAIT,
-                arrived, stable=True)
+                assistive_vision.is_home_visible, stable=True)
             if verified:
                 log.info("go_home: %s 后已确认主屏幕图标网格及 Dock", route)
                 self._set_verified_route(route)

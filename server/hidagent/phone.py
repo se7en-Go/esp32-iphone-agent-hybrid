@@ -24,7 +24,7 @@ from types import SimpleNamespace
 from PIL import Image, ImageChops, ImageStat
 
 from . import assistive_vision, feedback, freshness, ocr, screen_compare, vision
-from .assistive import AssistiveTouch
+from .assistive import AssistiveTouch, HomeUnconfirmed
 from .device import RELEASE_TIMEOUT, Device, DeviceError, exchange_timing, input_attempt
 from .input_context import InputContextGuard
 from .operation import OPERATION_TIMEOUT, OperationDeadline, bounded_operation, check_operation, shield_cleanup
@@ -2093,15 +2093,26 @@ class Phone:
             if before_action is not None:
                 before_action()
             home = validate_session()
-            if not assistive_vision.is_home_screen(home.frame):
-                await self.go_home()
-                home = validate_session()
-                if not assistive_vision.is_home_screen(home.frame):
+            home_contact = None
+            if not assistive_vision.is_home_visible(home.frame):
+                try:
+                    await self.go_home(report_unconfirmed=True)
+                except HomeUnconfirmed as pending:
+                    home = await self.assistive_touch.confirm_late_home(pending)
+                    if home is None:
+                        raise
+                    home_contact = pending
+                    validate_session()
+                else:
+                    home = validate_session()
+                if not assistive_vision.is_home_visible(home.frame):
                     raise AppSearchError("没有确认返回主屏幕，未发送搜索快捷键或 App 名。")
 
             def validate_shortcut():
                 nonlocal opened_at
                 current = validate_session()
+                if home_contact is not None and not home_contact.same_contact(self, self.screen):
+                    raise AppSearchError("确认返回主屏幕后输入会话已变化，未发送搜索快捷键。")
                 if screen_compare.observation_changed(
                         home.frame, current.frame, caret_frames=getattr(self.screen, "recent_frames", ())):
                     raise AppSearchError("App 搜索前画面已变化。")
