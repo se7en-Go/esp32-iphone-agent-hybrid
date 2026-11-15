@@ -15,7 +15,8 @@ def create_server(url: str | None = None):
         raise RuntimeError('Install with: pip install "hidagent[mcp]"') from e
 
     mcp = FastMCP("ESP32 to iPhone", instructions=(
-        "Use YOUR OWN vision model to inspect images and decide actions. No GLM credentials are needed. "
+        "Use YOUR OWN vision model to inspect images and decide actions. No service-side model credentials are needed. "
+        "Check iphone_capabilities for supported actions and configured optional features. "
         "Start with iphone_observe. Use its single-use screen_id for the next action; inspect each returned image. "
         "Reuse the image and NEW screen_id returned by each action for your next decision. Do not observe again "
         "unless the image is stale, missing, an error occurred, or the user changed the phone. "
@@ -24,6 +25,8 @@ def create_server(url: str | None = None):
         "A command acknowledgement or changed pixels is NOT verification of the user's goal. "
         "If an action fails, observe before deciding; never replay a message/send automatically. "
         "For Chinese, use iphone_type with a configured clipboard companion (docs/PASTE_INPUT.md). "
+        "Prefer staged iphone_paste_prepare, iphone_paste_status, iphone_paste, then iphone_paste_confirm "
+        "for configured clipboard input: inspect the field and full inserted text between stages. "
         "Otherwise confirm Chinese Pinyin keyboard, compose a short phrase and select candidates. "
         "Always verify the final text before a separate send. "
         "If you cannot see images, tell the user to use a vision-capable host or explicitly opt into a configured "
@@ -57,15 +60,31 @@ def create_server(url: str | None = None):
             return client.status()
 
     @mcp.tool()
-    def iphone_observe() -> list[TextContent | ImageContent]:
-        """Return screen image, dimensions and a single-use screen_id (30s). Replaces prior observation."""
+    def iphone_capabilities() -> dict:
+        """Read supported actions, limits, coordinate spaces and configured features; no model or HID calls.
+
+        Distinguish supported actions from readiness in iphone_status. Multitouch is not supported.
+        """
         with IPhoneClient(url) as client:
-            return content(client.observe())
+            return client.capabilities()
 
     @mcp.tool()
-    def iphone_screenshot() -> list[TextContent | ImageContent]:
+    def iphone_observe(for_click: bool = False) -> list[TextContent | ImageContent]:
+        """Return screen image, dimensions and a single-use screen_id (30s). Replaces prior observation.
+
+        for_click=True passively waits for a causal fresh pointer image without moving or calibrating.
+        Use it before iphone_click_observed; its original pixels may be inspected for up to 30s.
+        The current source must stay fresh and in the same input session, with unchanged page layout
+        and only tiny native-pixel JPEG noise allowed around the host-observed pointer.
+        This is host visual evidence, not automatic pointer or click-effect verification.
+        """
+        with IPhoneClient(url) as client:
+            return content(client.observe(for_click=for_click))
+
+    @mcp.tool()
+    def iphone_screenshot(for_click: bool = False) -> list[TextContent | ImageContent]:
         """Alias of iphone_observe: image plus screen_id. Not a text-only screenshot path."""
-        return iphone_observe()
+        return iphone_observe(for_click=for_click)
 
     @mcp.tool()
     def iphone_point(x: float, y: float, screen_id: str,
@@ -89,6 +108,23 @@ def create_server(url: str | None = None):
         return action("tap", screen_id, **fields)
 
     @mcp.tool()
+    def iphone_click_observed(pointer_x: float, pointer_y: float, screen_id: str,
+                              target_box: tuple[float, float, float, float], target_label: str = ""
+                              ) -> list[TextContent | ImageContent]:
+        """Click ONCE at the existing pointer position, after YOU inspect it inside the visible target.
+
+        All coordinates are normalized 0..1. Requires a new screenshot after connection/the last HID
+        input and full mirror delay. Do not infer the pointer from a requested movement or a failed CV result.
+        This never moves, nudges, calibrates, retries, holds or double-clicks. It is an explicit host
+        observation, not automatic CV verification. Inspect the returned image to verify the effect.
+        For a Send control, user authorization and its actual visible target_label are required;
+        the service cannot infer Send semantics from arbitrary coordinates. Never retry an uncertain send.
+        """
+        with IPhoneClient(url) as client:
+            return content(client.click_observed(screen_id, pointer_x, pointer_y, target_box,
+                                                 target_label=target_label))
+
+    @mcp.tool()
     def iphone_find_text(text: str, screen_id: str, nth: int = 1,
                          exact: bool = False, region: list[float] | None = None) -> list[TextContent | ImageContent]:
         """Find visible text with optional OCR; retain screen_id. nth is 1-based in ranked matches.
@@ -98,9 +134,7 @@ def create_server(url: str | None = None):
         region=[left,top,right,bottom] scopes complete boxes to normalized screen coordinates.
         """
         with IPhoneClient(url) as client:
-            return content(client.request("POST", "/api/control/find_text",
-                                          {"screen_id": screen_id, "text": text, "nth": nth, "exact": exact,
-                                           **({"region": region} if region is not None else {})}).json())
+            return content(client.find_text(text, screen_id, nth=nth, exact=exact, region=region))
 
     @mcp.tool()
     def iphone_tap_text(text: str, screen_id: str, nth: int | None = None,
@@ -122,6 +156,68 @@ def create_server(url: str | None = None):
         return action("swipe", screen_id, x1=x1, y1=y1, x2=x2, y2=y2, coordinate_space=coordinate_space)
 
     @mcp.tool()
+    def iphone_path(points: list[tuple[float, float]], screen_id: str, hold: bool = True,
+                    coordinate_space: Literal["normalized", "pixels"] = "normalized"
+                    ) -> list[TextContent | ImageContent]:
+        """Drag through 2..256 observed points in one continuous pointer stroke.
+
+        Use only on a visible canvas or drag target. The start is validated against the observation;
+        inspect the resulting image to verify the line or drag. hold controls a brief pause at the end
+        before releasing, to reduce inertia. hold=False still presses and drags; it does not move freely.
+        This is a single pointer gesture, not multitouch.
+        """
+        return action("path", screen_id, points=points, hold=hold, coordinate_space=coordinate_space)
+
+    @mcp.tool()
+    def iphone_circle(x: float, y: float, radius_x: float, radius_y: float, screen_id: str,
+                      segments: int = 48, hold: bool = True,
+                      coordinate_space: Literal["normalized", "pixels"] = "normalized"
+                      ) -> list[TextContent | ImageContent]:
+        """Trace a closed ellipse on an observed canvas, with 12..128 segments and a validated start.
+
+        hold controls a final pause before releasing; either value draws a pointer stroke.
+        Center and both radii use coordinate_space. For a visually round circle in normalized space,
+        use radius_y=radius_x*image_width/image_height. Inspect actual ink in the returned image.
+        """
+        return action("circle", screen_id, x=x, y=y, radius_x=radius_x, radius_y=radius_y,
+                      segments=segments, hold=hold, coordinate_space=coordinate_space)
+
+    @mcp.tool()
+    def iphone_long_press(x: float, y: float, screen_id: str, duration: float = .8,
+                          coordinate_space: Literal["normalized", "pixels"] = "normalized",
+                          target_box: tuple[float, float, float, float] | None = None
+                          ) -> list[TextContent | ImageContent]:
+        """Hold a visually checked target for 0.3..3 seconds, then release; inspect the resulting menu or state.
+
+        target_box is observed normalized [left,top,right,bottom], even with pixel point coordinates.
+        """
+        return action("long_press", screen_id, x=x, y=y, duration=duration, coordinate_space=coordinate_space,
+                      **({"target_box": target_box} if target_box is not None else {}))
+
+    @mcp.tool()
+    def iphone_double_tap(x: float, y: float, screen_id: str,
+                          coordinate_space: Literal["normalized", "pixels"] = "normalized",
+                          target_box: tuple[float, float, float, float] | None = None
+                          ) -> list[TextContent | ImageContent]:
+        """Double-click a visually checked target once; never automatically retry or use on a send control.
+
+        target_box is observed normalized [left,top,right,bottom]. Inspect the resulting image.
+        """
+        return action("double_tap", screen_id, x=x, y=y, coordinate_space=coordinate_space,
+                      **({"target_box": target_box} if target_box is not None else {}))
+
+    @mcp.tool()
+    def iphone_search_app(text: str, screen_id: str,
+                          coordinate_space: Literal["normalized", "pixels"] = "normalized"
+                          ) -> list[TextContent | ImageContent]:
+        """Open Spotlight and type an ASCII app name. This DOES NOT select or prove that the app opened.
+
+        Inspect the returned search results, then tap the observed app in a separate action.
+        Use visible names; do not submit Enter blindly or guess an app result location.
+        """
+        return action("open_app", screen_id, text=text, coordinate_space=coordinate_space)
+
+    @mcp.tool()
     def iphone_scroll(x: float, y: float, lines: int, screen_id: str,
                       coordinate_space: Literal["normalized", "pixels"] = "normalized"
                       ) -> list[TextContent | ImageContent]:
@@ -131,9 +227,11 @@ def create_server(url: str | None = None):
     @mcp.tool()
     def iphone_type(text: str, screen_id: str, mode: Literal["auto", "paste", "keys"] = "auto"
                     ) -> list[TextContent | ImageContent]:
-        """Enter one line in a focused field; never sends. Auto uses the configured clipboard companion,
-        otherwise ASCII keys. Paste needs docs/PASTE_INPUT.md setup, copy/focus acknowledgment,
-        and confirmation that the text appeared before the request completes.
+        """Enter text in a focused field; never sends. Auto uses the legacy synchronous clipboard
+        when available, otherwise printable ASCII keys. A staged-only companion requires
+        iphone_paste_prepare/status/paste/confirm for Unicode or multiline text. The explicit paste
+        mode is legacy-only and waits for copy/focus acknowledgment and confirmation of inserted text.
+        See docs/PASTE_INPUT.md and iphone_capabilities for the configured protocol.
         """
         return action("type", screen_id, text=text, mode=mode)
 
@@ -143,11 +241,71 @@ def create_server(url: str | None = None):
         """Compose 1..60 Chinese characters via Pinyin AFTER visually confirming input_mode=pinyin.
 
         Returns expected Chinese and typed Pinyin plus candidates image. It does NOT select candidates,
-        commit, or send. If the FIRST candidate is correct, iphone_key(space) selects it without sending.
-        Otherwise select with iphone_tap. Verify exact Chinese, then send separately.
+        commit, or send. Select the observed candidate using a new screenshot and iphone_tap.
+        Space/digit behavior depends on the active keyboard and Full Keyboard Access;
+        never assume those keys selected a candidate. Verify exact Chinese, then send separately.
         Split punctuation into ASCII input. Polyphonic names may need manual spelling correction.
         """
         return action("compose_chinese", screen_id, text=text, input_mode=input_mode)
+
+    @mcp.tool()
+    def iphone_paste_prepare(text: str, screen_id: str, focused: Literal[True],
+                             target_box: tuple[float, float, float, float] | None = None
+                             ) -> list[TextContent | ImageContent]:
+        """Prepare a 1..4000-character clipboard transaction; preserves newlines/tabs. No paste yet.
+
+        Set focused=true only after seeing the intended input field focused in the current image.
+        If no bounded blue-caret field is detected, supply its observed normalized target_box;
+        that focus evidence is explicitly attributed to the host. Returns immediately with transaction_id.
+        Triggers the installed Shortcut if configured. Shortcut acknowledges actual copy only, never focus.
+        Inspect a post-copy status/image before iphone_paste; the pre-copy observation cannot authorize it.
+        """
+        with IPhoneClient(url) as client:
+            return content(client.clipboard_stage("prepare", text=text, screen_id=screen_id, focused=focused,
+                                                   **({"target_box": target_box} if target_box is not None else {})))
+
+    @mcp.tool()
+    def iphone_paste_status(transaction_id: str) -> list[TextContent | ImageContent]:
+        """Read copy/paste phase and current image. Does not paste or confirm insertion.
+
+        Use the returned screen_id after inspecting the original target field, not a Shortcut overlay.
+        """
+        with IPhoneClient(url) as client:
+            return content(client.clipboard_stage("status", transaction_id=transaction_id))
+
+    @mcp.tool()
+    def iphone_paste(transaction_id: str, screen_id: str, focused: Literal[True]
+                     ) -> list[TextContent | ImageContent]:
+        """Paste once after actual copy and rechecking the original observed input context.
+
+        focused=true asserts you now see the original field focused. The returned image needs your
+        verification; paste_sent/command_acknowledged do not prove text insertion. Never retry Cmd+V.
+        """
+        with IPhoneClient(url) as client:
+            return content(client.clipboard_stage("paste", transaction_id=transaction_id,
+                                                   screen_id=screen_id, focused=focused))
+
+    @mcp.tool()
+    def iphone_paste_confirm(transaction_id: str, screen_id: str, observed_text: str,
+                             confirmed: Literal[True]) -> list[TextContent | ImageContent]:
+        """Confirm only after visually checking the complete exact inserted text in the original input field.
+
+        Supply that observed_text, not an assumed echo of the requested text. Requires fresh post-paste
+        evidence and consumes the transaction once. Result records host verification, not server OCR proof.
+        No new input can replace the pending transaction before confirmation or cancellation.
+        """
+        with IPhoneClient(url) as client:
+            return content(client.clipboard_stage("confirm", transaction_id=transaction_id, screen_id=screen_id,
+                                                   observed_text=observed_text, confirmed=confirmed))
+
+    @mcp.tool()
+    def iphone_paste_cancel(transaction_id: str) -> dict:
+        """Cancel staged input and invalidate its copy/host nonces; never claims text was or was not inserted.
+
+        If old text was fetched, needs_resolution stays true until the old Shortcut and outcome are checked.
+        """
+        with IPhoneClient(url) as client:
+            return client.clipboard_stage("cancel", transaction_id=transaction_id)
 
     @mcp.tool()
     def iphone_key(combo: str, screen_id: str, repeat: int = 1,
@@ -164,12 +322,21 @@ def create_server(url: str | None = None):
 
     @mcp.tool()
     def iphone_home(screen_id: str) -> list[TextContent | ImageContent]:
-        """Attempt Home swipe; not reliable on Home-button iPhones. Verify or use AssistiveTouch."""
+        """Return Home through an observed AssistiveTouch Home control or a previously verified route.
+
+        Guarded gesture/key fallbacks require visual confirmation of the Home icon grid and Dock.
+        An already-open AssistiveTouch menu is handled directly. Inspect the returned screenshot;
+        an ACK alone does not establish that Home was reached.
+        """
         return action("home", screen_id)
 
     @mcp.tool()
     def iphone_back(screen_id: str) -> list[TextContent | ImageContent]:
-        """Attempt the back gesture; inspect its effect."""
+        """Prefer the detected visible Back control in the navigation bar, with pointer verification.
+
+        If no Back control is detected, attempt the guarded edge-swipe fallback. A rejected or
+        uncertain Back click does not trigger another gesture. Inspect the returned screen for the result.
+        """
         return action("back", screen_id)
 
     @mcp.tool()

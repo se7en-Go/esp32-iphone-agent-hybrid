@@ -162,21 +162,58 @@ $("zoom").addEventListener("click", () => $("zoom").close());
 
 const live = $("live");
 let down = null, calibrating = false;
+let previewState = "waiting", previewGeneration = null, boardFrozen = false, expectsFrame = false;
+let previewEpoch = 0;
+let refreshingForInput = false;
+const canUsePreview = () => live.complete && live.naturalWidth > 0
+  && (previewState === "live" || previewState === "idle");
+
+async function refreshForInput() {
+  if (refreshingForInput) return;
+  refreshingForInput = true;
+  say("refreshForInput");
+  try {
+    // A preview can be retained after AirPlay goes idle. Wake it through the
+    // server without forwarding any coordinates from that older image.
+    const response = await fetch("/api/control/observe", { cache: "no-store", signal: AbortSignal.timeout(6000) });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      $("msg").textContent = data.detail || t("refreshInputFailed");
+      return;
+    }
+    say("refreshInputReady");
+  } catch {
+    say("refreshInputFailed");
+  } finally {
+    refreshingForInput = false;
+  }
+}
 function frac(e) {
   const r = live.getBoundingClientRect(), ratio = live.naturalWidth / live.naturalHeight || r.width / r.height;
   const w = Math.min(r.width, r.height * ratio), h = w / ratio;  // object-fit: contain box
   const x = (e.clientX - r.left - (r.width - w) / 2) / w, y = (e.clientY - r.top - (r.height - h) / 2) / h;
   return { x: Math.min(Math.max(x, 0), 1), y: Math.min(Math.max(y, 0), 1) };
 }
-live.addEventListener("pointerdown", (e) => { down = frac(e); });
+live.addEventListener("pointerdown", (e) => {
+  if (e.isPrimary && e.button === 0 && canUsePreview()) {
+    down = { point: frac(e), pointer: e.pointerId, generation: previewGeneration, state: previewState,
+      width: live.naturalWidth, height: live.naturalHeight };
+  }
+});
+live.addEventListener("pointercancel", () => { down = null; });
 live.addEventListener("pointerup", async (e) => {
-  if (!down) return;
-  const up = frac(e), from = down;
+  const pressed = down;
   down = null;
+  if (!pressed || e.pointerId !== pressed.pointer || !canUsePreview()
+      || pressed.generation !== previewGeneration || pressed.width !== live.naturalWidth
+      || pressed.height !== live.naturalHeight) return;
+  const up = frac(e), from = pressed.point;
   if (calibrating) {
     calibrating = false;
     const ok = await post("/api/calibrate/finish", up);
     calibrationHint(ok ? "calOk" : null);
+  } else if (pressed.state === "idle" || previewState === "idle") {
+    await refreshForInput();
   } else if (Math.hypot(up.x - from.x, up.y - from.y) < 0.02) {
     post("/api/tap", up);
   } else {
@@ -186,26 +223,67 @@ live.addEventListener("pointerup", async (e) => {
 let wheelAt = 0;
 live.addEventListener("wheel", (e) => {
   e.preventDefault();
-  if (Date.now() - wheelAt < 250) return;
+  if (!canUsePreview() || Date.now() - wheelAt < 250) return;
   wheelAt = Date.now();
-  post("/api/scroll", { ...frac(e), lines: e.deltaY > 0 ? -3 : 3 });
+  if (previewState === "idle") refreshForInput();
+  else post("/api/scroll", { ...frac(e), lines: e.deltaY > 0 ? -3 : 3 });
 }, { passive: false });
 
 // Show a frame, or nothing when the phone is gone, so a stale screenshot never lingers.
-function showFrame(url) {
+function showFrame(url, state, age, generation = null) {
+  if (!url || generation !== previewGeneration) {
+    down = null;
+    if (calibrating) {
+      calibrating = false;
+      calibrationHint(null);
+    }
+  }
+  previewState = state;
+  previewGeneration = generation;
   const old = live.src;
   if (url) live.src = url; else live.removeAttribute("src");
   if (old.startsWith("blob:")) URL.revokeObjectURL(old);
-  $("hint").hidden = Boolean(url);
+  const key = `video_${boardFrozen && !url ? "frozen" : state}`;
+  const message = I18N[lang][key] || t("waiting");
+  const hint = $("hint"), note = $("frame-note");
+  hint.textContent = message;
+  hint.hidden = Boolean(url);
+  note.textContent = state === "idle" && age ? `${t("lastFrame")} · ${age}s` : message;
+  note.hidden = !url || state === "live";
+}
+
+function invalidatePreview(state, generation = previewGeneration) {
+  previewEpoch += 1;
+  showFrame("", state, null, generation);
 }
 
 // Keep fetching the latest frame (works in every browser, unlike MJPEG).
 async function refreshLive() {
-  try {
-    const r = await fetch(`/api/frame.jpg?${Date.now()}`);
-    showFrame(r.ok ? URL.createObjectURL(await r.blob()) : "");
-  } catch { showFrame(""); }  // server restarting
-  setTimeout(refreshLive, 150);
+  if (expectsFrame) {
+    const epoch = previewEpoch;
+    try {
+      const r = await fetch("/api/frame.jpg", { cache: "no-store", signal: AbortSignal.timeout(2500) });
+      const state = r.headers.get("X-Preview-State") || (r.ok ? "live" : "waiting");
+      const generation = r.headers.get("X-Preview-Generation");
+      if (r.ok) {
+        const frame = await r.blob();
+        // Status may have observed a disconnect/new session while either headers
+        // or pixels were arriving. Only the currently confirmed session can draw.
+        if (epoch === previewEpoch && expectsFrame && generation === previewGeneration) {
+          showFrame(URL.createObjectURL(frame), state, r.headers.get("X-Frame-Age"), generation);
+        }
+      } else if (epoch === previewEpoch) {
+        expectsFrame = false;
+        invalidatePreview(state, generation);
+      }
+    } catch {
+      if (epoch === previewEpoch) {
+        expectsFrame = false;
+        invalidatePreview("disconnected");
+      }
+    }
+  }
+  setTimeout(refreshLive, expectsFrame ? 150 : 400);
 }
 
 // ---- controls ------------------------------------------------------------------------
@@ -219,9 +297,10 @@ function calibrationHint(key) {
   if (key === "calOk") setTimeout(() => calibrationHint(null), 4000);
 }
 $("cal").addEventListener("click", async () => {
+  const generation = previewGeneration;
   calibrationHint("calFinding");
   const r = await post("/api/calibrate/start");
-  if (!r) return calibrationHint(null);
+  if (!r || generation !== previewGeneration || !live.hasAttribute("src")) return calibrationHint(null);
   if (r.auto) return calibrationHint("calOk");  // found the pointer by itself
   calibrating = true;
   calibrationHint("calNow");
@@ -269,9 +348,16 @@ function formatHid(hid, hint) {
 let shown = "";
 async function poll() {
   try {
-    const s = await (await fetch("/api/status")).json();
+    const s = await (await fetch("/api/status", { cache: "no-store", signal: AbortSignal.timeout(2500) })).json();
     let ready = true;
+    boardFrozen = s.video?.board?.fz === 1;
+    expectsFrame = !!s.screen;
+    const generation = s.video?.generation?.toString() ?? null;
+    if (!expectsFrame || generation !== previewGeneration) {
+      invalidatePreview(expectsFrame ? "waiting" : s.video?.state || "waiting", generation);
+    }
     const hints = s.hints || {};
+    const link = s.link || {};
     $("setup").querySelectorAll("li").forEach((li) => {
       const ok = !!s[li.dataset.key];
       li.classList.toggle("done", ok);
@@ -279,18 +365,21 @@ async function poll() {
       ready &&= ok;
       const hint = hints[li.dataset.key];
       const span = li.querySelector("span");
+      if (li.dataset.key === "screen" && link.receiver) {
+        li.querySelector("b").textContent = `${t("s2")} · ${link.receiver}`;
+      }
       if (span && hint && !ok && (lang === "zh" ? hint.zh : hint.en)) span.textContent = lang === "zh" ? hint.zh : hint.en;
     });
     $("setup").classList.toggle("all-done", ready);
-    const link = s.link || {};
     if ($("link-line")) {
       const hidLine = formatHid(s.hid, s.hints && s.hints.hid);
       $("link-line").textContent = [link.port, link.mode, link.ip, link.receiver, hidLine].filter(Boolean).join(" · ");
     }
 
     const a = s.agent, steps = a.steps;
-    $("run").disabled = a.running || !ready;
-    $("examples").querySelectorAll("button").forEach((b) => { b.disabled = a.running || !ready; });
+    const taskReady = s.task_ready ?? ready;
+    $("run").disabled = a.running || !taskReady;
+    $("examples").querySelectorAll("button").forEach((b) => { b.disabled = a.running || !taskReady; });
     $("stop").hidden = !a.running;
     $("clear").hidden = a.running || !steps.length;
     $("live-dot").classList.toggle("on", a.running);
@@ -332,7 +421,13 @@ async function poll() {
       if (a.running && cards.length) cards.at(-1).classList.add("current");
       $("wall").replaceChildren(...cards.reverse());  // newest first
     }
-  } catch { /* server restarting */ }
+  } catch {
+    expectsFrame = false;
+    boardFrozen = false;
+    invalidatePreview("disconnected");
+    $("run").disabled = true;
+    $("examples").querySelectorAll("button").forEach((b) => { b.disabled = true; });
+  }
   setTimeout(poll, 500);
 }
 

@@ -4,7 +4,7 @@ import io
 import math
 from statistics import median
 
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageFilter
 
 Point = tuple[float, float]
 Box = tuple[float, float, float, float]
@@ -57,6 +57,57 @@ def _circle(gray: Image.Image, x: float, y: float, radius: float) -> list[int]:
             for a in range(12)]
 
 
+def _translucent_buttons(image, gray, near):
+    """Pale AT overlay on a light list: three grey concentric levels, not a flat disc.
+
+    App text can show through the centre. Require the same radial ordering on most
+    rays and a grey outer annulus; hints never manufacture a candidate.
+    """
+    w, h = image.size
+    short = min(w, h)
+    data = gray.tobytes()
+    found = []
+    for threshold in (190, 210, 225):
+        mask = bytearray(value <= threshold for value in data)
+        for left, top, right, bottom, count in _components(mask, w, h):
+            bw, bh = right-left, bottom-top
+            if not (.10*short <= bh <= .20*short and .7 <= bw/bh <= 1.4
+                    and .25 <= count/(bw*bh) <= .95):
+                continue
+            radius = bh/2
+            # Adjacent list glyphs can join the inward side. The outward arc is
+            # clear, so derive its centre from that boundary, not the joined mass.
+            if right > .83*w:
+                x = right-.5-radius
+            elif left < .17*w:
+                x = left-.5+radius
+            else:
+                continue
+            y = (top+bottom-1)/2
+            if not radius < x < w-radius or not radius < y < h-radius:
+                continue
+            core = _circle(gray, x, y, radius*.25)
+            inner = _circle(gray, x, y, radius*.58)
+            outer = _circle(gray, x, y, radius*.87)
+            outside = _circle(gray, x, y, radius*1.22)
+            c, i, o, beyond = map(median, (core, inner, outer, outside))
+            if not (c-i >= 8 and i-o >= 5 and beyond-o >= 18):
+                continue
+            coherent = sum(a-b > 5 and b-d > 2 and e-d > 12
+                           for a, b, d, e in zip(core, inner, outer, outside, strict=True))
+            if coherent < 7 or sum(abs(v-o) <= 18 for v in outer) < 9:
+                continue
+            colors = [_circle(channel, x, y, radius*.87) for channel in image.split()]
+            if sum(max(rgb)-min(rgb) <= 40 for rgb in zip(*colors, strict=True)) < 9:
+                continue
+            point = x/w, y/h
+            distance = math.dist(point, near) if near is not None else 0
+            r = radius*.85
+            box = ((x-r)/w, (y-r)/h, (x+r)/w, (y+r)/h)
+            found.append((beyond-o+c-i-distance*80, point, box))
+    return found
+
+
 def find_button_target(frame: bytes, near: Point | None = None) -> tuple[Point, Box] | None:
     """Find an edge button by its concentric rings; `near` only ranks real candidates.
 
@@ -69,7 +120,7 @@ def find_button_target(frame: bytes, near: Point | None = None) -> tuple[Point, 
     short = min(w, h)
     data = gray.tobytes()
     edge = [i for i in range(w*h) if min(i % w, w-1-i % w, i // w, h-1-i // w) < short * .2]
-    candidates = []
+    candidates = _translucent_buttons(image, gray, near)
     for threshold in (70, 110, 150, 190, 225, 245):
         mask = bytearray(w*h)
         for i in edge:
@@ -152,6 +203,27 @@ def find_icon_box(frame: bytes, panel: Box, point: Point) -> Box | None:
     return None
 
 
+def find_icon_target(frame: bytes, panel: Box, slot: Point) -> tuple[Point, Box] | None:
+    """Use a menu slot to choose one nearby visible icon, then target its actual centre.
+
+    The six-icon panel is verified by find_panel before this lookup. A slot is not
+    a click coordinate: missing or ambiguous icon bounds provide no target.
+    """
+    image = _small(frame).convert("L")
+    left, top, right, bottom = panel
+    pixels = (round(left*image.width), round(top*image.height),
+              round(right*image.width), round(bottom*image.height))
+    sx, sy = (slot[0]-left)/(right-left), (slot[1]-top)/(bottom-top)
+    candidates = []
+    for x0, y0, x1, y1 in _icon_boxes(image, pixels):
+        x, y = (x0+x1)/2, (y0+y1)/2
+        if abs(x-sx) <= .10 and abs(y-sy) <= .10:
+            box = (left+x0*(right-left), top+y0*(bottom-top),
+                   left+x1*(right-left), top+y1*(bottom-top))
+            candidates.append(((left+x*(right-left), top+y*(bottom-top)), box))
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def find_panel(frame: bytes, before: bytes | None = None) -> Box | None:
     """Locate a rounded dark panel with the default six-icon arrangement.
 
@@ -207,18 +279,20 @@ def is_home_screen(frame: bytes) -> bool:
     App Library. Unknown layouts fail closed. A dismissed menu or a changed app
     alone supplies none of this evidence.
     """
-    from PIL import ImageFilter
-
-    image = _small(frame).convert("L")
+    image = _small(frame)
     w, h = image.size
     if not 1.4 < h/w < 2.5:
         return False
-    edges = image.filter(ImageFilter.FIND_EDGES)
+    edges = image.convert("L").filter(ImageFilter.FIND_EDGES)
     data = edges.tobytes()
     # A full-width toolbar separator below the status bar is application chrome.
     if any(sum(data[y*w+x] > 45 for x in range(round(.05*w), round(.95*w))) > .72*w
            for y in range(round(.075*h), round(.16*h))):
         return False
+    return _home_with_dock_outline(data, w, h) or _home_with_translucent_dock(image)
+
+
+def _home_with_dock_outline(data, w, h):
     mask = bytearray(value > 18 for value in data)
     icons, docks = [], []
     for left, top, right, bottom, count in _components(mask, w, h):
@@ -252,3 +326,45 @@ def is_home_screen(frame: bytes) -> bool:
                     / min(icon[2] for icon in row+other+dock_icons) < 1.35):
                 return True
     return False
+
+
+def _home_with_translucent_dock(image: Image.Image) -> bool:
+    """A translucent dock may have disconnected edges over colorful wallpaper."""
+    w, h = image.size
+    red, green, blue = (channel.filter(ImageFilter.FIND_EDGES) for channel in image.split())
+    edges = ImageChops.lighter(red, ImageChops.lighter(green, blue))
+    data = edges.tobytes()
+    # The dock's upper rim must span both halves; four bottom controls alone
+    # could also be an app toolbar. Require a distinct row of square dock icons.
+    dock_line = next((y/h for y in range(round(.825*h), round(.89*h))
+                      if sum(value > 18 for value in data[y*w+round(.05*w):y*w+round(.95*w)]) > .55*w
+                      and all(sum(value > 18 for value in data[y*w+left:y*w+right]) > .11*w
+                              for left, right in ((round(.07*w), w//2), (w//2, round(.93*w))))), None)
+    if dock_line is None:
+        return False
+
+    columns = (.15, .385, .615, .85)
+    rows = []
+    dock_columns = set()
+    for left, top, right, bottom, count in _components(bytearray(pixel > 55 for pixel in data), w, h):
+        width, height = right-left, bottom-top
+        if not (.12*w <= width <= .20*w and .8 <= width/height <= 1.25 and count > .08*width*height):
+            continue
+        x, y = (left+right)/(2*w), (top+bottom)/(2*h)
+        column = min(columns, key=lambda value: abs(x-value))
+        if abs(x-column) > .045:
+            continue
+        if .025 < y-dock_line < .09 and y < .96:
+            dock_columns.add(column)
+        elif .13 < y < .76:
+            row = next((row for center, row in rows if abs(y-center) < .025), None)
+            if row is None:
+                row = set()
+                rows.append((y, row))
+            row.add(column)
+    if len(dock_columns) < 3:
+        return False
+    rows = [(y, columns) for y, columns in rows if len(columns) >= 3]
+    return any(.08 < bottom_y-top_y < .22 and len(top & bottom & dock_columns) >= 2
+               and len(top | bottom) == 4
+               for index, (top_y, top) in enumerate(rows) for bottom_y, bottom in rows[index+1:])

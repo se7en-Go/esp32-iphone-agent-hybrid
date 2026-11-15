@@ -183,6 +183,50 @@ def test_manual_finish_without_a_frame_keeps_the_one_point_scale(tmp_path):
     assert phone.span == {"w": 400, "h": 800} and phone.origin == {"x": 0.0, "y": 0.0}
 
 
+def test_ble_calibration_keeps_both_probes_inside_short_pointer_range(tmp_path):
+    class ShortRangePointer:
+        pace_version = 4
+        links = 1
+        position = 0
+        sent = []
+
+        async def send(self, command):
+            self.sent.append(command)
+            if command == "home":
+                self.position = 0
+            elif command.startswith("move "):
+                self.position += int(command.split()[1])
+
+    device = ShortRangePointer()
+    phone = Phone(device, tmp_path / "calibration.json", SimpleNamespace(live=True))
+
+    async def locate(*args, **kwargs):
+        x = .08 + device.position / 224
+        y = device.position / 490
+        return (x, y) if x < .95 and y < .95 else None
+
+    phone._find_pointer = locate
+    assert asyncio.run(phone.start_calibration())
+    assert phone.span == {"w": 224, "h": 490}
+    assert phone.origin["x"] == pytest.approx(.08)
+    assert device.sent == ["home", "move 60 60", "move 60 60"]
+
+
+def test_ble_manual_fit_uses_the_same_short_distance_as_the_fallback(tmp_path):
+    sent = []
+
+    async def send(command):
+        sent.append(command)
+
+    phone = Phone(SimpleNamespace(pace_version=4, links=1, send=send),
+                  tmp_path / "calibration.json", SimpleNamespace(live=False))
+    assert asyncio.run(phone.start_calibration()) is False
+    assert sent[-2:] == ["home", "move 90 90"]
+    phone.finish_calibration(.45, .20)
+    assert phone.span == {"w": 200, "h": 450}
+    assert phone._pos == (90, 90)
+
+
 def test_failed_auto_calibration_leaves_the_pointer_where_manual_finish_expects_it(tmp_path, monkeypatch):
     monkeypatch.setattr(freshness, "MIRROR_LAG_SECONDS", 0)
     monkeypatch.setattr(phone_module, "POINTER_WAIT", 0.3)
@@ -309,9 +353,9 @@ def test_nudge_candidate_must_be_newer_than_the_command_even_across_wrap(
     comparisons = []
     original = phone_module.vision.pointer_move
 
-    def compare(*args):
+    def compare(*args, **kwargs):
         comparisons.append(args)
-        return original(*args)
+        return original(*args, **kwargs)
 
     monkeypatch.setattr(phone_module.vision, "pointer_move", compare)
     sent = time.monotonic()

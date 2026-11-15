@@ -97,6 +97,31 @@ def test_target_guard_rejects_a_local_change_even_with_pointer_movement():
         TextTargetGuard(screen, before, target)()
 
 
+def test_target_guard_rechecks_the_crop_of_an_observed_cursor_overlay():
+    before = frame()
+    landing = frame((360, 624))
+    screen = SimpleNamespace(updated=time.time(), live=True, frame=landing)
+    guard = TextTargetGuard(screen, before, SimpleNamespace(center=(.5, .4)))
+    cursor = ((.5, .4), landing)
+    guard(cursor=cursor)
+
+    noisy = Image.open(io.BytesIO(landing))
+    for x in range(350, 371, 3):
+        noisy.putpixel((x, 624), (180, 180, 180))
+    out = io.BytesIO()
+    noisy.save(out, "PNG")
+    screen.frame = out.getvalue()
+    guard(cursor=cursor)
+
+    edited = Image.open(io.BytesIO(landing))
+    ImageDraw.Draw(edited).rectangle((354, 620, 366, 629), fill="black")
+    out = io.BytesIO()
+    edited.save(out, "PNG")
+    screen.frame = out.getvalue()
+    with pytest.raises(RuntimeError, match="未发送点击"):
+        guard(cursor=cursor)
+
+
 @pytest.mark.parametrize("live,content", [(False, frame()), (True, None), (True, b"invalid")])
 def test_target_guard_rejects_lost_or_invalid_frames(live, content):
     screen = SimpleNamespace(updated=time.time(), live=live, frame=content)

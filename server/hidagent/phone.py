@@ -12,22 +12,26 @@ import io
 import json
 import logging
 import math
+import os
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 
-from . import feedback, freshness, screen_compare, vision
+from . import assistive_vision, feedback, freshness, ocr, screen_compare, vision
 from .assistive import AssistiveTouch
-from .device import RELEASE_TIMEOUT, Device, DeviceError, exchange_timing
-from .operation import OPERATION_TIMEOUT, bounded_operation, check_operation, shield_cleanup
+from .device import RELEASE_TIMEOUT, Device, DeviceError, exchange_timing, input_attempt
+from .input_context import InputContextGuard
+from .operation import OPERATION_TIMEOUT, OperationDeadline, bounded_operation, check_operation, shield_cleanup
+from .pointer_diagnostics import PointerDiagnostics
 from .screen import FrameSnapshot
-from .text_input import ClipboardWriter, TypeMode, select_type_mode
-from .text_target import TextTargetGuard
+from .text_input import ClipboardWriter, TypeMode, clipboard_mode_options, select_type_mode
+from .text_target import PointerLandingError, TargetChangedError, TextTargetGuard
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +78,8 @@ def type_chunks(text: str, limit: int = TYPE_LIMIT) -> list[str]:
 
 CALIBRATION_MOVE = 200  # mouse units moved diagonally for a manual (one point) calibration; stays on screen
 CALIBRATION_STOPS = (150, 350)  # automatic calibration finds the pointer at these distances from the corner
+BLE_CALIBRATION_MOVE = 90
+BLE_CALIBRATION_STOPS = (60, 120)  # larger BLE reports can hit the edge before the USB probe distances
 REHOME_EVERY = 10       # gestures between re-homing
 HOLD = 0.25             # seconds to rest before lifting, so iOS adds no momentum (the swipe stops where it ends)
 TAP_GAP = 0.15          # seconds to stay still after a click, so iOS sees a finished tap, not the start of a drag
@@ -89,22 +95,119 @@ POINTER_WAIT = 2.5      # seconds per direction (nudge, then the way back), neve
 REPLAY_LAG = 5          # seconds; a still screen keeps its last live frame
 CATCH_UP_WAIT = 15      # leave time for verification inside the operation budget
 USB_PACE = 3            # firmware HID_PACE_USB. A saved file with no pace number is this schedule.
+BLE_PACE = 4            # firmware HID_PACE_BLE
 AIM_TOLERANCE = 0.008   # screen fraction; a bigger miss is corrected before pressing
 MAX_MISS = 0.06         # larger misses may be misreadings; never correct or learn from them
+BLE_PAIRED_MAX_MISS = 0.12  # a paired movement can authorize a correction, never an unseen click
 TAP_POINTER_WAIT = 0.12  # opportunistic disc check; a late/hidden pointer uses the calibrated landing
 TAP_EFFECT_WAIT = 1.75  # one mirror-lag window after the click; no automatic retry
 WAKE_NUDGE = 2
+WAKE_OUTWARD_HOLD = .05  # separate the two reports; only the completed return authorizes a new frame
 POINTER_FADE_SECONDS = 3.0
 OBSERVATION_REFRESH_WAIT = 3.5
+OBSERVATION_ENTRY_MAX_AGE = 1.0  # leave motion/verification time inside the unchanged 5-second write limit
 PASTE_CONTEXT_WAIT = 3.5  # bounded allowance for a dismissed Shortcut alert to leave the mirror
+APP_SEARCH_MAX = 64
+SPOTLIGHT_PLACEHOLDERS = {"search", "搜索", "搜尋"}
+SPOTLIGHT_MARKERS = {"sirisuggestions", "siri建议", "siri建議"}
+HOST_OBSERVATION_TTL = 30.0
+_HOST_OBSERVATION_ISSUER = object()
+
+
+def _host_observed_pixels_match(before: bytes, current: bytes, pointer_xy) -> bool:
+    """Host-only stationary evidence: unchanged page plus tiny native RGB noise.
+
+    No caller-supplied mask, target-box exemption, resizing, pointer estimation
+    or CV confirmation is used. In particular, a faded/moved pointer must still
+    pass the stricter native-pixel neighborhood even if page comparison ignores it.
+    """
+    try:
+        with Image.open(io.BytesIO(before)) as image:
+            original = image.convert("RGB")
+        with Image.open(io.BytesIO(current)) as image:
+            latest = image.convert("RGB")
+    except (OSError, TypeError, ValueError):
+        return False
+    if original.size != latest.size:
+        return False
+    if screen_compare.observation_changed(before, current):
+        return False
+    width, height = original.size
+    x, y = round(pointer_xy[0] * width), round(pointer_xy[1] * height)
+    radius = max(32, math.ceil(.064 * width))
+    region = (max(0, x - radius), max(0, y - radius), min(width, x + radius + 1), min(height, y + radius + 1))
+    difference = ImageChops.difference(original.crop(region), latest.crop(region))
+    return (max(high for _, high in difference.getextrema()) <= 5
+            and sum(ImageStat.Stat(difference).mean) / 3 <= .15)
+
+
+@dataclass(frozen=True, init=False)
+class HostObservation:
+    """Internal proof that original pixels were fresh and causal when issued."""
+
+    snapshot: freshness.FrameSnapshot = field(repr=False)
+    device: object = field(repr=False)
+    links: int
+    abort_epoch: int
+    input_sequence: int
+    last_input_at: float
+    session_started_at: float
+    issued_monotonic: float
+    expires_monotonic: float
+    lease: object = field(repr=False)
+    _phone: object = field(repr=False)
+    _seal: object = field(repr=False)
+
+    def __init__(self, *args, **kwargs):
+        raise TypeError("host observation must come from passive, verified source observation")
+
+    def validate(self, phone):
+        check_operation()
+        device = phone.device
+        if (getattr(self, "_seal", None) is not _HOST_OBSERVATION_ISSUER or self._phone is not phone
+                or not 0 <= time.monotonic() - self.issued_monotonic < HOST_OBSERVATION_TTL
+                or time.monotonic() >= self.expires_monotonic or not self.lease.active):
+            raise RuntimeError("宿主观察资格无效或已过期，请重新观察。")
+        if (device is not self.device or device.links != self.links
+                or device.abort_epoch != self.abort_epoch or device.input_sequence != self.input_sequence
+                or device.last_input_at != self.last_input_at or device.session_started_at != self.session_started_at
+                or freshness.snapshot(phone.screen).generation != self.snapshot.generation):
+            raise RuntimeError("宿主观察后的设备、画面或输入会话已变化，未继续操作。")
+
+
+class AppSearchError(RuntimeError):
+    """App search could not proceed with verified evidence."""
+
+
+class TypingVerificationError(DeviceError):
+    """A type command was ACKed, but its field could not be verified afterward."""
+
+    def __init__(self, message, *, completed_at, chunks_acknowledged, chunks_total, characters_acknowledged):
+        super().__init__(message)
+        self.completed_at = completed_at
+        self.outcome = {
+            "requires_verification": True, "input_verified": False,
+            "typing_progress": {"chunks_acknowledged": chunks_acknowledged, "chunks_total": chunks_total,
+                                "characters_acknowledged": characters_acknowledged,
+                                "all_chunks_acknowledged": chunks_acknowledged == chunks_total}}
+
+
+def validate_app_query(name: str) -> None:
+    """Validate search input before a batch can send its first command."""
+    if not 1 <= len(name) <= APP_SEARCH_MAX or name != name.strip() or not name.isascii() or not name.isprintable():
+        raise ValueError("App 搜索目前只接受 1–64 个可打印 ASCII 字符，请使用英文 App 名。")
 
 
 def _accepts_stage(callback) -> bool:
+    return _accepts_keywords(callback, "stage")
+
+
+def _accepts_keywords(callback, *names) -> bool:
     try:
         parameters = inspect.signature(callback).parameters
     except (TypeError, ValueError):
         return False
-    return "stage" in parameters or any(
+    return all(name in parameters for name in names) or any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
 
 
@@ -155,6 +258,9 @@ class Phone:
         self._seen = {axis: deque(map(tuple, seen.get(axis, [])), maxlen=12) for axis in ("x", "y")}
         self._pointer_seen = False
         self._pointer_confirmed = False
+        self._pointer_pair_verified = False
+        self._pointer_overlay = None
+        self._pointer_reference = None
         self._last_motion = 0.0
         self._position_before = None
         self._position_from = None
@@ -252,9 +358,10 @@ class Phone:
         self._pos = None
         epoch = getattr(self.device, "abort_epoch", 0)
         await self._pull_pace()
+        stops = BLE_CALIBRATION_STOPS if self._pace == BLE_PACE else CALIBRATION_STOPS
         await self._send(epoch, "home")
         seen = []
-        for units in CALIBRATION_STOPS:
+        for units in stops:
             step = units - (seen[-1][0] if seen else 0)
             await self._send(epoch, f"move {step} {step}")
             found = await self._find_pointer(epoch=epoch) if self.screen is not None and self.screen.live else None
@@ -265,8 +372,9 @@ class Phone:
         if fit is None:
             log.info("calibration: pointer not found on screen (%s), waiting for a click", seen)
             # the user clicks the pointer next, and finish_calibration counts from exactly this spot
+            move = BLE_CALIBRATION_MOVE if self._pace == BLE_PACE else CALIBRATION_MOVE
             await self._send(epoch, "home")
-            await self._send(epoch, f"move {CALIBRATION_MOVE} {CALIBRATION_MOVE}")
+            await self._send(epoch, f"move {move} {move}")
             return False
         span, origin = fit
         self.span, self.origin = span, origin
@@ -297,7 +405,7 @@ class Phone:
 
     async def _find_pointer(self, near: tuple[float, float] | None = None,
                             conservative: bool = False, epoch: int | None = None,
-                            quick: bool = False) -> tuple[float, float] | None:
+                            quick: bool = False, required: bool = False) -> tuple[float, float] | None:
         """Wiggle the pointer and find where it rests (the span may still be unknown).
 
         The mirror lags and stays silent while the screen is still, so the frame taken before the nudge may
@@ -308,7 +416,7 @@ class Phone:
         if epoch is None:
             epoch = getattr(self.device, "abort_epoch", 0)
         if quick:
-            return await self._quick_pointer(near, epoch)
+            return await self._quick_pointer(near, epoch, required=required)
         await self._catch_up(epoch)
         await self._wait_screen(epoch, self.screen.settled(
             quiet=0.2, least=0.3, most=1.5, transport=conservative))
@@ -319,28 +427,34 @@ class Phone:
         baseline = self._snapshot()
         history = [baseline.frame] if baseline and baseline.frame else []
         sent = await self._send(epoch, f"move {nudge} 0")
-        found = await self._watch(epoch, history, near, shift, sent, conservative, True, self._mono_clock)
+        generation = baseline.generation if baseline is not None else None
+        strict = self._pace == BLE_PACE
+        found = await self._watch(epoch, history, near, shift, sent, conservative, True, self._mono_clock,
+                                  generation=generation, strict=strict)
         # An interrupted or expired search must not issue a cleanup movement.
         back = await self._send(epoch, f"move {-nudge} 0")
         if found is None and not self._stopped(epoch):
             # the nudge was not seen: the pointer rests where the way back leaves it
-            found = await self._watch(epoch, history, near, -shift, back, conservative, False, self._mono_clock)
+            found = await self._watch(epoch, history, near, -shift, back, conservative, False, self._mono_clock,
+                                      generation=generation, strict=strict)
         return found if found and 0.03 < found[0] < 0.97 and 0.03 < found[1] < 0.97 else None
 
-    async def _quick_pointer(self, near: tuple[float, float], epoch: int) -> tuple[float, float] | None:
+    async def _quick_pointer(self, near: tuple[float, float], epoch: int, *,
+                             required: bool = False) -> tuple[float, float] | None:
         """Observe motion first; wake only an idle pointer when a search is necessary."""
         if self._clock_link != getattr(self.device, "links", 0):
             await self._board_clock()
         freshness.require_fresh(self.screen)
+        reference = (self._position_before, None) if self._pace == BLE_PACE else None
         if time.monotonic() - self._last_motion < POINTER_FADE_SECONDS:
             found = await self._observe_landing(near, epoch)
-            if found is not None or self._tap_blind_allowed or self._tap_timing is None:
+            if found is not None or self._tap_blind_allowed or not required:
                 return found
-            return await self._localize_pointer(near, epoch)
+            return await self._localize_pointer(near, epoch, reference=reference)
         if self._tap_blind_allowed:
             return None  # an already bounded observed target does not need an idle-pointer search
-        if self._tap_timing is not None:
-            return await self._localize_pointer(near, epoch)
+        if required:
+            return await self._localize_pointer(near, epoch, reference=reference)
         started = time.time()  # point() has finished; earlier captures cannot describe this landing
         clock = self._clock
         if clock is None or self._clock_link != getattr(self.device, "links", 0):
@@ -396,41 +510,209 @@ class Phone:
             await asyncio.sleep(0.005)
         return None
 
-    async def _localize_pointer(self, near, epoch):
+    async def _localize_pointer(self, near, epoch, *, reference=None, probe=None, before_probe=None):
         """Required localization pairs a deliberate move and return, never a lone round UI element."""
+        if before_probe is not None:
+            before_probe()
         position, self._pos = self._pos, None
-        nudge = NUDGE if near[0] < .9 else -NUDGE
-        shift = nudge / self.span["w"]
-        baseline = freshness.require_fresh(self.screen).frame
+        ble = self._pace == BLE_PACE
+        # Probe toward the blank canvas past a bottom corner control so the pointer's
+        # outward position clears the icon and the screen edge.
+        vertical = ble and near[1] >= .90 and (near[0] <= .16 or near[0] >= .86)
+        nudge = -2 * NUDGE if vertical else (NUDGE if near[0] < .9 else -NUDGE)
+        if probe is not None:
+            vertical, nudge = probe[0] == 1, probe[1]
+        dx, dy = (0, nudge) if vertical else (nudge, 0)
+        shift = nudge / self.span["h" if vertical else "w"]
+        sample_limit = 3 if ble else 1
+        probe_reach = min(.09, abs(shift) * 2.2)
+        reach = (BLE_PAIRED_MAX_MISS + .033 + (0 if vertical else probe_reach),
+                 BLE_PAIRED_MAX_MISS + .025 + (probe_reach if vertical else 0)) if ble else (
+                     MAX_MISS + .04, MAX_MISS + .03)
+        observed = freshness.require_fresh(self.screen)
+        link = getattr(self.device, "links", 0)
 
-        async def capture_after(sent):
+        def same_session():
+            if before_probe is not None:
+                before_probe()
+            if self._stopped(epoch):
+                raise DeviceError("已紧急停止，后面的内容没有发出。")
+            if (freshness.require_fresh(self.screen).generation != observed.generation
+                    or getattr(self.device, "links", 0) != link):
+                raise RuntimeError("指针探测期间设备或画面连接已变化，未继续移动。")
+            self._pointer_context_regions()
+
+        baseline = observed.frame
+        diagnostics = PointerDiagnostics.from_env()
+        self._pointer_diagnostics = diagnostics
+        if diagnostics:
+            diagnostics.capture("baseline", baseline, observed.updated)
+            target_reference = getattr(self, "_tap_target_frame", None)
+            if target_reference is not None:
+                diagnostics.capture("target_reference", target_reference)
+            if reference is not None and reference[0] is not None:
+                diagnostics.capture("position_reference", reference[0])
+            diagnostics.event("probe", near=near, shift=shift, axis=int(vertical),
+                              kind="escape_target" if probe is not None else "standard")
+
+        async def capture_after(sent, select, *, on_arrival=None, phase="return"):
             deadline = time.monotonic() + feedback.MIRROR_LAG_SECONDS + .3
             cursor = sent
             while time.monotonic() < deadline:
                 if self._stopped(epoch):
                     raise DeviceError("已紧急停止，后面的内容没有发出。")
-                eligible = freshness.fresh_frame(self.screen, since=sent)
-                if eligible is not None:
-                    return eligible.frame
+                same_session()
+                current = freshness.fresh_frame(self.screen)
+                if current is not None and current.updated > cursor:
+                    if diagnostics:
+                        diagnostics.capture(phase, current.frame, current.updated)
+                    if current.generation != observed.generation:
+                        raise RuntimeError("指针定位期间画面连接已变化，请重新观察。")
+                    if on_arrival is not None:
+                        if (selected := on_arrival(current)) is not None:
+                            return selected
+                    if freshness.fresh_frame(self.screen, since=sent) == current:
+                        if (selected := select(current.frame)) is not None:
+                            return selected
+                    cursor = current.updated
                 await self.screen.fresh(cursor, min(.1, max(0, deadline - time.monotonic())))
-                cursor = max(cursor, getattr(self.screen, "updated", cursor))
                 await asyncio.sleep(.005)
             return None
 
-        outward = None
-        await self._send(epoch, f"move {nudge} 0")
+        outward = []
+        early = deque(maxlen=4)
+
+        def remember(frame):
+            if frame not in outward:
+                outward.append(frame)
+            return frame if len(outward) >= sample_limit else None
+
+        def remember_early(snapshot):
+            if snapshot.frame_ts is None and (not early or snapshot.frame != early[-1]):
+                early.append(snapshot.frame)
+
+        def outward_visible():
+            # This hypothetical return to the *observed* pre-probe frame only
+            # decides whether a full outward candidate was exposed. It never
+            # authorizes a landing; the real fresh return is still paired below.
+            prior_frame, prior_pointer = reference or (None, None)
+            if prior_frame is None:
+                return False
+            return any(screen_compare.cursor_overlay_pair(
+                prior_frame, frame, baseline, near, -shift, reach,
+                reference_pointer=prior_pointer, axis=int(vertical),
+                caret_frames=getattr(self.screen, "recent_frames", ()),
+                context_regions=self._pointer_context_regions()) is not None
+                for frame in dict.fromkeys([*reversed(outward), *reversed(early)]))
+
+        sent = await self._send(epoch, f"move {dx} {dy}", before_write=same_session)
+        return_allowed = True
         try:
-            outward = await capture_after(time.time())
+            outward_started = time.time() - (time.monotonic() - sent) if ble else time.time()
+            await capture_after(outward_started, remember, on_arrival=remember_early if ble else None,
+                                phase="outward")
+            if ble and probe is not None and (outward or early) and not outward_visible():
+                extended = self._extend_escape_probe(near, int(vertical), nudge)
+                if extended is not None:
+                    extra = extended - nudge
+                    ex, ey = (0, extra) if vertical else (extra, 0)
+                    # An unacknowledged extra move has an unknown physical
+                    # outcome. Stop with position invalidated instead of sending
+                    # a guessed inverse. All successful legs return cumulatively.
+                    return_allowed = False
+                    sent = await self._send(epoch, f"move {ex} {ey}", before_write=same_session)
+                    nudge, return_allowed = extended, True
+                    dx, dy = (0, nudge) if vertical else (nudge, 0)
+                    shift = nudge / self.span["h" if vertical else "w"]
+                    probe_reach = min(.09, abs(shift) * 2.2)
+                    reach = (BLE_PAIRED_MAX_MISS + .033 + (0 if vertical else probe_reach),
+                             BLE_PAIRED_MAX_MISS + .025 + (probe_reach if vertical else 0))
+                    outward.clear()
+                    early.clear()
+                    if diagnostics:
+                        diagnostics.event("probe_extension", shift=shift, axis=int(vertical))
+                    outward_started = time.time() - (time.monotonic() - sent)
+                    await capture_after(outward_started, remember, on_arrival=remember_early,
+                                        phase="outward_extended")
         finally:
-            if not self._stopped(epoch):
-                await self._send(epoch, f"move {-nudge} 0")
-                self._pos = position
-        returned = await capture_after(time.time())
-        if outward is None or returned is None or screen_compare.observation_changed(baseline, returned):
+            if return_allowed and not self._stopped(epoch):
+                sent = await self._send(epoch, f"move {-dx} {-dy}", before_write=same_session)
+                if not ble:
+                    self._pos = position
+        if not (outward or early) or self._stopped(epoch):
+            if diagnostics:
+                diagnostics.event("result", pointer=None, reason="no_outward_or_stopped")
             return None
-        paired = vision.pointer_move(outward, returned, near, -shift,
-                                      (MAX_MISS + .04, MAX_MISS + .03), strict=True)
-        return paired[1] if paired else None
+
+        def locate(returned):
+            context_regions = self._pointer_context_regions()
+            if not ble and screen_compare.observation_changed(
+                baseline, returned,
+                caret_frames=getattr(self.screen, "recent_frames", ()), context_regions=context_regions):
+                return None
+            for frame in dict.fromkeys([*reversed(outward), *reversed(early)]):
+                pair = None if vertical else vision.pointer_move(frame, returned, near, -shift, reach, strict=True)
+                prior_frame, prior_pointer = reference or (None, None)
+                if ble and prior_frame is not None:
+                    if pair is None:
+                        evidence = screen_compare.cursor_overlay_pair(
+                            prior_frame, frame, returned, near, -shift, reach,
+                            reference_pointer=prior_pointer, report_reference=True, axis=int(vertical),
+                            caret_frames=getattr(self.screen, "recent_frames", ()), context_regions=context_regions)
+                        if evidence is not None:
+                            pair, prior_pointer = evidence
+                    else:
+                        stable, detected = screen_compare.verify_cursor_reference(
+                            prior_frame, frame, returned, pair, prior_pointer,
+                            caret_frames=getattr(self.screen, "recent_frames", ()), context_regions=context_regions)
+                        prior_pointer = detected if stable else None
+                if pair is None:
+                    if diagnostics:
+                        diagnostics.event("pair", matched=False)
+                    continue
+                if diagnostics:
+                    diagnostics.event("pair", matched=True, coordinates=pair)
+                if ble:
+                    if (any(abs(p - t) > BLE_PAIRED_MAX_MISS for p, t in zip(pair[1], near, strict=True))
+                            or screen_compare.observation_changed(
+                                frame, returned, moved_pointer=pair,
+                                caret_frames=getattr(self.screen, "recent_frames", ()),
+                                context_regions=context_regions)):
+                        continue
+                    self._pointer_pair_verified = True
+                    self._pos = position
+                    self._pointer_overlay = pair[1], returned
+                    if self._pointer_reference is None and prior_pointer is not None:
+                        self._pointer_reference = prior_pointer, prior_frame, returned
+                return pair[1]
+            return None
+
+        if sample_limit == 1:
+            returned = await capture_after(time.time(), lambda frame: frame)
+            result = locate(returned) if returned is not None else None
+            if diagnostics:
+                diagnostics.event("result", pointer=result)
+            return result
+        return_started = time.time() - (time.monotonic() - sent)
+
+        def find_early_return(snapshot):
+            if snapshot.frame_ts is None:
+                return locate(snapshot.frame)
+            return None
+
+        result = await capture_after(return_started, locate, on_arrival=find_early_return)
+        if diagnostics:
+            diagnostics.event("result", pointer=result)
+        return result
+
+    def _pointer_context_regions(self):
+        """Only a scoped, detector-issued navigation context can narrow pointer checks."""
+        context = getattr(self, "_navigation_context", None)
+        if context is None:
+            return None
+        if freshness.require_fresh(self.screen).generation != context.observation.generation:
+            raise RuntimeError("导航期间画面连接已变化，未继续移动。")
+        return context.regions
 
     async def _observe_landing(self, near, epoch):
         """Pair discs across the actual positioning move, without another nudge."""
@@ -442,6 +724,7 @@ class Phone:
         search_wait = TAP_POINTER_WAIT if self._tap_blind_allowed else feedback.MIRROR_LAG_SECONDS + .3
         deadline = time.monotonic() + search_wait
         since = self._position_completed
+        generation = freshness.require_fresh(self.screen).generation
         with Image.open(io.BytesIO(self._position_before)) as image:
             before = image.convert("RGB")
         width, height = before.size
@@ -477,9 +760,14 @@ class Phone:
             snap = freshness.fresh_frame(self.screen, since=self._position_completed)
             if snap is None:
                 continue
+            if snap.generation != generation:
+                raise RuntimeError("指针定位期间画面连接已变化，请重新观察。")
             with Image.open(io.BytesIO(snap.frame)) as image:
                 current = image.convert("RGB")
-            if current.size != before.size or screen_compare.observation_changed(self._position_before, snap.frame):
+            if current.size != before.size or screen_compare.observation_changed(
+                self._position_before, snap.frame,
+                caret_frames=getattr(self.screen, "recent_frames", ()),
+                context_regions=self._pointer_context_regions()):
                 return None
             remaining = [(px + source_bounds[0], py + source_bounds[1], diameter, color)
                          for px, py, diameter, color in vision._discs(current.crop(source_bounds), width)]
@@ -498,12 +786,15 @@ class Phone:
                           and abs((py + bounds[1] - sy) / height - (near[1] - oy)) <= MAX_MISS]
             if len(candidates) == 1:
                 px, py = candidates[0]
-                return (px + bounds[0]) / width, (py + bounds[1]) / height
+                landing = (px + bounds[0]) / width, (py + bounds[1]) / height
+                if self._pace == BLE_PACE:
+                    self._pointer_overlay = landing, snap.frame
+                return landing
         return None
 
     async def _watch(self, epoch: int, history: list, near, shift: float, since: float,
                      conservative: bool, at_start: bool, clock: float | None = None,
-                     *, generation: int | None = None) -> tuple[float, float] | None:
+                     *, generation: int | None = None, strict: bool = False) -> tuple[float, float] | None:
         """Watch new frames until one shows the pointer nudged by `shift` from an earlier frame.
 
         `since` and `clock` are monotonic: board time of the command is `since * 1000 + clock`.
@@ -543,7 +834,7 @@ class Phone:
                     # each comparison is tens of ms of pure Python, and hogging the GIL starves the video thread
                     for before in dict.fromkeys(priors[:1] + priors[-1:]):
                         for look, reach in searches:
-                            moved = vision.pointer_move(before, after, look, shift, reach)
+                            moved = vision.pointer_move(before, after, look, shift, reach, strict=strict)
                             if moved:
                                 return moved[0] if at_start else moved[1]
                             await asyncio.sleep(0)
@@ -616,43 +907,166 @@ class Phone:
         after = await self.screen.fresh(wall_since, timeout)
         return self._snapshot() if after else None
 
+    @bounded_operation
     @_serialized
-    async def ensure_observation(self):
-        """Reacquire a silent live stream with one bounded, serialized pointer wake."""
+    async def observe_host_pointer(self, timeout: float = OBSERVATION_REFRESH_WAIT) -> HostObservation:
+        """Wait for a causal source image without moving or waking the pointer."""
+        if not math.isfinite(timeout) or not 0 < timeout <= OBSERVATION_REFRESH_WAIT:
+            raise ValueError("passive observation timeout must be within 0..3.5 seconds")
+        device = self.device
+        original = device.links, device.abort_epoch, freshness.snapshot(self.screen).generation
+        deadline = time.monotonic() + timeout
+        lease = device.acquire_host_observation_lease()
+        try:
+            while device._idle_nudge_inflight:
+                check_operation()
+                if (self.device is not device
+                        or original != (device.links, device.abort_epoch, freshness.snapshot(self.screen).generation)):
+                    raise RuntimeError("被动观察期间设备或画面连接已变化，请重新观察。")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("后台保活移动尚未完成，未签发宿主观察。")
+                await asyncio.sleep(min(.02, remaining))
+            if (self.device is not device
+                    or original != (device.links, device.abort_epoch, freshness.snapshot(self.screen).generation)):
+                raise RuntimeError("被动观察期间设备或画面连接已变化，请重新观察。")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("被动观察已超时，未签发宿主观察。")
+            return await self._observe_host_pointer(remaining, lease)
+        except BaseException:
+            lease.release()
+            raise
+
+    async def _observe_host_pointer(self, timeout, lease) -> HostObservation:
+        deadline = time.monotonic() + timeout
+        initial = freshness.snapshot(self.screen)
+        device = self.device
+        values = {"device": device, "links": getattr(device, "links", None),
+                  "abort_epoch": getattr(device, "abort_epoch", None),
+                  "input_sequence": getattr(device, "input_sequence", None),
+                  "last_input_at": getattr(device, "last_input_at", None),
+                  "session_started_at": getattr(device, "session_started_at", None)}
+        if (any(type(values[key]) is not int or values[key] < 0
+                for key in ("links", "abort_epoch", "input_sequence"))
+                or not all(isinstance(values[key], (int, float)) and math.isfinite(values[key])
+                           for key in ("last_input_at", "session_started_at"))):
+            raise RuntimeError("宿主观察缺少设备输入会话，未发送任何操作。")
+
+        def same_session():
+            check_operation()
+            if (self.device is not device or any(getattr(device, key, None) != values[key]
+                                                for key in values if key != "device")
+                    or self._stopped(values["abort_epoch"])
+                    or freshness.snapshot(self.screen).generation != initial.generation):
+                raise RuntimeError("被动观察期间设备、画面或输入会话已变化，请重新观察。")
+
         async with self._observation_lock:
+            same_session()
+            if self._clock_link != device.links or self._clock is None:
+                await self._board_clock()
+            same_session()
+            boundary = max(values["last_input_at"], values["session_started_at"])
+            while True:
+                same_session()
+                if time.monotonic() > deadline:
+                    raise RuntimeError("被动等待后仍没有超过镜像延迟的新源画面，未发送任何操作。")
+                current = freshness.snapshot(self.screen)
+                if not current.live:
+                    raise RuntimeError("屏幕镜像已断开，未获得宿主观察。")
+                accepted = freshness.fresh_frame(self.screen, since=boundary)
+                if accepted is not None and accepted.updated > boundary + freshness.MIRROR_LAG_SECONDS:
+                    same_session()
+                    qualified = object.__new__(HostObservation)
+                    for key, value in {**values, "snapshot": accepted, "issued_monotonic": time.monotonic(),
+                                       "expires_monotonic": lease.expires_monotonic, "lease": lease,
+                                       "_phone": self, "_seal": _HOST_OBSERVATION_ISSUER}.items():
+                        object.__setattr__(qualified, key, value)
+                    return qualified
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("被动等待后仍没有超过镜像延迟的新源画面，未发送任何操作。")
+                await self.screen.fresh(current.updated, min(.1, remaining))
+                await asyncio.sleep(min(.005, max(0, deadline - time.monotonic())))
+
+    @_serialized
+    async def ensure_observation(self, *, before_refresh: Callable[[], None] | None = None):
+        """Reacquire a silent live stream with one bounded, serialized pointer wake."""
+        observed = freshness.snapshot(self.screen)
+        device = self.device
+        link, epoch = getattr(device, "links", 0), getattr(device, "abort_epoch", 0)
+
+        def same_session():
+            self._check_operation()
+            if self._stopped(epoch):
+                raise DeviceError("已紧急停止，后面的内容没有发出。")
+            if (self.device is not device or getattr(device, "links", 0) != link
+                    or freshness.snapshot(self.screen).generation != observed.generation):
+                raise RuntimeError("唤醒期间设备或画面连接已变化，未继续移动。")
+
+        def original_context():
+            same_session()
+            if before_refresh is not None:
+                before_refresh()
+                same_session()
+
+        async with self._observation_lock:
+            original_context()
             if self._clock_link != getattr(self.device, "links", 0) or self._clock is None:
                 await self._board_clock()
-            current = freshness.fresh_frame(self.screen)
+            original_context()
+            current = freshness.fresh_frame(self.screen, max_age=OBSERVATION_ENTRY_MAX_AGE)
             if current is not None:
                 return current
             # A stale host receipt may be a healthy still screen. Replay or a
             # disconnected stream cannot use this exception to authorize motion.
             stale = freshness.require_fresh(self.screen, max_age=float("inf"))
-            epoch = getattr(self.device, "abort_epoch", 0)
             try:
-                return await asyncio.wait_for(self._refresh_observation(stale, epoch), OBSERVATION_REFRESH_WAIT)
+                await asyncio.wait_for(self._refresh_observation(stale, epoch, before_write=original_context),
+                                       OBSERVATION_REFRESH_WAIT)
+                original_context()
+                current = freshness.require_fresh(self.screen, max_age=OBSERVATION_ENTRY_MAX_AGE)
+                return current
             except asyncio.TimeoutError as exc:
                 raise RuntimeError("唤醒后仍没有足够新鲜的画面，未发送点击；请检查屏幕镜像。") from exc
 
-    async def _refresh_observation(self, stale, epoch):
-        started = time.time()
-        self._pos = None  # clipping a small edge nudge can invalidate a known position
-        await self._send(epoch, f"move {WAKE_NUDGE} 0")
-        try:
-            # Let pre-wake phone-to-board images drain, then induce one more
-            # frame even when AirPlay stops publishing a motionless screen.
-            await asyncio.sleep(freshness.MIRROR_LAG_SECONDS + .02)
-        finally:
-            if not self._stopped(epoch):
-                await self._send(epoch, f"move {-WAKE_NUDGE} 0")
-        cursor = started
-        while True:
+    async def _refresh_observation(self, stale, epoch, *, before_write=None):
+        device, link = self.device, getattr(self.device, "links", 0)
+
+        def same_session():
+            self._check_operation()
             if self._stopped(epoch):
                 raise DeviceError("已紧急停止，后面的内容没有发出。")
-            current = freshness.snapshot(self.screen)
-            if current.generation != stale.generation:
-                raise RuntimeError("唤醒期间画面连接已变化，请重新观察。")
-            accepted = freshness.fresh_frame(self.screen, since=started)
+            if (self.device is not device or getattr(device, "links", 0) != link
+                    or freshness.snapshot(self.screen).generation != stale.generation):
+                raise RuntimeError("唤醒期间设备或画面连接已变化，未继续移动。")
+            # A wake exists precisely for a silent old receipt. Keep its replay
+            # and live checks, but do not require the normal action-age budget.
+            freshness.require_fresh(self.screen, max_age=float("inf"))
+
+        def forward_context():
+            same_session()
+            if before_write is not None:
+                before_write()
+                same_session()
+
+        self._pos = None  # clipping a small edge nudge can invalidate a known position
+        # Unknown delivery never authorizes a guessed inverse. Only a successful
+        # forward ACK reaches the one bounded return below.
+        await self._send(epoch, f"move {WAKE_NUDGE} 0", before_write=forward_context)
+        try:
+            await asyncio.sleep(WAKE_OUTWARD_HOLD)
+        finally:
+            if not self._stopped(epoch):
+                # The forward's own pointer pixels must not prevent this known
+                # inverse. Session, stop and operation checks still run in the
+                # actual write lock; original layout is checked after new video.
+                await self._send(epoch, f"move {-WAKE_NUDGE} 0", before_write=same_session)
+        returned_at = time.time()  # completion/ACK, not forward send or host receipt
+        cursor = returned_at
+        while True:
+            same_session()
+            accepted = freshness.fresh_frame(self.screen, since=returned_at)
             if accepted is not None:
                 return accepted
             await self.screen.fresh(cursor, .1)
@@ -718,18 +1132,19 @@ class Phone:
         of the left edge. The pointer moves the same number of pixels per unit across and down, so the
         vertical scale gives the horizontal one, and the rest of x is the corner offset.
         """
-        span = {"w": round(CALIBRATION_MOVE / x), "h": round(CALIBRATION_MOVE / y)}
+        move = BLE_CALIBRATION_MOVE if self._pace == BLE_PACE else CALIBRATION_MOVE
+        span = {"w": round(move / x), "h": round(move / y)}
         origin = {"x": 0.0, "y": 0.0}
         aspect = self.screen.aspect if self.screen is not None and getattr(self.screen, "frame", None) else None
         if aspect:
-            w = round(CALIBRATION_MOVE * aspect / y)
-            x0 = x - CALIBRATION_MOVE / w
+            w = round(move * aspect / y)
+            x0 = x - move / w
             if 0 <= x0 < 0.25:  # otherwise the point is odd; fall back to the plain one point scale
                 span["w"], origin["x"] = w, x0
         self.span, self.origin = span, origin
         for samples in self._seen.values():
             samples.clear()
-        self._pos = (CALIBRATION_MOVE, CALIBRATION_MOVE)
+        self._pos = (move, move)
         self._moves, self._link = 0, getattr(self.device, "links", 0)
         self._save()
 
@@ -779,38 +1194,153 @@ class Phone:
 
     @bounded_operation
     @_serialized
-    async def point_verified(self, x: float, y: float) -> tuple[float, float]:
-        """Use calibrated landings, correcting at most once from a plausible visible disc."""
-        freshness.require_fresh(self.screen)
+    async def point_verified(self, x: float, y: float, *, target_box=None) -> tuple[float, float]:
+        """Use measured landings and verify every correction before it can authorize a click."""
+        observed = freshness.require_fresh(self.screen)
         epoch = getattr(self.device, "abort_epoch", 0)
+        link = getattr(self.device, "links", 0)
+
+        def same_session():
+            if self._stopped(epoch):
+                raise DeviceError("已紧急停止，后面的内容没有发出。")
+            if (freshness.require_fresh(self.screen).generation != observed.generation
+                    or getattr(self.device, "links", 0) != link):
+                raise RuntimeError("指针定位期间设备或画面连接已变化，请重新观察。")
+
         self._pointer_seen = self._pointer_confirmed = False
+        self._pointer_escape_attempted = False
+        self._pointer_pair_verified = False
+        self._pointer_overlay = None
+        self._pointer_reference = None
         await self.point(x, y)
+        same_session()
         self._pointer_spots = ((x, y),)
-        found = await self._find_pointer((x, y), epoch=epoch, quick=True)
-        if found is None or not all(abs(f - t) <= MAX_MISS for f, t in zip(found, (x, y), strict=True)):
+        found = await self._find_pointer((x, y), epoch=epoch, quick=True, required=True)
+        same_session()
+        # A circle overlapping a textured icon may expose only a crescent. Once,
+        # leave the observed target by a full cursor radius, then return and use
+        # the same strict paired-motion detector. This does not permit a click
+        # without a measured landing or bypass the original target comparison.
+        async def escape_target(reference):
+            if self._pace != BLE_PACE or target_box is None or self._pointer_escape_attempted:
+                return None
+            probe = self._target_escape_probe((x, y), target_box)
+            if probe is None:
+                return None
+            self._pointer_escape_attempted = True
+            measured = await self._localize_pointer(
+                (x, y), epoch, reference=reference, probe=probe, before_probe=same_session)
+            same_session()
+            return measured
+
+        if found is None:
+            found = await escape_target((self._position_before, None))
+        miss = max(abs(found[0] - x), abs(found[1] - y)) if found is not None and all(
+            math.isfinite(value) for value in found) else math.inf
+        ble = self._pace == BLE_PACE
+        paired_ble = ble and self._pointer_pair_verified
+        if miss > (BLE_PAIRED_MAX_MISS if paired_ble else MAX_MISS):
             return x, y
         self._pointer_seen = True
         self._pointer_spots += (found,)
-        fx, fy = found
-        self._seen["x"].append((self._fix(x, "x"), fx))
-        self._seen["y"].append((self._fix(y, "y"), fy))
-        self._save()
-        if abs(fx - x) <= AIM_TOLERANCE and abs(fy - y) <= AIM_TOLERANCE:
-            self._pointer_confirmed = True
-            return found
-        dx, dy = round((x - fx) * self.span["w"]), round((y - fy) * self.span["h"])
-        position, self._pos = self._pos, None
-        self._position_before, self._position_from = self.screen.frame, found
-        await self._send(epoch, f"move {dx} {dy}")
-        self._pos = (position[0] + dx, position[1] + dy)
-        self._position_completed = time.time()
-        if not self._tap_blind_allowed:
-            corrected = await self._observe_landing((x, y), epoch)
-            self._pointer_confirmed = bool(corrected and abs(corrected[0] - x) <= AIM_TOLERANCE
-                                           and abs(corrected[1] - y) <= AIM_TOLERANCE)
-            if self._pointer_confirmed:
-                return corrected
+        if miss <= MAX_MISS:
+            fx, fy = found
+            self._seen["x"].append((self._fix(x, "x"), fx))
+            self._seen["y"].append((self._fix(y, "y"), fy))
+            self._save()
+
+        def on_target(point):
+            px, py = point
+            if abs(px - x) <= AIM_TOLERANCE and abs(py - y) <= AIM_TOLERANCE:
+                return True
+            if not paired_ble or target_box is None:
+                return False
+            left, top, right, bottom = target_box
+            # Each measured axis can independently satisfy the established
+            # center tolerance or the target's safe interior. A narrow icon need
+            # not force a second correction when the other axis is already safe.
+            return ((abs(px - x) <= AIM_TOLERANCE or left + AIM_TOLERANCE < px < right - AIM_TOLERANCE)
+                    and (abs(py - y) <= AIM_TOLERANCE or top + AIM_TOLERANCE < py < bottom - AIM_TOLERANCE))
+
+        for attempt in range(3 if ble else 2):
+            if found is None:
+                break
+            if on_target(found):
+                self._pointer_confirmed = True
+                return found
+            if attempt >= (2 if paired_ble else 1) or self._pos is None:
+                break
+            fx, fy = found
+            dx, dy = round((x - fx) * self.span["w"]), round((y - fy) * self.span["h"])
+            if not (dx or dy):
+                break
+            position, self._pos = self._pos, None
+            self._position_before, self._position_from = self.screen.frame, found
+            self._pointer_overlay = None
+            await self._send(epoch, f"move {dx} {dy}", before_write=same_session)
+            self._pos = (position[0] + dx, position[1] + dy)
+            self._position_completed = time.time()
+            if self._tap_blind_allowed and not ble:
+                break
+            self._tap_blind_allowed = False
+            found = await self._observe_landing((x, y), epoch)
+            same_session()
+            if found is None and ble:
+                reference = self._position_before, (fx, fy)
+                found = await self._localize_pointer((x, y), epoch, reference=reference, before_probe=same_session)
+                same_session()
+                if found is None:
+                    found = await escape_target(reference)
+                paired_ble = self._pointer_pair_verified
+            if found is not None:
+                limit = BLE_PAIRED_MAX_MISS if paired_ble else MAX_MISS
+                if not all(math.isfinite(actual) and abs(actual - requested) <= limit
+                           for actual, requested in zip(found, (x, y), strict=True)):
+                    break
+                self._pointer_spots += (found,)
         return x, y
+
+    def _target_escape_probe(self, near, box):
+        """One screen-bounded probe, at most 18% of width, sized to a known target."""
+        if (len(box) != 4 or not all(math.isfinite(value) for value in box)
+                or not (0 <= box[0] < near[0] < box[2] <= 1 and 0 <= box[1] < near[1] < box[3] <= 1)):
+            return None
+        with Image.open(io.BytesIO(self.screen.frame)) as image:
+            dimensions = image.size
+        radius = .055 * dimensions[0]  # cursor radius plus a small clear-background margin
+        candidates = []
+        for axis in (0, 1):
+            span, size = self.span["wh"[axis]], dimensions[axis]
+            for side in (-1, 1):
+                edge = box[axis if side < 0 else axis + 2]
+                distance = (edge - near[axis]) * size + side * radius
+                destination = near[axis] * size + distance
+                if not radius <= destination <= size - radius or abs(distance) > .18 * dimensions[0]:
+                    continue
+                units = side * math.ceil(abs(distance) * span / size)
+                actual = near[axis] * size + units * size / span
+                if radius <= actual <= size - radius and abs(actual - near[axis] * size) <= .18 * dimensions[0]:
+                    candidates.append((abs(distance), axis, units))
+        if not candidates:
+            return None
+        shortest = min(item[0] for item in candidates)
+        normal_vertical = near[1] >= .90 and (near[0] <= .16 or near[0] >= .86)
+        alternate = 0 if normal_vertical else 1
+        practical = [item for item in candidates if item[0] <= 1.35 * shortest]
+        _, axis, units = min(practical, key=lambda item: (item[1] != alternate, item[0]))
+        return axis, units
+
+    def _extend_escape_probe(self, near, axis, units):
+        """One extra cursor clearance, keeping the entire outward leg within its original bound."""
+        with Image.open(io.BytesIO(self.screen.frame)) as image:
+            dimensions = image.size
+        size, span = dimensions[axis], self.span["wh"[axis]]
+        radius = .055 * dimensions[0]  # same clearance as the initial target escape
+        side = 1 if units > 0 else -1
+        edge_room = size - radius - near[axis] * size if side > 0 else near[axis] * size - radius
+        limit = math.floor(min(.18 * dimensions[0], edge_room) * span / size)
+        extra = min(math.ceil(radius * span / size), limit - abs(units))
+        return side * (abs(units) + extra) if extra > 0 else None
 
     def _pointer_position(self) -> tuple[float, float] | None:
         if self._pos is None or self.span is None:
@@ -834,80 +1364,293 @@ class Phone:
 
     def _guard_blind_landing(self, x, y, target_box, target_frame):
         if target_frame is None or target_box is None:
-            raise RuntimeError("无法确认指针落点：需要当前观察中的已知目标及其大小，未发送点击。")
+            raise PointerLandingError("无法确认指针落点：需要当前观察中的已知目标及其大小，未发送点击。")
         if len(target_box) != 4 or not all(math.isfinite(value) for value in target_box):
-            raise RuntimeError("目标大小无效，未发送点击。")
+            raise PointerLandingError("目标大小无效，未发送点击。")
         left, top, right, bottom = target_box
         if not (0 <= left < x < right <= 1 and 0 <= top < y < bottom <= 1):
-            raise RuntimeError("点击坐标不在已观察目标内，未发送点击。")
+            raise PointerLandingError("点击坐标不在已观察目标内，未发送点击。")
         error = self._landing_error(x, y)
         if error is None or error[0] * 2 > min(x - left, right - x) or error[1] * 2 > min(y - top, bottom - y):
-            raise RuntimeError("校准与已测落点不足，或落点误差相对目标过大，未发送点击。")
+            raise PointerLandingError("校准与已测落点不足，或落点误差相对目标过大，未发送点击。")
+
+    async def click_observed(self, *, observation: freshness.FrameSnapshot,
+                             pointer_xy, target_box, expected_device, expected_links: int,
+                             expected_abort_epoch: int, expected_input_seq: int,
+                             before_click: Callable[[], None] | None = None,
+                             host_observation: HostObservation | None = None) -> dict:
+        try:
+            return await self._click_observed(
+                observation=observation, pointer_xy=pointer_xy, target_box=target_box,
+                expected_device=expected_device, expected_links=expected_links,
+                expected_abort_epoch=expected_abort_epoch, expected_input_seq=expected_input_seq,
+                before_click=before_click, host_observation=host_observation)
+        finally:
+            if isinstance(host_observation, HostObservation):
+                lease = getattr(host_observation, "lease", None)
+                if lease is not None:
+                    lease.release()
+
+    @bounded_operation
+    @_serialized
+    async def _click_observed(self, *, observation: freshness.FrameSnapshot,
+                              pointer_xy, target_box, expected_device, expected_links: int,
+                              expected_abort_epoch: int, expected_input_seq: int,
+                              before_click: Callable[[], None] | None = None,
+                              host_observation: HostObservation | None = None) -> dict:
+        """One explicit host-observed contact at the unmoved pointer; never a CV fallback."""
+        if (not isinstance(observation, freshness.FrameSnapshot) or not observation.frame
+                or len(pointer_xy) != 2 or len(target_box) != 4
+                or not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                           and math.isfinite(value) and 0 <= value <= 1
+                           for value in (*pointer_xy, *target_box))):
+            raise ValueError("host-observed click requires an original frame and finite normalized coordinates")
+        x, y = pointer_xy
+        left, top, right, bottom = target_box
+        if not (left < x < right and top < y < bottom):
+            raise ValueError("host-observed pointer must lie strictly inside its observed target box")
+        if any(type(value) is not int or value < 0
+               for value in (expected_links, expected_abort_epoch, expected_input_seq)):
+            raise ValueError("host-observed click requires the original device session and input sequence")
+        if host_observation is not None:
+            if not isinstance(host_observation, HostObservation):
+                raise ValueError("host observation qualification must be internally issued")
+            host_observation.validate(self)
+            if (host_observation.snapshot != observation or host_observation.device is not expected_device
+                    or host_observation.links != expected_links or host_observation.abort_epoch != expected_abort_epoch
+                    or host_observation.input_sequence != expected_input_seq):
+                raise ValueError("host observation qualification does not belong to this original evidence")
+        began = time.monotonic()
+        self._effect_frame = self._effect_snapshot = None
+
+        def same_session(sequence):
+            if (self.device is not expected_device or self._stopped(expected_abort_epoch)
+                    or getattr(self.device, "links", None) != expected_links
+                    or getattr(self.device, "input_sequence", None) != sequence
+                    or freshness.snapshot(self.screen).generation != observation.generation):
+                raise RuntimeError("宿主观察后的设备、画面或输入会话已变化，未继续操作。")
+
+        def validate_observation():
+            same_session(expected_input_seq)
+            if host_observation is not None:
+                host_observation.validate(self)
+            current = freshness.require_fresh(self.screen)
+            if not _host_observed_pixels_match(observation.frame, current.frame, pointer_xy):
+                raise RuntimeError("宿主观察的原画面已变化或过期，未发送原地点击。")
+            if host_observation is not None:
+                # Admission proved the immutable original image was fresh and
+                # causal. The host may spend up to the ticket TTL reading it;
+                # only a genuinely fresh, unchanged source with bounded native
+                # RGB compression noise at the observed pointer can act.
+                return
+            if (not observation.live or not math.isfinite(observation.updated)
+                    or not -.1 <= time.time() - observation.updated <= freshness.MAX_FRAME_AGE):
+                raise RuntimeError("宿主观察的原画面已变化或过期，未发送原地点击。")
+            last_input = getattr(self.device, "last_input_at", None)
+            connected_at = getattr(self.device, "session_started_at", None)
+            if (not all(isinstance(value, (int, float)) and math.isfinite(value)
+                        for value in (last_input, connected_at))):
+                raise RuntimeError("宿主观察缺少输入或连接时点，未发送原地点击。")
+            boundary = max(last_input, connected_at)
+            original = SimpleNamespace(snapshot=observation, _freshness_phone=self)
+            if (observation.updated <= boundary + freshness.MIRROR_LAG_SECONDS
+                    or freshness.fresh_frame(original, since=boundary) is None):
+                raise RuntimeError("宿主观察尚未超过上次输入的镜像延迟，请重新观察指针后再点击。")
+
+        def validate_click():
+            validate_observation()
+            if before_click is not None:
+                before_click()
+                validate_observation()
+
+        # No ensure_observation, nudge, calibrated estimate or pointer flag may
+        # alter the host's evidence before this actual, single write boundary.
+        if host_observation is not None:
+            deadline = min(time.monotonic() + OBSERVATION_REFRESH_WAIT,
+                           host_observation.expires_monotonic,
+                           host_observation.issued_monotonic + HOST_OBSERVATION_TTL)
+            while True:
+                host_observation.validate(self)
+                same_session(expected_input_seq)
+                if time.monotonic() > deadline:
+                    raise RuntimeError("被动等待后仍没有足够新鲜的同一画面，未发送点击。")
+                if before_click is not None:
+                    before_click()
+                current = freshness.snapshot(self.screen)
+                # Once a different page is observed, never wait for it to turn
+                # back into A. We retain no history of unseen inference frames.
+                if (not current.live
+                        or not _host_observed_pixels_match(observation.frame, current.frame, pointer_xy)):
+                    raise RuntimeError("等待点击期间原画面已变化或断开，请重新观察。")
+                current_source = SimpleNamespace(snapshot=current, _freshness_phone=self)
+                if freshness.fresh_frame(current_source) is not None:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("被动等待后仍没有足够新鲜的同一画面，未发送点击。")
+                await self.screen.fresh(current.updated, min(.1, remaining))
+                await asyncio.sleep(min(.005, max(0, deadline - time.monotonic())))
+        validate_click()
+        await self._send(expected_abort_epoch, "click", before_write=validate_click)
+        completed_at = time.time()
+        same_session(expected_input_seq + 1)  # our own click advances the sequence exactly once
+        changed, fresh = await self._tap_effect(observation.frame, completed_at, expected_abort_epoch, (), ())
+        same_session(expected_input_seq + 1)
+        return {"clicked": True, "click_count": 1, "evidence_source": "host_observed",
+                "pointer_seen": False, "effect_verified": False, "screen_changed": changed if fresh else None,
+                "effect_observed": changed if fresh else None, "fresh": fresh, "completed_at": completed_at,
+                "latency": round(time.monotonic() - began, 3),
+                "_after_frame": self._effect_frame, "_after_snapshot": self._effect_snapshot,
+                "warning": "已按宿主看到的指针位置原地单击；请查看结果，勿自动重试。"}
 
     @bounded_operation
     @_serialized
     async def tap_verified(self, x: float, y: float, *,
                            before_click: Callable[[], None] | None = None,
                            target_box: tuple[float, float, float, float] | None = None,
-                           target_frame: bytes | None = None) -> dict:
-        """Click once only with a confirmed pointer or a bounded, observed target landing."""
+                           target_frame: bytes | None = None,
+                           allow_estimated_landing: bool = True,
+                           duration: float = 0, click_count: int = 1, navigation_context=None) -> dict:
+        """Perform a single observed contact gesture, then return its visual evidence."""
+        if (click_count not in (1, 2) or isinstance(click_count, bool)
+                or not math.isfinite(duration) or duration < 0 or duration > 3
+                or (duration and (duration < .3 or click_count != 1))):
+            raise ValueError("contact requires one/two clicks or a single 0.3..3 second hold")
         began = time.monotonic()
         self._tap_timing = {"positioning": 0.0, "firmware": 0.0, "wait_for_frames": 0.0, "diff": 0.0}
         timing = self._tap_timing
-        epoch = getattr(self.device, "abort_epoch", 0)
+        device = self.device
+        epoch, link = getattr(device, "abort_epoch", 0), getattr(device, "links", 0)
+        generation = freshness.snapshot(self.screen).generation
+
+        def same_session():
+            self._check_operation()
+            if (self.device is not device or getattr(device, "links", 0) != link
+                    or getattr(device, "abort_epoch", 0) != epoch):
+                raise DeviceError("点击期间设备连接已变化或已停止，未继续操作；请重新观察。")
+            if freshness.snapshot(self.screen).generation != generation:
+                raise RuntimeError("点击期间画面连接已变化，未继续操作；请重新观察。")
+
         previous = self._pointer_spots + tuple(p for p in (self._pointer_position(),) if p is not None)
         hover = self._pointer_spots[:1] + ((x, y),)
         self._pointer_seen = self._pointer_confirmed = False
+        self._pointer_escape_attempted = False
         self.last_tap = None
+        self._pointer_diagnostics = None
+        self._tap_target_frame = None
+        self._navigation_context = None
         try:
-            observed = await self.ensure_observation()
-            target = SimpleNamespace(center=(x, y))
-            if target_box is not None:
-                target.box = target_box
-            target_guard = TextTargetGuard(self.screen, target_frame or observed.frame, target)
-            try:
-                self._guard_blind_landing(x, y, target_box, target_frame)
-                self._tap_blind_allowed = True
-            except RuntimeError:
+            with input_attempt(before_write=same_session, inherit=True,
+                               write_lock=getattr(self.screen, "_frame_lock", None)):
+                same_session()
+                observed = await self.ensure_observation()
+                same_session()
+                self._tap_target_frame = target_frame or observed.frame
+                if navigation_context is not None:
+                    from .navigation_context import NavigationContext
+
+                    if not isinstance(navigation_context, NavigationContext) or duration or click_count != 1:
+                        raise ValueError("navigation context only supports one observed system navigation click")
+                    navigation_context.validate_target(target_frame or observed.frame, observed.generation, (x, y))
+                    self._navigation_context = navigation_context
+                    target_box = navigation_context.target.box
+                    allow_estimated_landing = False
+                target = SimpleNamespace(center=(x, y))
+                if target_box is not None:
+                    target.box = target_box
+                target_guard = TextTargetGuard(self.screen, target_frame or observed.frame, target,
+                                              navigation_context=navigation_context)
                 self._tap_blind_allowed = False
-            landed = await self.point_verified(x, y)
-            freshness.require_fresh(self.screen)
-            if self._pointer_confirmed and target_box is not None:
-                self._pointer_confirmed = bool(landed and len(target_box) == 4
-                    and target_box[0] < landed[0] < target_box[2]
-                    and target_box[1] < landed[1] < target_box[3])
-            if not self._pointer_confirmed:
-                self._guard_blind_landing(x, y, target_box, target_frame)
-            before = None
+                if allow_estimated_landing:
+                    try:
+                        self._guard_blind_landing(x, y, target_box, target_frame)
+                    except PointerLandingError:
+                        pass
+                    else:
+                        self._tap_blind_allowed = True
+                if self._pace == BLE_PACE and target_box is not None:
+                    landed = await self.point_verified(x, y, target_box=target_box)
+                else:
+                    landed = await self.point_verified(x, y)
+                same_session()
+                freshness.require_fresh(self.screen)
+                if self._pointer_confirmed and target_box is not None:
+                    self._pointer_confirmed = bool(landed and len(target_box) == 4
+                        and target_box[0] < landed[0] < target_box[2]
+                        and target_box[1] < landed[1] < target_box[3])
+                if not self._pointer_confirmed:
+                    if self._pointer_escape_attempted:
+                        raise PointerLandingError("离开目标再返回后仍未确认指针落点，未发送点击。")
+                    if self._pace == BLE_PACE and self._pointer_pair_verified:
+                        raise PointerLandingError("蓝牙指针纠偏后未能确认落点在目标内，未发送点击。")
+                    if not allow_estimated_landing:
+                        raise PointerLandingError("没有观察到指针落在目标内，未发送点击。")
+                    self._guard_blind_landing(x, y, target_box, target_frame)
+                before = None
 
-            def validate_click():
-                nonlocal before
-                current = freshness.require_fresh(self.screen)
-                if current.generation != observed.generation:
-                    raise RuntimeError("点击前画面连接已变化，未发送点击；请重新观察。")
-                target_guard()
-                if before_click is not None:
-                    before_click()
-                before = freshness.require_fresh(self.screen).frame
+                def validate_click():
+                    nonlocal before
+                    # Legacy web taps do not carry an outer Controls/Agent input
+                    # guard. Recheck their original session inside the serial lock.
+                    same_session()
+                    current = freshness.require_fresh(self.screen)
+                    if current.generation != observed.generation:
+                        raise RuntimeError("点击前画面连接已变化，未发送点击；请重新观察。")
+                    cursor = self._pointer_overlay if self._pointer_confirmed else None
+                    reference = self._pointer_reference if cursor else None
+                    diagnostics = self._pointer_diagnostics
+                    if diagnostics:
+                        diagnostics.capture("target_reference", target_frame or observed.frame)
+                        diagnostics.capture("write_candidate", current.frame, current.updated)
+                    try:
+                        target_guard(cursor=cursor, reference=reference)
+                        if before_click is not None:
+                            if isinstance(before_click, TextTargetGuard):
+                                before_click(cursor=cursor, reference=reference)
+                            else:
+                                before_click()
+                    except RuntimeError as exc:
+                        if diagnostics:
+                            diagnostics.event("write_validation", accepted=False, reason=type(exc).__name__)
+                        raise
+                    if diagnostics:
+                        diagnostics.event("write_validation", accepted=True)
+                    before = freshness.require_fresh(self.screen).frame
 
-            timing["positioning"] = (time.monotonic() - began) * 1000 - timing["firmware"]
-            await self._send(epoch, "click", before_write=validate_click)
-            sent = time.time()
-            ignore = previous + self._pointer_spots + ((x, y),)
-            changed, fresh = await self._tap_effect(before, sent, epoch, ignore, hover)
-            timing["total"] = (time.monotonic() - began) * 1000
-            result = {"clicked": True, "pointer_seen": self._pointer_seen, "screen_changed": changed,
-                      "effect_observed": changed if fresh else None, "effect_verified": False,
-                      "fresh": fresh, "completed_at": sent, "latency": round(timing["total"] / 1000, 3),
-                      "timing_ms": {key: round(value, 2) for key, value in timing.items()},
-                      "_after_frame": self._effect_frame, "_after_snapshot": self._effect_snapshot,
-                      "warning": ("已点击并观察到画面变化，但尚未验证预期效果。" if changed else
-                                  "已点击，但等待窗口内未见有效画面变化；请观察后再操作，勿自动重试。")}
-            self.last_tap = result
-            return result
+                timing["positioning"] = (time.monotonic() - began) * 1000 - timing["firmware"]
+                if duration:
+                    try:
+                        await self._send(epoch, "press", before_write=validate_click)
+                        await asyncio.sleep(duration)
+                    finally:
+                        await shield_cleanup(asyncio.wait_for(self._command("release"), RELEASE_TIMEOUT))
+                else:
+                    for index in range(click_count):
+                        if index:
+                            await asyncio.sleep(.08)
+                        # Never send a second contact after an observed navigation or disconnect.
+                        await self._send(epoch, "click", before_write=validate_click)
+                same_session()
+                sent = time.time()
+                ignore = previous + self._pointer_spots + ((x, y),)
+                changed, fresh = await self._tap_effect(before, sent, epoch, ignore, hover)
+                same_session()
+                timing["total"] = (time.monotonic() - began) * 1000
+                result = {"clicked": True, "pointer_seen": self._pointer_seen, "screen_changed": changed,
+                          "click_count": click_count if not duration else 0, "hold_seconds": duration,
+                          "effect_observed": changed if fresh else None, "effect_verified": False,
+                          "fresh": fresh, "completed_at": sent, "latency": round(timing["total"] / 1000, 3),
+                          "timing_ms": {key: round(value, 2) for key, value in timing.items()},
+                          "_after_frame": self._effect_frame, "_after_snapshot": self._effect_snapshot,
+                          "warning": ("已点击并观察到画面变化，但尚未验证预期效果。" if changed else
+                                      "已点击，但等待窗口内未见有效画面变化；请观察后再操作，勿自动重试。")}
+                self.last_tap = result
+                return result
         finally:
             self._tap_timing = None
             self._tap_blind_allowed = False
+            self._navigation_context = None
+            self._tap_target_frame = None
 
     async def _tap_effect(self, before, since: float, epoch: int, ignore: tuple, hover: tuple) -> tuple[bool, bool]:
         self._effect_frame = self._effect_snapshot = None
@@ -985,7 +1728,11 @@ class Phone:
         b = mf - a * mc
         return (t - b) / a if abs(b) < 0.1 else t
 
-    async def _move_to(self, tx: int, ty: int, rehome: bool = True) -> None:
+    async def _move_to(self, tx: int, ty: int, rehome: bool = True, *, before_write=None) -> None:
+        if before_write is not None:
+            before_write()
+        if not rehome and (self._pos is None or self._link != self.device.links):
+            raise DeviceError("拖动期间指针位置或设备连接已变化，未继续移动。")
         if self._link != self.device.links:  # new link: a dropped gesture may have left the button down
             await self._send(getattr(self.device, "abort_epoch", 0), "release")
             self._pos, self._link = None, self.device.links
@@ -998,11 +1745,11 @@ class Phone:
         if (tx < 0 or ty < 0) and (x, y) == (0, 0):
             # Leave the rounded home corner first; negative offsets are reachable from the interior.
             wx, wy = max(tx, round(.15 * self.span["w"])), max(ty, round(.15 * self.span["h"]))
-            await self._send(epoch, f"move {wx} {wy}")
-            await self._send(epoch, f"move {tx - wx} 0")
-            await self._send(epoch, f"move 0 {ty - wy}")
+            await self._send(epoch, f"move {wx} {wy}", before_write=before_write)
+            await self._send(epoch, f"move {tx - wx} 0", before_write=before_write)
+            await self._send(epoch, f"move 0 {ty - wy}", before_write=before_write)
         elif (tx, ty) != (x, y):
-            await self._send(epoch, f"move {tx - x} {ty - y}")
+            await self._send(epoch, f"move {tx - x} {ty - y}", before_write=before_write)
         self._pos, self._moves = (tx, ty), self._moves + 1
 
     async def reset(self) -> None:
@@ -1015,18 +1762,19 @@ class Phone:
     async def tap(self, x: float, y: float, aim: bool = False, *,
                   target_box: tuple[float, float, float, float] | None = None,
                   target_frame: bytes | None = None,
-                  before_click: Callable[[], None] | None = None) -> float:
+                  before_click: Callable[[], None] | None = None, navigation_context=None) -> float:
         """All public taps share the guarded path; retain the legacy ACK timestamp return."""
+        options = {"navigation_context": navigation_context} if navigation_context is not None else {}
         result = await self.tap_verified(x, y, target_box=target_box, target_frame=target_frame,
-                                         before_click=before_click)
+                                         before_click=before_click, **options)
         return result["completed_at"]
 
     @_serialized
     async def swipe(self, x1: float, y1: float, x2: float, y2: float, hold: bool = True, *,
                     before_action: Callable[[], None] | None = None) -> None:
-        await self.drag([(x1, y1), (x2, y2)], hold, before_action=before_action)
+        await self.drag([(x1, y1), (x2, y2)], hold, before_action=before_action, verify_start=True)
 
-    def _gesture_guard(self, point, before_action):
+    def _gesture_guard(self, point, before_action, *, verified_pointer=False):
         if before_action is not None:
             before_action()
         if self.screen is None:
@@ -1034,30 +1782,82 @@ class Phone:
         observed = freshness.require_fresh(self.screen)
         guard = TextTargetGuard(self.screen, observed.frame, SimpleNamespace(center=point), observation=observed)
 
-        def validate():
-            guard()
-            if before_action is not None:
-                before_action()
+        def validate(*, include_context=True):
+            cursor = self._pointer_overlay if verified_pointer and self._pointer_confirmed else None
+            reference = self._pointer_reference if cursor else None
+            guard(cursor=cursor, reference=reference)
+            if include_context and before_action is not None:
+                if _accepts_keywords(before_action, "cursor", "reference"):
+                    before_action(cursor=cursor, reference=reference)
+                else:
+                    before_action()
 
         return validate
 
     @_serialized
+    @bounded_operation
     async def drag(self, points: list[tuple[float, float]], hold: bool = True, *,
-                   before_action: Callable[[], None] | None = None) -> None:
+                   before_action: Callable[[], None] | None = None, verify_start: bool = False) -> None:
         """Press at the first point, move through the rest, release: one continuous stroke.
 
         hold=True rests at the end first, so lists and pickers stop exactly there instead of flinging on.
         System gestures (home, back) need the flick, so they pass hold=False.
         """
+        if not 2 <= len(points) <= 256 or any(
+                not math.isfinite(v) or not 0 <= v <= 1 for point in points for v in point):
+            raise ValueError("drag requires 2..256 finite normalized points")
         epoch = getattr(self.device, "abort_epoch", 0)
-        validate = self._gesture_guard(points[0], before_action)
-        await self.point(*points[0])
+        link = getattr(self.device, "links", 0)
+        generation = freshness.require_fresh(self.screen).generation if self.screen is not None else None
+
+        def same_session():
+            self._check_operation()
+            if self._stopped(epoch) or getattr(self.device, "links", 0) != link:
+                raise DeviceError("拖动期间设备连接已变化或已停止，未继续移动。")
+            if self.screen is not None and freshness.require_fresh(self.screen).generation != generation:
+                raise RuntimeError("拖动期间画面连接已变化，未继续移动。")
+
+        validate = self._gesture_guard(points[0], before_action, verified_pointer=verify_start)
+        if verify_start:
+            await self.point_verified(*points[0])
+            if not self._pointer_confirmed:
+                raise PointerLandingError("未确认绘图起点的指针，未按下；请重新观察。")
+        else:
+            await self.point(*points[0])
+        if self.screen is not None:
+            try:
+                validate(include_context=False)
+            except TargetChangedError:
+                # AirPlay can briefly show an in-flight pointer between the old and new
+                # positions. Recheck a fresh observation before pressing, with the original guard.
+                if await feedback.wait_after_action(self.screen, self._position_completed) is None:
+                    raise
+                validate(include_context=False)
+        # A measured landing may include a correction that differs from the
+        # absolute calibration model. Keep that acquired board pose as the
+        # stroke origin; returning to theoretical coordinates would draw the
+        # correction backwards into the first segment while the button is down.
+        anchor = self._pos
+        if anchor is None or self._link != link:
+            raise DeviceError("拖动起点的指针位置或设备连接已变化，未按下。")
+        origin = self._dx(points[0][0]), self._dy(points[0][1])
+        targets = [(anchor[0] + self._dx(x) - origin[0], anchor[1] + self._dy(y) - origin[1])
+                   for x, y in points[1:]]
+
+        def validate_press():
+            same_session()
+            if validate is not None:
+                validate()
+
         try:
-            await self._send(epoch, "press", before_write=validate)
-            for x, y in points[1:]:
-                await self._move_to(self._dx(x), self._dy(y), rehome=False)  # never home mid-drag
+            await self._send(epoch, "press", before_write=validate_press)
+            for tx, ty in targets:
+                # Check again under the device write lock: a reconnect can happen
+                # while waiting for that lock, after the preceding segment ACK.
+                await self._move_to(tx, ty, rehome=False, before_write=same_session)
             if hold:
                 await asyncio.sleep(HOLD)
+            same_session()
         finally:
             try:
                 await shield_cleanup(asyncio.wait_for(self._command("release"), RELEASE_TIMEOUT))
@@ -1065,28 +1865,41 @@ class Phone:
                 raise DeviceError("release cleanup timed out") from exc
 
     @_serialized
+    @bounded_operation
     async def scroll(self, x: float, y: float, lines: int, *,
                      before_action: Callable[[], None] | None = None) -> None:
         epoch = getattr(self.device, "abort_epoch", 0)
-        validate = self._gesture_guard((x, y), before_action)
-        await self.point(x, y)
-        await self._send(epoch, f"scroll {lines} 0", before_write=validate)
+        link = getattr(self.device, "links", 0)
+        validate = self._gesture_guard((x, y), before_action, verified_pointer=True)
+        await self.point_verified(x, y)
+        if not self._pointer_confirmed:
+            raise PointerLandingError("未确认滚动起点的指针，未滚动；请重新观察。")
+
+        def validate_scroll():
+            if self._stopped(epoch) or getattr(self.device, "links", 0) != link:
+                raise DeviceError("滚动前设备连接已变化或已停止，未滚动。")
+            if validate is not None:
+                validate()
+
+        await self._send(epoch, f"scroll {lines} 0", before_write=validate_scroll)
 
     @_serialized
     async def type(self, text: str, mode: TypeMode = "auto", *,
                    before_action: Callable[[], None] | None = None) -> None:
         """优先确认剪贴板后粘贴；未配置时仅 ASCII 可退回逐键输入。"""
         try:
-            selected = select_type_mode(text, mode, clipboard_available=self.clipboard is not None)
+            selected = select_type_mode(text, mode, **clipboard_mode_options(self.clipboard))
         except ValueError as exc:
             raise DeviceError(str(exc)) from exc
         epoch = getattr(self.device, "abort_epoch", 0)
+        parts = type_chunks(text) if selected == "keys" else []
         async with self._typing:
             if self._stopped(epoch):
                 raise DeviceError("已紧急停止，后面的内容没有发出。")
             if before_action is not None:
                 before_action()  # serialization may have waited while the observed context changed
             chunks_sent = False
+            chunks_acknowledged = characters_acknowledged = 0
 
             def invoke(stage: str) -> None:
                 if before_action is None:
@@ -1099,7 +1912,7 @@ class Phone:
                     before_action()
 
             async def send_input(command):
-                nonlocal chunks_sent
+                nonlocal chunks_sent, chunks_acknowledged, characters_acknowledged
                 paste_command = selected == "paste" and command == "key cmd+v"
                 stage = "chunk" if command.startswith("type ") and chunks_sent else "context"
                 validate_paste = getattr(self.clipboard, "validate_paste", None) if paste_command else None
@@ -1131,15 +1944,27 @@ class Phone:
                 guarded = before_action is not None or validate_paste is not None
                 await self._send(epoch, command, before_write=validate_input if guarded else None)
                 if command.startswith("type "):
-                    # Confirm that only the original input field changed during the ACK wait.
-                    invoke("accept")
+                    # Only a successful _send establishes a positive ACK. A
+                    # later visual rejection must not erase that fact or retry.
+                    completed_at = time.time()
+                    chunks_acknowledged += 1
+                    characters_acknowledged += len(command.removeprefix("type "))
                     chunks_sent = True
+                    # Confirm that only the original input field changed during the ACK wait.
+                    try:
+                        invoke("accept")
+                    except OperationDeadline:
+                        raise
+                    except (RuntimeError, ValueError) as exc:
+                        raise TypingVerificationError(
+                            str(exc), completed_at=completed_at, chunks_acknowledged=chunks_acknowledged,
+                            chunks_total=len(parts), characters_acknowledged=characters_acknowledged) from exc
 
             if selected == "paste":
                 await self.clipboard.paste(text, stopped=lambda: self._stopped(epoch),
                                            send=send_input)
             else:
-                for part in type_chunks(text):
+                for part in parts:
                     await send_input(f"type {part}")
 
     @_serialized
@@ -1148,13 +1973,148 @@ class Phone:
             before_action()
         await self._send(getattr(self.device, "abort_epoch", 0), f"key {combo}", before_write=before_action)
 
+    @property
+    def app_search_available(self) -> bool:
+        hid = (getattr(self.device, "board_status", None) or {}).get("hid") or {}
+        return (os.environ.get("HIDAGENT_SPOTLIGHT_BLE_VERIFIED") == "1"
+                and getattr(self.device, "connected", False) and hid.get("path") == "ble"
+                and ocr.available())
+
+    @bounded_operation
     @_serialized
-    async def go_home(self) -> None:
-        await self.assistive_touch.go_home()
+    async def open_app_search(self, name: str, *, before_action: Callable[[], None] | None = None
+                              ) -> tuple[float, float, float, float]:
+        """Reach verified Home, open Spotlight, then fill its observed input field."""
+        if not self.app_search_available:
+            raise AppSearchError("App 搜索快捷键尚未在当前蓝牙设备上验证，或本地文字识别不可用。")
+        try:
+            validate_app_query(name)
+        except ValueError as exc:
+            raise AppSearchError(str(exc)) from exc
+
+        try:
+            original = freshness.require_fresh(self.screen)
+            link, generation = self.device.links, original.generation
+            epoch = getattr(self.device, "abort_epoch", 0)
+            opened_at = 0.0
+
+            def validate_session():
+                self._check_operation()
+                if self._stopped(epoch):
+                    raise AppSearchError("App 搜索期间已紧急停止，未继续输入。")
+                if not self.app_search_available or self.device.links != link:
+                    raise AppSearchError("App 搜索期间蓝牙连接已变化。")
+                current = freshness.require_fresh(self.screen)
+                if current.generation != generation:
+                    raise AppSearchError("App 搜索期间画面连接已变化。")
+                return current
+
+            # Consume the caller's original page once. The intentional Home
+            # transition gets a new visual anchor, never a new link/epoch/session.
+            validate_session()
+            if before_action is not None:
+                before_action()
+            home = validate_session()
+            if not assistive_vision.is_home_screen(home.frame):
+                await self.go_home()
+                home = validate_session()
+                if not assistive_vision.is_home_screen(home.frame):
+                    raise AppSearchError("没有确认返回主屏幕，未发送搜索快捷键或 App 名。")
+
+            def validate_shortcut():
+                nonlocal opened_at
+                current = validate_session()
+                if screen_compare.observation_changed(
+                        home.frame, current.frame, caret_frames=getattr(self.screen, "recent_frames", ())):
+                    raise AppSearchError("App 搜索前画面已变化。")
+                opened_at = time.time()
+
+            await self.key("cmd+space", before_action=validate_shortcut)
+            if await feedback.wait_after_action(self.screen, opened_at) is None:
+                raise AppSearchError("快捷键已发送，但没有收到新画面来确认 Spotlight。")
+            validate_session()
+            focused = freshness.require_fresh(self.screen, since=opened_at)
+            if (focused.generation != generation
+                    or not screen_compare.observation_changed(
+                        home.frame, focused.frame,
+                        caret_frames=getattr(self.screen, "recent_frames", ()))):
+                raise AppSearchError("没有观察到进入 Spotlight，未输入 App 名。")
+
+            labels = [(ocr.normalize_text(hit.text), hit.box) for hit in await ocr.read_text_async(focused.frame)
+                      if hit.conf >= .8]
+            # A white vertical stroke alone is not input-focus evidence. Only
+            # consider it on an OCR-observed Spotlight, then require the search
+            # placeholder inside that same bounded field before typing anything.
+            field = InputContextGuard(self.screen, focused, allow_white=any(
+                label in SPOTLIGHT_MARKERS for label, _ in labels))
+            if field.region is None:
+                raise AppSearchError("无法确认 Spotlight 搜索框获得焦点，未输入 App 名。")
+            left, top, right, bottom = field.region
+            placeholder = any(label in SPOTLIGHT_PLACEHOLDERS and left <= x0 < x1 <= right
+                              and top <= y0 < y1 <= bottom for label, (x0, y0, x1, y1) in labels)
+            marker = any(label in SPOTLIGHT_MARKERS and box[3] < top for label, box in labels)
+            if not placeholder or not marker:
+                raise AppSearchError("无法确认系统 Spotlight 搜索框，未输入 App 名。")
+
+            def validate_field(*, stage="context"):
+                validate_session()
+                return field(stage=stage)
+
+            await self.type(name, mode="keys", before_action=validate_field)
+            return field.region
+        except AppSearchError:
+            raise
+        except (RuntimeError, ValueError) as exc:
+            raise AppSearchError(f"未能验证 App 搜索流程：{exc}") from exc
 
     @_serialized
-    async def go_back(self, *, before_action: Callable[[], None] | None = None) -> None:
-        await self.swipe(0.005, 0.45, 0.6, 0.45, hold=False, before_action=before_action)
+    async def go_home(self, *, navigation_context=None) -> None:
+        if navigation_context is None:
+            await self.assistive_touch.go_home()
+        else:
+            await self.assistive_touch.go_home(navigation_context=navigation_context)
+
+    @_serialized
+    async def go_back(self, *, before_action: Callable[[], None] | None = None, navigation_context=None) -> None:
+        from .navigation_context import NavigationContext, from_navigation
+
+        epoch, link = getattr(self.device, "abort_epoch", 0), getattr(self.device, "links", 0)
+        if navigation_context is not None:
+            if not isinstance(navigation_context, NavigationContext) or navigation_context.action != "back":
+                raise ValueError("back requires a detected Back navigation context")
+            navigation_context.validate_current(self.screen)
+        else:
+            navigation_context = from_navigation("back", freshness.require_fresh(self.screen))
+        if navigation_context is None:
+            await self.swipe(0.005, 0.45, 0.6, 0.45, hold=False, before_action=before_action)
+            return
+        observed, target = navigation_context.observation, navigation_context.target
+
+        def validate_back(*, positioned=False):
+            self._check_operation()
+            current = freshness.require_fresh(self.screen)
+            if (self._stopped(epoch) or getattr(self.device, "links", 0) != link
+                    or current.generation != observed.generation):
+                raise RuntimeError("返回前设备或画面连接已变化，未发送点击；请重新观察。")
+            # At entry these fields can still describe the previous page's tap.
+            # Only this Back gesture's completed positioning supplies evidence
+            # for the final write; the initial check uses the observed nav bar.
+            cursor = self._pointer_overlay if positioned and self._pointer_confirmed else None
+            reference = self._pointer_reference if cursor else None
+            navigation_context.validate_current(self.screen, cursor=cursor, reference=reference)
+            if before_action is not None:
+                if _accepts_keywords(before_action, "cursor", "reference"):
+                    before_action(cursor=cursor, reference=reference)
+                else:
+                    before_action()
+
+        validate_back()
+        # A visible navigation control avoids a clipped pointer at the physical
+        # edge. Its actual target and original session still guard the HID write;
+        # an uncertain click never triggers a second fallback gesture.
+        await self.tap_verified(*target.center, target_box=target.box,
+                                target_frame=observed.frame, before_click=lambda: validate_back(positioned=True),
+                                navigation_context=navigation_context)
 
     def _dx(self, x: float) -> int:
         return round((self._fix(x, "x") - self.origin["x"]) * self.span["w"])

@@ -3,7 +3,7 @@ import io
 import pytest
 from PIL import Image, ImageDraw
 
-from hidagent.vision import changed, pointer
+from hidagent.vision import changed, pointer, pointer_move
 
 W, H = 498, 1080  # a mirrored iPhone frame
 
@@ -47,6 +47,44 @@ def test_pointer_is_found_from_a_nudge():
 def test_pointer_not_found_when_nothing_moved():
     frame = screen((262, 856))
     assert pointer(frame, frame, near=(0.5, 0.8), shift=12 / W) is None
+
+
+def dim_pointer_frame(x, *, erase=False):
+    image = Image.new("RGB", (W, H), (18, 26, 42))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((184, 165, 208, 189), fill=(39, 43, 52))  # unchanged UI
+    if not erase:
+        draw.ellipse((x - 12, 165, x + 12, 189), fill=(39, 43, 52))
+    output = io.BytesIO()
+    image.save(output, "JPEG", quality=75)
+    return output.getvalue()
+
+
+def test_strict_nudge_detects_dim_gray_pointer_without_selecting_a_static_circle():
+    before, after = dim_pointer_frame(232), dim_pointer_frame(246)
+    found = pointer_move(before, after, (.47, .16), 14 / W, strict=True)
+    assert found is not None
+    assert [p[0] * W for p in found] == pytest.approx([232, 246], abs=2)
+    assert pointer_move(before, dim_pointer_frame(246, erase=True), (.47, .16), 14 / W, strict=True) is None
+
+
+def test_strict_nudge_detects_a_translucent_pointer_over_a_color_gradient():
+    def painted(x):
+        image = Image.new("RGB", (W, H))
+        draw = ImageDraw.Draw(image)
+        for column in range(W):
+            draw.line((column, 0, column, H), fill=(218, 22, min(240, 91 + column // 2)))
+        overlay = Image.new("RGBA", image.size)
+        ImageDraw.Draw(overlay).ellipse((x - 12, 702, x + 12, 726), fill=(30, 30, 30, 55))
+        out = io.BytesIO()
+        Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB").save(out, "JPEG", quality=75)
+        return out.getvalue()
+
+    before, after = painted(342), painted(355)
+    pair = pointer_move(before, after, (.67, .66), 13 / W, strict=True)
+    assert pair is not None
+    assert [p[0] * W for p in pair] == pytest.approx([342, 355], abs=2)
+    assert pointer_move(before, before, (.67, .66), 13 / W, strict=True) is None
 
 
 def checkmark_screen(checked: bool, pointer_at=(100, 500)) -> bytes:

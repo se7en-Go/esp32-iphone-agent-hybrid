@@ -2,28 +2,85 @@
 
 USB/BLE HID 只能发送键盘、鼠标事件，**不能直接设置 iPhone 剪贴板**。现有固件支持 `key cmd+v`；正文仍须由 iPhone 快捷指令或前台 App 写入剪贴板。
 
+## 宿主 AI 推荐路线：分阶段粘贴
+
+现在提供 `prepare → 查看复制状态与画面 → paste → 查看完整输入结果 → confirm`，每阶段返回后释放控制锁，AI 可以继续观察。正常使用不再需要下面旧流程里的两次人工提醒。首次安装快捷指令、设置配对信息、允许网络访问及绑定触发键仍是独立配置环节；iOS 是否再次弹出权限提示取决于实际权限和网络地址。
+
+**使用本仓库生成的新模板时，服务端须设置 `HIDAGENT_CLIPBOARD_PROTOCOL=staged-v1`。** 这样普通 `type` 的 `auto` 模式仍将可打印 ASCII/数字作为键盘事件输入；中文、Unicode、换行文本以及显式 `type --mode paste` 会立即提示使用下列分阶段接口，不发布旧协议任务、不等待 TTL，也不发送触发键。新模板不会处理旧同步协议，不能仅配置 URL/Key 后就让普通 `auto` 输入走旧同步粘贴。
+
+`capabilities.features.clipboard` 区分 `configured`、`protocol`、`legacy_paste_available`、`staged_available` 与 `trigger_configured`。这些是服务端配置/接口能力；不证明 iPhone 已导入模板、绑定按键或实际粘贴成功。触发键未配置时，prepare 仍可发布待办，但需要由宿主按实际已安装的入口运行快捷指令。
+
+| MCP 工具 | CLI | 行为 |
+| --- | --- | --- |
+| `iphone_paste_prepare` | `paste-prepare 文本 --screen-id ID --focused` | 保留原输入画面，发布一次性任务并可选触发快捷指令；尚未粘贴。 |
+| `iphone_paste_status` | `paste-status 事务ID` | 返回复制阶段、当前图和新的观察凭证；不会确认输入成功。 |
+| `iphone_paste` | `paste 事务ID --screen-id ID --focused` | 实际复制完成、原输入上下文复查通过后，只发送一次 Cmd+V，返回新图。 |
+| `iphone_paste_confirm` | `paste-confirm 事务ID --screen-id ID --observed-text 完整文字 --confirmed` | 宿主已经看清文字完整进入原输入框后确认，结束事务。 |
+| `iphone_paste_cancel` | `paste-cancel 事务ID` | 作废正文和事务凭证。已领取或粘贴结果不明时仍须核对旧任务后解除阻止。 |
+
+这些工具使用 `/api/control/clipboard/{prepare,status,paste,confirm,cancel}`，只在本机控制端口提供。不要将它们开放到局域网代理。CLI 可加 `--image-output 文件` 保存阶段返回图片。
+
+`focused=true` / `--focused` 是宿主根据当前截图作出的明确判断。服务器优先寻找有蓝色插入光标的有界输入框；若无法识别，prepare 必须同时提供宿主观察到的归一化 `target_box=[left,top,right,bottom]`。后者返回 `focus_verified_by=host_observation`，不会冒充自动识别。不能仅传 `focused:true` 而不给无边框编辑器的区域。
+
+快捷指令只在真实执行 Copy 后回报 `copied:true`，不回报 `focused` 或 `pasted`。真正的 Cmd+V 要求所选观察和当前帧都晚于复制 ACK，并经过镜像传输延迟余量，不能复用 prepare 时的旧图。原画面、设备连接和镜像代次仍须一致，并在串口写入前再次校验。等待确认期间禁止其它键盘输入或第二次复制覆盖当前事务；仍允许观察和用指针处理界面。确认同样要求粘贴后的新图，只允许原输入区域内发生变化，并要求完整 `observed_text` 与预期文本一致。返回 `verified_by=host_observation, server_content_verified=false`，明确是宿主视觉核验，不是像素改变或键盘 ACK 自动证明。
+
+紧急停止会立即作废待处理的分阶段正文与凭证。连接或镜像会话改变后，旧 payload、复制 ACK 和宿主事务在访问前均撤销；已领取的剪贴板仍保留结果不明标记，不能误认清理服务端正文也清除了 iPhone 剪贴板。prepare / paste 各自受动作超时约束，超时后不得继续发出迟到按键。
+
+阶段调用之间不要盲目固定等待后直接粘贴。AI 应读取 `phase`：`awaiting_copy` 仍需等待 Shortcut，`awaiting_paste` 可以核对焦点，`awaiting_confirmation` 需要核对实际文字。若弹出系统权限、运行浮层或页面跳转，先处理并恢复原目标；状态不明时取消，不能重发 Cmd+V。正文默认 60 秒到期，首次安装先完成授权再发布真实输入事务。
+
+## 安装不含秘密的快捷指令模板
+
+构建器只生成模板，不读取环境密钥、私人快捷指令或剪贴板。macOS 可同时调用系统工具签名：
+
+```sh
+python3 scripts/build_clipboard_shortcut.py \
+  --output build/shortcuts/ESP32-Agent-Clipboard.shortcut --sign
+```
+
+输出 `ESP32-Agent-Clipboard-signed.shortcut` 可交给 iPhone 导入。Apple 签名会接收文件副本，因此模板只包含 `http://computer.local:8891` 占位和空配对 Key；**不要把真实地址/Key 先写入模板再签名**。导入设置会分别询问服务器地址和本机生成的剪贴板配对 Key，此 Key 与 DeepSeek Key 无关。设置答案保存在设备上，不进入仓库。可由已授权的配置流程填入；它不是每次粘贴都要填写的输入。
+
+安装步骤：
+
+1. 按下文配置本机服务和仅转发剪贴板的 8891 监听器，并设置 `HIDAGENT_CLIPBOARD_PROTOCOL=staged-v1`；受管服务可写入私密 `runtime.env`。
+2. 在 iPhone 导入签名文件，按设置问题填服务器地址和配对 Key，确认快捷指令名称；可命名为 `ESP32 Agent Clipboard`。
+3. 首次允许该快捷指令访问自己的剪贴板服务。若 iOS 提供“始终允许”，可选择它；不能伪造或绕过系统权限结果。
+4. 将此快捷指令绑定到 `HIDAGENT_CLIPBOARD_TRIGGER_KEY` 指定的组合键，例如 `ctrl+alt+p`。绑定方法见下文，此处选择新模板的名称。
+5. 在空白测试输入框中运行分阶段流程，验证复制、浮层退出、原焦点恢复和准确文字。不得仅凭文件签名成功宣称手机粘贴已验收。
+
+模板动作只有：领取 staged-v1 待办 → 获取结构化正文 → 检查 `copy_allowed` → 按文本原样本地复制 → 发送复制 ACK → 结束。没有自定义提醒、没有发送动作，也不自动声称输入完成。没有待办、旧协议待办、下载错误或过期响应缺少 `copy_allowed` 时，不复制错误正文。
+
+依据：[Apple 命令行签名说明](https://support.apple.com/guide/shortcuts-mac/apd455c82f02/mac)、[导入设置问题](https://support.apple.com/guide/shortcuts/apdf330fd3a0/ios)、[首次权限与始终允许](https://support.apple.com/guide/shortcuts/apd961a4fc65/ios)。生成器参考系统自带 Gallery `.wflow` 的 plist 结构；签名、导入兼容性和真机输入效果是不同的验收阶段。
+
 ## 输入模式与路线
+
+默认 `HIDAGENT_CLIPBOARD_PROTOCOL=legacy-v1` 保留以下 `Phone.type` / `iphone_type` 的等待完成行为和两条旧快捷指令兼容性；现有用户无需改配置。新模板应显式选择 `staged-v1`，普通输入不会再错误等待旧版 `focused:true` / 完成确认。宿主 AI 自动控制请使用上面的分阶段工具。
 
 `Phone.type(text, mode="auto")`、`POST /api/type`、控制接口的 `type`、MCP `iphone_type` 和 CLI `type --mode` 支持：
 
 | 模式 | 行为 |
 | --- | --- |
-| `auto`（默认） | 配置剪贴板通道后中文、ASCII、数字都粘贴；未配置时分块发送 ASCII（含数字）。 |
-| `paste` | 必须配置通道；确认复制和焦点后发一次 `key cmd+v`，确认文字已出现后才完成请求。 |
+| `auto`（默认） | `legacy-v1` 通道配置后中文、ASCII、数字都同步粘贴；未配置或 `staged-v1` 时分块发送可打印 ASCII（含数字）。`staged-v1` 的其他文本立即提示分阶段接口。 |
+| `paste` | 仅 `legacy-v1` 同步通道：确认复制和焦点后发一次 `key cmd+v`，确认文字已出现后才完成请求。`staged-v1` 立即拒绝此同步模式并指向分阶段工具。 |
 | `keys` | 强制分块发送可打印 ASCII；非 ASCII 提示配置剪贴板通道。 |
 
-限 **1–4000 字符、单行文本**，不接受换行或控制字符，不自动发送消息。粘贴失败不会自动改成逐键重试。**一个 batch 最多包含一个粘贴步骤**；多个粘贴步骤在执行前整批拒绝。此预检限制针对粘贴；批次执行后续打字或按键前也须重新观察并核对焦点，不能凭前一步 ACK 继续输入。
+限 **1–4000 字符**。选定粘贴模式时允许标准换行和制表符（`\n`、`\r`、`\t`），原样传递，不做空白或换行规范化；这些字符是剪贴板文本，不会转换成 Enter/Tab 按键。逐键输入仍只接受单行 ASCII；其他 C0/C1 控制字符、Unicode 行/段分隔符及非法代理字符在所有模式下均拒绝。输入不自动发送消息。粘贴失败不会自动改成逐键重试。**一个 batch 最多包含一个粘贴步骤**；多个粘贴步骤在执行前整批拒绝。此预检限制针对粘贴；批次执行后续打字或按键前也须重新观察并核对焦点，不能凭前一步 ACK 继续输入。
 
 输入始终绑定开始时的画面：粘贴键发出前复查原画面、连接代次及新鲜度。逐键分块时，只允许原画面中带蓝色插入光标的有界输入框内部变化；无法识别输入框时，画面变化会停止后续分块。ACK 等待期间换页或断开连接也会停止，已写入的部分不会自动重放。
 
-推荐顺序：
+旧版同步输入支持以下触发方式：
 
 1. **已实现：服务端组合键触发 iOS 快捷指令。** Windows、Linux、Mac 均可作服务器。先把 iPhone「全键盘控制」的组合键绑定到下述快捷指令，再设置 `HIDAGENT_CLIPBOARD_TRIGGER_KEY`。服务端发布文本后发送该 HID 组合键；手机领取、复制，用户确认目标焦点，服务端才粘贴。用户看到文字出现后运行完成确认快捷指令。这是有人工确认的流程，不是无人值守焦点检测。
 2. **已实现：手动触发同一快捷指令。** 不设置触发组合键时，在请求等待期间用轻点背面或辅助触控启动。确认协议相同。
 3. **未交付 App：前台伴侣应用接入下述协议。** App 必须自行实现 `UIPasteboard` 写入、恢复目标焦点及结果确认；不能假设 iOS 允许后台常驻写剪贴板。
 4. **未实现：Mac 通用剪贴板 / iPhone 镜像。** 要求同一 Apple 账户、Handoff、Wi-Fi 与蓝牙等条件；Windows 无等价通道。`pbcopy` 成功不能证明 iPhone 已收到，故没有自动回退。
 
-## 服务器配置（两个终端）
+## 服务器配置
+
+macOS / Linux 使用本仓库后台管理入口时，推荐把下列 `HIDAGENT_CLIPBOARD_*` 配置保存在数据目录的私密 `runtime.env`，然后运行 `./scripts/run-local.sh start`（已有 worker 用 `restart-worker`）。配对 URL 和 Key 同时存在时，后台管理进程自动启动专用剪贴板代理，并随 worker 一起重启/关闭；无需第二个终端。用 `status` 的 `clipboard_proxy` 核对监听状态，详细规则见 [RUNTIME.md](RUNTIME.md#受管剪贴板代理)。默认未配置不增加代理，使用外置代理时设置 `HIDAGENT_CLIPBOARD_MANAGED_PROXY=0`。
+
+新生成模板另加 `HIDAGENT_CLIPBOARD_PROTOCOL=staged-v1`；下方旧版双快捷指令流程使用默认 `legacy-v1`。无效协议值在启动服务前拒绝。协议选择只决定是否提供旧同步粘贴；不会取消原会话、焦点、复制 ACK 或全文观察确认要求。
+
+下面的两个终端方案保留给 Windows、无参数前台启动或外部管理代理的情况。不要在已启用受管代理的同一端口再手动启动第二个实例。
 
 iPhone 与服务器须在同一可互通局域网，快捷指令须允许获取服务器 URL。`127.0.0.1` 是手机自己；将下例 `computer.local` 替换成手机能访问的电脑主机名或局域网地址。以下命令都在**仓库根目录**运行，使用安装步骤创建的 `server/.venv`，无需先激活环境。
 
@@ -95,7 +152,7 @@ iPhone 与服务器须在同一可互通局域网，快捷指令须允许获取�
 
 ## 绑定服务端触发组合键
 
-1. 打开 iPhone **「设置」→「辅助功能」→「键盘与键入」→「全键盘控制」**（部分 iOS 版本将「键盘与键入」显示为「键盘」），打开「全键盘控制」开关。此设置需要主人同意并亲自完成；不要为了测试改动借用手机的无关设置。
+1. 打开 iPhone **「设置」→「辅助功能」→「键盘与键入」→「全键盘控制」**（部分 iOS 版本将「键盘与键入」显示为「键盘」），打开「全键盘控制」开关。此设置由机主确认，可由已授权的配置流程完成；不要为了测试改动借用手机的无关设置。
 2. 进入同页 **「命令」**，向下找到 **「快捷指令」** 分组，点 **「领取待粘贴文本」**。在组合键录入界面，用连接到 iPhone 的键盘同时按 **Control + Option + P**（Windows 键盘上是 **Ctrl + Alt + P**），保存/返回。若没有外接键盘，可在这个录入界面从现有控制界面发送一次 `key ctrl+alt+p`。手机的组合键与 `HIDAGENT_CLIPBOARD_TRIGGER_KEY=ctrl+alt+p` 必须完全一致。
 3. 若提示此键已有用途，换一个未占用的组合键，并同步修改服务器变量；不要覆盖 Return/Enter、普通编辑键或 `cmd+v`。若「快捷指令」分组未列出刚保存的指令，先退出并重新进入「命令」，确认指令已经保存在「快捷指令」App 中。iOS 26 的具体绑定和焦点行为尚待真机确认；找不到此入口时先使用下一段的手动方式，不要把键盘 ACK 当成运行成功。
 4. 在目标 App 的普通可编辑文本框中点出光标。服务器发起输入时，会先发布待办文本，再发送组合键。手机应显示上面第 9 步的确认提醒；没有提醒就不要继续发粘贴命令，按文末排查。
@@ -160,11 +217,14 @@ HTTP 用户也可 POST `/api/type`，JSON `{"text":"你好00123","mode":"paste"}
 | --- | --- |
 | GET `/api/clipboard/pending`，Bearer 密钥 | 返回一次待领取任务的 `text_url`、`ack_url`、`status_url`、`complete_url`、剩余秒数；已领取或空闲时 `pending:false`。 |
 | GET `text_url` | UTF-8 纯文本，一次性领取；成功后清除服务端正文。 |
+| GET `payload_url`（仅 staged-v1） | 一次性 JSON 正文，含 `copy_allowed:true,text`；失败响应不含 copy_allowed，快捷指令不得复制。 |
 | POST `ack_url`，`{"copied":true,"focused":true}` | 复制及目标焦点确认；只下载内容不够。 |
 | GET `status_url` | 查询 `paste_sent`；这只是快捷键发送状态，不是输入效果证明。 |
 | GET `/api/clipboard/current`，Bearer 密钥 | 返回进行中任务的状态及完成地址；无任务时返回 `active:false` 和 `needs_resolution`。 |
 | POST `complete_url`，`{"pasted":true}` | 确认本次文字已进入目标框，结束请求；发送粘贴键之前拒绝。 |
 | POST `/api/clipboard/resolve`，Bearer 密钥，`{"paste_finished":true}` | 只在无活动任务时解除阻塞；须先确认旧快捷指令已结束，且前次粘贴（如有）已经结束。 |
+
+staged-v1 的 `ack_url` 只要求 `{"copied":true}`；Shortcut 的 `complete_url` 在此模式明确拒绝调用。宿主专属事务 nonce 不会交给 Shortcut；完成必须通过本机分阶段确认接口。新旧协议共用同一待办槽，不能互相覆盖。
 
 令牌随机、到期失效，正文和 ACK 只接受一次。`/api/type`、`/api/control/action`、`/api/control/batch` 调用方断连会取消并等待输入操作清理，旧令牌随后不可再领取或确认。按停止、超时或取消也会清除正文及令牌。尚未领取时只清理令牌；已领取后发生上述情况则还会阻止新复制，因为旧快捷指令可能仍握有正文并稍后写入剪贴板。
 

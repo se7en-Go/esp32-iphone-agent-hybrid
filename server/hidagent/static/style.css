@@ -30,6 +30,8 @@ main { display: grid; grid-template-columns: auto minmax(300px, 1fr) minmax(420p
           background: var(--soft); border: 9px solid var(--fg); border-radius: 42px; overflow: hidden; touch-action: none; }
 .screen img { width: 100%; height: 100%; object-fit: contain; display: block; cursor: crosshair; user-select: none; -webkit-user-drag: none; }
 .hint { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px; text-align: center; color: var(--muted); pointer-events: none; }
+.frame-note { position: absolute; left: 12px; right: 12px; bottom: 14px; padding: 6px 10px;
+              border-radius: 8px; color: #fff; background: #242424e8; font-size: 12px; text-align: center; pointer-events: none; }
 .caption { color: var(--muted); font-size: 12px; margin: 0; }
 .caption.callout { color: #000; background: var(--hl); font-size: 14px; font-weight: 600; padding: 6px 12px; border-radius: 8px; }
 .screen.calibrating { border-color: var(--hl); }

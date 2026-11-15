@@ -272,7 +272,7 @@ def test_trigger_key_configuration_validation(trigger):
 
 
 def test_configuration_from_environment(monkeypatch):
-    for name in ("BASE_URL", "KEY", "TTL", "TRIGGER_KEY"):
+    for name in ("BASE_URL", "KEY", "TTL", "TRIGGER_KEY", "PROTOCOL"):
         monkeypatch.delenv("HIDAGENT_CLIPBOARD_" + name, raising=False)
     assert CompanionClipboard.from_env() is None
     monkeypatch.setenv("HIDAGENT_CLIPBOARD_KEY", KEY)

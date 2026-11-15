@@ -247,8 +247,14 @@ def test_cancelled_gesture_releases_before_serial_close(tmp_path, monkeypatch, p
         if repeat_cancel:
             monkeypatch.setattr(asyncio, "shield", observe_shield)
         device.attach(link)
-        phone = Phone(device, tmp_path / "calibration.json")
+        phone = Phone(device, tmp_path / "calibration.json", Screen())
         phone.span = {"w": 500, "h": 1000}
+
+        async def measured_pointer(near, **kwargs):
+            # Focus this transport test on cancellation after measured positioning.
+            return near
+
+        phone._find_pointer = measured_pointer
         monkeypatch.setattr(app_module, "device", device)
         monkeypatch.setattr(app_module, "phone", phone)
         monkeypatch.setattr(app_module, "agent", SimpleNamespace(running=False, stop=lambda: None))

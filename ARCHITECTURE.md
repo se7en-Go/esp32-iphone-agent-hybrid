@@ -1,35 +1,34 @@
 # 架构
 
-本文先于代码写定。seven 已批准的偏差（见下）覆盖 `muse-spec` 里与之冲突的句子。没有真机，文中凡是“能在 iPhone 上怎样”都只是协议推断，不是实测结论。
+本文记录当前实现及原始设计决策。ESP32 蓝牙 HID 与 Mac AirPlay 已在真机上验证输入和画面链路，也验证了网页 worker 重启后独立接收器与镜像连接仍保持。完整连续自主任务验收尚未完成；协议、自动化测试、真机单步结果与端到端任务完成是不同证据。
 
 ## 一句话
 
-电脑上的任意 MCP Agent，通过本仓库的 Python 服务（`127.0.0.1:8890`）控制一块 ESP32-S3 N16R8。板子的 **COM（USB 转串口，可能是 CH343 / FTDI / CP210x）** 接电脑，只传命令、vtok 和配网；板子的 **USB（GPIO19/20）** 接 iPhone，做 USB HID 鼠标键盘。画面不经过 UxPlay：iPhone 系统“屏幕镜像”到板载 AirPlay 接收器，板子把 H.264 从 **TCP 7201** 推给电脑，电脑用 **PyAV** 解成 JPEG。
+电脑上的 MCP Agent 或 CLI，通过本仓库的 Python 服务（`127.0.0.1:8890`）控制 ESP32-S3 N16R8。板子的 **COM（USB 转串口，可能是 CH343 / FTDI / CP210x）** 接电脑，传命令、vtok 和配网；板子通过 USB 或 BLE HID 控制 iPhone。视频单独走 Wi-Fi：板载后端经 **TCP 7201 + PyAV** 提供画面，Mac 后端由独立 UxPlay 接收器提供最新 JPEG。BLE 不负责传屏幕。
 
 ```
-Codex / Pi / Claude Code / Cursor / 任意 MCP 客户端
-        │  stdio MCP（工具名与 Kz-Aven 保持一致，并多了 batch / layout / skill）
+Codex / Pi / Claude Code / Cursor / 任意 MCP 客户端 / CLI
+        │  观察 → 动作 → 核对新画面
         ▼
-Python 服务  127.0.0.1:8890   （macOS 与 Windows 10/11 原生，同一套代码）
+Python worker  127.0.0.1:8890   （macOS 与 Windows 10/11 共用控制核心）
         │  命令、vtok、配网：COM 串口 115200，协议 `<id> <cmd>`
-        │  画面：Wi-Fi TCP 7201，hello <vtok> / ka，PyAV 解码
         ▼
-ESP32-S3 N16R8 固件（Handsy hid_bridge，commit 5a4fddf，协议未改）
-        │  原生 USB HID
+ESP32-S3 N16R8 固件
+        │  USB HID 或 BLE HID（单指针鼠标 + 键盘）
         ▼
 iPhone（Lightning 或 USB-C，目标 iOS 16.7+）
-        │  辅助触控指针 + 控制中心里的「屏幕镜像 → ESP32 Agent」
-        ▼
-微信或任意 App（只模拟真人点按，不碰 App 协议）
+        │  Wi-Fi AirPlay
+        ├─ ESP32 Agent → 板载 TCP 7201 → PyAV → Python worker
+        └─ ESP32 Agent Mac → 独立 UxPlay receiver → 本地 Unix socket → Python worker
 ```
 
-默认网络是 **STA**：板子、iPhone、电脑连同一个 2.4GHz 路由器。电脑用自己原来的网上网，云端模型不会因为连板子热点而断开。
+板载模式默认网络是 **STA**：板子、iPhone、电脑连同一个 2.4GHz 路由器。Mac 镜像模式需要 iPhone 和 Mac 在同一局域网，画面不经 ESP32。电脑用自己原来的网上网，云端模型不会因为连板子热点而断开。
 
 ## 已批准、并覆盖原 spec 的偏差
 
 1. **默认 STA，不是 AP。** 家里或办公室的 2.4GHz 路由器上，板子、手机、电脑在同一局域网。电脑经 COM 口发 `0 net {"mode":"sta","ssid","pass"}`，配置写入板子 NVS。换地方就再跑一次配网脚本，不重烧、不提交 `secrets.h`。AP 只留给“电脑另有网线”的人：板子热点不下发网关（`netcfg.cpp` 的 `noDefaultRoute`），只连热点的电脑会失去互联网和云端模型。
-2. **拓扑固定成双 Type-C。** 标着 USB 的口接手机（USB HID）。标着 COM 的口接电脑（命令、`0 netinfo` 读 vtok、配网）。视频只走 Wi-Fi 7201。电脑这一侧不要求蓝牙。7202 + 配套 App 的 BLE 配对留作实验，本阶段不交付。手机这一侧可以改用蓝牙 HID，见后面的「蓝牙 HID」一节；那一步还没有真机验证。
-3. **iOS 目标 16.7+。** 不装 Handsy iOS App，不用 TestFlight，不越狱，不开开发者模式。板载接收器代码里没有 iOS 版本判断，但 Handsy 作者的记录是 iOS 18/26/27；Kz-Aven 在 iOS 16.7.16 上测通的是电脑上的 UxPlay，不是这块板子。**iOS 16/17 镜像到板载接收器是第一道硬件关，本仓库没有测过。** 失败时的退路：把手机升到 iOS 18，或仅在 Mac 上把 `SCREEN_BACKEND=uxplay` 打开（要自己装 UxPlay 和 GStreamer，Windows 不走这条）。
+2. **COM 固定接电脑，手机可选 USB 或 BLE HID。** 标着 USB 的口用于手机有线 HID；蓝牙模式不接这根线。COM 口用于命令、`0 netinfo` 读 vtok 和配网，电脑自身不要求蓝牙。视频走板载 Wi-Fi 7201 或独立 Mac AirPlay 接收器。7202 + 配套 App 的 BLE 配对仍是另一条实验路径，不能与 BLE HID 混为一谈。
+3. **iOS 目标 16.7+。** 不装 Handsy iOS App，不用 TestFlight，不越狱，不开开发者模式。板载接收器需按机型、系统、网络验证兼容性；Mac UxPlay 路径已有真机画面记录。`SCREEN_BACKEND=uxplay` 需要已有 UxPlay 和 GStreamer runtime；Windows 保留板载后端。这些局部实测不构成所有 iOS 版本或长时间自治任务的兼容承诺。
 4. **许可证拆开。** `hardware/` 里的固件链接了 GPL-3.0 的 AirPlay 代码，固件源码与固件二进制按 GPL-3.0 分发，保留 `src/airplay/LICENSE-GPL.md` 和各文件头。`server/`、`scripts/`、`skills/`、`docs/` 是独立程序，只通过串口和 TCP 与固件说话，按 MIT 分发，保留 Kz-Aven 与 Henry Yuan 的版权声明。根目录 `NOTICE` 说明边界。
 5. **小白不装 arduino-cli。** GitHub Actions 用报告里已编译通过的 FQBN 打出 N16R8 的 `merged.bin`。日常刷机是 `esptool`（pip）一键脚本，按 VID 自动找 COM 口：沁恒 `0x1A86`、FTDI `0x0403`、CP210x `0x10C4`；不会去认乐鑫原生 USB（`0x303A`）。想改固件的人仍可从源码编译。
 6. **微信群自动回复是第二阶段，不挡住核心。** 按 seven 的选择，发送是全自动的：代码里没有草稿、没有人工确认弹窗。回复内容只受 `skills/wechat-group-reply/SKILL.md` 约束。系统级熔断另算，而且不能被 skill 关掉：见到「操作频繁 / 风控 / 验证码」立刻停、不重试；有频率上限；只有调用方声明屏幕上出现了完整的新气泡，才把这一次计为发送成功。微信逻辑不进核心服务，skill 可插拔。
@@ -46,7 +45,7 @@ Kz-Aven 的 `hid_bridge.ino` 把 Wi-Fi 名、密码和电脑 IP 写进 `secrets.
 - NVS 里的 AP/STA（`netcfg.cpp`），串口 `0 net` 可改，不必重烧
 - 串口与 App 同一套 `<id> <command>`（`hid_bridge.ino` 的 `loop`）
 
-本仓库把 Handsy `5a4fddf` 的 `hardware/hid_bridge` 原样引进，**不改协议**。产品默认的 STA 由电脑在第一次配网时写入 NVS；固件里 `mode` 的出厂缺省仍是 `ap`（`netcfg.cpp` 的 `prefs.getString("mode", "ap")`），没有 SSID 时也会退回 AP。这是为了让“还没配过网的板子”能启动。配过一次之后 NVS 记住 STA，重启不用再烧。
+固件初始基线来自 Handsy `5a4fddf` 的 `hardware/hid_bridge`，保留 `<id> <cmd>` 串口命令帧，后续加入 BLE HID 与传输稳定性改动。产品默认的 STA 由电脑在第一次配网时写入 NVS；固件里 `mode` 的出厂缺省仍是 `ap`（`netcfg.cpp` 的 `prefs.getString("mode", "ap")`），没有 SSID 时也会退回 AP。这是为了让“还没配过网的板子”能启动。配过一次之后 NVS 记住 STA，重启不用再烧。
 
 N16R8 的编译参数用可行性报告里已经编过的这一条，而不是 spec 草稿里的 `CDCOnBoot=cdc` + `PartitionScheme=default_16MB`：
 
@@ -61,18 +60,32 @@ esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=default,FlashSize=16M,PSRAM=opi,Pa
 
 ### 电脑端以 Kz-Aven 为底
 
-保留 `server/hidagent` 的工具面：`iphone_status`、`iphone_observe` / `iphone_screenshot`、`iphone_point` / `iphone_tap`、`iphone_swipe` / `iphone_scroll`、`iphone_type`、`iphone_compose_chinese`、`iphone_key`、`iphone_home` / `iphone_back`、`iphone_calibrate`，以及 `task_status`、`stop_task`、`iphone_model_help`。`delegate_task` 仍要 `IPHONE_MCP_ENABLE_DELEGATE=1` 才出现。
+保留 `server/hidagent` 的工具面：状态、观察、指针、点击、滑动、滚动、输入、拼音、按键、主屏幕、返回和校准。新增能力查询、文字定位、路径、圆形、长按、双击与 App 搜索；具体名称和限制由 `iphone_capabilities` 给出。App 搜索只展示结果，不代表 App 已打开，宿主必须观察后再选择。`delegate_task` 仍要 `IPHONE_MCP_ENABLE_DELEGATE=1` 才出现。
 
 `iphone_compose_chinese` 继续只负责把 1–60 个汉字打成拼音、不选词、不发送。选词和发送是后面的独立工具调用，方便对着截图核对。
 
-改掉的只有传输层：
+最初适配替换了以下传输层，后续补充了观察校验与独立接收器：
 
 | 原 Kz-Aven | 本仓库 |
 |---|---|
 | 板子作为 TCP 客户端连电脑的 7300，回复裸的 `ok` | 电脑打开 COM 口，发送 `<id> <cmd>\n`，读 `<id> ok` 或 `<id> err …` |
-| `screen.py` 拉起 UxPlay + GStreamer，`pass_fds` 只在 Unix 上存在 | `video7201.py` 连板子 7201，PyAV 解码，pip wheel，三个操作系统都能装 |
+| `screen.py` 拉起 UxPlay + GStreamer，`pass_fds` 只在 Unix 上存在 | 板载路径用 `video7201.py` + PyAV；Mac 路径把 UxPlay 放到独立 receiver，worker 只订阅画面 |
 
 `Phone`、`Controls`、校准和 `screen_id` 单次有效这些语义不动，所以原来的测试大部分可以留着。
+
+### 持久启动与独立接收器
+
+Unix 入口 `scripts/run_server.py` 调用仓库中的 `hidagent.local_runtime`，不依赖临时目录启动脚本。`start` 启动独立 receiver 和受管理的 worker，`restart-worker` 只替换 worker，`stop` 才停止两者。Windows 入口仍运行原生前台 worker，不导入依赖 `fcntl` 的 Unix 管理模块。配置与校准默认存于 `server/.local-data`，已有本地 UxPlay runtime 的可执行文件、插件与 scanner 路径由启动器发现。详细命令与配置位置见 [docs/RUNTIME.md](docs/RUNTIME.md)。
+
+receiver 的 Unix socket 仅允许当前用户访问。响应包含 daemon 实例、画面代际和原始帧时间；重复读取不刷新时间，接收器重启或已观察到的断连会使旧操作凭据失效。worker 关闭不终止 receiver。macOS 上不能仅凭 UxPlay 进程存在推断手机不断线，动作仍须通过新鲜画面与目标校验。
+
+已在真机检查 worker 重启前后 receiver 身份不变且画面仍在线。复查步骤如下，不应只比较网页 HTTP 200：
+
+1. iPhone 连接「ESP32 Agent Mac」，运行 `./scripts/run-local.sh status`，记录 receiver 的 `pid`、`instance` 以及 worker 的 `screen` 状态。
+2. 运行 `./scripts/run-local.sh restart-worker`，再运行 `status`，比较 receiver 的两个身份字段保持一致。
+3. 在手机切换一个可见页面，确认网页显示新的内容，调用 `iphone_observe` 得到新观察后再执行动作。重启前的 `screen_id` 不继续使用。
+
+该验证只说明 worker 与接收器已分离，不证明连续自主任务已经完成。宿主 MCP/CLI 路径不需要服务端 LLM Key；自定义 DeepSeek 等模型只用于可选的网页模型任务。
 
 ### 为什么不让电脑去连板子热点
 
@@ -100,7 +113,7 @@ STA 的限制也写清楚：路由器要有 2.4GHz；不能开 AP 隔离或访�
 
 鼠标、键盘、地球键（切换输入法，用量 0x029D）是同一个 HID 服务，和原来的 GATT 共用一个广播。Wi-Fi、AirPlay 和 BLE 共用一块射频。连接间隔保持在建链时的 15 ms，不再为手势改短或改长，避免把同一条链上的画面拖慢。蓝牙报告比 USB 少、步子更大（pace 4，USB 仍是 pace 3），并且要等上一包 HID 归还缓冲、同时给视频留出 16 块 mbuf。电脑发现 pace 数字变了会丢掉旧校准。
 
-这一节描述的是固件和电脑端的行为。蓝牙 HID 还没有在真 iPhone 上验证。
+BLE HID 已在真 iPhone 上验证输入；指针纠偏、小目标点击、中文候选选择和连续操作仍需逐项验收。相对鼠标只有一个指针，不提供原生多指触控。
 
 蓝牙配对默认关闭。固件不再在每次上电后的 3 分钟里接受没有密码的 Just Works 配对，否则旁边的设备可以读到 Wi-Fi 密码、vtok，并发 HID 或用 vtok 做 OTA。需要实验 BLE / 7202 时，在 COM 口发送 `0 ble pair on`，窗口 60 秒，`0 ble pair off` 可以提前关掉。已经绑定过的设备仍可重连。日常控制不需要这一步。
 
@@ -131,16 +144,16 @@ Windows 10/11 上的运行时是：官方 Python 3.10+、PowerShell、pip wheel�
 
 服务默认只听 `127.0.0.1:8890`，本机防火墙通常不用为 8890 开入站。7201 是电脑主动连板子，属于出站。启动脚本会用中文提醒：如果系统弹出 Python 联网提示，选择允许专用网络出站。
 
-### 速度：少调模型，而不是把帧率拉高
+### 速度：分别测量定位、镜像与模型
 
-慢的主要原因是每一步都要等视觉模型看图，不是 USB 或 Wi-Fi。本仓库落地四件事：
+一次操作包括宿主看图决策、指针定位与纠偏、HID 发送、等待镜像及核验。返回的 `timing_ms` 可区分这些阶段；不能把等待旧画面或定位失败归因于模型。本仓库提供以下减少重复工作的机制：
 
-1. **一次观察、多步动作。** 新增 `iphone_batch`：同一个 `screen_id` 上连续执行最多 8 个不依赖新画面的动作（点输入框、打拼音、按一个编辑键），最后只回一张图。Kz 的内置 actor 本来就可以在一条回复里给多行 `DO`，这条保留。选词、发送这种“必须先看见结果”的步骤不要放进同一次 batch。
+1. **一次观察、受限多步。** `iphone_batch` 最多 8 步，不允许跨页面盲续。前一步点击未验证、上下文改变或没有新画面会停止；输入和按键必须基于独立观察，不能跟在点击之后假定焦点正确。选词、输入、发送分步核对。一次按键动作自身支持重复编辑键，可减少不必要的往返。
 2. **固定界面用坐标，不每次全屏找按钮。** `skills/*/layout.json` 提供命名坐标（0..1）。核心只提供通用的 `iphone_layouts` / `iphone_layout_tap`，微信坐标放在 skill 目录，不写进 `phone.py`。可选的区域模板用 Pillow 做差异比较；真要认字，默认仍是宿主 Agent 看截图。不把 PaddleOCR / Tesseract 装进必选依赖，否则 Windows 小白的安装会失败。
 3. **截图复用。** 沿用 `screen_id`：30 秒、单次有效，画面变了就作废。动作返回的新图既核对上一步，也作为下一步的 `screen_id`。板子出厂默认 5 fps（NVS 里 `fps` 的缺省）。电脑端把交给模型的帧上限默认收在 8，对应 `VIDEO_FPS`（`screen.py` 的缺省）；要改再设这个环境变量。
-4. **模型可换。** 默认路径是宿主 Agent 自己的视觉模型，MCP 不需要额外的 key。若启用服务端回退（`IPHONE_MCP_ENABLE_DELEGATE=1`），`LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` 是任何 OpenAI 兼容接口。换一个更快的视觉模型，是提速最直接的办法。
+4. **模型可换。** 默认路径是宿主 Agent 自己的视觉模型，MCP 不需要额外的 key。若启用服务端回退（`IPHONE_MCP_ENABLE_DELEGATE=1`），可配置 `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`。更快的模型仅改善模型决策阶段，不能修复画面或指针链路。
 
-诚实的耗时预期（不是本仓库的真机测量；Kz-Aven 在 Mac 上的局部记录是指针定位中位数大约 5 秒）：短回复大约 30–60 秒，长回复更久。群里几十条未读不要指望一次回完。不要写“秒回”或“实时”。
+目前没有覆盖机型、网络和连续任务的稳定耗时基准。以实际返回的分阶段时间和任务完成证据判断性能，不把连接成功、串口 ACK 或画面改变写成任务完成。
 
 ### 微信：skill 管内容，代码管熔断
 
@@ -162,7 +175,7 @@ Windows 10/11 上的运行时是：官方 Python 3.10+、PowerShell、pip wheel�
 1. 安装 Python 3.10+（Windows 用 python.org 的安装包，勾选 PATH），运行 `setup`。
 2. COM 口插电脑，运行 `flash`（esptool 写入 CI 打好的 merged.bin）。
 3. 运行 `wifi`，把家里的 2.4GHz 名称和密码经串口写进 NVS。
-4. USB 口经数据线（Lightning 手机要用相机转换器）接 iPhone，打开辅助触控，屏幕镜像选 “ESP32 Agent”。运行 `run-server`，打开 `http://127.0.0.1:8890`，先等 device 和 screen 变绿，再校准，第三盏灯随后才绿。
+4. 手机用 USB 或已配对 BLE HID，打开辅助触控。运行服务，屏幕镜像选择网页提示的接收器：板载是 “ESP32 Agent”，Mac 是 “ESP32 Agent Mac”。打开 `http://127.0.0.1:8890`，先等 device 和 screen 变绿，再校准。
 5. 运行 `mcp-config`，把片段贴进 Agent，让它把指针移到屏幕中央并停住，不要只看 ACK。
 
 每一步失败都走中文错误，带下一步，不把 traceback 甩给用户。网页上 `device` / `screen` / `calibrated` 三个灯常亮，缺一个就显示缺什么、怎么修。
@@ -177,7 +190,7 @@ iPhone 11 Pro 是 Lightning，要“Lightning 转 USB 相机转换器”，手�
 hardware/hid_bridge/     Handsy 固件（GPL-3.0 整体，因为链接 airplay）
 hardware/tests/          固件里纯 C 模块的主机测试
 hardware/flash.sh|.ps1   开发者编译，以及转给 scripts/flash.py 的刷机入口
-server/hidagent/         MIT。device=串口，screen=7201，另有 video7201、guard、layouts
+server/hidagent/         MIT。串口控制、板载7201、Mac receiver、worker、guard、layouts
 server/tests/
 scripts/                 跨平台 Python 入口；.sh / .ps1 只负责调用它们
 skills/                  可插拔 skill。微信群回复在这里，不在核心里
@@ -187,8 +200,8 @@ docs/                    中文。macOS 与 Windows 分开写
 
 ## 已知做不到或还没测的
 
-- 没有在真 iPhone、真 N16R8、真 Windows 桌面上跑通过。蓝牙 HID 同样没有真机记录：配对、重启重连、指针加速、中文输入、和 AirPlay 共用射频，都要在真 iPhone 上再做一遍。CI 能证明的是：固件能编译、PyAV 能解我们自己生成的 7201 分帧、串口协议能在假串口上往返、传输选择和错误字符串能在主机测试里跑通、MCP stdio 能列出并调用工具、PowerShell 脚本能在 `windows-latest` 上解析并跑到 `--help`。
+- ESP32 BLE + Mac AirPlay 有真机输入与画面记录，worker 重启保留镜像已验证；连续自主导航、绘图、中文输入和长期稳定性仍需完整验收，Windows 真机全链路结果也不能由 Mac 推定。CI 的编译、模拟串口、视频解码、MCP stdio 与脚本帮助检查不替代这些验收。
 - 锁屏、密码、Apple Pay、DRM 画面不会出现在镜像里。镜像停止后要解锁并重新选一次屏幕镜像。
-- `type` 只接受可打印 ASCII。中文走拼音和候选词，emoji 打不了。
+- 未配置剪贴板伴随流程时，`type` 使用可打印 ASCII 键盘输入，中文需拼音与候选词。配置后的粘贴支持范围及确认流程见 [docs/PASTE_INPUT.md](docs/PASTE_INPUT.md)，HID 本身没有剪贴板通道。
 - 横屏不支持。指针是相对坐标，靠校准和偶尔 `home` 消除漂移；Home 键机型的底部上滑不一定回主屏幕，需要辅助触控。
 - 预编译固件是某个 commit 的产物。改了 `hardware/hid_bridge` 却没有新的 CI 产物时，刷机脚本会拒绝使用过期的 bin，并告诉你怎么编译。

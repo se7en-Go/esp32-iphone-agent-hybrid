@@ -98,6 +98,18 @@ def test_precise_tap_flag():
     assert "precise" not in parse_command("tap 120 640")
 
 
+def test_parse_tap_with_observed_control_box():
+    assert parse_command('tap {"x":120,"y":640,"box":[80,610,200,660]}') == {
+        "action": "tap", "x": 120, "y": 640, "box": [80, 610, 200, 660],
+    }
+
+
+@pytest.mark.parametrize("box", ["[]", "[120,610,200,660]", "[80,610,200,1001]", "[80,610,200,660.0]"])
+def test_invalid_tap_box_is_rejected(box):
+    with pytest.raises(ValueError, match="inside"):
+        parse_command('tap {"x":120,"y":640,"box":' + box + '}')
+
+
 def test_agent_resumes_real_key_command_after_device_reconnects(tmp_path, monkeypatch):
     import asyncio
 

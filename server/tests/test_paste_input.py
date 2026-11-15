@@ -78,13 +78,41 @@ def test_missing_clipboard_or_ascii_limit_explains_setup(tmp_path, text, mode, c
     assert device.sent == []
 
 
-@pytest.mark.parametrize("text", ["", "x" * 4001, "hello\nkey enter", "\x00", "\x7f", "\x85", "\ud800"])
+@pytest.mark.parametrize("text", ["", "x" * 4001, "\x00", "\x7f", "\x85", "\ud800"])
 def test_invalid_text_never_reaches_clipboard_or_hid(tmp_path, text):
     device, clipboard = Device(), Clipboard()
     phone = Phone(device, tmp_path / "cal.json", clipboard=clipboard)
     with pytest.raises(DeviceError):
         asyncio.run(phone.type(text))
     assert not clipboard.copied and not device.sent
+
+
+@pytest.mark.parametrize("mode", ["paste", "auto"])
+def test_paste_preserves_multiline_text_and_tabs_without_pressing_enter(tmp_path, mode):
+    device, clipboard = Device(), Clipboard()
+    phone = Phone(device, tmp_path / "cal.json", clipboard=clipboard)
+    text = " 00123\t中文\r\n第二行\nkey enter\r末行 "
+    asyncio.run(phone.type(text, mode=mode))
+    assert clipboard.copied == [text]
+    assert device.sent == ["key cmd+v"]
+
+
+@pytest.mark.parametrize("mode,configured", [("keys", False), ("keys", True), ("auto", False)])
+@pytest.mark.parametrize("separator", ["\n", "\r", "\t"])
+def test_keys_reject_line_breaks_and_tabs_before_any_hid_write(tmp_path, mode, configured, separator):
+    device, clipboard = Device(), Clipboard()
+    phone = Phone(device, tmp_path / "cal.json", clipboard=clipboard if configured else None)
+    with pytest.raises(DeviceError, match="控制字符"):
+        asyncio.run(phone.type("first" + separator + "second", mode=mode))
+    assert not clipboard.copied and not device.sent
+
+
+@pytest.mark.parametrize("mode", ["keys", "paste", "auto"])
+@pytest.mark.parametrize("control", ["\x00", "\x01", "\x0b", "\x0c", "\x1b", "\x7f", "\x80", "\x85", "\x9f",
+                                     "\ud800", "\udfff", "\u2028", "\u2029"])
+def test_all_input_modes_reject_other_controls_and_surrogates(mode, control):
+    with pytest.raises(ValueError, match="控制字符"):
+        select_type_mode("text" + control, mode, clipboard_available=True)
 
 
 @pytest.mark.parametrize("text,mode", [("你好，123 👩‍💻", "auto"), ("13267179555", "auto"), ("中文", "paste")])

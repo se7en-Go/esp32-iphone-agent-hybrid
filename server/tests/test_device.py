@@ -90,6 +90,45 @@ def test_send_without_board_fails_fast():
         asyncio.run(Device().send("ping"))
 
 
+def test_status_clock_sample_is_bounded_by_serial_exchange_and_cleared_on_reconnect():
+    async def scenario():
+        device = Device()
+        link = MemoryLink()
+        device.attach(link)
+        pending = asyncio.create_task(device.refresh_hid_status())
+        before_write = time.monotonic()
+        assert await link.commands.get() == b"0 status\n"
+        before_reply = time.monotonic()
+        link.replies.put_nowait(b'0 {"up":4912,"hid":{"pace":4}}\n')
+        await pending
+
+        uptime, sent, received = device.board_clock_sample
+        assert uptime == 4912
+        assert before_write <= sent <= before_reply <= received <= time.monotonic()
+        device.attach(MemoryLink())
+        assert device.board_clock_sample is None
+        assert device.board_status == {}
+        device.close()
+
+    asyncio.run(scenario())
+
+
+def test_missing_hid_transport_does_not_look_like_a_switch_to_usb():
+    async def scenario():
+        device = Device()
+        link = MemoryLink()
+        device.attach(link)
+        for path, reported, expected in (("ble", 4, 4), ("none", 3, 4), ("usb", 3, 3)):
+            pending = asyncio.create_task(device.refresh_hid_status())
+            assert await link.commands.get() == b"0 status\n"
+            link.replies.put_nowait(f'0 {{"hid":{{"path":"{path}","pace":{reported}}}}}\n'.encode())
+            await pending
+            assert device.pace_version == expected
+        device.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("method", ["wait_connected", "keep_awake"])
 def test_device_exposes_connection_lifecycle_methods(method):
     assert callable(getattr(Device(), method, None)), f"Device.{method} is missing"

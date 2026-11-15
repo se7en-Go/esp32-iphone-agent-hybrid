@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw
 from hidagent import assistive
 from hidagent.device import DeviceError
 from hidagent.phone import Phone
+from hidagent.text_target import PointerLandingError, TargetChangedError
 
 
 def app_frame(*, home=False, clock=False, pointer=False):
@@ -72,6 +73,13 @@ def make_phone(tmp_path, device, screen=None, *, calibrated=True):
     phone = Phone(device, tmp_path / "calibration.json", screen)
     if calibrated:
         phone.span = {"w": 360, "h": 780}
+
+    async def measured_pointer(near, **kwargs):
+        # These tests isolate route selection, ACKs and Home recognition; cursor
+        # detection is covered separately with real/synthetic image fixtures.
+        return near
+
+    phone._find_pointer = measured_pointer
     return phone
 
 
@@ -107,6 +115,25 @@ def test_unsupported_consumer_home_continues_to_keyboard(tmp_path):
         asyncio.run(phone.go_home())
 
     assert device.sent[-2:] == ["homescreen", "key cmd+h"]
+
+
+@pytest.mark.parametrize("error", [PointerLandingError, TargetChangedError])
+def test_confirmed_no_pointer_click_can_use_consumer_home(tmp_path, monkeypatch, error):
+    screen = Screen()
+
+    def change_screen(command):
+        if command == "homescreen":
+            asyncio.get_running_loop().call_soon(screen.show, app_frame(home=True))
+
+    device = Device(change_screen)
+    phone = make_phone(tmp_path, device, screen)
+
+    async def rejected(*args):
+        raise error("pointer target could not be verified before sending")
+
+    monkeypatch.setattr(phone.assistive_touch, "_assistive_home", rejected)
+    asyncio.run(phone.go_home())
+    assert device.sent == ["homescreen"]
 
 
 @pytest.mark.parametrize("successful_command", ["release", "homescreen", "key cmd+h"])
@@ -191,22 +218,104 @@ def test_cancellation_does_not_trigger_another_fallback(tmp_path):
     assert device.sent == ["homescreen"]
 
 
-def test_known_assistive_route_is_not_followed_by_hid_fallbacks(tmp_path):
-    device = Device()
+@pytest.mark.parametrize("error", [None, PointerLandingError, TargetChangedError])
+def test_known_assistive_failure_uses_visually_verified_fallback(tmp_path, monkeypatch, error):
     screen = Screen()
-    phone = make_phone(tmp_path, device, screen)
+
+    def change_screen(command):
+        if command == "homescreen":
+            asyncio.get_running_loop().call_soon(screen.show, app_frame(home=True))
+
+    device = Device(change_screen)
+    phone = make_phone(tmp_path, device, screen, calibrated=False)
     phone.assistive_touch._saved["verified_route"] = "assistive-touch"
     phone.assistive_touch._write_profile()
-    reloaded = make_phone(tmp_path, Device(), Screen())
-    assert reloaded.assistive_touch._saved["verified_route"] == "assistive-touch"
+    attempts = []
 
-    for _ in range(2):
-        with pytest.raises(RuntimeError, match="辅助触控"):
-            asyncio.run(phone.go_home())
+    async def unavailable(epoch):
+        attempts.append("assistive-touch")
+        if error is not None:
+            raise error("pointer target could not be verified before sending")
+        return False
+
+    monkeypatch.setattr(phone.assistive_touch, "_assistive_home", unavailable)
+    asyncio.run(phone.go_home())
+    assert attempts == ["assistive-touch"]
+    assert device.sent == ["homescreen"]
+    assert json.loads(phone.assistive_touch.path.read_text())["verified_route"] == "homescreen"
+
+
+def test_saved_keyboard_route_runs_before_pointer_routes(tmp_path, monkeypatch):
+    screen = Screen()
+
+    def change_screen(command):
+        if command == "key cmd+h":
+            asyncio.get_running_loop().call_soon(screen.show, app_frame(home=True))
+
+    device = Device(change_screen)
+    phone = make_phone(tmp_path, device, screen)
+    phone.assistive_touch._saved["verified_route"] = "cmd+h"
+    phone.assistive_touch._write_profile()
+    phone = make_phone(tmp_path, device, screen)
+
+    async def unnecessary_pointer_route(epoch):
+        pytest.fail("saved keyboard route must run before a pointer route")
+
+    monkeypatch.setattr(phone.assistive_touch, "_assistive_home", unnecessary_pointer_route)
+    asyncio.run(phone.go_home())
+    assert device.sent == ["key cmd+h"]
+
+
+def test_saved_route_ack_without_home_does_not_count_as_success(tmp_path):
+    device = Device()
+    phone = make_phone(tmp_path, device, Screen(), calibrated=False)
+    phone.assistive_touch._saved["verified_route"] = "homescreen"
+    with pytest.raises(RuntimeError, match="未确认主屏幕"):
+        asyncio.run(phone.go_home())
+    assert device.sent == ["homescreen", "key cmd+h"]
+
+
+def test_already_home_is_idempotent_without_sending_hid(tmp_path, monkeypatch):
+    screen = Screen()
+    screen.show(app_frame(home=True))
+    device = Device()
+    phone = make_phone(tmp_path, device, screen)
+
+    async def unnecessary_pointer_route(epoch):
+        pytest.fail("already on Home; should not touch the AssistiveTouch menu")
+
+    monkeypatch.setattr(phone.assistive_touch, "_assistive_home", unnecessary_pointer_route)
+    asyncio.run(phone.go_home())
     assert device.sent == []
 
+
+def test_reset_routes_forgets_saved_preference(tmp_path):
+    phone = make_phone(tmp_path, Device(), Screen())
+    phone.assistive_touch._set_verified_route("homescreen")
     phone.assistive_touch.reset_routes()
     assert "verified_route" not in json.loads(phone.assistive_touch.path.read_text())
-    with pytest.raises(RuntimeError, match="未确认"):
-        asyncio.run(phone.go_home())
-    assert "homescreen" in device.sent and "key cmd+h" in device.sent
+
+
+def test_already_open_menu_uses_visible_home_icon_before_saved_key_route(tmp_path, monkeypatch):
+    from test_assistive_vision import panel_frame
+
+    screen = Screen()
+    screen.show(panel_frame(home_y=.74))
+    device = Device()
+    phone = make_phone(tmp_path, device, screen)
+    phone.assistive_touch._saved["verified_route"] = "cmd+h"
+    taps = []
+
+    async def tap(x, y, *, target_box=None, target_frame=None, before_click=None, navigation_context=None):
+        before_click()
+        navigation_context.validate_target(target_frame, getattr(screen, "generation", 0), (x, y))
+        taps.append((x, y, target_box, target_frame))
+        assert target_box[0] < x < target_box[2] and target_box[1] < y < target_box[3]
+        since = time.time()
+        asyncio.get_running_loop().call_soon(screen.show, app_frame(home=True))
+        return since
+
+    monkeypatch.setattr(phone, "tap", tap)
+    asyncio.run(phone.go_home())
+    assert len(taps) == 1 and not device.sent
+    assert phone.assistive_touch._saved["verified_route"] == "assistive-touch"

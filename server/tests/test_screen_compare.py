@@ -1,14 +1,88 @@
 import io
+import math
 import time
 from pathlib import Path
 
 import pytest
 from PIL import Image, ImageDraw
 
-from hidagent.screen_compare import effect_changed, observation_changed
+from hidagent.screen_compare import cursor_overlay_pair, effect_changed, observation_changed
 
 FIXTURES = Path(__file__).parent / "fixtures" / "ios26"
 SIZE = (720, 1560)
+
+
+def test_overlay_pair_tracks_a_cursor_over_icon_detail_and_rejects_edit_elsewhere():
+    reference = Image.new("RGB", (500, 1080), (220, 55, 202))
+    draw = ImageDraw.Draw(reference)
+    draw.rounded_rectangle((240, 578, 328, 663), radius=19, fill=(161, 161, 161))
+    for i in range(7):
+        draw.ellipse((247 + 4*i, 585 + 4*i, 320 - 4*i, 657 - 4*i), outline=(20, 22, 28), width=2)
+    draw.ellipse((368, 705, 392, 729), fill=(130, 46, 122))
+
+    def take(image, x=None, changed=False):
+        image = image.copy()
+        if x is not None:
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((367, 704, 393, 730), fill=(220, 55, 202))
+            overlay = Image.new("RGBA", image.size)
+            ImageDraw.Draw(overlay).ellipse((x-12, 608, x+12, 632), fill=(235, 235, 235, 100))
+            image = Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
+        if changed:
+            ImageDraw.Draw(image).rectangle((347, 587, 374, 621), fill="black")
+        out = io.BytesIO()
+        image.save(out, "JPEG", quality=84)
+        return out.getvalue()
+
+    baseline, outward, returned = take(reference), take(reference, 300), take(reference, 287)
+
+    def match(frame, reference_pointer=(.76, .665)):
+        return cursor_overlay_pair(baseline, outward, frame, (.575, .57), -13/500, (.20, .12),
+                                   reference_pointer=reference_pointer)
+
+    found = match(returned)
+    assert found is not None
+    assert found[1] == pytest.approx((287/500, 620/1080), abs=.006)
+    inferred = match(returned, reference_pointer=None)
+    assert inferred is not None
+    assert inferred[1] == pytest.approx(found[1], abs=.006)
+    assert match(outward) is None
+    assert match(take(reference, 287, changed=True)) is None
+    assert match(take(reference, 287, changed=True), reference_pointer=None) is None
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_vertical_overlay_pair_at_pen_control(changed):
+    width, height = 500, 1080
+    x, outward_y, landed_y = 38, 984, 1006
+    board = Image.new("RGB", (width, height), (249, 249, 249))
+    controls = ImageDraw.Draw(board)
+    controls.ellipse((20, 988, 56, 1024), fill=(42, 143, 182))
+    controls.line((31, 1013, 45, 999), fill="white", width=4)
+
+    def jpeg(pointer_y=None, *, changed=False):
+        frame = board.copy()
+        if pointer_y is not None:
+            pointer = Image.new("RGBA", frame.size)
+            ImageDraw.Draw(pointer).ellipse((x - 12, pointer_y - 12, x + 12, pointer_y + 12),
+                                           fill=(110, 110, 110, 120))
+            frame = Image.alpha_composite(frame.convert("RGBA"), pointer).convert("RGB")
+        if changed:
+            ImageDraw.Draw(frame).rectangle((112, 970, 129, 993), fill=(22, 24, 26))
+        buffer = io.BytesIO()
+        frame.save(buffer, "JPEG", quality=84)
+        return buffer.getvalue()
+
+    target = (x / width, landed_y / height)
+    found = cursor_overlay_pair(jpeg(), jpeg(outward_y), jpeg(landed_y, changed=changed), target,
+                                (landed_y - outward_y) / height, (.2, .12),
+                                axis=1, reference_pointer=None)
+    if changed:
+        assert found is None
+    else:
+        assert found is not None
+        assert found[0] == pytest.approx((x / width, outward_y / height), abs=.006)
+        assert found[1] == pytest.approx(target, abs=.006)
 
 
 def picture(*, pointers=(), clock=False, panel=False, check=False, color=(30, 40, 50)):
@@ -27,10 +101,105 @@ def picture(*, pointers=(), clock=False, panel=False, check=False, color=(30, 40
     return buffer.getvalue()
 
 
+def test_overlay_pair_preserves_departure_evidence_at_the_status_bar_boundary():
+    width, height = SIZE
+    original = (70, 89)
+    outbound = (150, 138)
+    landing = (128, 138)
+    baseline = picture(pointers=(original,))
+    outward = picture(pointers=(outbound,))
+
+    def match(frame):
+        return cursor_overlay_pair(baseline, outward, frame, (landing[0] / width, landing[1] / height),
+                                   -22 / width, (.15, .09), reference_pointer=None, report_reference=True)
+
+    evidence = match(picture(pointers=(landing,)))
+    assert evidence is not None
+    pair, departed = evidence
+    assert pair[1] == pytest.approx((landing[0] / width, landing[1] / height), abs=.003)
+    assert departed == pytest.approx((original[0] / width, original[1] / height), abs=.003)
+    assert match(picture(pointers=(landing,), check=True)) is None
+
+
 def test_status_clock_does_not_invalidate_observation_or_prove_a_click():
     before, after = picture(), picture(clock=True)
     assert not observation_changed(before, after)
     assert not effect_changed(before, after)
+
+
+def clock_icon(*, center=(600, 545), second=0.1, minute=0.32, dark_tile=True,
+               edit=None, fragmented=False, chroma_halo=False):
+    image = Image.new("RGB", SIZE, (186, 103, 56))
+    draw = ImageDraw.Draw(image)
+    x, y = center
+    if dark_tile:
+        draw.rounded_rectangle((x - 58, y - 58, x + 58, y + 58), radius=16, fill=(22, 22, 22))
+    draw.ellipse((x - 50, y - 50, x + 50, y + 50), fill=(249, 249, 249))
+
+    def end(angle, length):
+        return x + math.cos(angle) * length, y + math.sin(angle) * length
+
+    for i in range(12):
+        px, py = end(i * math.tau / 12, 43)
+        draw.ellipse((px - 2, py - 2, px + 2, py + 2), fill=(24, 24, 24))
+    draw.line((center, end(-1.0, 27)), fill=(20, 20, 20), width=6)
+    draw.line((center, end(minute, 45)), fill=(20, 20, 20), width=5)
+    def draw_second_hand(start, stop):
+        draw.line((end(second, start), end(second, stop)), fill=(240, 112, 35), width=4)
+
+    if chroma_halo:
+        draw.line((end(second, 27), end(second, 45)), fill=(236, 220, 183), width=22)
+    if fragmented:
+        draw_second_hand(-6, 17)
+        draw_second_hand(25, 46)
+    else:
+        draw_second_hand(-6, 46)
+    if edit == "inside":
+        draw.rectangle((x - 32, y + 14, x - 21, y + 23), fill=(25, 25, 25))
+    if edit == "nearby":
+        draw.rectangle((x - 79, y + 14, x - 69, y + 24), fill=(40, 40, 40))
+    if edit == "colored":
+        draw.rectangle((x - 22, y - 30, x - 15, y - 23), fill=(225, 20, 70))
+    buffer = io.BytesIO()
+    image.save(buffer, "JPEG", quality=75)
+    return buffer.getvalue()
+
+
+@pytest.mark.parametrize("center", [(600, 545), (180, 1050)])
+def test_home_clock_tick_does_not_invalidate_observation_or_prove_a_click(center):
+    before = clock_icon(center=center, second=-2.2, minute=.31)
+    after = clock_icon(center=center, second=-.9, minute=.33)
+    assert not observation_changed(before, after)
+    assert not effect_changed(before, after)
+
+
+@pytest.mark.parametrize("edit", [None, "inside", "nearby", "colored"])
+def test_home_clock_with_fragmented_second_hand_keeps_unrelated_edits_visible(edit):
+    before = clock_icon(second=-2.2)
+    after = clock_icon(second=-.9, fragmented=True, edit=edit)
+    assert observation_changed(before, after) is (edit is not None)
+    assert effect_changed(before, after) is (edit is not None)
+
+
+@pytest.mark.parametrize("edit", [None, "inside", "colored"])
+def test_clock_tip_chroma_halo_preserves_other_dial_changes(edit):
+    before = clock_icon(second=.1)
+    after = clock_icon(second=-.81, chroma_halo=True, edit=edit)
+    assert observation_changed(before, after) is (edit is not None)
+    assert effect_changed(before, after) is (edit is not None)
+
+
+@pytest.mark.parametrize("edit", ["inside", "nearby", "colored"])
+def test_content_edits_remain_visible_when_the_home_clock_ticks(edit):
+    before = clock_icon(second=-2.2)
+    after = clock_icon(second=-.9, edit=edit)
+    assert observation_changed(before, after)
+    assert effect_changed(before, after)
+
+
+def test_moving_analog_icon_or_orange_line_in_non_clock_shape_is_content_change():
+    assert observation_changed(clock_icon(second=-2.2), clock_icon(center=(610, 555), second=-.9))
+    assert observation_changed(clock_icon(second=-2.2, dark_tile=False), clock_icon(second=-.9, dark_tile=False))
 
 
 @pytest.mark.parametrize("before,after", [
