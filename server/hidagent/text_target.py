@@ -1,6 +1,7 @@
 """Recheck an OCR target's visible context immediately before clicking."""
 
 import io
+import math
 
 from PIL import Image, ImageChops, ImageDraw
 
@@ -31,7 +32,7 @@ def _cursor_patch_matches(image, reference, center):
     cx, cy, radius = x * width, y * height, .036 * width
     box = (max(0, int(cx - radius)), max(0, int(cy - radius)),
            min(width, round(cx + radius + 1)), min(height, round(cy + radius + 1)))
-    measured = _image(reference)
+    measured = reference if isinstance(reference, Image.Image) else _image(reference)
     if measured.size != image.size:
         return False
     red, green, blue = ImageChops.difference(measured.crop(box), image.crop(box)).split()
@@ -97,9 +98,10 @@ class TextTargetGuard:
 
         if cursor is not None:
             point, observed = cursor
+            measured = _image(observed)
             # Only suppress the cursor footprint while the write-time crop still
             # matches the frame in which its movement was verified.
-            if not _cursor_patch_matches(after, observed, point):
+            if not _cursor_patch_matches(after, measured, point):
                 return True
             mask_cursor(point)
         if reference is not None:
@@ -139,4 +141,51 @@ class TextTargetGuard:
         for x, y, diameter in old + new:
             radius = diameter / 2 + max(2, width / 180)
             draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=0)
+        if cursor is not None and 24 <= mask.histogram()[255] < 48:
+            self._mask_home_icon_edge_noise(after, mask, cursor[0], measured, delta)
         return mask.histogram()[255] >= 24
+
+    def _mask_home_icon_edge_noise(self, after, mask, point, measured, delta):
+        """A measured Home icon may retain a few stationary JPEG edge specks.
+
+        Keep the original target, label and panel. Neither a blue highlight nor
+        a fresh measurement alone excuses a changed icon or a later edit.
+        """
+        context = self.navigation_context
+        if context is None or context.action != "home" or context.kind != "menu":
+            return
+        left, top, right, bottom = context.target.box
+        if not (left < point[0] < right and top < point[1] < bottom):
+            return
+        width, height = after.size
+        margin = math.ceil(.012 * width)
+        bounds = (math.floor(left*width)-margin, math.floor(top*height)-margin,
+                  math.ceil(right*width)+margin, math.ceil(bottom*height)+margin)
+        panel = tuple(value*(width if index % 2 == 0 else height)
+                      for index, value in enumerate(context.regions[0]))
+        if not (0 <= panel[0] <= bounds[0] < bounds[2] <= panel[2] <= width
+                and 0 <= panel[1] <= bounds[1] < bounds[3] <= panel[3] <= height):
+            return
+        # The original measured cursor crop was checked above. Also retain its
+        # surrounding halo: a new edit outside that circle disables all relief.
+        stationary = ImageChops.difference(measured, after)
+        cx, cy, radius = point[0]*width, point[1]*height, .036*width
+        ImageDraw.Draw(stationary).ellipse((cx-radius, cy-radius, cx+radius, cy+radius), fill=0)
+        if max(high for _, high in stationary.crop(bounds).getextrema()) > 6:
+            return
+        before_luma, after_luma = self.before.convert("L"), after.convert("L")
+        candidates = []
+        # Inspect whole components, never fragments cropped at the icon edge.
+        for component in _regions(mask, 0):
+            if len(component) > 6 or any(not (bounds[0] <= x < bounds[2] and bounds[1] <= y < bounds[3])
+                                         for x, y in component):
+                continue
+            if any(max(delta.getpixel(pixel)) > 40 for pixel in component):
+                continue
+            if any(high-low < 40 for image in (before_luma, after_luma) for x, y in component
+                   for low, high in [image.crop((x-1, y-1, x+2, y+2)).getextrema()]):
+                continue
+            candidates.extend(component)
+        if 0 < len(candidates) <= 24:
+            for pixel in candidates:
+                mask.putpixel(pixel, 0)
