@@ -1262,14 +1262,38 @@ class Phone:
             return ((abs(px - x) <= AIM_TOLERANCE or left + AIM_TOLERANCE < px < right - AIM_TOLERANCE)
                     and (abs(py - y) <= AIM_TOLERANCE or top + AIM_TOLERANCE < py < bottom - AIM_TOLERANCE))
 
+        relative_corrected = False
         for attempt in range(3 if ble else 2):
             if found is None:
                 break
             if on_target(found):
                 self._pointer_confirmed = True
                 return found
-            if attempt >= (2 if paired_ble else 1) or self._pos is None:
+            if attempt >= (2 if paired_ble else 1):
                 break
+            correction_guard = None
+            cursor, reference = self._pointer_overlay, self._pointer_reference
+            if self._pos is None:
+                # A failed probe invalidates the absolute accumulator, even if
+                # a later paired probe recovers the real pointer. One relative
+                # correction needs that measured pose, not an invented origin.
+                if (relative_corrected or not paired_ble or cursor is None or cursor[0] != found
+                        or target_box is None or len(target_box) != 4
+                        or not all(math.isfinite(value) for value in target_box)
+                        or not (0 <= target_box[0] < x < target_box[2] <= 1
+                                and 0 <= target_box[1] < y < target_box[3] <= 1)):
+                    break
+                correction_guard = TextTargetGuard(
+                    self.screen, self._tap_target_frame or observed.frame,
+                    SimpleNamespace(center=(x, y), box=target_box), observation=observed,
+                    navigation_context=self._navigation_context)
+                relative_corrected = True
+
+            def before_correction(guard=correction_guard, cursor=cursor, reference=reference):
+                same_session()
+                if guard is not None:
+                    guard(cursor=cursor, reference=reference)
+
             fx, fy = found
             dx, dy = round((x - fx) * self.span["w"]), round((y - fy) * self.span["h"])
             if not (dx or dy):
@@ -1277,8 +1301,9 @@ class Phone:
             position, self._pos = self._pos, None
             self._position_before, self._position_from = self.screen.frame, found
             self._pointer_overlay = None
-            await self._send(epoch, f"move {dx} {dy}", before_write=same_session)
-            self._pos = (position[0] + dx, position[1] + dy)
+            await self._send(epoch, f"move {dx} {dy}", before_write=before_correction)
+            if position is not None:
+                self._pos = (position[0] + dx, position[1] + dy)
             self._position_completed = time.time()
             if self._tap_blind_allowed and not ble:
                 break
