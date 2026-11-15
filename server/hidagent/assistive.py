@@ -18,6 +18,7 @@ from . import assistive_vision
 from .device import DeviceError
 from .freshness import fresh_frame, require_fresh, snapshot
 from .navigation_context import NavigationContext, from_navigation
+from .operation import remaining_operation_time
 from .text_target import PointerLandingError, TargetChangedError
 
 log = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ DEFAULT_LAYOUT = {"home": (0.5, 0.82)}
 MENU_WAIT = 3.0
 RESULT_WAIT = 3.0
 STABLE_QUIET = 0.2
+LATE_HOME_WAIT = 3.2
 
 
 def _point(value) -> Point:
@@ -267,6 +269,7 @@ class AssistiveTouch:
 
     async def _menu_home(self, epoch: int, menu: bytes, panel, *, observation=None, navigation_context=None) -> bool:
         device = self.phone.device
+        link = getattr(device, "links", 0)
         if self._home_link is None:
             self._home_link, self._home_epoch = getattr(self.phone.device, "links", 0), epoch
         self._check(epoch)
@@ -289,6 +292,7 @@ class AssistiveTouch:
                     and assistive_vision.is_home_screen(frame))
 
         verified = await self._wait(epoch, since, RESULT_WAIT, arrived, stable=True)
+        refreshed = False
         if not verified and fresh_frame(self.phone.screen, clock=self._clock, since=since) is None:
             candidate = snapshot(self.phone.screen)
             ensure = getattr(self.phone, "ensure_observation", None)
@@ -308,10 +312,29 @@ class AssistiveTouch:
 
                 # An early Home frame can arrive inside the mirror allowance
                 # and then stop updating. Reacquire once; never click it again.
+                refreshed = True
                 await ensure(before_refresh=home_candidate)
                 home_candidate()
                 verified = await self._wait(epoch, since, RESULT_WAIT, arrived, stable=True)
                 home_candidate()
+        if not verified and not refreshed:
+            def same_confirmation():
+                self.phone._check_operation()
+                self._check(epoch)
+                if (self.phone.device is not device or getattr(device, "links", 0) != link
+                        or getattr(device, "abort_epoch", 0) != epoch):
+                    raise DeviceError("等待主屏幕结果期间设备连接已变化，未确认返回；请重新观察。")
+                current = snapshot(self.phone.screen)
+                if not current.live or current.generation != observation.generation:
+                    raise RuntimeError("等待主屏幕结果期间画面连接已变化，未确认返回；请重新观察。")
+
+            same_confirmation()
+            # A late transition may arrive after the first window. Observe once
+            # more within the original budget, without another click or wake.
+            budget = min(LATE_HOME_WAIT, remaining_operation_time() - .05)
+            if budget >= STABLE_QUIET + .05:
+                verified = await self._wait(epoch, since, budget, arrived, stable=True)
+                same_confirmation()
         if verified:
             log.info("go_home: AssistiveTouch 主屏幕已确认：菜单消失、图标网格及 Dock 可见")
             return True

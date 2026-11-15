@@ -108,6 +108,7 @@ OBSERVATION_REFRESH_WAIT = 3.5
 OBSERVATION_ENTRY_MAX_AGE = 1.0  # leave motion/verification time inside the unchanged 5-second write limit
 PASTE_CONTEXT_WAIT = 3.5  # bounded allowance for a dismissed Shortcut alert to leave the mirror
 APP_SEARCH_MAX = 64
+SPOTLIGHT_FOCUS_WAIT = 2.0  # one passive alternate frame; never repeat the search shortcut
 SPOTLIGHT_PLACEHOLDERS = {"search", "搜索", "搜尋"}
 SPOTLIGHT_MARKERS = {"sirisuggestions", "siri建议", "siri建議"}
 HOST_OBSERVATION_TTL = 30.0
@@ -2067,15 +2068,16 @@ class Phone:
 
         try:
             original = freshness.require_fresh(self.screen)
-            link, generation = self.device.links, original.generation
-            epoch = getattr(self.device, "abort_epoch", 0)
+            device = self.device
+            link, generation = device.links, original.generation
+            epoch = getattr(device, "abort_epoch", 0)
             opened_at = 0.0
 
             def validate_session():
                 self._check_operation()
                 if self._stopped(epoch):
                     raise AppSearchError("App 搜索期间已紧急停止，未继续输入。")
-                if not self.app_search_available or self.device.links != link:
+                if self.device is not device or not self.app_search_available or device.links != link:
                     raise AppSearchError("App 搜索期间蓝牙连接已变化。")
                 current = freshness.require_fresh(self.screen)
                 if current.generation != generation:
@@ -2113,23 +2115,55 @@ class Phone:
                         caret_frames=getattr(self.screen, "recent_frames", ()))):
                 raise AppSearchError("没有观察到进入 Spotlight，未输入 App 名。")
 
-            labels = [(ocr.normalize_text(hit.text), hit.box) for hit in await ocr.read_text_async(focused.frame)
-                      if hit.conf >= .8]
-            # A white vertical stroke alone is not input-focus evidence. Only
-            # consider it on an OCR-observed Spotlight, then require the search
-            # placeholder inside that same bounded field before typing anything.
-            def search_field(region):
-                left, top, right, bottom = region
-                placeholder = any(label in SPOTLIGHT_PLACEHOLDERS and left <= x0 < x1 <= right
-                                  and top <= y0 < y1 <= bottom for label, (x0, y0, x1, y1) in labels)
-                marker = any(label in SPOTLIGHT_MARKERS and box[3] < top for label, box in labels)
-                return placeholder and marker
+            async def read_focus(observed, anchors=None):
+                labels = [(ocr.normalize_text(hit.text), hit.box)
+                          for hit in await ocr.read_text_async(observed.frame) if hit.conf >= .8]
+                validate_session()
 
-            # Keyboard labels or unrelated cards can also contain thin white
-            # strokes. Exclude their fields using the original OCR evidence
-            # before requiring one unique, geometrically proven caret.
-            field = InputContextGuard(self.screen, focused, allow_white=any(
-                label in SPOTLIGHT_MARKERS for label, _ in labels), accept_field=search_field)
+                def same_label(label, box):
+                    # Associate the same system labels, allowing only small OCR
+                    # edge jitter. This does not authorize any input region.
+                    return anchors is None or any(label == old_label and max(
+                        abs(a-b) for a, b in zip(box, old_box, strict=True)) <= .01
+                        for old_label, old_box in anchors)
+
+                def search_field(region):
+                    left, top, right, bottom = region
+                    placeholder = any(label in SPOTLIGHT_PLACEHOLDERS and left <= box[0] < box[2] <= right
+                                      and top <= box[1] < box[3] <= bottom and same_label(label, box)
+                                      for label, box in labels)
+                    marker = any(label in SPOTLIGHT_MARKERS and box[3] < top and same_label(label, box)
+                                 for label, box in labels)
+                    return placeholder and marker
+
+                # Both label positions and the unique bounded caret must come
+                # from this observation, never from an earlier keyboard/frame.
+                field = InputContextGuard(self.screen, observed, allow_white=any(
+                    label in SPOTLIGHT_MARKERS for label, _ in labels), accept_field=search_field)
+                return labels, field
+
+            labels, field = await read_focus(focused)
+            known_spotlight = any(marker in SPOTLIGHT_MARKERS and placeholder in SPOTLIGHT_PLACEHOLDERS
+                                  and marker_box[3] < placeholder_box[1]
+                                  for marker, marker_box in labels for placeholder, placeholder_box in labels)
+            if field.region is None and known_spotlight:
+                # A first eligible frame may arrive during the caret's dark
+                # phase. Observe once more without any HID, preserving the
+                # original shortcut/session and requiring independent focus.
+                validate_session()
+                try:
+                    later = await asyncio.wait_for(self.screen.fresh(focused.updated, SPOTLIGHT_FOCUS_WAIT),
+                                                   SPOTLIGHT_FOCUS_WAIT)
+                except asyncio.TimeoutError:
+                    later = None
+                validate_session()
+                if later is not None:
+                    alternate = freshness.require_fresh(self.screen, since=opened_at)
+                    with Image.open(io.BytesIO(focused.frame)) as first_image, \
+                            Image.open(io.BytesIO(alternate.frame)) as next_image:
+                        same_size = first_image.size == next_image.size
+                    if alternate.updated > focused.updated and same_size:
+                        _, field = await read_focus(alternate, labels)
             if field.region is None:
                 raise AppSearchError("无法确认 Spotlight 搜索框获得焦点，未输入 App 名。")
 
