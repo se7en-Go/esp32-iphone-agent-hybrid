@@ -266,6 +266,7 @@ class AssistiveTouch:
         return await self._menu_home(epoch, menu, panel, observation=self._last_wait_observation)
 
     async def _menu_home(self, epoch: int, menu: bytes, panel, *, observation=None, navigation_context=None) -> bool:
+        device = self.phone.device
         if self._home_link is None:
             self._home_link, self._home_epoch = getattr(self.phone.device, "links", 0), epoch
         self._check(epoch)
@@ -288,6 +289,29 @@ class AssistiveTouch:
                     and assistive_vision.is_home_screen(frame))
 
         verified = await self._wait(epoch, since, RESULT_WAIT, arrived, stable=True)
+        if not verified and fresh_frame(self.phone.screen, clock=self._clock, since=since) is None:
+            candidate = snapshot(self.phone.screen)
+            ensure = getattr(self.phone, "ensure_observation", None)
+            if ensure is not None and candidate.frame and arrived(candidate.frame):
+                def home_candidate():
+                    self.phone._check_operation()
+                    self._check(epoch)
+                    if self.phone.device is not device:
+                        raise DeviceError("返回主屏幕期间设备连接已变化，未继续操作；请重新观察。")
+                    # Only wake admission may use an old receipt. A new source
+                    # frame must still satisfy the original click's causal gate.
+                    current = require_fresh(self.phone.screen, clock=self._clock, max_age=float("inf"))
+                    if current.generation != observation.generation:
+                        raise RuntimeError("返回主屏幕期间画面连接已变化，请重新观察。")
+                    if not arrived(current.frame):
+                        raise TargetChangedError("等待主屏幕新画面时页面已变化，未继续唤醒；请重新观察。")
+
+                # An early Home frame can arrive inside the mirror allowance
+                # and then stop updating. Reacquire once; never click it again.
+                await ensure(before_refresh=home_candidate)
+                home_candidate()
+                verified = await self._wait(epoch, since, RESULT_WAIT, arrived, stable=True)
+                home_candidate()
         if verified:
             log.info("go_home: AssistiveTouch 主屏幕已确认：菜单消失、图标网格及 Dock 可见")
             return True
