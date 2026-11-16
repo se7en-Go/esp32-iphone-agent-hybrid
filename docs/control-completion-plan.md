@@ -12,3 +12,35 @@ The Mac receives the live AirPlay picture. The ESP32 sends Bluetooth mouse and k
 | Long press and double-tap | A CLI long press on Notes opened its Home screen quick-actions menu. The host opened a test note and typed test text. After requiring a visually measured landing, Safari with default gesture settings recorded two trusted clicks and one native double-click on the attached iPhone. | Confirm word selection in Notes. The Safari fixture's alternate touch settings emitted two separate clicks even at a shorter interval. |
 
 The local web service and stdio MCP can be used independently. Hands-on navigation used MCP against the loopback server, with no model delegation. Mac mirror reload, device-session checks, and clipboard protocol checks are also covered by automated tests. Synthetic test runs do not verify iOS permission prompts, foreground shortcuts, or gesture effects on a particular app.
+
+## 2026-11-16 acceptance pass — branch `muse/iphone-control-acceptance`
+
+Baseline: `codex/complete-iphone-control` at `83d4af7`. All work below is unmerged; merge only after Codex review and CI pass.
+
+### Automated test results
+
+- Full Python suite: **2199 passed, 1 skipped** (2026-11-16, after the item 2 and item 4 fixes).
+- Native UxPlay GStreamer test (720p burst, 30 distinct frames): old patch **0/30 JPEGs**, new patch **30/30**.
+- New: `server/tests/test_home_occluded_return.py` — 6 tests (2 accept, 4 refuse), all passing.
+- New: `server/tests/test_confirm_sheet_retry.py` — 2 tests, both passing; `test_staged_clipboard.py` / `test_paste_confirmation.py` — 65 tests, all passing.
+
+### Item 1 — web mirror stale/stalling frames
+
+- Root cause: the pre-decode `queue` in the framed GStreamer pipeline was `max-size-buffers=2 leaky=downstream`, so under decode lag it dropped the IDR carrying SPS/PPS and `h264parse` had no `config-interval`; the decoder stalled until the phone's next IDR. Fix: `max-size-buffers=16 leaky=no` + `h264parse config-interval=-1` (`native/uxplay/patches/uxplay-1.73.7-hafe-v1.patch`, `upstream.json` re-pinned). Deployed receiver `6acb30860f144578988ddf6431c111f7` (pid 69934), generation 2 → 4, calibration preserved.
+- **Still unverified on device:** the iPhone does not auto-reconnect after a receiver restart — the user must re-select "ESP32 Agent Mac" in Control Center → Screen Mirroring. Then verify frames update continuously, a rapid disconnect+reconnect yields new frames with the old ticket rejected, and a worker-only restart keeps the same receiver instance and a usable mirror.
+
+### Item 2 — Home → Spotlight → target app
+
+- Root cause: on the Home icon the pointer disc is occluded to a crescent, so the landing measurement failed before any click was sent (`PointerLandingError`). Fix (scheme A, `server/hidagent/phone.py`): accept occluded-return evidence only for the Home-menu case — a pointer-sized grey disc seen at the probe's escape point in an outward frame, absent there in the baseline frame, with no pointer-sized disc on the return path and no change outside the icon box. Gated on the navigation context (action `home`, kind `menu`). Disc colour uses the same mid-grey range as the existing landing check, so dark interiors of ring-shaped UI are not mistaken for the pointer.
+- **Still unverified on device:** Home visible → Spotlight → target app opens end-to-end, and retest the web "主屏幕" entry.
+
+### Item 3 — native Notes double-tap word selection
+
+- No code change. No selection/highlight/handle detector exists; acceptance is by screenshot (highlight + both handles).
+- **Still unverified on device:** double-tap a word in Notes and confirm the selection appears.
+
+### Item 4 — native Notes Chinese staged paste to `completed`
+
+- Config: `HIDAGENT_CLIPBOARD_TTL=180`, `HIDAGENT_CLIPBOARD_TRIGGER_KEY=ctrl+alt+p` (`server/.local-data/runtime.env`, local only); capabilities now report `trigger_configured: true`.
+- Code fix (`server/hidagent/clipboard_control.py`): when the guard rejects and `verify_after_paste_permission` fails with `first_post_paste_frame`, retry with the most recent frames that could still show the permission sheet (newest first, up to 4 candidates). The staged-clipboard test's verify fake was updated to allow the extra calls.
+- **Still unverified on device:** a staged paste with new test text (different Chinese words, newline positions, leading-zero number) returning `completed`, and the independent trigger-key check (prepare → `awaiting_copy` → send only `ctrl+alt+p` → `awaiting_paste`, `copied=true`). The user must bind Control+Option+P to `ESP32 Agent Clipboard` in Settings → Accessibility → Keyboard & Typing → Full Keyboard Access → Commands.
