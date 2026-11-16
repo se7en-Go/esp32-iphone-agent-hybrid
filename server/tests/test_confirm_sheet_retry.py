@@ -285,3 +285,96 @@ def test_confirm_reuses_verified_sheet_on_retry(monkeypatch):
         assert provider.current() == {"active": False, "needs_resolution": False}
 
     asyncio.run(scenario())
+
+
+def test_confirm_accepts_newline_leading_append_with_retained_sheet(monkeypatch):
+    """Notes append: newline-leading Chinese text, verified in one transaction.
+
+    The appended text starts with a newline (no OCR row for the blank line),
+    then Chinese words, a leading-zero number and mixed case. The permission
+    sheet left the 4 s recent window before confirm runs, so the only sheet
+    candidate is the frame paste() retained at paste time. The dialog wording
+    is the Notes one, not Safari's; the Safari wording stays covered by
+    test_paste_confirmation. The real verifier runs here, not a mock: the
+    transaction digest pins the exact bytes (leading newline, case) while
+    the OCR check covers the visible lines.
+    """
+    import io
+
+    from PIL import Image, ImageDraw
+    from hidagent import feedback, ocr
+    from hidagent.clipboard_control import PreparePaste
+    from test_paste_confirmation import REGION, label
+
+    NEW_TEXT = "\n秋天到了00731\n第二行 AbD eFg"
+
+    def borderless_frame(bars, sheet=False, outside_change=False):
+        image = Image.new("RGB", (500, 1000), (235, 235, 230))
+        draw = ImageDraw.Draw(image)
+        for y in bars:
+            draw.rectangle((116, y - 2, 230, y + 2), fill="black")
+        if sheet:
+            draw.rounded_rectangle((90, 350, 410, 650), radius=20, fill=(180, 180, 180))
+        if outside_change:
+            # Outside the input region: trips the accept-stage guard into the
+            # sheet fallback without moving any OCR anchor.
+            draw.rectangle((50, 80, 350, 155), fill="orange")
+        result = io.BytesIO()
+        image.save(result, "PNG")
+        return result.getvalue()
+
+    existing = [label("已有第一行", .25, .36), label("已有第二行", .25, .40)]
+    pasted = [label("秋天到了00731", .25, .44), label("第二行 AbD eFg", .25, .48)]
+    context = [label("Safari test page", .25, .13), label("Tester", .25, .25), label("Expected text", .23, .65),
+               label("页面标题", .25, .72), label("页面副标题", .25, .76)]
+    dialog = [label("“备忘录”想从“快捷指令”粘贴", .5, .39), label("你允许这样做吗？", .5, .44),
+              label("不允许粘贴", .27, .52), label("允许粘贴", .7, .52)]
+    original = borderless_frame([360, 400])
+    sheet = borderless_frame([360, 400], sheet=True)
+    after = borderless_frame([360, 400, 440, 480], outside_change=True)
+    frames = {original: context + existing, sheet: dialog, after: context + existing + pasted}
+
+    async def read(image):
+        return frames.get(image, [])
+
+    async def scenario():
+        screen, provider, phone, control, manager = setup(monkeypatch)
+        # The guard's original observation must be this frame, not the
+        # 400x800 fixture setup() publishes first.
+        screen._on_jpeg(original)
+        monkeypatch.setattr(ocr, "read_text_async", read)
+
+        async def capture(_screen, _completed_at):
+            # The sheet arrives while paste() waits for post-action evidence,
+            # so it is part of the frames retained at paste time.
+            screen._on_jpeg(sheet)
+            return sheet
+
+        monkeypatch.setattr(feedback, "wait_after_action", capture)
+        prepared = await manager.prepare(PreparePaste(
+            text=NEW_TEXT, screen_id=control.observation()["screen_id"],
+            focused=True, target_box=REGION))
+        # Claim the staged payload the way the Shortcut does, then ack.
+        pending = provider.pending()
+        assert pending["protocol"] == "staged-v1"
+        token = pending["text_url"].rsplit("/", 1)[-1]
+        assert provider.fetch_payload(token) == {"copy_allowed": True, "text": NEW_TEXT}
+        provider.acknowledge(token, copied=True, focused=False)
+        screen._on_jpeg(screen.frame)
+        await manager.paste(PasteTransaction(transaction_id=prepared["transaction_id"],
+                                             screen_id=control.observation()["screen_id"], focused=True))
+        # The 4 s recent window has passed: the live history no longer holds
+        # the sheet, but the transaction retained it at paste time.
+        screen._recent_frames.clear()
+        screen._on_jpeg(after)
+        receipt = await manager.confirm(ConfirmPaste(
+            transaction_id=prepared["transaction_id"],
+            screen_id=control.observation()["screen_id"],
+            observed_text=NEW_TEXT, confirmed=True))
+        assert receipt["phase"] == "completed" and receipt["effect_verified"]
+        assert receipt["confirmation_evidence"] == "paste_permission_dismissed"
+        assert receipt["sheet_frame_updated"] is not None
+        assert receipt["sheet_frame_generation"] is not None
+        assert provider.current() == {"active": False, "needs_resolution": False}
+
+    asyncio.run(scenario())

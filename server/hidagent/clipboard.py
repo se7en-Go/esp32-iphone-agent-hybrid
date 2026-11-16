@@ -51,6 +51,20 @@ class _Pending:
     expired: bool = False
     host_nonce: str | None = None
     validate_session: Callable[[], None] | None = None
+    # Copy diagnostics: counts and timestamps only, never text or tokens.
+    # pending_polls counts authorised GET /pending calls while this item was
+    # active; claim_attempts counts GET text/payload fetches (including a
+    # duplicate fetch); ack_attempts counts POST /ack calls (including ones
+    # rejected for arriving before the claim or without copied=true).
+    # claimed_at is monotonic seconds, the same clock as the TTL deadline
+    # (not wall time like copied_at): this module's time source may be a
+    # monotonic-only fake in tests.
+    pending_polls: int = 0
+    claim_attempts: int = 0
+    claimed_at: float | None = None
+    ack_attempts: int = 0
+    last_ack_error: str | None = None
+    auth_failures_at_begin: int = 0
 
 
 class CompanionClipboard:
@@ -86,6 +100,7 @@ class CompanionClipboard:
         self.trigger_key = trigger_key
         self.protocol = protocol
         self._pending: _Pending | None = None
+        self.pending_auth_failures = 0
         self._operation_active = False
         self._needs_resolution = False
         self._staged_expiry = None
@@ -148,7 +163,10 @@ class CompanionClipboard:
 
     def pending(self) -> dict | None:
         item = self._active()
-        if item is None or item.fetched:
+        if item is None:
+            return None
+        item.pending_polls += 1
+        if item.fetched:
             return None
         url = f"{self.base_url}/api/clipboard/{item.token}"
         return {"pending": True, "text_url": url, "ack_url": f"{url}/ack", **self._urls(item),
@@ -170,20 +188,31 @@ class CompanionClipboard:
 
     def fetch(self, token: str) -> str:
         item = self._lookup(token)
+        item.claim_attempts += 1
         if item.fetched:
             raise HTTPException(404, "剪贴板内容已经领取，不能重复读取。", headers=NO_STORE)
         text = item.text
         item.text = None
         item.fetched = True
+        item.claimed_at = time.monotonic()
         return text
 
     def acknowledge(self, token: str, *, copied: bool, focused: bool) -> None:
         item = self._lookup(token)
+        item.ack_attempts += 1
         if item.acknowledged:
+            item.last_ack_error = "copy already acknowledged"
             raise HTTPException(404, "剪贴板复制已经确认，不能重复确认。", headers=NO_STORE)
         if not item.fetched or copied is not True or (item.host_nonce is None and focused is not True):
+            if not item.fetched:
+                item.last_ack_error = "ack before claim"
+            elif copied is not True:
+                item.last_ack_error = "ack without copied=true"
+            else:
+                item.last_ack_error = "ack without focused=true"
             raise HTTPException(409, "请先复制到 iPhone 剪贴板并确认目标输入框有焦点。", headers=NO_STORE)
         item.acknowledged = True
+        item.last_ack_error = None
         if item.host_nonce is not None:
             item.copied_at = time.time()
         item.changed.set()
@@ -215,6 +244,7 @@ class CompanionClipboard:
             raise DeviceError("粘贴内容需要 1..4000 个字符。")
         item = _Pending(secrets.token_urlsafe(32), text, time.monotonic() + self.ttl,
                         host_nonce=secrets.token_urlsafe(32), validate_session=validate_session)
+        item.auth_failures_at_begin = self.pending_auth_failures
         self._pending, self._operation_active = item, True
         self._staged_expiry = asyncio.get_running_loop().call_later(self.ttl, self._expire, item)
         return item.host_nonce
@@ -238,7 +268,11 @@ class CompanionClipboard:
                  else "awaiting_paste" if item.acknowledged else "awaiting_copy")
         return {"transaction_id": nonce, "phase": phase, "copied": item.acknowledged,
                 "copied_at": item.copied_at, "paste_sent": item.paste_sent, "effect_verified": False,
-                "expires_in_seconds": max(0, item.deadline - time.monotonic())}
+                "expires_in_seconds": max(0, item.deadline - time.monotonic()),
+                "claimed": item.fetched, "claimed_at": item.claimed_at,
+                "pending_polls": item.pending_polls, "claim_attempts": item.claim_attempts,
+                "ack_attempts": item.ack_attempts, "last_ack_error": item.last_ack_error,
+                "pending_auth_failures": max(0, self.pending_auth_failures - item.auth_failures_at_begin)}
 
     def stage_start_paste(self, nonce: str) -> None:
         item = self._stage(nonce)
@@ -384,7 +418,17 @@ def create_router(get_provider: Callable[[], CompanionClipboard | None]) -> APIR
 
     @router.get("/pending")
     async def pending(request: Request):
-        return JSONResponse(paired(request).pending() or {"pending": False}, headers=NO_STORE)
+        current = get_provider()
+        if current is None:
+            raise HTTPException(404, "尚未配置 iPhone 剪贴板快捷指令。", headers=NO_STORE)
+        if not current.authorized(request.headers.get("authorization", "")):
+            # The Shortcut's first contact is /pending. A wrong stored key
+            # fails here and otherwise leaves no trace at all, so count it:
+            # it is what separates "never launched" from "launched with a
+            # stale key". Only the count is kept, never the header value.
+            current.pending_auth_failures += 1
+            raise HTTPException(401, "剪贴板配对密钥不正确。", headers=NO_STORE)
+        return JSONResponse(current.pending() or {"pending": False}, headers=NO_STORE)
 
     @router.get("/current")
     async def current(request: Request):

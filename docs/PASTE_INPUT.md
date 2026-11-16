@@ -242,3 +242,18 @@ staged-v1 的 `ack_url` 只要求 `{"copied":true}`；Shortcut 的 `complete_url
 剪贴板通道不记录正文。密钥与令牌 URL 都是秘密；标准启动入口配置密钥后关闭 Uvicorn 访问日志，直接运行时加 `--no-access-log`，代理也须关闭该路径日志或脱敏。保持 `HIDAGENT_DEBUG=0`，原 Agent 调试追踪可能保存提示、回复和截图。当前仅支持单进程内存，不能跨 worker 分流。
 
 实现见 [clipboard.py](../server/hidagent/clipboard.py)、[clipboard_proxy.py](../server/hidagent/clipboard_proxy.py) 与 [phone.py](../server/hidagent/phone.py)。自动化测试仅使用假设备和 ASGI；组合键绑定、手机权限、浮层退出、焦点与实际粘贴速度均待真机验收。
+
+## 复制失败诊断（paste-status 字段）
+
+`paste-status` 除了 `phase` / `copied`，还返回只含计数与时间戳的诊断
+字段（不记录正文、令牌、URL 或 Key），用于区分快捷指令没到服务端、
+到了没领正文、领了没回确认这三种情况。完整判断表与上一轮故障分析见
+[docs/paste-copy-diagnosis.md](paste-copy-diagnosis.md)。
+
+| 字段 | 含义 |
+| --- | --- |
+| `claimed` / `claimed_at` | 正文是否已被领取及领取时间（单调时钟） |
+| `pending_polls` | 本事务存续期间授权通过的 GET `/pending` 次数 |
+| `claim_attempts` | 领取尝试次数（含重复领取） |
+| `ack_attempts` / `last_ack_error` | POST `/ack` 尝试次数与最后一次被拒的原因 |
+| `pending_auth_failures` | 本事务开始后 GET `/pending` 因配对 Key 错误被拒的次数 |
