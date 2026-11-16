@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from . import feedback, ocr
 from .clipboard import NO_STORE
-from .freshness import fresh_frame, require_fresh
+from .freshness import fresh_frame, snapshot
 from .input_context import InputContextGuard
 from .operation import check_operation
 from .text_input import select_type_mode
@@ -76,11 +76,16 @@ class StagedClipboardControls:
     def _session(self, item):
         current = self.get_controls()
         try:
+            # A live static stream may retain old pixels while the Shortcut
+            # runs. Preserve its copy transaction, not its input eligibility:
+            # prepare/paste/confirm still require fresh action evidence.
+            observed = snapshot(current.screen)
             if (current.phone is not item.phone or current.phone.clipboard is not item.provider
                     or getattr(item.phone.device, "links", 0) != item.links
                     or getattr(item.phone.device, "abort_epoch", 0) != item.epoch
                     or not getattr(item.phone.device, "connected", False)
-                    or require_fresh(current.screen).generation != item.guard.original.generation):
+                    or not observed.live or not observed.frame
+                    or observed.generation != item.guard.original.generation):
                 raise RuntimeError("clipboard input session changed or stopped; do not paste")
         except (ValueError, RuntimeError):
             item.provider.cancel_staged()

@@ -347,7 +347,7 @@ def test_structured_payload_requires_active_staged_request_and_is_one_shot(monke
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("transition", ["generation", "epoch", "links", "disconnect"])
+@pytest.mark.parametrize("transition", ["generation", "epoch", "links", "disconnect", "screen_stopped"])
 @pytest.mark.parametrize("fetched", [False, True])
 def test_session_change_revokes_all_receipts_before_any_late_companion_access(monkeypatch, transition, fetched):
     async def scenario():
@@ -365,6 +365,8 @@ def test_session_change_revokes_all_receipts_before_any_late_companion_access(mo
             phone.device.abort_epoch += 1
         elif transition == "links":
             phone.device.links += 1
+        elif transition == "screen_stopped":
+            screen.stop()
         else:
             phone.device.connected = False
 
@@ -382,6 +384,117 @@ def test_session_change_revokes_all_receipts_before_any_late_companion_access(mo
         with pytest.raises(HTTPException):
             manager.status(prepared["transaction_id"])
         assert manager.transaction is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["board", "ipc"])
+@pytest.mark.parametrize("already_copied", [False, True])
+def test_live_idle_source_preserves_copy_status_without_authorizing_old_pixels(
+        monkeypatch, backend, already_copied):
+    from hidagent.screen_uxplay import UxPlayScreen
+
+    async def scenario():
+        screen, provider, phone, control, manager = setup(monkeypatch)
+        if backend == "ipc":
+            metadata = {"instance": "test-receiver", "generation": 1, "running": True, "live": True,
+                        "updated": screen.updated, "arrived": time.monotonic()}
+            image = screen.frame
+            screen = UxPlayScreen(socket_path="unused-test-socket")
+            screen._accept_remote(metadata, image)
+            phone.screen = control.screen = screen
+        prepared = await manager.prepare(prepare_body(control))
+        item = provider._pending
+        if already_copied:
+            copied(provider)
+        original = screen.snapshot
+        now = time.time()
+        monkeypatch.setattr(time, "time", lambda: now + 6)
+        if backend == "ipc":
+            # IPC heartbeat advances, but the receiver republishes unchanged
+            # source clocks. It must not freshen pixels just to retain a copy.
+            screen._accept_remote(metadata, image)
+        state = manager.status(prepared["transaction_id"])
+        assert state["phase"] == ("awaiting_paste" if already_copied else "awaiting_copy")
+        assert state["fresh"] is False and state["screen_id"] is None and state["image_base64"] is None
+        assert provider._pending is item and not item.expired
+        assert item.deadline > time.monotonic()
+        assert screen.snapshot.updated == original.updated
+        assert phone.sent == ["ctrl+alt+p"]
+        if not already_copied:
+            assert provider.fetch_payload(item.token)["copy_allowed"] is True
+            provider.acknowledge(item.token, copied=True, focused=False)
+        assert provider.stage_status(item.host_nonce)["copied"] is True
+        manager.cancel(prepared["transaction_id"])
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["prepare", "paste", "confirm"])
+def test_idle_transaction_does_not_authorize_a_stale_input_stage(monkeypatch, phase):
+    from hidagent.clipboard_control import ConfirmPaste, PasteTransaction
+
+    async def scenario():
+        screen, provider, phone, control, manager = setup(monkeypatch)
+        request = prepare_body(control)
+        if phase != "prepare":
+            prepared = await manager.prepare(request)
+            copied(provider, screen)
+            request = PasteTransaction(transaction_id=prepared["transaction_id"],
+                                       screen_id=control.observation()["screen_id"], focused=True)
+            if phase == "confirm":
+                await manager.paste(request)
+                request = ConfirmPaste(transaction_id=prepared["transaction_id"],
+                                       screen_id=control.observation()["screen_id"],
+                                       observed_text="你好00123", confirmed=True)
+        sent = list(phone.sent)
+        now = time.time()
+        monkeypatch.setattr(time, "time", lambda: now + 6)
+        with pytest.raises((ValueError, RuntimeError), match="新鲜"):
+            if phase == "confirm":
+                manager.confirm(request)
+            else:
+                await getattr(manager, phase)(request)
+        assert phone.sent == sent
+        if phase == "prepare":
+            assert provider._pending is None and manager.transaction is None
+        else:
+            assert provider.current()["active"] and manager.transaction is not None
+            manager.cancel(prepared["transaction_id"])
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("transition", ["ipc_disconnected", "ipc_heartbeat_lost", "stopped", "generation"])
+def test_idle_ipc_session_loss_revokes_pending_copy(monkeypatch, transition):
+    from hidagent.screen_uxplay import UxPlayScreen
+
+    async def scenario():
+        screen, provider, phone, control, manager = setup(monkeypatch)
+        metadata = {"instance": "test-receiver", "generation": 1, "running": True, "live": True,
+                    "updated": screen.updated, "arrived": time.monotonic()}
+        image = screen.frame
+        screen = UxPlayScreen(socket_path="unused-test-socket")
+        screen._accept_remote(metadata, image)
+        phone.screen = control.screen = screen
+        prepared = await manager.prepare(prepare_body(control))
+        item = provider._pending
+        now = time.time()
+        monkeypatch.setattr(time, "time", lambda: now + 6)
+        if transition == "ipc_disconnected":
+            screen._ipc_connected = False
+        elif transition == "ipc_heartbeat_lost":
+            screen._ipc_received = time.monotonic() - 3
+        elif transition == "stopped":
+            screen._stopping = True
+        else:
+            screen._accept_remote({**metadata, "generation": 2}, image)
+        with pytest.raises(HTTPException) as rejected:
+            manager.status(prepared["transaction_id"])
+        assert rejected.value.status_code == 404
+        assert item.expired and item.text is None
+        assert provider._pending is None and manager.transaction is None
+        assert phone.sent == ["ctrl+alt+p"]
 
     asyncio.run(scenario())
 
