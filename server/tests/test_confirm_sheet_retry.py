@@ -190,7 +190,7 @@ def test_confirm_uses_sheet_retained_at_paste_time_after_window_passes(monkeypat
 
     async def scenario():
         screen, provider, phone, control, manager = setup(monkeypatch)
-        before, sheet, after = field_image(), changed_scene("blue"), changed_scene("orange")
+        _, sheet, after = field_image(), changed_scene("blue"), changed_scene("orange")
         calls = []
 
         async def capture(_screen, _completed_at):
@@ -236,7 +236,7 @@ def test_confirm_reuses_verified_sheet_on_retry(monkeypatch):
 
     async def scenario():
         screen, provider, phone, control, manager = setup(monkeypatch)
-        before, sheet, after = field_image(), changed_scene("blue"), changed_scene("orange")
+        _, sheet, after = field_image(), changed_scene("blue"), changed_scene("orange")
         calls = []
 
         async def capture(_screen, _completed_at):
@@ -302,9 +302,10 @@ def test_confirm_accepts_newline_leading_append_with_retained_sheet(monkeypatch)
     import io
 
     from PIL import Image, ImageDraw
+    from test_paste_confirmation import REGION, label
+
     from hidagent import feedback, ocr
     from hidagent.clipboard_control import PreparePaste
-    from test_paste_confirmation import REGION, label
 
     NEW_TEXT = "\n秋天到了00731\n第二行 AbD eFg"
 

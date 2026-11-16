@@ -15,17 +15,17 @@ import asyncio
 import io
 import pathlib
 import time
-from types import SimpleNamespace
 
 import pytest
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 from test_pointer_session import setup_phone
 
 from hidagent.freshness import FrameSnapshot
 from hidagent.navigation_context import from_navigation
-from hidagent.text_target import PointerLandingError
+from hidagent.text_target import PointerLandingError, TargetChangedError
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures" / "menu_highlight_click"
+MENU_HIGHLIGHT_FIXTURES = pathlib.Path(__file__).parent / "fixtures" / "menu_highlight"
 
 
 def load(name):
@@ -158,3 +158,79 @@ def test_target_changed_sends_zero_clicks(tmp_path):
             *near, target_frame=mirror.frame, navigation_context=context))
 
     assert device.commands.count("click") == 0
+
+
+def _before_click_write(device, hook):
+    original = device.send_guarded
+
+    async def wrapped(command, before_write, **kwargs):
+        if command == "click":
+            hook()
+        return await original(command, before_write, **kwargs)
+
+    device.send_guarded = wrapped
+
+
+def test_pointer_fading_over_home_highlight_between_landing_and_write_sends_one_click(tmp_path):
+    # Pointer fade over bright blue Home alters RGB >100 levels between landing
+    # measurement (highlighted_oa2.jpg) and write validation (highlighted.jpg).
+    phone, device, mirror, context = rig(
+        tmp_path, "unhighlighted.jpg", "highlighted.jpg")
+    oa2 = (MENU_HIGHLIGHT_FIXTURES / "highlighted_oa2.jpg").read_bytes()
+    final = load("highlighted.jpg")
+
+    async def send_with_fade(command):
+        device.commands.append(command)
+        if command.startswith("move "):
+            mirror.frame = oa2
+            mirror.updated = time.time()
+
+    device.send = send_with_fade
+    _before_click_write(device, lambda: setattr(mirror, "frame", final))
+    near = context.target.center
+
+    result = asyncio.run(phone.tap_verified(
+        *near, target_frame=mirror.frame, navigation_context=context))
+
+    assert result["clicked"] is True
+    assert device.commands.count("click") == 1
+    assert phone._menu_highlight_evidence["centre"] == pytest.approx((0.582, 0.839), abs=0.01)
+
+
+def test_highlight_lost_before_write_sends_zero_clicks(tmp_path):
+    phone, device, mirror, context = rig(
+        tmp_path, "unhighlighted.jpg", "highlighted.jpg")
+    unhighlighted = load("unhighlighted.jpg")
+    _before_click_write(device, lambda: setattr(mirror, "frame", unhighlighted))
+
+    with pytest.raises(TargetChangedError, match="目标或屏幕已变化"):
+        asyncio.run(phone.tap_verified(
+            *context.target.center, target_frame=mirror.frame, navigation_context=context))
+
+    assert device.commands.count("click") == 0
+
+
+def test_menu_panel_shifted_before_write_sends_zero_clicks(tmp_path):
+    phone, device, mirror, context = rig(
+        tmp_path, "unhighlighted.jpg", "highlighted.jpg")
+    shifted_image = ImageChops.offset(Image.open(io.BytesIO(load("highlighted.jpg"))).convert("RGB"), 18, 0)
+    buf = io.BytesIO()
+    shifted_image.save(buf, "JPEG", quality=92)
+    shifted = buf.getvalue()
+    _before_click_write(device, lambda: setattr(mirror, "frame", shifted))
+
+    with pytest.raises(TargetChangedError, match="目标或屏幕已变化"):
+        asyncio.run(phone.tap_verified(
+            *context.target.center, target_frame=mirror.frame, navigation_context=context))
+
+    assert device.commands.count("click") == 0
+
+
+def test_pre_move_validate_current_rejects_unsolicited_highlight(tmp_path):
+    phone, device, mirror, context = rig(
+        tmp_path, "unhighlighted.jpg", "highlighted.jpg")
+    mirror.frame = load("highlighted.jpg")
+    mirror.updated = time.time()
+
+    with pytest.raises(TargetChangedError, match="目标或屏幕已变化"):
+        context.validate_current(mirror)

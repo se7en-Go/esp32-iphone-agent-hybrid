@@ -14,7 +14,6 @@ import io
 import time
 from types import SimpleNamespace
 
-import pytest
 from fake_clock import ManualClock
 from PIL import Image, ImageDraw
 from test_home_probe_direction import menu_frame

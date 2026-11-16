@@ -320,10 +320,17 @@ def translucent_pointer_pair(before, after, near, shift, reach, *, reference_poi
     rx, ry = reach
     bounds = (max(0, round((x - rx) * width)), max(0, round((y - ry) * height)),
               min(width, round((x + rx) * width)), min(height, round((y + ry) * height)))
+    # Pad the crop so any disc centred inside `bounds` keeps its full diameter
+    # and ring margin intact while avoiding full-frame pixel scans.
+    pad = math.ceil(.04 * width) + 6
+    crop_box = (max(0, bounds[0] - pad), max(0, bounds[1] - pad),
+                min(width, bounds[2] + pad), min(height, bounds[3] + pad))
+    if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+        return None
     with Image.open(io.BytesIO(before)) as image:
-        before_img = image.convert("RGB")
+        before_img = image.convert("RGB").crop(crop_box)
     with Image.open(io.BytesIO(after)) as image:
-        after_img = image.convert("RGB")
+        after_img = image.convert("RGB").crop(crop_box)
     red, green, blue = ImageChops.difference(before_img, after_img).split()
     delta = ImageChops.lighter(ImageChops.lighter(red, green), blue)
     clean_before = _discs(before_img, width)
@@ -343,8 +350,8 @@ def translucent_pointer_pair(before, after, near, shift, reach, *, reference_poi
         if not (.03 * width <= min(w, h) <= max(w, h) <= .067 * width
                 and .75 <= w / h <= 1.33 and .60 <= len(points) / (w * h) <= .90):
             continue
-        cx = (min(xs) + max(xs)) / (2 * width)
-        cy = (min(ys) + max(ys)) / (2 * height)
+        cx = (crop_box[0] + (min(xs) + max(xs)) / 2) / width
+        cy = (crop_box[1] + (min(ys) + max(ys)) / 2) / height
         if not (bounds[0] / width <= cx <= bounds[2] / width
                 and bounds[1] / height <= cy <= bounds[3] / height):
             continue
@@ -444,15 +451,26 @@ def verify_cursor_reference(reference, before, after, pair, reference_pointer, *
         first, second = (_difference(reference, frame, 360, ignore_status=False) for frame in (before, after))
         if first is None or second is None:
             return False, None
-        retain_context_regions(first, context_regions)
-        retain_context_regions(second, context_regions)
+        w, h = first.size
+        footprint_regions = context_regions
+        if context_regions is not None:
+            # Pad footprint detection by POINTER_RADIUS so a pre-move pointer
+            # straddling a scoped region edge stays intact for circularity
+            # checks; anchor protection below keeps the unpadded regions.
+            pad_x = POINTER_RADIUS
+            pad_y = POINTER_RADIUS * w / h
+            footprint_regions = tuple(
+                (max(0., left - pad_x), max(0., top - pad_y),
+                 min(1., right + pad_x), min(1., bottom + pad_y))
+                for left, top, right, bottom in context_regions)
+        retain_context_regions(first, footprint_regions)
+        retain_context_regions(second, footprint_regions)
         _mask_locations(first, (pair[0],), ())
         _mask_locations(second, (pair[1],), ())
         mask_clock_ticks(reference, before, first)
         mask_clock_ticks(reference, after, second)
         mask_caret_blink(reference, before, first, caret_frames)
         mask_caret_blink(reference, after, second, caret_frames)
-        w, h = first.size
         footprints = []
         for points in _regions(ImageChops.darker(first, second), 24):
             xs, ys = zip(*points, strict=True)

@@ -41,6 +41,20 @@ def _cursor_patch_matches(image, reference, center):
             and not any(len(region) >= 6 for region in _regions(change, 25)))
 
 
+def _home_slot_bounds(panel, width, height):
+    from .assistive_vision import MENU_ICON_REGIONS
+
+    pl, pt, pr, pb = panel
+    hl, ht, hr, hb = MENU_ICON_REGIONS[-1]
+    hb = min(0.96, hb + 0.025)
+    return (
+        (pl + hl * (pr - pl)) * width,
+        (pt + ht * (pb - pt)) * height,
+        (pl + hr * (pr - pl)) * width,
+        (pt + hb * (pb - pt)) * height,
+    )
+
+
 class PointerLandingError(RuntimeError):
     """The pointer landing could not be verified before writing a click."""
 
@@ -66,7 +80,7 @@ class TextTargetGuard:
         self._before_frame = before
         self.discs = _discs(self.before)
 
-    def __call__(self, *, cursor=None, reference=None):
+    def __call__(self, *, cursor=None, reference=None, home_highlight: bool = False):
         current = require_fresh(self.screen)
         if current.generation != self.generation:
             raise RuntimeError("目标观察后画面连接已变化，未发送点击；请重新观察。")
@@ -75,10 +89,11 @@ class TextTargetGuard:
         except (OSError, ValueError) as exc:
             raise RuntimeError("点击前画面无效，未发送点击。") from exc
         if after.size != self.before.size or self._changed(
-                after, cursor=cursor, reference=reference, after_frame=current.frame):
+                after, cursor=cursor, reference=reference, after_frame=current.frame,
+                home_highlight=home_highlight):
             raise TargetChangedError("指针定位期间目标或屏幕已变化，未发送点击；请重新观察。")
 
-    def _changed(self, after, *, cursor=None, reference=None, after_frame=None):
+    def _changed(self, after, *, cursor=None, reference=None, after_frame=None, home_highlight: bool = False):
         width, height = after.size
         delta = ImageChops.difference(self.before, after)
         red, green, blue = delta.split()
@@ -120,6 +135,12 @@ class TextTargetGuard:
                     and _cursor_patch_matches(after, unoccluded, point)):
                 mask_cursor(point)
 
+        home_panel = None
+        if home_highlight:
+            home_panel = self._valid_home_highlight(after_frame)
+            if home_panel is None:
+                return True
+
         # Only a changed, cursor-sized disc may disappear from the original frame.
         old = []
         for x, y, diameter in self.discs:
@@ -127,8 +148,17 @@ class TextTargetGuard:
             patch = mask.crop((int(x - radius), int(y - radius), int(x + radius), int(y + radius)))
             if patch.histogram()[255] >= 6:
                 old.append((x, y, diameter))
-        if len(old) > 1:
-            return True
+        if home_panel is not None:
+            slot_left, slot_top, slot_right, slot_bottom = _home_slot_bounds(home_panel, width, height)
+            old_outside = [
+                (x, y, d) for x, y, d in old
+                if not (slot_left <= x <= slot_right and slot_top <= y <= slot_bottom)]
+            if len(old_outside) > 1:
+                return True
+        else:
+            old_outside = old
+            if len(old) > 1:
+                return True
 
         tx, ty = self.target.center[0] * width, self.target.center[1] * height
         reach = .08 * width
@@ -144,97 +174,49 @@ class TextTargetGuard:
             return True
         morphed = (len(highlights) == 1 and abs(highlights[0][0] - tx) <= reach
                    and abs(highlights[0][1] - ty) <= reach)
-        if old and not (new or morphed or self._home_highlight_excuses_old_discs(old, after_frame)):
+        if old_outside and not (new or morphed or home_panel is not None):
             return True
-        if old and new and abs(old[0][2] - new[0][2]) > .35 * old[0][2]:
+        if old_outside and new and abs(old_outside[0][2] - new[0][2]) > .35 * old_outside[0][2]:
             return True
         for x, y, diameter in old + new:
             radius = diameter / 2 + max(2, width / 180)
             draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=0)
         if cursor is not None and 24 <= mask.histogram()[255] < 48:
             self._mask_home_icon_edge_noise(after, mask, cursor[0], measured, delta)
-        self._allow_home_highlight(after_frame, mask, draw)
+        if home_panel is not None:
+            margin = max(2, round(0.01 * width))
+            draw.rectangle(
+                (max(0, round(slot_left) - margin), max(0, round(slot_top) - margin),
+                 min(width, round(slot_right) + margin), min(height, round(slot_bottom) + margin)),
+                fill=0)
         return mask.histogram()[255] >= 24
 
-    def _home_highlight_excuses_old_discs(self, old, after_frame):
-        """Whether disappeared discs are just the Home icon turning blue.
+    def _valid_home_highlight(self, after_frame):
+        """Return the anchored menu panel iff this move produced a valid Home highlight.
 
-        A disc in the before frame that is no longer detected after the
-        Home slot turns blue has not vanished: the highlight recoloured it
-        past the disc detector's neutral-colour filter. Excuse it only
-        when the highlight is valid (before unhighlighted, after
-        highlighted on the same Home slot) and every disappeared disc
-        lies inside the Home slot.
+        Only authorized when this tap's positioning move established a Home
+        highlight landing (`home_highlight=True`). Pre-move checks and non-highlight
+        moves leave `home_highlight=False` so unsolicited highlights still trip.
         """
         context = self.navigation_context
         if context is None or context.action != "home" or context.kind != "menu":
-            return False
-        if after_frame is None or self._before_frame is None:
-            return False
-        if len(context.regions) != 1 or not old:
-            return False
-        from .assistive_vision import MENU_ICON_REGIONS, menu_home_highlight
+            return None
+        if after_frame is None or self._before_frame is None or len(context.regions) != 1:
+            return None
+        from .assistive_vision import menu_home_highlight
 
         panel = context.regions[0]
         try:
             before_hl = menu_home_highlight(self._before_frame, panel)
             after_hl = menu_home_highlight(after_frame, panel)
         except (OSError, ValueError):
-            return False
-        if before_hl.highlighted or not after_hl.highlighted:
-            return False
-        width, height = self.before.size
-        pl, pt, pr, pb = panel
-        hl, ht, hr, hb = MENU_ICON_REGIONS[-1]
-        left = (pl + hl * (pr - pl)) * width
-        top = (pt + ht * (pb - pt)) * height
-        right = (pl + hr * (pr - pl)) * width
-        bottom = (pt + hb * (pb - pt)) * height
-        return all(left <= x <= right and top <= y <= bottom for x, y, _ in old)
-
-    def _allow_home_highlight(self, after_frame, mask, draw):
-        """Mask out the expected Home hover highlight, and only that change.
-
-        For a home-menu navigation context, the positioning move turns the
-        target Home icon and label iOS blue. That white-to-blue change is
-        expected and must not trip the guard. Anything else -- another item
-        highlighted, the panel moved, other pixels changed -- stays in the
-        mask and still trips it. The highlight is verified from the
-        observed frames (before unhighlighted, current highlighted on the
-        same Home slot), never assumed from the request.
-        """
-        context = self.navigation_context
-        if context is None or context.action != "home" or context.kind != "menu":
-            return
-        if after_frame is None or self._before_frame is None:
-            return
-        if len(context.regions) != 1:
-            return
-        from .assistive_vision import MENU_ICON_REGIONS, menu_home_highlight
-
-        panel = context.regions[0]
-        try:
-            before_hl = menu_home_highlight(self._before_frame, panel)
-            after_hl = menu_home_highlight(after_frame, panel)
-        except (OSError, ValueError):
-            return
-        if before_hl.highlighted or not after_hl.highlighted:
-            return
-        # Mask the Home slot (icon + label) in the change mask, so only the
-        # expected highlight is excused. Other slots and the rest of the
-        # panel stay visible to the guard.
-        width, height = mask.size
-        pl, pt, pr, pb = panel
-        hl, ht, hr, hb = MENU_ICON_REGIONS[-1]
-        left = pl + hl * (pr - pl)
-        top = pt + ht * (pb - pt)
-        right = pl + hr * (pr - pl)
-        bottom = pt + hb * (pb - pt)
-        margin = max(2, round(0.01 * width))
-        draw.rectangle(
-            (max(0, round(left * width) - margin), max(0, round(top * height) - margin),
-             min(width, round(right * width) + margin), min(height, round(bottom * height) + margin)),
-            fill=0)
+            return None
+        if before_hl.highlighted or not after_hl.highlighted or after_hl.centre is None:
+            return None
+        left, top, right, bottom = context.target.box
+        if not (left <= after_hl.centre[0] <= right and top <= after_hl.centre[1] <= bottom):
+            return None
+        return panel
 
     def _mask_home_icon_edge_noise(self, after, mask, point, measured, delta):
         """A measured Home icon may retain a few stationary JPEG edge specks.

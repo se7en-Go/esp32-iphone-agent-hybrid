@@ -1,9 +1,9 @@
 """Small, dependency-free AssistiveTouch checks on mirrored screen images."""
 
-from typing import NamedTuple
 import io
 import math
 from statistics import median
+from typing import NamedTuple
 
 from PIL import Image, ImageChops, ImageFilter
 

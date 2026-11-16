@@ -262,6 +262,7 @@ class Phone:
         self._pointer_pair_verified = False
         self._pointer_overlay = None
         self._pointer_reference = None
+        self._menu_highlight_landing_active = False
         self._last_motion = 0.0
         self._position_before = None
         self._position_from = None
@@ -578,6 +579,14 @@ class Phone:
                     cursor = current.updated
                 await self.screen.fresh(cursor, min(.1, max(0, deadline - time.monotonic())))
                 await asyncio.sleep(.005)
+            latest = freshness.fresh_frame(self.screen, since=sent)
+            if latest is not None and latest.updated > cursor:
+                if diagnostics:
+                    diagnostics.capture(phase, latest.frame, latest.updated)
+                if latest.generation != observed.generation:
+                    raise RuntimeError("指针定位期间画面连接已变化，请重新观察。")
+                if (selected := select(latest.frame)) is not None:
+                    return selected
             return None
 
         outward = []
@@ -707,7 +716,9 @@ class Phone:
         return_started = time.time() - (time.monotonic() - sent)
 
         def find_early_return(snapshot):
-            if snapshot.frame_ts is None:
+            # Only probe frames with completely unknown capture timing early;
+            # HAFE/2 frames carry capture_age_s and must prove post-return capture.
+            if snapshot.frame_ts is None and getattr(snapshot, "capture_age_s", None) is None:
                 return locate(snapshot.frame)
             return None
 
@@ -1223,6 +1234,7 @@ class Phone:
         self._pointer_pair_verified = False
         self._pointer_overlay = None
         self._pointer_reference = None
+        self._menu_highlight_landing_active = False
         await self.point(x, y)
         same_session()
         self._pointer_spots = ((x, y),)
@@ -1394,7 +1406,10 @@ class Phone:
             "requested": near,
             "panel": panel,
         }
-        self._pointer_overlay = (measured, current.frame)
+        # Never store the highlight frame as _pointer_overlay: pointer fade
+        # over bright iOS blue alters RGB by >100 levels before write time.
+        self._pointer_overlay = None
+        self._menu_highlight_landing_active = True
         return measured
 
     def _target_escape_probe(self, near, box):
@@ -1739,6 +1754,7 @@ class Phone:
         hover = self._pointer_spots[:1] + ((x, y),)
         self._pointer_seen = self._pointer_confirmed = False
         self._pointer_escape_attempted = False
+        self._menu_highlight_landing_active = False
         self.last_tap = None
         self._pointer_diagnostics = None
         self._tap_target_frame = None
@@ -1770,7 +1786,8 @@ class Phone:
                     from .input_context import point_in_suggestion_bar
 
                     if point_in_suggestion_bar(target_frame or observed.frame, x, y):
-                        raise PointerLandingError("点击落在键盘建议栏，未发送；请用 tap_text 点建议词，或把目标点移到正文。")
+                        raise PointerLandingError(
+                            "点击落在键盘建议栏，未发送；请用 tap_text 点建议词，或把目标点移到正文。")
                 target = SimpleNamespace(center=(x, y))
                 if target_box is not None:
                     target.box = target_box
@@ -1814,15 +1831,17 @@ class Phone:
                         raise RuntimeError("点击前画面连接已变化，未发送点击；请重新观察。")
                     cursor = self._pointer_overlay if self._pointer_confirmed else None
                     reference = self._pointer_reference if cursor else None
+                    home_highlight = bool(
+                        self._pointer_confirmed and getattr(self, "_menu_highlight_landing_active", False))
                     diagnostics = self._pointer_diagnostics
                     if diagnostics:
                         diagnostics.capture("target_reference", target_frame or observed.frame)
                         diagnostics.capture("write_candidate", current.frame, current.updated)
                     try:
-                        target_guard(cursor=cursor, reference=reference)
+                        target_guard(cursor=cursor, reference=reference, home_highlight=home_highlight)
                         if before_click is not None:
                             if isinstance(before_click, TextTargetGuard):
-                                before_click(cursor=cursor, reference=reference)
+                                before_click(cursor=cursor, reference=reference, home_highlight=home_highlight)
                             else:
                                 before_click()
                     except RuntimeError as exc:
@@ -1877,6 +1896,7 @@ class Phone:
         finally:
             self._tap_timing = None
             self._tap_blind_allowed = False
+            self._menu_highlight_landing_active = False
             self._navigation_context = None
             self._tap_target_frame = None
 
