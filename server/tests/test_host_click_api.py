@@ -96,6 +96,62 @@ def test_host_evidence_clicks_once_without_calibration_or_pointer_movement(rig):
     assert len(rig.link.written) == 1
 
 
+def test_host_evidence_hold_has_no_click_or_send_accounting(rig):
+    result = asyncio.run(post(request_for(rig, duration=.3)))
+    assert result.status_code == 200, result.text
+    payload = result.json()
+    assert payload["command_acknowledged"] and payload["held"]
+    assert not payload["clicked"] and payload["click_count"] == 0
+    assert payload["hold_seconds"] == .3 and not payload["effect_verified"]
+    assert [line.split(b" ", 1)[1].strip() for line in rig.link.written] == [b"press", b"release"]
+    assert rig.guard.sends == []
+
+
+def test_observed_hold_rejects_named_send_target(rig):
+    result = asyncio.run(post(request_for(rig, duration=.3, target_label="Send")))
+    assert result.status_code == 409, result.text
+    assert rig.link.written == [] and rig.guard.sends == []
+
+
+def test_passively_qualified_hold_does_not_enter_click_send_scope(rig, monkeypatch):
+    from hidagent import control
+
+    def forbidden_scope(*_args):
+        pytest.fail("a hold must not enter the click/send scope")
+
+    monkeypatch.setattr(control, "send_target_scope", forbidden_scope)
+
+    async def scenario():
+        shot = (await passive_observation()).json()
+        result = await post({**from_shot(shot), "duration": .3})
+        assert result.status_code == 200, result.text
+        assert result.json()["command_acknowledged"] and result.json()["held"]
+        assert [line.split(b" ", 1)[1].strip() for line in rig.link.written] == [b"press", b"release"]
+        assert rig.device._host_observation_lease is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("rejected", [b"press", b"release"])
+def test_observed_hold_requires_both_ok_replies_for_command_acknowledged(rig, rejected):
+    original = rig.link.write
+
+    def write(data):
+        if data.split(b" ", 1)[1].strip() == rejected:
+            rig.link.written.append(data)
+            rig.link.replies.put_nowait(data.split(b" ", 1)[0] + b" error rejected\n")
+        else:
+            original(data)
+
+    rig.link.write = write
+    result = asyncio.run(post(request_for(rig, duration=.3)))
+    assert result.status_code == 200, result.text
+    payload = result.json()
+    assert not payload["command_acknowledged"] and payload["error"]
+    assert not payload.get("held") and not payload["effect_verified"]
+    assert [line.split(b" ", 1)[1].strip() for line in rig.link.written] == [b"press", b"release"]
+
+
 def test_host_click_returns_current_settled_frame_instead_of_first_effect(rig, monkeypatch):
     effect = rig.phone._tap_effect
     final = jpeg("red")
@@ -122,6 +178,7 @@ def test_host_click_returns_current_settled_frame_instead_of_first_effect(rig, m
     {"target_box": [.4, .3, .6]}, {"target_box": [.4, .3, .6, 2]},
     {"target_label": "x" * 121}, {"hold": True}, {"repeat": 2}, {"click_count": 2},
     {"action": "tap"}, {"coordinate_space": "pixels"}, {"screen_id": ""},
+    {"duration": 0}, {"duration": .29}, {"duration": 3.1}, {"duration": True}, {"duration": "1"},
 ])
 def test_host_click_schema_rejects_extra_modes_and_invalid_coordinates(rig, changes):
     result = asyncio.run(post(request_for(rig, **changes)))
@@ -268,7 +325,8 @@ def test_capabilities_describes_host_evidence_without_claiming_calibration_or_cv
             payload = (await client.get("/api/control/capabilities")).json()
             feature = payload["features"]["host_observed_click"]
             assert feature["evidence_source"] == "host_observed"
-            assert feature["single_click_only"] is True
+            assert feature["single_click_only"] is False
+            assert feature["hold_seconds"] == {"minimum": .3, "maximum": 3}
             assert feature["requires_calibration"] is False
             assert feature["auto_fallback"] is False
             assert "host-click" not in payload["actions"]

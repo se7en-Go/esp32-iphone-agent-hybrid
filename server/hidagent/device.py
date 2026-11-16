@@ -403,6 +403,18 @@ class Device:
         self._pressed_link = None
         return req_id
 
+    def _release_held_nowait(self, link) -> None:
+        """Emergency cleanup of the original contact without a competing reply reader."""
+        if self._pressed_link is not link or link is None:
+            return
+        try:
+            self._write_release(link)
+        except OSError:
+            link.close()
+            self._pressed_link = None
+            if self._link is link:
+                self._link = None
+
     async def _release_held(self, link) -> None:
         """Called with the serial lock held and the previous reply reader stopped."""
         if self._pressed_link is not link:
@@ -514,12 +526,7 @@ class Device:
                     # Cancellation may have happened while queued behind a background
                     # query. Only emergency release may bypass the serial lock. Do not
                     # start another reader; its unique ACK can be ignored by that query.
-                    try:
-                        self._write_release(link)
-                    except OSError:
-                        link.close()
-                        if self._link is link:
-                            self._link = None
+                    self._release_held_nowait(link)
             raise
         finally:
             self._exchanges.discard(task)
@@ -656,7 +663,7 @@ class Device:
     def _guard_idle_nudge(self) -> None:
         # Recheck inside exchange's actual serial write lock: an idle move may
         # already be queued when a host starts observing its stationary pointer.
-        if self._idle_nudge_paused():
+        if self._idle_nudge_paused() or self._pressed_link is not None:
             raise _IdleNudgePaused("host observation temporarily paused background pointer motion")
 
     async def _nudge_idle(self) -> None:

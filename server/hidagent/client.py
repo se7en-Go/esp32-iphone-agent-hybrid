@@ -58,10 +58,12 @@ class IPhoneClient:
         return self.request("POST", "/api/control/batch", {"screen_id": screen_id, "steps": steps}).json()
 
     def click_observed(self, screen_id: str, pointer_x: float, pointer_y: float,
-                       target_box: tuple[float, float, float, float], *, target_label: str = "") -> dict:
+                       target_box: tuple[float, float, float, float], *, target_label: str = "",
+                       duration: float | None = None) -> dict:
         return self.request("POST", "/api/control/host-click", {
             "screen_id": screen_id, "pointer_x": pointer_x, "pointer_y": pointer_y,
             "target_box": target_box, "target_label": target_label,
+            **({"duration": duration} if duration is not None else {}),
         }).json()
 
     def clipboard_stage(self, stage: str, **fields) -> dict:

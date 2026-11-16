@@ -61,14 +61,228 @@ def test_single_click_without_any_pointer_movement_or_cv_claim(tmp_path):
     asyncio.run(scenario())
 
 
+def test_observed_hold_is_stationary_and_acknowledges_both_edges(tmp_path):
+    async def scenario():
+        phone, device, screen, link = setup(tmp_path)
+        phone._tap_effect = no_effect
+
+        async def forbidden(*_args, **_kwargs):
+            pytest.fail("observed hold must never move or acquire the pointer")
+
+        phone.ensure_observation = phone.point = phone.point_verified = forbidden
+        began = time.monotonic()
+        try:
+            result = await phone.click_observed(**evidence(phone, screen), duration=.3)
+            assert [line.split(b" ", 1)[1].strip() for line in link.written] == [b"press", b"release"]
+            assert time.monotonic() - began >= .3
+            assert result["held"] and result["hold_seconds"] == .3
+            assert result["click_count"] == 0 and result["clicked"] is False
+            assert result["evidence_source"] == "host_observed" and not result["effect_verified"]
+            assert not phone._pointer_confirmed and not phone._pointer_pair_verified
+            assert device.input_sequence == 2 and device._pressed_link is None
+        finally:
+            device.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("duration", [True, 0, -.1, .299, 3.001, float("nan"), float("inf"), "1"])
+def test_observed_hold_rejects_invalid_duration_without_input(tmp_path, duration):
+    async def scenario():
+        phone, device, screen, link = setup(tmp_path)
+        try:
+            with pytest.raises(ValueError, match="duration"):
+                await phone.click_observed(**evidence(phone, screen), duration=duration)
+            assert link.written == []
+        finally:
+            device.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["lost_press_ack", "press_rejected", "stop", "cancel", "release_rejected"])
+def test_observed_hold_failure_releases_once_and_never_retries_contact(tmp_path, failure):
+    async def scenario():
+        phone, device, screen, _ = setup(tmp_path)
+        pressed = asyncio.Event()
+
+        class HoldLink(Link):
+            def write(self, data):
+                command = data.split(b" ", 1)[1].strip()
+                if command == b"press":
+                    pressed.set()
+                    if failure == "lost_press_ack":
+                        self.written.append(data)
+                        raise OSError("press may have arrived")
+                if ((command == b"release" and failure == "release_rejected")
+                        or (command == b"press" and failure == "press_rejected")):
+                    self.written.append(data)
+                    self.replies.put_nowait(data.split(b" ", 1)[0] + b" error release\n")
+                else:
+                    super().write(data)
+
+        link = HoldLink()
+        device.attach(link)
+        device.session_started_at = time.time() - 2
+        phone._clock_link = device.links
+        phone._tap_effect = no_effect
+        task = asyncio.create_task(phone.click_observed(**evidence(phone, screen), duration=.3))
+        try:
+            if failure in {"stop", "cancel"}:
+                await asyncio.wait_for(pressed.wait(), 1)
+                await asyncio.sleep(.01)
+                if failure == "stop":
+                    device.request_abort()
+                else:
+                    task.cancel()
+            with pytest.raises((RuntimeError, asyncio.CancelledError)):
+                await task
+            assert [line.split(b" ", 1)[1].strip() for line in link.written] == [b"press", b"release"]
+            assert device._pressed_link is None
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            device.close()
+
+    asyncio.run(scenario())
+
+
+def test_observed_hold_stop_while_release_queued_cleans_original_contact(tmp_path):
+    async def scenario():
+        phone, device, screen, link = setup(tmp_path)
+        phone._tap_effect = no_effect
+        task = asyncio.create_task(phone.click_observed(**evidence(phone, screen), duration=.3))
+
+        async def pressed():
+            while not link.written:
+                if task.done():
+                    await task
+                await asyncio.sleep(0)
+
+        try:
+            await asyncio.wait_for(pressed(), 1)
+            await asyncio.sleep(.01)  # the press ACK is consumed before blocking release
+            await device._lock.acquire()
+
+            async def release_queued():
+                while not device._lock._waiters:
+                    if task.done():
+                        await task
+                    await asyncio.sleep(.005)
+
+            await asyncio.wait_for(release_queued(), 1)
+            device.request_abort()
+            with pytest.raises(RuntimeError):
+                await asyncio.wait_for(task, 2)
+            assert [line.split(b" ", 1)[1].strip() for line in link.written] == [b"press", b"release"]
+            assert device._pressed_link is None
+            device._lock.release()
+            await asyncio.sleep(.01)
+            assert len(link.written) == 2  # no cancelled queued release later leaks through
+        finally:
+            if device._lock.locked():
+                device._lock.release()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            device.close()
+
+    asyncio.run(scenario())
+
+
+def test_emergency_release_uses_only_held_handle_and_clears_closed_handle():
+    device = Device()
+
+    class BrokenRelease(Link):
+        closed = False
+
+        def write(self, data):
+            self.written.append(data)
+            raise OSError("original UART gone")
+
+        def close(self):
+            self.closed = True
+
+    original, replacement = BrokenRelease(), Link()
+    device.attach(original)
+    device._pressed_link = original
+    device.attach(replacement)
+    device._release_held_nowait(original)
+    assert original.closed and device._pressed_link is None
+    assert len(original.written) == 1 and original.written[0].endswith(b" release\n")
+    assert replacement.written == [] and device._link is replacement
+    device._release_held_nowait(original)
+    assert len(original.written) == 1
+    device.close()
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+def test_observed_hold_rejects_background_move_queued_before_press_ack(tmp_path, qualified):
+    async def scenario():
+        phone, device, screen, link = setup(tmp_path)
+        phone._tap_effect = no_effect
+        original = evidence(phone, screen)
+        extra = {}
+        if qualified:
+            host = await phone.observe_host_pointer()
+            original["observation"] = host.snapshot
+            extra["host_observation"] = host
+        moves = []
+        write = link.write
+
+        def queue_idle(data):
+            write(data)
+            if data.endswith(b" press\n"):
+                if qualified:
+                    # Lease lifetime is independent of the admitted hold. Its
+                    # expiry must not permit background movement while down.
+                    host.lease.release()
+                moves.append(asyncio.create_task(device._nudge_idle()))
+
+        link.write = queue_idle
+        try:
+            result = await phone.click_observed(**original, **extra, duration=.3)
+            errors = await asyncio.gather(*moves, return_exceptions=True)
+            assert len(errors) == 1 and isinstance(errors[0], DeviceError)
+            assert result["held"] and device._pressed_link is None
+            assert [line.split(b" ", 1)[1].strip() for line in link.written] == [b"press", b"release"]
+        finally:
+            await asyncio.gather(*moves, return_exceptions=True)
+            device.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("pending", ["held", "idle_return"])
+def test_observed_hold_cannot_take_over_an_existing_contact_or_idle_pair(tmp_path, pending):
+    async def scenario():
+        phone, device, screen, link = setup(tmp_path)
+        phone._tap_effect = no_effect
+        if pending == "held":
+            device._pressed_link = link
+        else:
+            device._idle_nudge_inflight = True
+        try:
+            with pytest.raises(RuntimeError):
+                await phone.click_observed(**evidence(phone, screen), duration=.3)
+            assert link.written == []
+        finally:
+            device._pressed_link = None
+            device.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("transition", ["frame", "generation", "link", "abort", "input", "stale", "device"])
-def test_original_observation_is_rechecked_inside_device_lock(tmp_path, transition):
+@pytest.mark.parametrize("duration", [None, .3])
+def test_original_observation_is_rechecked_inside_device_lock(tmp_path, transition, duration):
     async def scenario():
         phone, device, screen, link = setup(tmp_path)
         phone._tap_effect = no_effect
         original = evidence(phone, screen)
         await device._lock.acquire()
-        task = asyncio.create_task(phone.click_observed(**original))
+        task = asyncio.create_task(phone.click_observed(**original, **({"duration": duration} if duration else {})))
         try:
             async def waiting():
                 while not device._lock._waiters:

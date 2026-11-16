@@ -69,6 +69,16 @@ def test_explicit_observed_click_has_its_own_route_and_preserves_visible_label(r
     })]
 
 
+def test_observed_hold_forwards_only_explicit_duration(remote, capsys):
+    assert cli.main(["click-observed", ".5", ".4", "--screen-id", "seen-pointer",
+                     "--target-box", ".4", ".3", ".6", ".5", "--duration", "1.2"]) == 0
+    capsys.readouterr()
+    assert remote == [("POST", "/api/control/host-click", {
+        "screen_id": "seen-pointer", "pointer_x": .5, "pointer_y": .4,
+        "target_box": [.4, .3, .6, .5], "target_label": "", "duration": 1.2,
+    })]
+
+
 @pytest.mark.parametrize("arguments", [
     [".5", ".4", "--target-box", ".4", ".3", ".6", ".5"],
     [".5", ".4", "--screen-id", "fresh"],

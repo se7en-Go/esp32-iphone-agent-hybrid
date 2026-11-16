@@ -313,6 +313,7 @@ class HostClickBody(BaseModel):
     pointer_y: UnitCoordinate
     target_box: tuple[UnitCoordinate, UnitCoordinate, UnitCoordinate, UnitCoordinate]
     target_label: str = Field(default="", max_length=120)
+    duration: float | None = Field(default=None, ge=.3, le=3, strict=True, allow_inf_nan=False)
 
 
 def check_keyboard(text):
@@ -489,7 +490,8 @@ def control_capabilities():
             "drawing": {"supported": True, "verified_start": True, "closed_loop_during_stroke": False},
             "host_observed_click": {
                 "supported": True, "endpoint": "/api/control/host-click", "evidence_source": "host_observed",
-                "moves_pointer": False, "requires_calibration": False, "single_click_only": True,
+                "moves_pointer": False, "requires_calibration": False, "single_click_only": False,
+                "hold_seconds": {"minimum": .3, "maximum": 3},
                 "auto_fallback": False,
                 "passive_observation": "/api/control/observe?for_click=true",
                 "qualified_ticket_seconds": 30,

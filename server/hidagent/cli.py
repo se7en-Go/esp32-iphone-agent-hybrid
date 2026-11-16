@@ -48,6 +48,7 @@ def parser() -> argparse.ArgumentParser:
     host_click.add_argument("--target-box", nargs=4, type=float, required=True,
                             metavar=("LEFT", "TOP", "RIGHT", "BOTTOM"))
     host_click.add_argument("--target-label", default="", help="visible target label; required for sending controls")
+    host_click.add_argument("--duration", type=float, help="hold the stationary pointer for 0.3..3 seconds")
     _context(host_click, required=True)
     for name, keys in {"point": ("x", "y"), "tap": ("x", "y"), "swipe": ("x1", "y1", "x2", "y2"),
                        "scroll": ("x", "y", "lines"), "long-press": ("x", "y"),
@@ -181,7 +182,8 @@ def main(argv=None) -> int:
                 case "observe": result = _save_evidence(client.observe(for_click=args.for_click), args.output)
                 case "click-observed":
                     result = client.click_observed(args.screen_id, args.pointer_x, args.pointer_y, args.target_box,
-                                                   target_label=args.target_label)
+                                                   target_label=args.target_label,
+                                                   **({"duration": args.duration} if args.duration is not None else {}))
                 case "screenshot":
                     args.output.write_bytes(client.screenshot())
                     result = {"path": str(args.output.resolve())}

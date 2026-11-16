@@ -147,6 +147,15 @@ def test_real_stdio_uses_host_vision_and_returns_action_images_without_model_key
                 "target_box": [.4, .3, .6, .5], "target_label": "主屏幕"})
             assert not observed_click.isError and observed_click.content[1].type == "image"
             assert json.loads(observed_click.content[0].text)["effect_verified"] is False
+            observed_hold = await session.call_tool("iphone_click_observed", {
+                "pointer_x": .5, "pointer_y": .4, "screen_id": "host-saw-hold",
+                "target_box": [.4, .3, .6, .5], "target_label": "AssistiveTouch", "duration": .8})
+            assert not observed_hold.isError
+            before_invalid_hold = len(requests)
+            invalid_hold = await session.call_tool("iphone_click_observed", {
+                "pointer_x": .5, "pointer_y": .4, "screen_id": "invalid-hold",
+                "target_box": [.4, .3, .6, .5], "duration": .2})
+            assert invalid_hold.isError and len(requests) == before_invalid_hold
 
     try:
         asyncio.run(asyncio.wait_for(scenario(), 25))
@@ -176,7 +185,10 @@ def test_real_stdio_uses_host_vision_and_returns_action_images_without_model_key
                          "text": "Freeform", "coordinate_space": "normalized"})] + [
                         ("/api/control/clipboard/" + stage, body) for stage, body in clipboard_steps] + [
                         ("/api/control/host-click", {"screen_id": "host-saw-pointer", "pointer_x": .5,
-                         "pointer_y": .4, "target_box": [.4, .3, .6, .5], "target_label": "主屏幕"})]
+                         "pointer_y": .4, "target_box": [.4, .3, .6, .5], "target_label": "主屏幕"}),
+                        ("/api/control/host-click", {"screen_id": "host-saw-hold", "pointer_x": .5,
+                         "pointer_y": .4, "target_box": [.4, .3, .6, .5], "target_label": "AssistiveTouch",
+                         "duration": .8})]
 
 
 def test_delegate_tool_requires_explicit_opt_in(monkeypatch):

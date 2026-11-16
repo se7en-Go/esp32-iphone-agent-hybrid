@@ -2,7 +2,9 @@
 
 import json
 import os
-from typing import Literal
+from typing import Annotated, Literal
+
+from pydantic import Field
 
 from .client import IPhoneClient
 
@@ -113,20 +115,25 @@ def create_server(url: str | None = None):
 
     @mcp.tool()
     def iphone_click_observed(pointer_x: float, pointer_y: float, screen_id: str,
-                              target_box: tuple[float, float, float, float], target_label: str = ""
+                              target_box: tuple[float, float, float, float], target_label: str = "",
+                              duration: Annotated[float | None, Field(ge=.3, le=3, strict=True)] = None
                               ) -> list[TextContent | ImageContent]:
         """Click ONCE at the existing pointer position, after YOU inspect it inside the visible target.
 
         All coordinates are normalized 0..1. Requires a new screenshot after connection/the last HID
         input and full mirror delay. Do not infer the pointer from a requested movement or a failed CV result.
-        This never moves, nudges, calibrates, retries, holds or double-clicks. It is an explicit host
+        Omit duration for one click; duration=0.3..3 holds then releases once without moving.
+        This never moves, nudges, calibrates, retries or double-clicks. It is an explicit host
         observation, not automatic CV verification. Inspect the returned image to verify the effect.
         For a Send control, user authorization and its actual visible target_label are required;
         the service cannot infer Send semantics from arbitrary coordinates. Never retry an uncertain send.
+        Holds cannot target Send controls. A hold ACK requires both press and release acknowledgments;
+        it does not verify an iOS long-press effect. Stop or lost ACK triggers bounded release recovery.
         """
         with IPhoneClient(url) as client:
             return content(client.click_observed(screen_id, pointer_x, pointer_y, target_box,
-                                                 target_label=target_label))
+                                                 target_label=target_label,
+                                                 **({"duration": duration} if duration is not None else {})))
 
     @mcp.tool()
     def iphone_find_text(text: str, screen_id: str, nth: int = 1,

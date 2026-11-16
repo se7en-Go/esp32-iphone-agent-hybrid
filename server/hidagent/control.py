@@ -10,6 +10,7 @@ import io
 import math
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from types import SimpleNamespace
 
@@ -777,14 +778,18 @@ class Controls:
         ready = time.perf_counter()
         completed_at, acknowledged, error = None, False, None
         extra = {"evidence_source": "host_observed", "pointer_seen": False, "effect_verified": False}
+        duration = getattr(request, "duration", None)
+        label = getattr(request, "target_label", "")
+        if duration is not None and is_send_target(label, label):
+            raise ValueError("host-observed hold cannot target a Send control")
         try:
-            label = getattr(request, "target_label", "")
-            with send_target_scope(is_send_target(label, label)):
+            with send_target_scope(is_send_target(label, label)) if duration is None else nullcontext():
                 result = await self.phone.click_observed(
                     observation=observation, pointer_xy=pointer, target_box=box,
                     expected_device=inputs.device, expected_links=inputs.links,
                     expected_abort_epoch=inputs.epoch, expected_input_seq=inputs.sequence,
                     before_click=validate_original,
+                    **({"duration": duration} if duration is not None else {}),
                     **({"host_observation": qualified} if qualified is not None else {}))
             if isinstance(result, dict):
                 result = dict(result)

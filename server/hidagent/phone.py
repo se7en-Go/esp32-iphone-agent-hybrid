@@ -1452,13 +1452,15 @@ class Phone:
                              pointer_xy, target_box, expected_device, expected_links: int,
                              expected_abort_epoch: int, expected_input_seq: int,
                              before_click: Callable[[], None] | None = None,
-                             host_observation: HostObservation | None = None) -> dict:
+                             host_observation: HostObservation | None = None,
+                             duration: float | None = None) -> dict:
         try:
             return await self._click_observed(
                 observation=observation, pointer_xy=pointer_xy, target_box=target_box,
                 expected_device=expected_device, expected_links=expected_links,
                 expected_abort_epoch=expected_abort_epoch, expected_input_seq=expected_input_seq,
-                before_click=before_click, host_observation=host_observation)
+                before_click=before_click, host_observation=host_observation,
+                **({"duration": duration} if duration is not None else {}))
         finally:
             if isinstance(host_observation, HostObservation):
                 lease = getattr(host_observation, "lease", None)
@@ -1471,8 +1473,12 @@ class Phone:
                               pointer_xy, target_box, expected_device, expected_links: int,
                               expected_abort_epoch: int, expected_input_seq: int,
                               before_click: Callable[[], None] | None = None,
-                              host_observation: HostObservation | None = None) -> dict:
+                              host_observation: HostObservation | None = None,
+                              duration: float | None = None) -> dict:
         """One explicit host-observed contact at the unmoved pointer; never a CV fallback."""
+        if duration is not None and (not isinstance(duration, (int, float)) or isinstance(duration, bool)
+                                     or not math.isfinite(duration) or not .3 <= duration <= 3):
+            raise ValueError("host-observed hold duration must be 0.3..3 seconds")
         if (not isinstance(observation, freshness.FrameSnapshot) or not observation.frame
                 or len(pointer_xy) != 2 or len(target_box) != 4
                 or not all(isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -1506,6 +1512,9 @@ class Phone:
 
         def validate_observation():
             same_session(expected_input_seq)
+            if duration is not None and (expected_device._pressed_link is not None
+                                         or expected_device._idle_nudge_inflight):
+                raise RuntimeError("已有按住动作或后台微移未结束，请重新观察后再原地按住。")
             if host_observation is not None:
                 host_observation.validate(self)
             current = freshness.require_fresh(self.screen)
@@ -1565,17 +1574,56 @@ class Phone:
                 await self.screen.fresh(current.updated, min(.1, remaining))
                 await asyncio.sleep(min(.005, max(0, deadline - time.monotonic())))
         validate_click()
-        await self._send(expected_abort_epoch, "click", before_write=validate_click)
+        if duration is None:
+            await self._send(expected_abort_epoch, "click", before_write=validate_click)
+        else:
+            held_link = expected_device._link
+
+            async def release_hold():
+                def same_handle():
+                    if expected_device._link is not held_link:
+                        raise DeviceError("原地按住期间串口已变化，不能向新连接发送松键。")
+
+                try:
+                    # Cleanup may cross stop/deadline, but never a UART handle.
+                    await expected_device.send_guarded("release", same_handle)
+                except BaseException:
+                    if expected_device._pressed_link is held_link:
+                        # Like Device's cancelled queued exchange recovery, do
+                        # not wait on a lock held by another reply reader. The
+                        # unique release ACK may be discarded; never claim it.
+                        expected_device._release_held_nowait(held_link)
+                    raise
+
+            try:
+                await self._send(expected_abort_epoch, "press", before_write=validate_click)
+                until = time.monotonic() + duration
+                while True:
+                    self._check_operation()
+                    same_session(expected_input_seq + 1)
+                    remaining = until - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(.05, remaining))
+            finally:
+                # Device already releases an uncertain/cancelled press exchange.
+                # Do not repeat that cleanup or release after a denied down-write.
+                if held_link is not None and expected_device._pressed_link is held_link:
+                    await shield_cleanup(asyncio.wait_for(release_hold(), RELEASE_TIMEOUT))
         completed_at = time.time()
-        same_session(expected_input_seq + 1)  # our own click advances the sequence exactly once
+        sequence = expected_input_seq + (1 if duration is None else 2)
+        same_session(sequence)
         changed, fresh = await self._tap_effect(observation.frame, completed_at, expected_abort_epoch, (), ())
-        same_session(expected_input_seq + 1)
-        return {"clicked": True, "click_count": 1, "evidence_source": "host_observed",
+        same_session(sequence)
+        return {"clicked": duration is None, "click_count": 1 if duration is None else 0,
+                **({"held": True, "hold_seconds": duration} if duration is not None else {}),
+                "evidence_source": "host_observed",
                 "pointer_seen": False, "effect_verified": False, "screen_changed": changed if fresh else None,
                 "effect_observed": changed if fresh else None, "fresh": fresh, "completed_at": completed_at,
                 "latency": round(time.monotonic() - began, 3),
                 "_after_frame": self._effect_frame, "_after_snapshot": self._effect_snapshot,
-                "warning": "已按宿主看到的指针位置原地单击；请查看结果，勿自动重试。"}
+                "warning": ("已在宿主看到的指针位置按住并松开；请查看结果，勿自动重试。" if duration is not None else
+                            "已按宿主看到的指针位置原地单击；请查看结果，勿自动重试。")}
 
     @bounded_operation
     @_serialized
