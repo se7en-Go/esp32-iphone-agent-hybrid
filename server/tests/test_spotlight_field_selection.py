@@ -146,7 +146,7 @@ def test_search_query_ack_is_separate_from_result_page_verification(tmp_path, mo
     async def scenario():
         phone, device, link, screen = setup(tmp_path, monkeypatch, on_home=True)
         controls = Controls(phone, screen)
-        after = spotlight(joined=True, extra=True, edit="sibling")
+        after = spotlight(joined=True, extra=True, edit="field" if outcome == "pre_context" else "sibling")
         send, write, timeout = phone._send, link.write, device._timeout
         query_acked = False
 

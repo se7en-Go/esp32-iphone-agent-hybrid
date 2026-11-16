@@ -2160,24 +2160,38 @@ class Phone:
             known_spotlight = any(marker in SPOTLIGHT_MARKERS and placeholder in SPOTLIGHT_PLACEHOLDERS
                                   and marker_box[3] < placeholder_box[1]
                                   for marker, marker_box in labels for placeholder, placeholder_box in labels)
-            if field.region is None and known_spotlight:
-                # A first eligible frame may arrive during the caret's dark
-                # phase. Observe once more without any HID, preserving the
-                # original shortcut/session and requiring independent focus.
-                validate_session()
-                try:
-                    later = await asyncio.wait_for(self.screen.fresh(focused.updated, SPOTLIGHT_FOCUS_WAIT),
-                                                   SPOTLIGHT_FOCUS_WAIT)
-                except asyncio.TimeoutError:
-                    later = None
-                validate_session()
-                if later is not None:
+            current = validate_session()
+            focus_changed = field.region is not None and screen_compare.observation_changed(
+                focused.frame, current.frame, caret_frames=getattr(self.screen, "recent_frames", ()))
+            if known_spotlight and (field.region is None or focus_changed):
+                # The caret may be dark, or suggestions may update during OCR.
+                # Re-read one later frame without reopening Spotlight or sending HID.
+                later = current.updated > focused.updated
+                if not later:
+                    try:
+                        later = await asyncio.wait_for(self.screen.fresh(focused.updated, SPOTLIGHT_FOCUS_WAIT),
+                                                       SPOTLIGHT_FOCUS_WAIT) is not None
+                    except asyncio.TimeoutError:
+                        pass
+                    validate_session()
+                if later:
                     alternate = freshness.require_fresh(self.screen, since=opened_at)
                     with Image.open(io.BytesIO(focused.frame)) as first_image, \
                             Image.open(io.BytesIO(alternate.frame)) as next_image:
                         same_size = first_image.size == next_image.size
                     if alternate.updated > focused.updated and same_size:
-                        _, field = await read_focus(alternate, labels)
+                        _, replacement = await read_focus(alternate, labels)
+                        if field.region is None:
+                            field = replacement
+                        elif replacement.region is not None:
+                            same_bounds = all(abs(a - b) <= .01 for a, b in
+                                              zip(field.region, replacement.region, strict=True))
+                            if same_bounds and not screen_compare.observation_changed(
+                                    focused.frame, alternate.frame, context_regions=(field.region,),
+                                    caret_frames=getattr(self.screen, "recent_frames", ())):
+                                field = replacement
+            if focus_changed and field.original is focused:
+                raise AppSearchError("Spotlight 搜索框在输入前已变化，未输入 App 名。")
             if field.region is None:
                 raise AppSearchError("无法确认 Spotlight 搜索框获得焦点，未输入 App 名。")
 

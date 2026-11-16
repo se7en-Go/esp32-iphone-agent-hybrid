@@ -70,6 +70,46 @@ def test_already_valid_first_observation_keeps_single_read_and_no_added_wait(tmp
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("change", ["suggestions", "field", "labels", "again", "generation"])
+def test_focused_spotlight_rechecks_one_newer_frame_before_typing(tmp_path, monkeypatch, change):
+    async def scenario():
+        phone, device, link, screen = setup(tmp_path, monkeypatch, on_home=True)
+        first = spotlight(extra=True)
+        later = spotlight(extra=True, edit="field" if change == "field" else "sibling")
+        inspected = []
+
+        async def opened(*_args):
+            screen._on_jpeg(first)
+            return first
+
+        async def labels(frame):
+            inspected.append(frame)
+            if frame == first:
+                if change == "generation":
+                    screen._on_ready()
+                screen._on_jpeg(later)
+            elif change == "again":
+                screen._on_jpeg(spotlight(extra=True, edit="keyboard"))
+            return system_labels(marker=change != "labels" or frame == first)
+
+        monkeypatch.setattr(feedback, "wait_after_action", opened)
+        monkeypatch.setattr(ocr, "read_text_async", labels)
+        try:
+            if change == "suggestions":
+                field = await phone.open_app_search("Settings")
+                assert field[1] < .54 < .56 < field[3]
+                assert link.written == [b"1 key cmd+space\n", b"2 type Settings\n"]
+            else:
+                with pytest.raises(AppSearchError):
+                    await phone.open_app_search("Settings")
+                assert link.written == [b"1 key cmd+space\n"]
+            assert inspected == ([first] if change == "generation" else [first, later])
+        finally:
+            device.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("labels", [[], system_labels(marker=False), system_labels(placeholder="missing"),
                                      system_labels(marker="below")])
 def test_first_frame_without_spotlight_identity_never_waits_for_a_replacement(tmp_path, monkeypatch, labels):
