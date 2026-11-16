@@ -76,3 +76,47 @@ Commits on top of round 1 (`ed4445e`): `3096228` (item 2), `e757651` (item 1), `
 - `confirm()` fallback rewritten: candidates only from `controls.screen.recent_frames` with matching generation and `updated` after this transaction's `completed_at` (Cmd+V) and at or before the result observation's `updated`; the receipt gains `sheet_frame_updated` + `sheet_frame_generation` and `confirmation_evidence="paste_permission_dismissed"`. A stale pre-paste sheet is refused; a sheet buried under later ordinary frames is found. `paste_confirmation.py`: append support — `current_lines` must end with the expected lines and the preceding lines must equal `original_lines`; `_same_field_outline` skips sides with no visible border (edge-profile max < 22), so a fully borderless field passes the outline check. Untouched: the observed-text SHA-256 check, the `paste_sent` precondition, the session lock, the three-frame permission verification.
 - Tests: 70 passed (paste-confirmation + confirm-sheet-retry + staged-clipboard, including the Safari regression fixtures).
 - **Still unverified on device:** Notes paste with new text (different Chinese words, newline positions, leading-zero number, mixed case; the already-verified set 你好00123 / 00123 / 00042 / 00084 / AbC xYz must not be reused); verify the actual Notes content against the `completed` receipt; trigger-key check: when configured, `prepare` auto-sends the key once, then only poll `copied=true`. The user must confirm Control+Option+P is bound to `ESP32 Agent Clipboard` in Settings → Accessibility → Keyboard & Typing → Full Keyboard Access → Commands.
+
+## 2026-11-16 acceptance pass, round 3 — branch `muse/iphone-control-acceptance`
+
+Commits on top of round 2 (`6681954`): `d69e30b` (both regressions below). Merge still waits for Codex review and CI pass.
+
+### Automated vs real-device results
+
+- **Automated:** full Python suite after `d69e30b`: **2217 passed, 1 skipped** (2026-11-16, 313 s); the 83 tests in the files touched by the two regressions pass within it.
+- **Real-device:** partial — item 1a/1b passed; items 2/3 failed with zero clicks sent (diagnosis below, needs a detection-code fix decision); item 4 blocked on the iPhone-side shortcut binding (see below); item 1c not yet run.
+
+### Regression 1 — mirror time validation (Codex offline repro)
+
+- `FrameSnapshot` gained `capture_age_s` (seconds between iPhone capture and arrival; None = unknown: board path, legacy UxPlay, HAFE/1). `fresh_frame(since=...)` now requires `frame.updated - frame.capture_age_s > since` (strict) when the capture age is known, superseding the arrival/`frame_ts` lag branches; unknown capture time keeps the old arrival-based rule. `_on_native_record` and `_accept_remote` carry the age into the snapshot (the latter adds IPC transit so `updated - age` is never later than the true capture).
+- Tests in `test_screen_uxplay.py`: a frame captured 0.1 s before the action, arriving 1.8 s after it (capture age 1.9 s), is rejected by `fresh_frame(since=action)`; a post-action capture arriving late is accepted; no-capture-time keeps the arrival rule; remote snapshots carry the age with transit.
+
+### Regression 2 — paste sheet evidence retention
+
+- `_Transaction` gained `post_paste_frames` (snapshotted in `paste()` after `wait_after_action`) and `sheet_evidence` (set on verify success). `confirm()` first retries the retained evidence, then scans the retained frames + live `recent_frames`; the windowed generation/time checks are unchanged. `paste_confirmation.py` now filters out empty lines from the expected lines (blank lines have no OCR row), so an append starting with a newline is verifiable; the transaction digest still pins the exact text.
+- Tests: `test_confirm_sheet_retry.py` gained a window-passed retention test (sheet published during the wait, live frames cleared, confirm still completes) and a retry-reuse test; `test_paste_confirmation.py` gained a newline-leading append test.
+
+### Item 1 — mirror (1a/1b passed on device, 1c pending)
+
+- State at round-3 start: `/api/status` device/screen/calibrated/ready all true, video live, frame_age_s 0.179, generation 5, HID ble conn=1 bond=1. **Worker staleness:** the web worker (pid 71934, started 12:30) was still running pre-round-2 code, which is why `/api/status` showed `replay_lag_s: null` on a live mirror (the receiver socket probe itself returned `capture_age_s: 0.005`). Fixed by `restart-worker` (new worker pid 44998, instance `9621ae1c…`); `replay_lag_s` then reported real values (~0.04–0.18 s). Any code change needs a worker restart before device testing.
+- 1a continuous frames: 7 samples over 30 s, all live, frame_age_s 0.150–0.234, replay_lag_s 0.075–0.180 → pass.
+- 1b worker-only restart: receiver instance `1a0a4b77…` / pid 24772 unchanged; status after restart device/screen/calibrated/ready all true; video live, frame_age 0.077, replay_lag 0.039; calibration.json SHA-256 identical before/after; pre-restart screen_id rejected with 409 `invalid or consumed screen_id; observe again before acting`; fresh observe works → pass.
+- 1c disconnect+reconnect: not yet run — do after items 2–4 so a stranded mirror cannot block them. Round-2 evidence says the iPhone does not auto-reconnect after a receiver restart; expect the user to re-select "ESP32 Agent Mac" in Control Center → Screen Mirroring.
+
+### Item 2 — Home → Spotlight → Safari (failed on device, zero clicks sent)
+
+- Attempts (all from the native Notes test note, keyboard up): 2× `open_app` "Safari" (failed in `go_home`: "离开目标再返回后仍未确认指针落点，未发送点击", 0/75 and 0/~30 pair matches), 3× direct tap on the AssistiveTouch 主屏幕 item (failed at the write guard: "指针定位期间目标或屏幕已变化，未发送点击"), 2× `key cmd+h` (sent, no effect on this iPhone), 1× swipe-up from the bottom edge (failed at the write guard), Esc dismissed the AssistiveTouch menu once of three tries.
+- Diagnosis from the pointer diagnostics (offline, production detector): in the `open_app` attempt the pointer disc (44,42,45) is visible in the outward frames at (294, 864) → (294, 843) but absent from all 12 return frames — the stationary iOS pointer fades within ~1 s and the faded disc falls below the 40-min detection floor over the dark menu. In the direct taps the landing was measured once, but the write guard tripped on the Notes caret blink: the caret is saturated yellow (on-pixels ~(186,175,5), off ~white), `field_carets` cannot see it, so `mask_caret_blink` exempts nothing (verified offline: 161 hot px remain before and after masking; guard threshold is 24) and the caret phase at write time differs from the observation frame. The 主屏幕 hover highlight toggling adds further change near the target. One tap on blank note area did succeed (guard passed when the caret phases aligned) and dismissed the menu.
+- **Blocked:** needs a detection-code fix (fade-tolerant pairing, yellow-caret recognition, highlight-tolerant menu guard) — out of the round-3 scope; awaiting the user's decision. No Home → Spotlight → Safari end-to-end run exists yet.
+
+### Item 3 — native Notes double-tap word selection (failed on device, zero clicks sent)
+
+- Target: "你好" in "验收：你好 00084" (OCR line box [0.066, 0.219, 0.443, 0.242], center (0.2545, 0.2303)). 2 attempts: plain `double_tap` ("蓝牙指针纠偏后未能确认落点在目标内，未发送点击", 0/32 pair matches) and `double_tap` with the line box as `target_box` (escape probe + extension ran, 0/78 pair matches).
+- Diagnosis: the pointer is detectable on blank canvas (extended outward frames show it at (125, 185), (157,174,166)) but undetectable on the return frame when it sits on text glyphs (occluded + faded), so the return pair never matches. The yellow-caret guard is a second blocker for the write step.
+- **Blocked:** same detection-code fix decision as item 2. No selection screenshot exists yet.
+
+### Item 4 — native Notes paste (blocked on the iPhone-side binding)
+
+- New text (not reused from the verified set): `"\n秋天到了00731\n第二行 AbD eFg"` — starts with a newline (regression-2 coverage), new Chinese words, leading-zero `00731`, mixed case `AbD eFg`. Baseline note content at prepare time: alphatargetomegadelta / alphatargetomega / 验收：你好 00084 / 核对：AbC xylem.
+- `prepare` (transaction `8BPX4-X_9JaVO2Lq9YWckC4UlSfwMHzJhmE1PMItD8s`, focus verified by host_observation with target_box [0.03, 0.10, 0.97, 0.55]) succeeded: phase `awaiting_copy`, trigger key `ctrl+alt+p` auto-sent once. Polled `status` 24 times over 120 s: `copied` stayed false, phase `awaiting_copy`. The iPhone-side binding (Control+Option+P → `ESP32 Agent Clipboard` in Settings → Accessibility → Keyboard & Typing → Full Keyboard Access → Commands) is not taking effect. The user was asked to set/check it; after that, re-run prepare (new transaction), poll `copied=true`, then paste → allow the sheet → confirm → verify the actual Notes content against the `completed` receipt.
+- Side effect during testing: a tap accepted the keyboard suggestion "xylem" and changed the note's last line from "核对：AbC xYz" to "核对：AbC xylem". The paste baseline uses the current content, so verification is unaffected; restore "xYz" after the acceptance run.
