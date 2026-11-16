@@ -120,3 +120,50 @@ Commits on top of round 2 (`6681954`): `d69e30b` (both regressions below). Merge
 - New text (not reused from the verified set): `"\n秋天到了00731\n第二行 AbD eFg"` — starts with a newline (regression-2 coverage), new Chinese words, leading-zero `00731`, mixed case `AbD eFg`. Baseline note content at prepare time: alphatargetomegadelta / alphatargetomega / 验收：你好 00084 / 核对：AbC xylem.
 - `prepare` (transaction `8BPX4-X_9JaVO2Lq9YWckC4UlSfwMHzJhmE1PMItD8s`, focus verified by host_observation with target_box [0.03, 0.10, 0.97, 0.55]) succeeded: phase `awaiting_copy`, trigger key `ctrl+alt+p` auto-sent once. Polled `status` 24 times over 120 s: `copied` stayed false, phase `awaiting_copy`. The iPhone-side binding (Control+Option+P → `ESP32 Agent Clipboard` in Settings → Accessibility → Keyboard & Typing → Full Keyboard Access → Commands) is not taking effect. The user was asked to set/check it; after that, re-run prepare (new transaction), poll `copied=true`, then paste → allow the sheet → confirm → verify the actual Notes content against the `completed` receipt.
 - Side effect during testing: a tap accepted the keyboard suggestion "xylem" and changed the note's last line from "核对：AbC xYz" to "核对：AbC xylem". The paste baseline uses the current content, so verification is unaffected; restore "xYz" after the acceptance run.
+
+## Round 4–5 (2026-11-16 evening) — detection fixes, end-to-end regressions, highlight acceptance
+
+### Automated vs real-device results
+
+- **Automated:** full Python suite after `9e2a8c7`: **2234 passed, 1 skipped**; after `9372f80`: **2239 passed, 1 skipped**; after `f8a8651`: **2240 passed, 1 skipped** (2026-11-16, ~423 s).
+- **Real-device:** item 3 passed (Notes double-tap selects "你好"); item 2 still blocked (zero clicks sent — see below); item 4 blocked on the iPhone-side shortcut binding; item 1c not yet run (do last); the test note's line 3 still carries a stray "xYz" from an earlier suggestion-bar misfire (restore blocked, see below).
+
+### Round 4 — detection fixes (`9e2a8c7`)
+
+Offline diagnosis on the round-3 real frames pinned each failure to a layer:
+
+- **Fix 1 — yellow caret:** `caret.py` `_amber_tone` required `r - g >= 14`; sampled on-phase pixels of the lemon caret (186,175,5) have `r - g` in {9..36}, so `mask_caret_blink` masked nothing (161 hot px before and after; guard threshold 24). Threshold is now `r - g >= 0` (with `r >= 165`, `g - b >= 48`). Regression test fails under the old predicate.
+- **Fix 2 — faded pointer over text:** the return frame matched the reference, so `cursor_overlay_pair` returned no overlays at all. Added `_faded_pointer_disc` (pairing-only, never for masking; silhouette symdiff cap 0.12 → 0.25, no core/antialias fit) and `translucent_pointer_pair(before, after, ...)` which diffs the two motion frames directly. Verified on the dt2 frames: outward (126,188) → return (126,241); a mid-return frame is safely rejected. Fixtures in `tests/fixtures/dt2_text_pointer/`.
+- **Fix 3 — faded pointer on the dark menu:** the disc over the dark menu is literally indistinguishable (mean RGB delta 0.0). The hover highlight is the evidence: the 主屏幕 item turns blue (icon + label) while the others stay white (171 blue px in the oa2 frame, 205–213 in the item-2 frames, 0 elsewhere). `assistive_vision.menu_home_highlighted(frame, panel)` counts blue pixels per menu slot; `phone._menu_highlight_landing` uses it as a fallback in `point_verified`.
+- **Fix 4 — keyboard suggestion bar:** `input_context.keyboard_suggestion_bar(frame)` finds the keyboard top from grey-row bands; `point_in_suggestion_bar` guards `tap_verified` so a bare tap whose requested point falls in the bar is refused with "点击落在键盘建议栏…". This is the negative case for the earlier misfire that changed the note's last line to "xylem".
+- **Fix 4b:** the detector misread a uniform grey background as a keyboard (legacy `direct_tap` regression). It now also requires a brightness jump (> 0.30) at the keyboard top and non-grey content above it.
+
+### Round 5 — end-to-end regressions (`9372f80`)
+
+- **Regression 1 — Home-highlight click flow** (`test_menu_highlight_click_flow.py`, real white→blue frames): `menu_home_highlight` now returns a `MenuHomeHighlight` (highlighted, centroid, blue count, ratio, other_max); `phone._menu_highlight_landing` returns the measured centroid and records evidence separately (`before_blue`, `after_blue`, `after_other_max`, `centre`); `TextTargetGuard` allows only this move's Home highlight change (masks the Home slot, and `_home_highlight_excuses_old_discs` excuses the pre-move disc that disappears when it turns blue). Valid highlight sends exactly one click; static highlight or a changed target sends zero.
+- **Regression 2 — bare-tap suggestion-bar guard** (`test_bare_tap_suggestion_bar_flow.py`): `tap_verified.validate_click` checks the measured landing (not the requested point) against the latest frame's suggestion bar before sending; "request outside the bar, landing inside the bar" sends zero clicks.
+
+### Highlight acceptance fix (`f8a8651`)
+
+- Live diagnosis (temporary HL-DIAG logging, since reverted): `_menu_highlight_landing` **did** return the measured centroid (0.5837, 0.8395) with before_blue=0 → after_blue=205, but `point_verified.on_target` rejected it — the centroid sits 0.0085 from the target centre in y, just outside `AIM_TOLERANCE` (0.008), and `paired_ble` is False because the disc is invisible over the blue highlight, so the target-box interior fallback never ran.
+- Fix: a highlight centroid inside the target box is itself the landing evidence (the blue highlight only appears while the pointer hovers Home), so `on_target` accepts it without demanding paired BLE verification. New regression test: a centroid inside the box but 0.010 outside `AIM_TOLERANCE` in y still sends exactly one click.
+
+### Item 2 — Home → Spotlight → Safari (still blocked on device, zero clicks sent)
+
+- After `f8a8651` and a worker restart, the menu-open attempt's landing was accepted (the failure moved to the write guard: "指针定位期间目标或屏幕已变化"), and the menu then dismissed without going Home.
+- From a clean Notes state, `home` fails at the AssistiveTouch **bubble** tap: the bubble is a small translucent grey circle and its landing cannot be confirmed ("离开目标再返回后仍未确认指针落点"); a direct bare tap on it reports "无法确认指针落点：需要当前观察中的已知目标及其大小，未发送点击". The menu never opens.
+- `worker.log` confirms the `go_home` fallbacks actually tried are assistive-touch → homescreen → cmd+h (no swipe-up entry in the log); all three fail. `cmd+h` has no effect on this iPhone (11 Pro, iOS 17.5.1).
+- **Blocked:** needs a way past the bubble tap (or a guard that tolerates the already-highlighted menu). No Home → Spotlight → Safari end-to-end run exists yet.
+
+### Item 3 — native Notes double-tap word selection (passed on device)
+
+- After the round-4 worker restart, `double_tap` on "你好" (line box [0.066, 0.219, 0.441, 0.242], centre (0.2535, 0.2303)) returned http=200; the after frame shows "你好" selected (blue highlight) with the selection menu open (粘贴/选择/全选/插入涂鸦). Evidence: `r4-item3-after-dt.jpg`.
+
+### Restore of the test note (blocked)
+
+- Line 4 is fixed (`核对：AbC xYz`). Line 3 still reads `验收：xYz你好 00084` — the stray "xYz" before "你好" must be removed so it reads `验收：你好 00084`. Six approaches failed, all blocked by pointer-landing confirmation on the thin Latin glyphs (bare tap, bare double-tap, tap/double-tap with the line box, `tap_text "你好"` needs an explicit region, `key "up"` is unsupported). The item-3 double-tap on the wide Chinese glyphs at nearly the same coordinates succeeded, so this is specific to small Latin text. Do not keep hammering the same taps; it may need a separate fix or the user deleting the 3 characters manually.
+
+### Item 4 — native Notes paste (blocked on the iPhone-side binding)
+
+- The round-3 transaction expired without being fetched (`needs_resolution: False` — the Shortcut never claimed the text). The user was asked to bind Control+Option+P → **"ESP32 Agent Clipboard"** (Settings → Accessibility → Keyboard & Typing → Full Keyboard Access → Commands). Not yet confirmed.
+- A parallel branch `muse/paste-shortcut-regression` (worktree `esp32-iphone-agent-hybrid-paste`, baseline `9e2a8c7`, commit `71fa712`) adds paste-status diagnostics (`claimed`, `pending_polls`, `claim_attempts`, `ack_attempts`, `last_ack_error`, `pending_auth_failures` — counts and timestamps only) so the three failure modes (not launched / not claimed / not acked) can be told apart, plus the newline-leading append sheet-evidence regression. Full suite there: 2243 passed, 1 skipped. Note: the binding must point at the staged template "ESP32 Agent Clipboard" — the old "领取待粘贴文本" shortcut waits for the user to tap a notification before returning ACK, which produces the same copied=false symptom.
