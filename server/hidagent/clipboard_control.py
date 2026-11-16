@@ -230,11 +230,29 @@ class StagedClipboardControls:
                 raise
             # A native paste permission sheet can re-render the original page.
             # This evidence only records the effect of a paste that already ran.
+            # The first post-paste frame may have missed the sheet entirely
+            # (it appears after cmd+v, or was already dismissed), so retry
+            # with the most recent frames that could still show it.
             from .paste_confirmation import verify_after_paste_permission
 
-            if not await verify_after_paste_permission(
-                    item.guard.original.frame, item.first_post_paste_frame,
-                    controls._observation.frame, item.guard.region, request.observed_text):
+            after = controls._observation.frame
+            candidates = [item.first_post_paste_frame]
+            seen = {item.guard.original.frame, after, item.first_post_paste_frame}
+            for snapshot in reversed(getattr(controls.screen, "recent_frames", ())):
+                frame = getattr(snapshot, "frame", snapshot)
+                if frame and frame not in seen:
+                    seen.add(frame)
+                    candidates.append(frame)
+                if len(candidates) >= 4:
+                    break
+            verified = False
+            for sheet in candidates:
+                if await verify_after_paste_permission(
+                        item.guard.original.frame, sheet, after,
+                        item.guard.region, request.observed_text):
+                    verified = True
+                    break
+            if not verified:
                 raise
             evidence["confirmation_evidence"] = "paste_permission_dismissed"
         if evidence:

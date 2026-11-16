@@ -256,9 +256,14 @@ def test_permission_confirmation_keeps_the_original_transaction_and_current_tick
             screen._on_jpeg(sheet)
             return sheet
 
+        calls = []
+
         async def verify(original, presented, selected, region, text):
-            assert (original, presented, selected, text) == (before, sheet, after, "你好00123")
+            assert (original, selected, text) == (before, after, "你好00123")
             assert region == manager.transaction.guard.region
+            if not calls:
+                assert presented == sheet
+            calls.append(presented)
             if transition == "new_page":
                 screen._on_jpeg(changed_scene("green"))
             if transition == "new_session":
@@ -270,7 +275,7 @@ def test_permission_confirmation_keeps_the_original_transaction_and_current_tick
                 replacement._on_jpeg(after)
                 assert replacement.generation == screen.generation
                 phone.screen = control.screen = replacement
-            return transition != "unproved"
+            return presented == sheet and transition != "unproved"
 
         monkeypatch.setattr(feedback, "wait_after_action", capture)
         monkeypatch.setattr(paste_confirmation, "verify_after_paste_permission", verify)
