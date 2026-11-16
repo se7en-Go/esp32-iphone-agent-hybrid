@@ -172,11 +172,16 @@ class TextTargetGuard:
                and 40 <= min(color) <= max(color) <= 210 and max(color) - min(color) <= 25]
         if len(new) > 1:
             return True
+        faded_arrival = (self._arrived_faded_cursor(after, bounds, tx, ty, reach, cursor)
+                         if old_outside and not new else None)
         morphed = (len(highlights) == 1 and abs(highlights[0][0] - tx) <= reach
                    and abs(highlights[0][1] - ty) <= reach)
-        if old_outside and not (new or morphed or home_panel is not None):
+        if old_outside and not (new or morphed or faded_arrival is not None or home_panel is not None):
             return True
         if old_outside and new and abs(old_outside[0][2] - new[0][2]) > .35 * old_outside[0][2]:
+            return True
+        if (old_outside and faded_arrival is not None
+                and abs(old_outside[0][2] - faded_arrival[2]) > .45 * old_outside[0][2]):
             return True
         for x, y, diameter in old + new:
             radius = diameter / 2 + max(2, width / 180)
@@ -262,3 +267,32 @@ class TextTargetGuard:
         if 0 < len(candidates) <= 24:
             for pixel in candidates:
                 mask.putpixel(pixel, 0)
+
+    def _arrived_faded_cursor(self, after, bounds, tx, ty, reach, cursor):
+        """Confirm a pre-move disc arrived over glyphs at the verified cursor, without masking."""
+        if cursor is None:
+            return None
+        from .screen_compare import _faded_pointer_disc
+
+        width, height = after.size
+        px, py = cursor[0][0] * width, cursor[0][1] * height
+        if abs(px - tx) > reach or abs(py - ty) > reach:
+            return None
+        red, green, blue = ImageChops.difference(self.before.crop(bounds), after.crop(bounds)).split()
+        cdelta = ImageChops.lighter(ImageChops.lighter(red, green), blue)
+        matches = []
+        for pts in _regions(cdelta, 10):
+            if len(pts) < (.022 * width) ** 2:
+                continue
+            full_pts = [(x + bounds[0], y + bounds[1]) for x, y in pts]
+            if _faded_pointer_disc(after, self.before, full_pts, width):
+                xs, ys = zip(*full_pts, strict=True)
+                cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+                diam = ((max(xs) - min(xs) + 1) + (max(ys) - min(ys) + 1)) / 2
+                matches.append((cx, cy, diam))
+        if len(matches) != 1:
+            return None
+        cx, cy, diam = matches[0]
+        if math.hypot(cx - px, cy - py) > .02 * width:
+            return None
+        return cx, cy, diam
