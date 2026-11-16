@@ -24,13 +24,13 @@ int main(int argc, char **argv) {
     {
         HafeWriter stream(capture.fd[1]);
         auto old = stream.begin(); assert(old == 1);
-        assert(stream.jpeg(old,old_jpeg,sizeof(old_jpeg)));
+        assert(stream.jpeg(old,old_jpeg,sizeof(old_jpeg),777));
         auto current = stream.begin(); assert(current == 2);
         // Simulated delayed callbacks retain the original immutable session.
-        std::thread late([&]{ for(int i=0;i<10000;i++) assert(!stream.jpeg(old,old_jpeg,sizeof(old_jpeg))); stream.end(old); });
-        for(int i=0;i<100;i++) assert(stream.jpeg(current,new_jpeg,sizeof(new_jpeg)));
+        std::thread late([&]{ for(int i=0;i<10000;i++) assert(!stream.jpeg(old,old_jpeg,sizeof(old_jpeg),777)); stream.end(old); });
+        for(int i=0;i<100;i++) assert(stream.jpeg(current,new_jpeg,sizeof(new_jpeg),12345));
         late.join(); stream.end(current);
-        assert(!stream.jpeg(current,new_jpeg,sizeof(new_jpeg)));
+        assert(!stream.jpeg(current,new_jpeg,sizeof(new_jpeg),12345));
         stream.end(current); // duplicate native close must not duplicate END.
         auto third=stream.begin(); assert(third==3); stream.end(third);
     }
@@ -39,12 +39,13 @@ int main(int argc, char **argv) {
     while(pos<capture.bytes.size()) {
         assert(capture.bytes.size()-pos>=32);
         auto h=capture.bytes.data()+pos; assert(std::string((char*)h,4)=="HAFE");
-        assert(h[4]==1 && h[6]==0 && h[7]==0 && number(h+28,4)==0);
+        assert(h[4]==2 && h[6]==0 && h[7]==0);
         auto epoch=number(h+8,8), frame=number(h+16,8), len=number(h+24,4); pos+=32;
         assert(capture.bytes.size()-pos>=len);
-        if(h[5]==1) { assert(!active && epoch>last_epoch && !frame && !len); active=epoch; last_epoch=epoch;seq=0; }
-        else if(h[5]==3) { assert(epoch==active && !frame && !len); active=0; }
+        if(h[5]==1) { assert(!active && epoch>last_epoch && !frame && !len && number(h+28,4)==0); active=epoch; last_epoch=epoch;seq=0; }
+        else if(h[5]==3) { assert(epoch==active && !frame && !len && number(h+28,4)==0); active=0; }
         else { assert(h[5]==2 && epoch==active && frame==++seq && len==5);
+            assert(number(h+28,4)==(epoch==1 ? 777 : 12345));
             assert(capture.bytes[pos+2]==epoch); ++frames; }
         pos+=len; ++records;
     }
@@ -56,13 +57,13 @@ int main(int argc, char **argv) {
     }
     {
         Capture bad; { HafeWriter stream(bad.fd[1]);auto epoch=stream.begin();
-          assert(!stream.jpeg(epoch,new_jpeg,HafeWriter::MAX_JPEG+1));assert(!stream.healthy()); }
+          assert(!stream.jpeg(epoch,new_jpeg,HafeWriter::MAX_JPEG+1,12345));assert(!stream.healthy()); }
         bad.finish();
     }
     {
         int fd[2]; assert(pipe(fd)==0); HafeWriter stream(fd[1]); auto epoch=stream.begin();
         std::vector<unsigned char> huge(HafeWriter::MAX_JPEG,1);huge[0]=255;huge[1]=216;huge[huge.size()-2]=255;huge.back()=217;
-        auto start=std::chrono::steady_clock::now(); assert(!stream.jpeg(epoch,huge.data(),huge.size()));
+        auto start=std::chrono::steady_clock::now(); assert(!stream.jpeg(epoch,huge.data(),huge.size(),12345));
         auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count();
         assert(ms>=100 && ms<1000); assert(!stream.healthy() && stream.begin()==0);close(fd[0]);
     }

@@ -35,7 +35,7 @@ def test_new_begin_retires_previous_epoch_and_ignores_validated_late_callbacks()
 
 
 @pytest.mark.parametrize("wire", [
-    record(1, magic=b"RAW!"), record(1, version=2), record(0), record(4), record(1, flags=1),
+    record(1, magic=b"RAW!"), record(1, version=3), record(0), record(4), record(1, flags=1),
     record(1, reserved=1), record(1, epoch=0), record(1, sequence=1), record(3, sequence=1),
     record(1, payload=b"x"), record(3, payload=b"x"), record(2, sequence=1, payload=JPEG),
     record(1) + record(1), record(1) + record(1, epoch=2), record(1) + record(3, epoch=2),
@@ -67,6 +67,18 @@ def test_eof_does_not_accept_partial_record_or_unclosed_session(wire):
     parser.feed(wire)
     with pytest.raises(FrameProtocolError):
         parser.finish()
+
+
+def test_v2_records_carry_a_capture_timestamp_and_v1_records_do_not():
+    parser = FrameStreamParser()
+    accepted = parser.feed(
+        record(1) + record(2, sequence=1, payload=JPEG)
+        + record(3) + record(1, epoch=2, version=2)
+        + record(2, epoch=2, sequence=1, payload=JPEG, version=2, reserved=12345)
+        + record(2, epoch=2, sequence=2, payload=JPEG, version=2, reserved=0)
+        + record(3, epoch=2, version=2))
+    parser.finish()
+    assert [x.capture_ms for x in accepted] == [None, None, None, None, 12345, None, None]
 
 
 def test_stale_epoch_must_still_have_a_structurally_valid_jpeg():

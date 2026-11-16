@@ -1,6 +1,6 @@
 # Optional native AirPlay session frames
 
-This patch adds HAFE/1 session events and JPEG frames to UxPlay 1.73.7. Each
+This patch adds HAFE/2 session events and JPEG frames to UxPlay 1.73.7. Each
 mirroring connection gets a decoder with its own immutable epoch. The receiver
 can distinguish a sender reconnect even if its PID stays the same. BEGIN, JPEG
 and END share one ordered, bounded pipe.
@@ -59,12 +59,22 @@ restarted. Reloading the web worker keeps the current receiver and mirror.
 ## Capability and protocol
 
 `uxplay --hafe-protocol` exits before config parsing, GStreamer UI or networking.
-The enabled build prints exactly `HAFE/1\n` and exits with status 0. The default
+The enabled build prints exactly `HAFE/2\n` and exits with status 0. The default
 build prints `HAFE/0\n` and exits with status 2.
-Python should require the exact HAFE/1 capability with a two-second timeout.
+Python should require the exact HAFE/1 or HAFE/2 capability with a two-second timeout.
 Then pass a writable inherited pipe FD >= 3 via `HIDAGENT_UXPLAY_FRAMED_FD` and
 omit `-vs`. A missing variable selects stock rendering. A malformed value is
 fatal in an enabled build.
+
+HAFE/2 adds a capture timestamp and overload recovery. Each JPEG record carries
+the frame's capture time (monotonic ms at push into the decoder) in header
+bytes 28-31, 0 when the buffer had no timestamp; v1 records have that field
+zero and are still accepted. The Python side drops frames whose capture age
+exceeds 2 seconds instead of publishing them as fresh, and reports the last
+accepted capture age as `replay_lag_s`. When the decoder queue overflows
+(8 MB of backed-up input), the pipeline is torn down and a fresh epoch begins
+instead of ending the session; the phone's next IDR re-syncs the new decoder,
+so the mirror recovers without a new AirPlay connection.
 
 Each record has a 32-byte network-order `!4sBBHQQII` header:
 

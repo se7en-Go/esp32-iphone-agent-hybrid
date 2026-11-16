@@ -108,7 +108,7 @@
  # hacks to fix cmake confusion due to links in path with macOS FrameWorks
 --- /dev/null
 +++ b/renderers/hafe_renderer.cpp
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,128 @@
 +#include "hafe_renderer.h"
 +#include "hafe_stream.hpp"
 +#include <gst/gst.h>
@@ -121,8 +121,9 @@
 +
 +static std::unique_ptr<HafeWriter> writer;
 +struct HafeSession {
-+    /* Never overwrite this value. Every appsink owns this particular context. */
-+    const uint64_t epoch;
++    /* Overwritten only by the overload recovery in hafe_process, which ends
++       the old epoch and starts a fresh one. Every appsink owns this context. */
++    uint64_t epoch;
 +    GstElement *pipeline = nullptr, *source = nullptr;
 +    bool h265 = false;
 +    explicit HafeSession(uint64_t value): epoch(value) {}
@@ -135,7 +136,18 @@
 +    GstMapInfo map;
 +    bool written = false;
 +    if (buffer && gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-+        written = writer->jpeg(session->epoch, map.data, map.size);
++        /* HAFE v2: stamp the frame with its capture time (pipeline
++           clock, monotonic ms). A frame that waited in the decode
++           queue keeps its old timestamp, so the Python side can drop
++           it instead of publishing it as fresh. 0 = no timestamp. */
++        uint32_t capture_ms = 0;
++        GstClockTime pts = GST_BUFFER_PTS(buffer);
++        if (GST_CLOCK_TIME_IS_VALID(pts) && session->pipeline) {
++            GstClockTime base = gst_element_get_base_time(session->pipeline);
++            if (GST_CLOCK_TIME_IS_VALID(base))
++                capture_ms = static_cast<uint32_t>(((pts + base) / 1000000) & 0xffffffff);
++        }
++        written = writer->jpeg(session->epoch, map.data, map.size, capture_ms);
 +        gst_buffer_unmap(buffer, &map);
 +    }
 +    gst_sample_unref(value);
@@ -203,7 +215,22 @@
 +    guint64 queued = 0;
 +    g_object_get(session->source, "current-level-bytes", &queued, nullptr);
 +    if (queued + static_cast<guint64>(data->data_len) > 8*1024*1024) {
-+        writer->end(session->epoch); return;
++        /* Overload recovery: the backed-up pipeline can never catch up,
++           and ending the session would freeze the mirror until a new
++           AirPlay connection. Tear the pipeline down and start a fresh
++           epoch; the decoder restarts and the phone's next IDR re-syncs
++           it. The Python side treats the new epoch as a new session
++           (generation bump, old screen_id rejected). */
++        if (session->pipeline) {
++            gst_element_set_state(session->pipeline, GST_STATE_NULL);
++            gst_object_unref(session->source);
++            gst_object_unref(session->pipeline);
++            session->pipeline = nullptr;
++            session->source = nullptr;
++        }
++        uint64_t epoch = writer->begin();
++        if (epoch) session->epoch = epoch;
++        return;
 +    }
 +    GstBuffer *buffer = gst_buffer_new_allocate(nullptr, data->data_len, nullptr);
 +    gst_buffer_fill(buffer, 0, data->data, data->data_len);
@@ -228,7 +255,7 @@
 +#endif
 --- /dev/null
 +++ b/renderers/hafe_stream.cpp
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,85 @@
 +#include "hafe_stream.hpp"
 +#include <chrono>
 +#include <cerrno>
@@ -263,10 +290,11 @@
 +    fd_ = -1; active_ = 0;
 +}
 +bool HafeWriter::record(unsigned char kind, uint64_t epoch, uint64_t seq,
-+                        const unsigned char *data, size_t length) {
++                        const unsigned char *data, size_t length, uint32_t capture_ms) {
 +    if (fd_ < 0) return false;
-+    unsigned char header[32] = {'H','A','F','E',1,kind,0,0};
++    unsigned char header[32] = {'H','A','F','E',2,kind,0,0};
 +    be(header+8, epoch, 8); be(header+16, seq, 8); be(header+24, length, 4);
++    be(header+28, capture_ms, 4);
 +    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
 +    for (int part = 0; part < 2; ++part) {
 +        const unsigned char *bytes = part ? data : header;
@@ -291,48 +319,52 @@
 +uint64_t HafeWriter::begin() {
 +    std::lock_guard<std::mutex> lock(mutex_);
 +    if (fd_ < 0) return 0;
-+    if (active_ && !record(3, active_, 0, nullptr, 0)) return 0;
++    if (active_ && !record(3, active_, 0, nullptr, 0, 0)) return 0;
 +    if (next_ == UINT64_MAX) { fail(); return 0; }
 +    active_ = ++next_; sequence_ = 0;
-+    return record(1, active_, 0, nullptr, 0) ? active_ : 0;
++    return record(1, active_, 0, nullptr, 0, 0) ? active_ : 0;
 +}
-+bool HafeWriter::jpeg(uint64_t epoch, const unsigned char *data, size_t length) {
++bool HafeWriter::jpeg(uint64_t epoch, const unsigned char *data, size_t length,
++                    uint32_t capture_ms) {
 +    std::lock_guard<std::mutex> lock(mutex_);
 +    if (!epoch || epoch != active_ || fd_ < 0) return false;
 +    if (!data || length < 4 || length > MAX_JPEG || data[0] != 0xff ||
 +        data[1] != 0xd8 || data[length-2] != 0xff || data[length-1] != 0xd9 ||
 +        sequence_ == UINT64_MAX) { fail(); return false; }
-+    return record(2, epoch, ++sequence_, data, length);
++    return record(2, epoch, ++sequence_, data, length, capture_ms);
 +}
 +void HafeWriter::end(uint64_t epoch) {
 +    std::lock_guard<std::mutex> lock(mutex_);
 +    if (!epoch || epoch != active_) return;
-+    record(3, epoch, 0, nullptr, 0); active_ = 0;
++    record(3, epoch, 0, nullptr, 0, 0); active_ = 0;
 +}
 +bool HafeWriter::healthy() {
 +    std::lock_guard<std::mutex> lock(mutex_); return fd_ >= 0;
 +}
 --- /dev/null
 +++ b/renderers/hafe_stream.hpp
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,26 @@
 +#pragma once
 +#include <cstddef>
 +#include <cstdint>
 +#include <mutex>
 +
-+/* HAFE v1: 32-byte network-order header, then bounded JPEG payload. */
++/* HAFE v2: 32-byte network-order header, then bounded JPEG payload.
++   Header bytes 28-31 carry the JPEG capture time (monotonic ms, 0 =
++   unknown); v1 records have that field zero and are still accepted. */
 +class HafeWriter {
 +public:
 +    static const size_t MAX_JPEG = 8 * 1024 * 1024;
 +    explicit HafeWriter(int fd);
 +    ~HafeWriter();
 +    uint64_t begin();
-+    bool jpeg(uint64_t immutable_epoch, const unsigned char *data, size_t length);
++    bool jpeg(uint64_t immutable_epoch, const unsigned char *data, size_t length,
++            uint32_t capture_ms);
 +    void end(uint64_t immutable_epoch);
 +    bool healthy();
 +private:
 +    bool record(unsigned char kind, uint64_t epoch, uint64_t seq,
-+                const unsigned char *data, size_t length);
++                const unsigned char *data, size_t length, uint32_t capture_ms);
 +    void fail();
 +    std::mutex mutex_;
 +    int fd_;
@@ -380,7 +412,7 @@
  int main (int argc, char *argv[]) {
 +    if (argc == 2 && !strcmp(argv[1], "--hafe-protocol")) {
 +#ifdef HAFE_NATIVE
-+        puts("HAFE/1"); return 0;
++        puts("HAFE/2"); return 0;
 +#else
 +        puts("HAFE/0"); return 2;
 +#endif
@@ -394,7 +426,7 @@
  int main (int argc, char *argv[]) {
 +    if (argc == 2 && !strcmp(argv[1], "--hafe-protocol")) {
 +#ifdef HAFE_NATIVE
-+        puts("HAFE/1"); return 0;
++        puts("HAFE/2"); return 0;
 +#else
 +        puts("HAFE/0"); return 2;
 +#endif

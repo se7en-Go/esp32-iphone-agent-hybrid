@@ -54,6 +54,9 @@ def validate_snapshot(metadata, frame):
         value = metadata.get(name)
         if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= now + .1:
             raise ValueError("invalid receiver clock")
+    age = metadata.get("capture_age_s")
+    if age is not None and (type(age) not in (int, float) or not math.isfinite(age) or age < 0):
+        raise ValueError("invalid receiver capture age")
     if frame and (not frame.startswith(b"\xff\xd8") or not frame.endswith(b"\xff\xd9")
                   or not metadata["updated"] or not metadata["arrived"]):
         raise ValueError("invalid receiver image")
@@ -104,7 +107,8 @@ class ReceiverServer(socketserver.ThreadingUnixStreamServer):
             metadata = {"protocol": PROTOCOL, "instance": self.instance, "pid": os.getpid(),
                         "generation": screen.generation, "running": running, "live": live,
                         "updated": snapshot.updated if snapshot else 0,
-                        "arrived": snapshot.arrived if snapshot else 0}
+                        "arrived": snapshot.arrived if snapshot else 0,
+                        "capture_age_s": screen._last_capture_age}
             return metadata, frame or b""
 
 

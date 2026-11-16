@@ -185,7 +185,7 @@ def test_framed_preview_uses_protocol_session_not_tcp_count(native, monkeypatch)
     assert screen.preview().state == "disconnected"
 
 
-@pytest.mark.parametrize("outcome", [b"", b"UxPlay stock\n", b"HAFE/2\n", "timeout"])
+@pytest.mark.parametrize("outcome", [b"", b"UxPlay stock\n", b"HAFE/0\n", b"HAFE/3\n", "timeout"])
 @pytest.mark.skipif(sys.platform == "win32", reason="native UxPlay owner is POSIX-only")
 def test_framed_owner_refuses_unsupported_binary_before_starting_receiver(monkeypatch, outcome):
     import subprocess
@@ -207,18 +207,19 @@ def test_framed_owner_refuses_unsupported_binary_before_starting_receiver(monkey
 
     monkeypatch.setattr("hidagent.screen_uxplay.subprocess.run", probe)
     monkeypatch.setattr("hidagent.screen_uxplay.threading.Thread", lambda **kw: pytest.fail("receiver started"))
-    with pytest.raises(RuntimeError, match="HAFE/1"):
+    with pytest.raises(RuntimeError, match="HAFE"):
         screen.start()
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("protocol", [b"HAFE/1\n", b"HAFE/2\n"])
 @pytest.mark.skipif(sys.platform == "win32", reason="native UxPlay owner is POSIX-only")
-def test_exact_native_capability_allows_only_thread_start_without_network(monkeypatch):
+def test_exact_native_capability_allows_only_thread_start_without_network(monkeypatch, protocol):
     from types import SimpleNamespace
 
     monkeypatch.setenv("HIDAGENT_UXPLAY_FRAMED", "1")
     monkeypatch.setattr("hidagent.screen_uxplay.subprocess.run",
-                        lambda *a, **kw: SimpleNamespace(returncode=0, stdout=b"HAFE/1\n"))
+                        lambda *a, **kw: SimpleNamespace(returncode=0, stdout=protocol))
     started = []
     monkeypatch.setattr("hidagent.screen_uxplay.threading.Thread",
                         lambda **kw: SimpleNamespace(start=lambda: started.append(kw["target"])))

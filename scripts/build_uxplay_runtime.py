@@ -164,7 +164,7 @@ def build(args) -> Path:
     run([tools["cmake"], "--install", work / "build"])
     binary = output / "bin/uxplay"
     probe = subprocess.run([binary, "--hafe-protocol"], env=env, capture_output=True, timeout=2, check=False)
-    expected = (0, b"HAFE/1\n") if args.mode == "framed" else (2, b"HAFE/0\n")
+    expected = (0, b"HAFE/2\n") if args.mode == "framed" else (2, b"HAFE/0\n")
     if (probe.returncode, probe.stdout) != expected:
         raise RuntimeError("built binary failed the non-network capability probe")
     tested = ["capability probe"]

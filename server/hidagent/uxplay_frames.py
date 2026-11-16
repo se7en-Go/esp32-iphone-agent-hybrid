@@ -18,6 +18,9 @@ class FrameRecord:
     epoch: int
     sequence: int
     payload: bytes = b""
+    # HAFE v2 capture time (monotonic ms at push into the decoder); None for
+    # v1 records and for control records. 0 on the wire means "unknown".
+    capture_ms: int | None = None
 
 
 class FrameStreamParser:
@@ -43,8 +46,16 @@ class FrameStreamParser:
     def _header(self):
         magic, version, kind, flags, epoch, sequence, size, reserved = HEADER.unpack(self._buffer)
         self._buffer.clear()
-        if magic != b"HAFE" or version != 1 or kind not in (BEGIN, JPEG, END) or flags or reserved:
+        if magic != b"HAFE" or version not in (1, 2) or kind not in (BEGIN, JPEG, END) or flags:
             self._error("invalid native frame header")
+        # HAFE v2 reuses the old reserved field for the JPEG capture time
+        # (monotonic ms, 0 = unknown). v1 records must still have it zero.
+        if version == 1:
+            if reserved:
+                self._error("invalid native frame header")
+            capture_ms = None
+        else:
+            capture_ms = reserved or None
         if not epoch:
             self._error("invalid native session epoch")
         if kind == JPEG:
@@ -52,9 +63,9 @@ class FrameStreamParser:
                 self._error("invalid native JPEG sequence or size")
         elif sequence or size:
             self._error("native control record has payload or sequence")
-        return kind, epoch, sequence, size
+        return kind, epoch, sequence, size, capture_ms
 
-    def _record(self, kind, epoch, sequence, payload):
+    def _record(self, kind, epoch, sequence, payload, capture_ms=None):
         if kind == JPEG and (not payload.startswith(b"\xff\xd8") or not payload.endswith(b"\xff\xd9")):
             self._error("incomplete native JPEG")
         if epoch < self.epoch:
@@ -74,7 +85,7 @@ class FrameStreamParser:
                 self._error("native JPEG sequence did not increase")
             else:
                 self.sequence = sequence
-        return FrameRecord(kind, epoch, sequence, payload)
+        return FrameRecord(kind, epoch, sequence, payload, capture_ms)
 
     def feed(self, data: bytes) -> list[FrameRecord]:
         if self._failed or self._finished:
@@ -93,11 +104,11 @@ class FrameStreamParser:
                 self._pending = self._header()
                 if self._pending[3]:
                     continue
-            kind, epoch, sequence, _size = self._pending
+            kind, epoch, sequence, _size, capture_ms = self._pending
             payload = bytes(self._buffer)
             self._buffer.clear()
             self._pending = None
-            record = self._record(kind, epoch, sequence, payload)
+            record = self._record(kind, epoch, sequence, payload, capture_ms)
             if record is not None:
                 accepted.append(record)
         return accepted

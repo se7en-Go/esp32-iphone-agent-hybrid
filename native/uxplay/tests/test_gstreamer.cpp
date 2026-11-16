@@ -46,6 +46,12 @@ int main(int argc, char **argv) {
         if(h[5]==2 && read_be(h+8,8)==epoch)++count;pos+=32+len;}return count;};
     auto wait=[&](uint64_t epoch) {auto end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
         while(!frames(epoch)&&std::chrono::steady_clock::now()<end)std::this_thread::sleep_for(std::chrono::milliseconds(10));assert(frames(epoch)>0);};
+    auto begins=[&](std::vector<uint64_t> &out) {std::lock_guard<std::mutex> lock(capture_mutex);size_t pos=0;
+        while(bytes.size()-pos>=32){auto h=bytes.data()+pos;auto len=read_be(h+24,4);if(bytes.size()-pos<32+len)break;
+        if(h[5]==1)out.push_back(read_be(h+8,8));pos+=32+len;}};
+    auto stamps=[&](uint64_t epoch, std::vector<uint32_t> &out) {std::lock_guard<std::mutex> lock(capture_mutex);size_t pos=0;
+        while(bytes.size()-pos>=32){auto h=bytes.data()+pos;auto len=read_be(h+24,4);if(bytes.size()-pos<32+len)break;
+        if(h[5]==2 && read_be(h+8,8)==epoch)out.push_back((uint32_t)read_be(h+28,4));pos+=32+len;}};
     HafeSession *old=static_cast<HafeSession*>(hafe_begin(nullptr));assert(old&&old->epoch==1);
     hafe_process(old,&packet);wait(1);int old_count=frames(1);
     HafeSession *current=static_cast<HafeSession*>(hafe_begin(nullptr));assert(current&&current->epoch==2);
@@ -92,6 +98,53 @@ int main(int argc, char **argv) {
       while(frames(burst_epoch)<29&&std::chrono::steady_clock::now()<deadline)
           std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
     assert(frames(burst_epoch)>=29);
+    // Overload recovery: feeding bursts back-to-back fills the 8MB appsrc
+    // queue faster than the software decoder drains it. The old code ended
+    // the session on overflow and froze the mirror until a new AirPlay
+    // connection. Now the pipeline is torn down and a fresh epoch begins;
+    // the next burst (starting with an IDR) re-syncs the new decoder.
+    uint64_t recovered_epoch = 0;
+    size_t fed_bytes = 0, burst_bytes = 0;
+    for (auto &frame : burst) burst_bytes += frame.size();
+    std::cout<<"overflow test: burst is "<<burst_bytes<<" bytes ("<<burst_bytes/30<<" avg AU), feeding to 48MB\n";
+    // Feed by total bytes, not rounds: a 720p ball AU is only a few KB, so a
+    // fixed round count can stay under the 8MB appsrc queue. The feed rate
+    // (back-to-back pushes) far exceeds the software decoder drain rate, so
+    // the queue must fill once enough bytes are fed.
+    for (; !recovered_epoch && fed_bytes < 48u*1024u*1024u;) {
+        for (auto &frame : burst) {
+            video_decode_struct p={}; p.data=frame.data(); p.data_len=frame.size(); p.nal_count=3;
+            hafe_process(burst_session,&p); fed_bytes += frame.size();
+        }
+        std::vector<uint64_t> seen; begins(seen);
+        for (auto e : seen) if (e > burst_epoch) recovered_epoch = e;
+    }
+    std::cout<<"overflow test fed "<<fed_bytes<<" bytes, recovered epoch "<<recovered_epoch<<"\n";
+    assert(recovered_epoch > burst_epoch);
+    // Feed one more burst so the new decoder gets its IDR, then wait for JPEGs
+    // on the newest epoch (a second overload during this burst would restart
+    // again; take whatever epoch is latest).
+    for (auto &frame : burst) {
+        video_decode_struct p={}; p.data=frame.data(); p.data_len=frame.size(); p.nal_count=3;
+        hafe_process(burst_session,&p);
+    }
+    { std::vector<uint64_t> seen; begins(seen);
+      for (auto e : seen) if (e > recovered_epoch) recovered_epoch = e; }
+    { auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+      while(frames(recovered_epoch)<1&&std::chrono::steady_clock::now()<deadline)
+          std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+    assert(frames(recovered_epoch)>=1);
+    // HAFE v2: the new epoch's JPEGs carry a version-2 header and a nonzero,
+    // non-decreasing capture timestamp (monotonic ms at push).
+    { std::vector<uint32_t> ts; stamps(recovered_epoch, ts);
+      assert(!ts.empty());
+      for (size_t i=0;i<ts.size();++i) {
+          assert(ts[i]!=0);
+          if (i) assert(ts[i]>=ts[i-1]);
+      }
+      std::lock_guard<std::mutex> lock(capture_mutex); size_t pos=0;
+      while(bytes.size()-pos>=32){auto h=bytes.data()+pos;auto len=read_be(h+24,4);if(bytes.size()-pos<32+len)break;
+      if(read_be(h+8,8)==recovered_epoch) assert(h[4]==2); pos+=32+len;} }
     hafe_end(nullptr,burst_session);
     hafe_end(nullptr,old);assert(frames(1)==old_count);
     hafe_end(nullptr,current);writer.reset();reader.join();

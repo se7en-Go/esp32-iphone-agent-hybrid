@@ -47,6 +47,9 @@ class UxPlayScreen(RecentFrameHistory):
         self._framed = mode == "1"
         self._native_epoch = 0
         self._native_active = False
+        # Capture age (seconds) of the most recent accepted native frame,
+        # from its HAFE v2 timestamp; None when the frame carried no timestamp.
+        self._last_capture_age = None
         self.last_error = ""
 
     def start(self) -> None:
@@ -64,9 +67,9 @@ class UxPlayScreen(RecentFrameHistory):
             result = subprocess.run(["uxplay", "--hafe-protocol"], env=env, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, timeout=2, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
-            raise RuntimeError("Native UxPlay HAFE/1 support could not be verified") from exc
-        if result.returncode != 0 or result.stdout.strip() != b"HAFE/1":
-            raise RuntimeError("Selected UxPlay does not support native HAFE/1; framed mode was not started")
+            raise RuntimeError("Native UxPlay HAFE support could not be verified") from exc
+        if result.returncode != 0 or result.stdout.strip() not in (b"HAFE/1", b"HAFE/2"):
+            raise RuntimeError("Selected UxPlay does not support native HAFE; framed mode was not started")
 
     def stop(self) -> None:
         # A guarded HID write holds this same lock until it finishes validating.
@@ -75,6 +78,7 @@ class UxPlayScreen(RecentFrameHistory):
             self._stop_event.set()
             self._ipc_connected = False
             self.frame, self.updated, self._snapshot = None, 0.0, None
+            self._last_capture_age = None
             if self._proc is not None:
                 self._proc.terminate()
 
@@ -95,6 +99,7 @@ class UxPlayScreen(RecentFrameHistory):
                 self.generation += 1
             self._ipc_connected = self._ipc_live = False
             self.frame, self.updated, self._snapshot = None, 0.0, None
+            self._last_capture_age = None
             self.last_error = "Mac 镜像接收器连接中，请检查本地 receiver 服务。"
 
     def _accept_remote(self, metadata, jpeg) -> None:
@@ -110,12 +115,14 @@ class UxPlayScreen(RecentFrameHistory):
                     or (self._ipc_live and not live)):
                 self.generation += 1
                 self.frame, self.updated, self._snapshot = None, 0.0, None
+                self._last_capture_age = None
             self._ipc_source = source
             self._ipc_connected, self._ipc_live = True, live
             self._ipc_received = time.monotonic()
             self.last_error = ""
             if not live:
                 self.frame, self.updated, self._snapshot = None, 0.0, None
+                self._last_capture_age = None
                 return
             if jpeg:
                 # Keep receiver publication clocks. Polling an unchanged snapshot must
@@ -124,6 +131,8 @@ class UxPlayScreen(RecentFrameHistory):
                 self._snapshot = FrameSnapshot(jpeg, None, metadata["arrived"], self.updated,
                                                self.generation, True)
                 self._remember_snapshot(self._snapshot)
+                age = metadata.get("capture_age_s")
+                self._last_capture_age = age if type(age) in (int, float) and age >= 0 else None
 
     def _supervise(self) -> None:
         """Keep UxPlay running: it exits on some disconnects, so restart it every time."""
@@ -217,7 +226,7 @@ class UxPlayScreen(RecentFrameHistory):
         with self._frame_lock:
             snapshot = self._snapshot
             age = max(0.0, time.monotonic() - snapshot.arrived) if snapshot and snapshot.frame else None
-            details = (age, None, None, self.generation)
+            details = (age, self._last_capture_age, None, self.generation)
             if self._stopping:
                 return PreviewStatus("disconnected", *details)
             if self.socket_path:
@@ -338,6 +347,7 @@ class UxPlayScreen(RecentFrameHistory):
     def _native_boundary(self):
         self.generation += 1
         self.frame, self.updated, self._snapshot = None, 0.0, None
+        self._last_capture_age = None
         self._recent_frames.clear()
 
     def _on_native_record(self, record):
@@ -352,6 +362,18 @@ class UxPlayScreen(RecentFrameHistory):
                     self._native_boundary()
                     self._native_active = False
                 elif self._native_active:
+                    # HAFE v2: the record carries its capture time (monotonic ms
+                    # at push). A frame that waited in the decode queue is old
+                    # even though it arrived just now; drop it instead of
+                    # publishing it as fresh. 0 / absent = no timestamp.
+                    capture_age = None
+                    if record.capture_ms:
+                        now_ms = int(time.monotonic() * 1000) & 0xFFFFFFFF
+                        capture_age = freshness.board_delta(now_ms, record.capture_ms) / 1000
+                        if capture_age > freshness.MAX_REPLAY_LAG or capture_age < -0.5:
+                            log.warning("Dropping stale native frame (capture age %.2fs)", capture_age)
+                            return
+                    self._last_capture_age = capture_age
                     arrived, updated = time.monotonic(), time.time()
                     self.frame, self.updated = record.payload, updated
                     self._snapshot = FrameSnapshot(record.payload, None, arrived, updated, self.generation, True)

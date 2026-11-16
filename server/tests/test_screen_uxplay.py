@@ -92,6 +92,63 @@ def test_uxplay_preview_holds_idle_jpeg_for_only_fifteen_seconds(monkeypatch):
     assert (preview.state, preview.frame) == ("disconnected", None)
 
 
+def test_native_stale_frame_is_dropped_and_fresh_frame_reports_its_capture_age(monkeypatch):
+    from hidagent.uxplay_frames import BEGIN, FrameRecord
+
+    clock = ManualClock()
+    clock.install(monkeypatch)
+    screen = UxPlayScreen()
+    screen._proc = ReceiverProcess()
+    monkeypatch.setattr(screen, "_clients", lambda: None)
+
+    def now_ms():
+        return int(clock.monotonic() * 1000) & 0xFFFFFFFF
+
+    screen._on_native_record(FrameRecord(BEGIN, 1, 0, b""))
+    # A frame that spent 5s in the decode queue must not be published as fresh.
+    screen._on_native_record(FrameRecord(2, 1, 1, b"stale JPEG", (now_ms() - 5000) & 0xFFFFFFFF))
+    assert screen.frame is None
+    assert screen.snapshot is None
+    assert screen.preview().replay_lag_s is None
+
+    screen._on_native_record(FrameRecord(2, 1, 2, b"fresh JPEG", now_ms()))
+    assert screen.frame == b"fresh JPEG"
+    preview = screen.preview()
+    assert preview.replay_lag_s is not None and preview.replay_lag_s < 0.1
+
+    # A later stale frame must not evict the fresh one or renew its age.
+    screen._on_native_record(FrameRecord(2, 1, 3, b"older JPEG", (now_ms() - 3000) & 0xFFFFFFFF))
+    assert screen.frame == b"fresh JPEG"
+    assert screen.preview().replay_lag_s < 0.1
+
+
+def test_native_end_then_new_begin_recovers_with_a_new_generation(monkeypatch):
+    from hidagent.uxplay_frames import BEGIN, END, FrameRecord
+
+    clock = ManualClock()
+    clock.install(monkeypatch)
+    screen = UxPlayScreen()
+    screen._proc = ReceiverProcess()
+    monkeypatch.setattr(screen, "_clients", lambda: None)
+
+    screen._on_native_record(FrameRecord(BEGIN, 1, 0, b""))
+    screen._on_native_record(FrameRecord(2, 1, 1, b"first JPEG"))
+    assert screen.frame == b"first JPEG"
+    first_generation = screen.generation
+
+    screen._on_native_record(FrameRecord(END, 1, 0, b""))
+    assert screen.frame is None
+    # Same-epoch JPEGs after END are terminally rejected; the screen must
+    # not publish them either.
+    screen._on_native_record(FrameRecord(2, 1, 2, b"late JPEG"))
+    assert screen.frame is None
+
+    screen._on_native_record(FrameRecord(BEGIN, 2, 0, b""))
+    screen._on_native_record(FrameRecord(2, 2, 1, b"recovered JPEG"))
+    assert screen.frame == b"recovered JPEG"
+    assert screen.generation > first_generation
+
+
 def test_uxplay_receiver_restart_invalidates_previous_observation(monkeypatch):
     screen = UxPlayScreen()
     observations = []

@@ -6,5 +6,5 @@
   "archive_root": "UxPlay-1.73.7",
   "archive_sha256": "65feb8732de666a7161a9e562aa603a7f5fe0ebb890c2a30c5e1a9c85c76309f",
   "patch": "uxplay-1.73.7-hafe-v1.patch",
-  "patch_sha256": "f17c4842ce959c553f5ae64b8e6909015864cba42af362b475c81a4719bc1d29"
+  "patch_sha256": "61bfe0750b46e3104ee2f43bf4d69b1953a73b5d638385be32b42bfdcac9a3b8"
 }
