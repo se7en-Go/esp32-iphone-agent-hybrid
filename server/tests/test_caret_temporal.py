@@ -236,3 +236,28 @@ def test_lemon_yellow_caret_never_masks_new_content():
     assert observation_changed(lemon_editor_frame(1),
                                lemon_editor_frame(0, edit="same_patch"),
                                caret_frames=lemon_editor_history())
+
+
+def test_mid_fade_jpeg_lemon_caret_with_segmented_diff_still_masks():
+    def jpeg_lemon(level, *, split=False, edit=None):
+        image = Image.new("RGB", (500, 1080), "white")
+        draw = ImageDraw.Draw(image)
+        draw.text((310, 197), "test editor", fill=(30, 30, 30))
+        draw.rectangle((0, 575, 499, 1079), fill=(211, 212, 221))
+        tone = tuple(round(255 + level * (channel - 255)) for channel in (186, 175, 5))
+        draw.line((361, 175, 361, 226), fill=tone, width=2)
+        if split:
+            # JPEG DCT dim on the lower tail stays within phase tolerance while
+            # dropping 360p diff>24 below threshold past the old 6px vertical pad.
+            faded = tuple(round(255 + 0.14 * (channel - 255)) for channel in (186, 175, 5))
+            draw.line((361, 214, 361, 226), fill=faded, width=2)
+        if edit == "same_patch":
+            draw.rectangle((361, 219, 363, 225), fill=(39, 38, 35))
+        output = io.BytesIO()
+        image.save(output, "JPEG", quality=75)
+        return output.getvalue()
+
+    history = tuple(SimpleNamespace(frame=jpeg_lemon(level), arrived=i * .4, generation=1)
+                    for i, level in enumerate((1, 0, 1, 0)))
+    assert not observation_changed(jpeg_lemon(0), jpeg_lemon(0.22, split=True), caret_frames=history)
+    assert observation_changed(jpeg_lemon(0), jpeg_lemon(0, edit="same_patch"), caret_frames=history)

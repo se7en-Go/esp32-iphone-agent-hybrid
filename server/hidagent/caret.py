@@ -490,11 +490,12 @@ def mask_caret_blink(before, after, diff, frames=()):
     if any(_image(frame.frame).size != first.size for frame in frames):
         return
     padding = max(3, round(.012 * first.width))
+    pad_y = max(padding, round(.03 * first.height))
     regions = []
     for bounds in changed_lines:
         native = [round(value * first.size[i % 2] / diff.size[i % 2]) for i, value in enumerate(bounds)]
-        regions.append((max(0, native[0] - padding), max(0, native[1] - padding),
-                        min(first.width, native[2] + padding), min(first.height, native[3] + padding)))
+        regions.append((max(0, native[0] - padding), max(0, native[1] - pad_y),
+                        min(first.width, native[2] + padding), min(first.height, native[3] + pad_y)))
     candidates = []
     for bright in (first, second):
         for caret in field_carets(bright, allow_white=True, regions=regions):
