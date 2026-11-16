@@ -143,8 +143,12 @@ async def verify_after_paste_permission(before, sheet, after, region, observed_t
         return False
     try:
         region = ocr.validate_region(region)
-        expected = tuple(_visible_text(line) for line in observed_text.splitlines())
-        if not expected or not all(expected):
+        # Blank lines (e.g. a leading newline when appending after existing
+        # text) have no OCR row, so they cannot be verified visually; the
+        # transaction digest already pins the exact intended text. Compare
+        # only the visible lines.
+        expected = tuple(line for line in (_visible_text(line) for line in observed_text.splitlines()) if line)
+        if not expected:
             return False
         original_image, sheet_image, current_image = (_image(frame) for frame in (before, sheet, after))
         if original_image.size != sheet_image.size or original_image.size != current_image.size:

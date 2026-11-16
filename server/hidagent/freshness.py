@@ -20,6 +20,9 @@ class FrameSnapshot:
     frame_ts: int | None
     generation: int
     live: bool
+    # Seconds between iPhone capture and arrival at this host (HAFE v2);
+    # None when the frame carries no capture time.
+    capture_age_s: float | None = None
 
 
 def snapshot(screen) -> FrameSnapshot:
@@ -34,16 +37,18 @@ def snapshot(screen) -> FrameSnapshot:
             # Pixels stay frozen, but a stopped or disconnected screen is no longer eligible.
             if observed.live and hasattr(screen, "live") and not screen.live:
                 return FrameSnapshot(observed.frame, observed.updated, observed.frame_ts,
-                                     observed.generation, False)
+                                     observed.generation, False, observed.capture_age_s)
             return observed
     if take is not None and (hasattr(take, 'board_ts') or hasattr(take, 'frame_ts')):
         return FrameSnapshot(
             getattr(take, 'frame', None), getattr(screen, 'updated', getattr(take, 'updated', 0)),
             getattr(take, 'board_ts', getattr(take, 'frame_ts', None)),
             getattr(take, 'generation', getattr(screen, 'generation', 0)),
-            bool(getattr(take, 'observed_live', getattr(screen, 'live', False))))
+            bool(getattr(take, 'observed_live', getattr(screen, 'live', False))),
+            getattr(take, 'capture_age_s', getattr(screen, '_last_capture_age', None)))
     return FrameSnapshot(screen.frame, getattr(screen, 'updated', 0),
-                         getattr(screen, 'frame_ts', None), getattr(screen, 'generation', 0), screen.live)
+                         getattr(screen, 'frame_ts', None), getattr(screen, 'generation', 0), screen.live,
+                         getattr(screen, '_last_capture_age', None))
 
 
 def board_delta(newer: float, older: float) -> float:
@@ -83,7 +88,16 @@ def fresh_frame(screen, *, clock=None, clock_link=None, link=None, since=None,
     if since is not None:
         if frame.updated <= since:
             return None
-        if frame.frame_ts is not None and clock is not None:
+        if frame.capture_age_s is not None:
+            # HAFE v2: the frame carries its iPhone capture time. A frame
+            # captured before the action must never count as post-action
+            # evidence, however late it arrives: a frame captured 0.1 s
+            # before the action and arriving 1.8 s after it is still a
+            # pre-action picture. This check supersedes the arrival-based
+            # lag allowances below whenever the capture time is known.
+            if frame.updated - frame.capture_age_s <= since:
+                return None
+        elif frame.frame_ts is not None and clock is not None:
             # Firmware stamps board receipt: the image may still have spent the
             # whole mirror allowance between phone capture and board receipt.
             if board_delta(frame.frame_ts, since * 1000 + clock) < (MIRROR_LAG_SECONDS + uncertainty) * 1000:

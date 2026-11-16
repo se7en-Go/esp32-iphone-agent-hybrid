@@ -36,11 +36,16 @@ class FrameSnapshot:
     updated: float = 0.0
     generation: int = 0
     observed_live: bool = False
+    # Seconds between iPhone capture and arrival at this host (HAFE v2);
+    # None when the frame carries no capture time (board path, legacy
+    # UxPlay, HAFE/1). `updated - capture_age_s` is the capture wall time.
+    capture_age_s: float | None = None
 
     def __call__(self):
         from .freshness import FrameSnapshot as ObservedFrame
 
-        return ObservedFrame(self.frame, self.updated, self.board_ts, self.generation, self.observed_live)
+        return ObservedFrame(self.frame, self.updated, self.board_ts, self.generation, self.observed_live,
+                             self.capture_age_s)
 
 
 @dataclass(frozen=True)

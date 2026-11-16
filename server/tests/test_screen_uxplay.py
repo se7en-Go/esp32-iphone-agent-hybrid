@@ -173,3 +173,85 @@ def test_uxplay_receiver_restart_invalidates_previous_observation(monkeypatch):
     assert between_receivers[0] is None
     with pytest.raises(RuntimeError, match="新鲜"):
         require_fresh(screen)
+
+def test_fresh_frame_rejects_pre_action_capture_arriving_late(monkeypatch):
+    """Codex repro: a frame captured 0.1 s before the action, arriving 1.8 s
+    after it, must never count as post-action evidence.
+
+    Arrival alone would pass the old lag allowance (1.8 > 1.7); the HAFE/2
+    capture time is what rejects it.
+    """
+    from hidagent.uxplay_frames import BEGIN, FrameRecord
+
+    clock = ManualClock()
+    clock.install(monkeypatch)
+    screen = UxPlayScreen()
+    screen._proc = ReceiverProcess()
+    monkeypatch.setattr(screen, "_clients", lambda: None)
+
+    def now_ms():
+        return int(clock.monotonic() * 1000) & 0xFFFFFFFF
+
+    screen._on_native_record(FrameRecord(BEGIN, 1, 0, b""))
+    action_at = clock.time()
+    clock.advance(1.8)
+    screen._on_native_record(FrameRecord(2, 1, 1, b"late JPEG", (now_ms() - 1900) & 0xFFFFFFFF))
+    assert screen.frame == b"late JPEG"  # published: age 1.9 s is under the drop limit
+    assert screen.snapshot.capture_age_s is not None
+    assert abs(screen.snapshot.capture_age_s - 1.9) < 0.01
+    assert fresh_frame(screen, since=action_at) is None
+
+
+def test_fresh_frame_accepts_post_action_capture_arriving_late(monkeypatch):
+    from hidagent.uxplay_frames import BEGIN, FrameRecord
+
+    clock = ManualClock()
+    clock.install(monkeypatch)
+    screen = UxPlayScreen()
+    screen._proc = ReceiverProcess()
+    monkeypatch.setattr(screen, "_clients", lambda: None)
+
+    def now_ms():
+        return int(clock.monotonic() * 1000) & 0xFFFFFFFF
+
+    screen._on_native_record(FrameRecord(BEGIN, 1, 0, b""))
+    action_at = clock.time()
+    clock.advance(1.8)
+    screen._on_native_record(FrameRecord(2, 1, 1, b"late JPEG", (now_ms() - 1600) & 0xFFFFFFFF))
+    observed = fresh_frame(screen, since=action_at)
+    assert observed is not None and observed.frame == b"late JPEG"
+
+
+def test_fresh_frame_without_capture_time_keeps_arrival_rule(monkeypatch):
+    """No capture time (legacy path): the old arrival-based lag rule stays."""
+    clock = ManualClock()
+    clock.install(monkeypatch)
+    screen = UxPlayScreen()
+    screen._proc = ReceiverProcess()
+    monkeypatch.setattr(screen, "_clients", lambda: None)
+
+    action_at = clock.time()
+    clock.advance(1.0)
+    screen._on_jpeg(b"early JPEG")
+    assert screen.snapshot.capture_age_s is None
+    assert fresh_frame(screen, since=action_at) is None
+    clock.advance(0.8)
+    screen._on_jpeg(b"late JPEG")
+    observed = fresh_frame(screen, since=action_at)
+    assert observed is not None and observed.frame == b"late JPEG"
+
+
+def test_remote_snapshot_carries_capture_age_with_transit(monkeypatch):
+    """Receiver metadata age plus the IPC transit since publication."""
+    clock = ManualClock()
+    clock.install(monkeypatch)
+    screen = UxPlayScreen()
+    screen._proc = ReceiverProcess()
+    monkeypatch.setattr(screen, "_clients", lambda: None)
+    metadata = {"instance": "a" * 32, "generation": 0, "running": True, "live": True,
+                "updated": clock.time(), "arrived": clock.monotonic() - 0.12, "capture_age_s": 0.05}
+    screen._accept_remote(metadata, b"remote JPEG")
+    observed = require_fresh(screen)
+    assert observed.frame == b"remote JPEG"
+    assert observed.capture_age_s is not None
+    assert abs(observed.capture_age_s - 0.17) < 0.02

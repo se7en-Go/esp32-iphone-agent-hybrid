@@ -55,6 +55,13 @@ class _Transaction:
     expected_digest: bytes
     focus_verified_by: str
     completed_at: float | None = None
+    # Frames observed right after Cmd+V, retained for this transaction: the
+    # permission sheet may leave the 4 s recent window before confirm runs.
+    post_paste_frames: tuple = ()
+    # (frame, updated, generation) of a sheet frame the triple check already
+    # verified for this transaction; a later confirm retry reuses it instead
+    # of re-scanning frames that have since rolled out of the window.
+    sheet_evidence: tuple | None = None
 
 
 class StagedClipboardControls:
@@ -194,6 +201,11 @@ class StagedClipboardControls:
             item.provider.stage_paste_sent(item.nonce)
             item.completed_at = time.time()
             await feedback.wait_after_action(controls.screen, item.completed_at)
+            # Retain the frames observed right after Cmd+V in this
+            # transaction. The permission sheet appears here, but confirm
+            # may run after the 4 s recent window has dropped it; the
+            # triple check below can still verify a retained frame.
+            item.post_paste_frames = tuple(getattr(controls.screen, "recent_frames", ()))
         except asyncio.CancelledError:
             self._abandon(item)
             raise
@@ -231,7 +243,9 @@ class StagedClipboardControls:
             # the result frame. Each candidate carries its own timestamp and
             # generation, so a stale sheet from an earlier transaction can
             # never verify a new one, and a sheet is not pushed out of the
-            # candidate list by later ordinary frames.
+            # candidate list by later ordinary frames or by the 4 s recent
+            # window expiring: frames retained at paste time, and a sheet
+            # verified once in this transaction, stay candidates.
             from .paste_confirmation import verify_after_paste_permission
 
             result = controls._observation
@@ -239,21 +253,40 @@ class StagedClipboardControls:
             original = item.guard.original
             seen = {original.frame, after}
             verified = None
-            for snapshot in getattr(controls.screen, "recent_frames", ()):
-                frame = getattr(snapshot, "frame", None)
-                updated = getattr(snapshot, "updated", None)
-                generation = getattr(snapshot, "generation", None)
-                if (not frame or frame in seen or updated is None or generation is None
-                        or generation != original.generation
-                        or updated <= item.completed_at
-                        or updated > result.updated):
-                    continue
-                seen.add(frame)
-                if await verify_after_paste_permission(
-                        original.frame, frame, after,
-                        item.guard.region, request.observed_text):
-                    verified = (frame, updated, generation)
-                    break
+            # A sheet this transaction already verified stays usable even
+            # after the 4 s recent window has dropped it: the window and
+            # session checks below already ran for it at verification time.
+            if item.sheet_evidence is not None:
+                frame, updated, generation = item.sheet_evidence
+                if (frame and frame not in seen and generation == original.generation
+                        and updated > item.completed_at and updated <= result.updated
+                        and await verify_after_paste_permission(
+                            original.frame, frame, after,
+                            item.guard.region, request.observed_text)):
+                    verified = item.sheet_evidence
+            if verified is None:
+                # Candidates are the frames retained right after Cmd+V first,
+                # then the live recent window; a sheet is not pushed out of
+                # the candidate list by later ordinary frames, and a sheet
+                # that left the window before confirm still verifies.
+                candidates = tuple(item.post_paste_frames) + tuple(
+                    getattr(controls.screen, "recent_frames", ()))
+                for snapshot in candidates:
+                    frame = getattr(snapshot, "frame", None)
+                    updated = getattr(snapshot, "updated", None)
+                    generation = getattr(snapshot, "generation", None)
+                    if (not frame or frame in seen or updated is None or generation is None
+                            or generation != original.generation
+                            or updated <= item.completed_at
+                            or updated > result.updated):
+                        continue
+                    seen.add(frame)
+                    if await verify_after_paste_permission(
+                            original.frame, frame, after,
+                            item.guard.region, request.observed_text):
+                        verified = (frame, updated, generation)
+                        item.sheet_evidence = verified
+                        break
             if verified is None:
                 raise
             _sheet_frame, sheet_updated, sheet_generation = verified

@@ -178,3 +178,110 @@ def test_confirm_without_any_sheet_frame_still_refuses(monkeypatch):
         assert provider.current()["active"]
 
     asyncio.run(scenario())
+
+def test_confirm_uses_sheet_retained_at_paste_time_after_window_passes(monkeypatch):
+    """A sheet that left the 4 s recent window before confirm still verifies.
+
+    paste() retains the frames observed right after Cmd+V in the
+    transaction; confirm falls back to them when the live window no longer
+    holds the sheet.
+    """
+    from hidagent import feedback, paste_confirmation
+
+    async def scenario():
+        screen, provider, phone, control, manager = setup(monkeypatch)
+        before, sheet, after = field_image(), changed_scene("blue"), changed_scene("orange")
+        calls = []
+
+        async def capture(_screen, _completed_at):
+            # The sheet arrives while paste() waits for post-action evidence,
+            # so it is part of the frames retained at paste time.
+            screen._on_jpeg(sheet)
+            return sheet
+
+        async def verify(original, presented, selected, region, text):
+            calls.append(presented)
+            return presented == sheet
+
+        monkeypatch.setattr(feedback, "wait_after_action", capture)
+        monkeypatch.setattr(paste_confirmation, "verify_after_paste_permission", verify)
+        prepared = await manager.prepare(prepare_body(control))
+        copied(provider, screen)
+        await manager.paste(PasteTransaction(transaction_id=prepared["transaction_id"],
+                                             screen_id=control.observation()["screen_id"], focused=True))
+        # The 4 s recent window has passed: the live history no longer holds
+        # the sheet, but the transaction retained it at paste time.
+        screen._recent_frames.clear()
+        screen._on_jpeg(after)  # then the pasted field
+        receipt = await manager.confirm(ConfirmPaste(
+            transaction_id=prepared["transaction_id"],
+            screen_id=control.observation()["screen_id"],
+            observed_text="你好00123", confirmed=True))
+        assert receipt["phase"] == "completed" and receipt["effect_verified"]
+        assert receipt["confirmation_evidence"] == "paste_permission_dismissed"
+        assert calls == [sheet]
+        assert provider.current() == {"active": False, "needs_resolution": False}
+
+    asyncio.run(scenario())
+
+
+def test_confirm_reuses_verified_sheet_on_retry(monkeypatch):
+    """A sheet verified once stays usable for a later confirm retry.
+
+    The first confirm verifies the sheet but fails to finish (stage_finish
+    raises); the retry reuses the retained verified evidence even though
+    the live recent window no longer holds the sheet.
+    """
+    from hidagent import feedback, paste_confirmation
+
+    async def scenario():
+        screen, provider, phone, control, manager = setup(monkeypatch)
+        before, sheet, after = field_image(), changed_scene("blue"), changed_scene("orange")
+        calls = []
+
+        async def capture(_screen, _completed_at):
+            screen._on_jpeg(sheet)
+            return sheet
+
+        async def verify(original, presented, selected, region, text):
+            calls.append(presented)
+            return presented == sheet
+
+        monkeypatch.setattr(feedback, "wait_after_action", capture)
+        monkeypatch.setattr(paste_confirmation, "verify_after_paste_permission", verify)
+        prepared = await manager.prepare(prepare_body(control))
+        copied(provider, screen)
+        await manager.paste(PasteTransaction(transaction_id=prepared["transaction_id"],
+                                             screen_id=control.observation()["screen_id"], focused=True))
+        finish = provider.stage_finish
+        attempts = []
+
+        def flaky_finish(nonce, **kwargs):
+            attempts.append(nonce)
+            if len(attempts) == 1:
+                raise RuntimeError("transient finish failure")
+            return finish(nonce, **kwargs)
+
+        monkeypatch.setattr(provider, "stage_finish", flaky_finish)
+        screen._on_jpeg(after)
+        with pytest.raises(RuntimeError, match="transient finish failure"):
+            await manager.confirm(ConfirmPaste(
+                transaction_id=prepared["transaction_id"],
+                screen_id=control.observation()["screen_id"],
+                observed_text="你好00123", confirmed=True))
+        assert calls == [sheet]
+        assert provider.current()["active"]
+        # The window has passed and the live history no longer holds the
+        # sheet; the retry reuses the evidence verified in the first attempt.
+        screen._recent_frames.clear()
+        screen._on_jpeg(changed_scene("orange"))
+        receipt = await manager.confirm(ConfirmPaste(
+            transaction_id=prepared["transaction_id"],
+            screen_id=control.observation()["screen_id"],
+            observed_text="你好00123", confirmed=True))
+        assert receipt["phase"] == "completed" and receipt["effect_verified"]
+        assert receipt["confirmation_evidence"] == "paste_permission_dismissed"
+        assert calls == [sheet, sheet]
+        assert provider.current() == {"active": False, "needs_resolution": False}
+
+    asyncio.run(scenario())

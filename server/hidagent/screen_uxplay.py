@@ -127,12 +127,19 @@ class UxPlayScreen(RecentFrameHistory):
             if jpeg:
                 # Keep receiver publication clocks. Polling an unchanged snapshot must
                 # never make old pixels eligible for a new input operation.
+                # The receiver stamps the capture age at publication; add the
+                # IPC transit since then, so `updated - capture_age_s` stays
+                # the capture wall time (never later than the true capture).
+                age = metadata.get("capture_age_s")
+                if type(age) in (int, float) and age >= 0:
+                    age = age + max(0.0, time.monotonic() - metadata["arrived"])
+                else:
+                    age = None
                 self.frame, self.updated = jpeg, metadata["updated"]
                 self._snapshot = FrameSnapshot(jpeg, None, metadata["arrived"], self.updated,
-                                               self.generation, True)
+                                               self.generation, True, capture_age_s=age)
                 self._remember_snapshot(self._snapshot)
-                age = metadata.get("capture_age_s")
-                self._last_capture_age = age if type(age) in (int, float) and age >= 0 else None
+                self._last_capture_age = age
 
     def _supervise(self) -> None:
         """Keep UxPlay running: it exits on some disconnects, so restart it every time."""
@@ -376,7 +383,8 @@ class UxPlayScreen(RecentFrameHistory):
                     self._last_capture_age = capture_age
                     arrived, updated = time.monotonic(), time.time()
                     self.frame, self.updated = record.payload, updated
-                    self._snapshot = FrameSnapshot(record.payload, None, arrived, updated, self.generation, True)
+                    self._snapshot = FrameSnapshot(record.payload, None, arrived, updated, self.generation,
+                                                   True, capture_age_s=capture_age)
                     self._remember_snapshot(self._snapshot)
 
     def _read_framed(self, fd):

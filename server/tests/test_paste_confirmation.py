@@ -107,3 +107,39 @@ def test_permission_confirmation_accepts_append_after_existing_borderless_text(m
     monkeypatch.setattr(ocr, "read_text_async", read)
     proof = verify_after_paste_permission(original, sheet, after, REGION, EXPECTED)
     assert asyncio.run(proof) is True
+
+def test_permission_confirmation_accepts_append_starting_with_newline(monkeypatch):
+    """Appending text that starts with a newline still verifies.
+
+    The leading blank line has no OCR row, so only the visible lines are
+    compared; the transaction digest already pins the exact intended text.
+    """
+    def borderless_frame(bars, sheet=False):
+        image = Image.new("RGB", (500, 1000), (235, 235, 230))
+        draw = ImageDraw.Draw(image)
+        for y in bars:
+            draw.rectangle((116, y - 2, 230, y + 2), fill="black")
+        if sheet:
+            draw.rounded_rectangle((90, 350, 410, 650), radius=20, fill=(180, 180, 180))
+        result = io.BytesIO()
+        image.save(result, "PNG")
+        return result.getvalue()
+
+    existing = [label("第一行旧文字", .25, .36), label("第二行旧文字", .25, .40)]
+    pasted = [label("第二次：你好00042", .25, .44), label("校验：XYZabc", .25, .48)]
+    context = [label("Safari test page", .25, .13), label("Tester", .25, .25), label("Expected text", .23, .65),
+               label("第二次：你好00042", .25, .72), label("校验：XYZabc", .25, .76)]
+    dialog = [label('“Safari浏览器”想从“快捷指令”粘贴', .5, .39), label("你允许这样做吗？", .5, .44),
+              label("不允许粘贴", .27, .52), label("允许粘贴", .7, .52)]
+    original = borderless_frame([360, 400])
+    sheet = borderless_frame([360, 400], sheet=True)
+    after = borderless_frame([360, 400, 440, 480])
+    frames = {original: context + existing, sheet: dialog, after: context + existing + pasted}
+
+    async def read(image):
+        return frames[image]
+
+    monkeypatch.setattr(ocr, "read_text_async", read)
+    proof = verify_after_paste_permission(original, sheet, after, REGION,
+                                          "\n第二次：你好00042\n校验：XYZabc")
+    assert asyncio.run(proof) is True
