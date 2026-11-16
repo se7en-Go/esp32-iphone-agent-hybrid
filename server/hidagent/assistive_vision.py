@@ -233,6 +233,42 @@ def _highlighted_home_box(panel, white_boxes):
     return candidates[0] if len(candidates) == 1 else None
 
 
+def menu_home_highlighted(frame: bytes, panel: Box) -> bool:
+    """Whether the Home slot of an AssistiveTouch menu is hover-highlighted.
+
+    The hovered Home icon and its label turn iOS blue while the other five
+    stay white. The blue Home icon is a hollow ring plus text, so the strict
+    solid-disc shape check in _highlighted_home_box rejects it; count blue
+    pixels in the Home slot instead. Highlighted iff the Home slot holds a
+    substantial blue share and dominates every other slot, so a blue app
+    icon elsewhere cannot fake a highlight. This is hover evidence only,
+    not a click target: the caller still runs the pre-click guard.
+    """
+    image = _small(frame)
+    width, height = image.size
+    left, top, right, bottom = (round(panel[0] * width), round(panel[1] * height),
+                                round(panel[2] * width), round(panel[3] * height))
+    cropped = image.crop((left, top, right, bottom))
+    pw, ph = cropped.size
+    counts = []
+    for rl, rt, rr, rb in MENU_ICON_REGIONS:
+        x0, y0 = round(rl * pw), round(rt * ph)
+        x1, y1 = round(rr * pw), round(rb * ph)
+        blue = 0
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                r, g, b = cropped.getpixel((x, y))
+                if b >= 140 and b - r >= 35 and b >= g:
+                    blue += 1
+        counts.append(blue)
+    home_left, home_top, home_right, home_bottom = MENU_ICON_REGIONS[-1]
+    home_area = ((round(home_right * pw) - round(home_left * pw))
+                 * (round(home_bottom * ph) - round(home_top * ph)))
+    home = counts[-1]
+    others = max(counts[:-1]) if counts[:-1] else 0
+    return home_area > 0 and home / home_area >= 0.02 and home >= 5 * max(1, others)
+
+
 def _menu_icons(image: Image.Image, box: tuple[int, int, int, int]) -> bool:
     centres = [((left+right)/2, (top+bottom)/2) for left, top, right, bottom in _icon_boxes(image, box)]
     return all(any(left < x < right and top < y < bottom for x, y in centres)

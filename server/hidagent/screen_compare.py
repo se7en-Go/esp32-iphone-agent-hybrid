@@ -241,6 +241,133 @@ def _mask_translucent_pointer_fade(before, after, diff):
             diff.putpixel(point, 0)
 
 
+def _faded_pointer_disc(visible, background, points, width):
+    """Prove a faded pointer disc over preserved glyphs, for pairing only.
+
+    A relaxed sibling of _translucent_pointer_fade. The strict fit rejects a
+    real faded disc over bold glyphs: the glyph edges fragment the silhouette
+    (symdiff 0.18 against the 0.12 cap) and break the per-pixel luminance fit
+    (core max error 30 against the 12 cap, mean 5.9 against 4). For pairing,
+    the displacement band and the exactly-one-pair rule carry the proof, so
+    this keeps only the checks that identify a faded neutral disc: disc
+    size/shape, a textured background, one opacity, one neutral colour, and
+    an unchanged ring. It never masks content, so it must not be used for
+    masking; masking keeps the strict _translucent_pointer_fade.
+    """
+    xs, ys = zip(*points, strict=True)
+    left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+    w, h = right - left + 1, bottom - top + 1
+    if not (.03 * width <= min(w, h) <= max(w, h) <= .067 * width
+            and .75 <= w / h <= 1.33 and .60 <= len(points) / (w * h) <= .90):
+        return False
+    cx, cy, radius = (left + right) / 2, (top + bottom) / 2, (w + h) / 4
+    footprint = set(points)
+    ideal = {(x, y) for y in range(top, bottom + 1) for x in range(left, right + 1)
+             if math.hypot(x - cx, y - cy) <= radius}
+    if (any(math.hypot(x - cx, y - cy) > radius + 1 for x, y in footprint)
+            or len(footprint ^ ideal) > .25 * len(ideal)):
+        return False
+    margin = 4
+    box = left - margin, top - margin, right + margin + 1, bottom + margin + 1
+    if min(box[:2]) < 0 or box[2] > visible.width or box[3] > visible.height:
+        return False
+    a, b = visible.crop(box), background.crop(box)
+    cx, cy = cx - box[0], cy - box[1]
+    core = [(x, y) for y in range(a.height) for x in range(a.width)
+            if math.hypot(x - cx, y - cy) <= .75 * radius]
+    al, bl = a.convert("L"), b.convert("L")
+    mean_a = sum(al.getpixel(p) for p in core) / len(core)
+    mean_b = sum(bl.getpixel(p) for p in core) / len(core)
+    variance = sum((bl.getpixel(p) - mean_b) ** 2 for p in core)
+    if variance / len(core) < 225:
+        return False  # a new flat gray button cannot prove preserved underlying text
+    scale = sum((al.getpixel(p) - mean_a) * (bl.getpixel(p) - mean_b) for p in core) / variance
+    if not .30 <= scale <= .75:
+        return False  # opaque shapes and weak arbitrary tint changes are unsupported
+    alpha = 1 - scale
+    color = tuple((sum(a.getpixel(p)[c] for p in core) - scale * sum(b.getpixel(p)[c] for p in core))
+                  / (len(core) * alpha) for c in range(3))
+    if not 24 <= min(color) <= max(color) <= 100 or max(color) - min(color) > 20:
+        return False
+    pixels = [(x, y) for y in range(a.height) for x in range(a.width)]
+    around = [p for p in pixels if math.hypot(p[0] - cx, p[1] - cy) > radius + 2]
+    ring_errors = [max(abs(u - v) for u, v in zip(a.getpixel(p), b.getpixel(p), strict=True)) for p in around]
+    if max(ring_errors) > 24 or sum(ring_errors) / len(ring_errors) > 6:
+        return False
+    return True
+
+
+def translucent_pointer_pair(before, after, near, shift, reach, *, reference_pointer=None, axis=0):
+    """Pair a pointer disc across two motion frames, without a reference.
+
+    The reference-based cursor_overlay_pair fails when the return frame
+    matches the reference: the pointer came back to where it started, so a
+    difference against the reference has nothing to pair. Diff the two
+    motion frames directly instead. A disc in `before` (the outward
+    position) and a disc in `after` (the return position) must be displaced
+    by the expected return move, in the same band cursor_overlay_pair uses.
+    Each disc is proved either as a clean disc (_discs) or as a faded disc
+    over preserved glyphs (_faded_pointer_disc). Returns (pair,
+    reference_pointer) with the reference pointer passed through unchanged:
+    this pairing does not re-derive it.
+    """
+    with Image.open(io.BytesIO(before)) as image:
+        width, height = image.size
+    with Image.open(io.BytesIO(after)) as image:
+        if image.size != (width, height):
+            return None
+    x, y = near
+    rx, ry = reach
+    bounds = (max(0, round((x - rx) * width)), max(0, round((y - ry) * height)),
+              min(width, round((x + rx) * width)), min(height, round((y + ry) * height)))
+    with Image.open(io.BytesIO(before)) as image:
+        before_img = image.convert("RGB")
+    with Image.open(io.BytesIO(after)) as image:
+        after_img = image.convert("RGB")
+    red, green, blue = ImageChops.difference(before_img, after_img).split()
+    delta = ImageChops.lighter(ImageChops.lighter(red, green), blue)
+    clean_before = _discs(before_img, width)
+    clean_after = _discs(after_img, width)
+
+    def disc_in(frame_discs, points):
+        xs, ys = zip(*points, strict=True)
+        left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+        return any(left - 2 <= dx <= right + 2 and top - 2 <= dy <= bottom + 2
+                   for dx, dy, _, _ in frame_discs)
+
+    old, new = [], []
+    for points in _regions(delta, 10):
+        xs, ys = zip(*points, strict=True)
+        left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+        w, h = right - left + 1, bottom - top + 1
+        if not (.03 * width <= min(w, h) <= max(w, h) <= .067 * width
+                and .75 <= w / h <= 1.33 and .60 <= len(points) / (w * h) <= .90):
+            continue
+        cx = (min(xs) + max(xs)) / (2 * width)
+        cy = (min(ys) + max(ys)) / (2 * height)
+        if not (bounds[0] / width <= cx <= bounds[2] / width
+                and bounds[1] / height <= cy <= bounds[3] / height):
+            continue
+        disc = (cx, cy, (w + h) / 2)
+        if _faded_pointer_disc(after_img, before_img, points, width) or disc_in(clean_after, points):
+            new.append(disc)
+        if _faded_pointer_disc(before_img, after_img, points, width) or disc_in(clean_before, points):
+            old.append(disc)
+    pairs = []
+    for ax, ay, a_size in old:
+        for bx, by, b_size in new:
+            movement = (bx - ax, by - ay)
+            along = movement[axis]
+            across = movement[1 - axis] * (width, height)[1 - axis]
+            if (along * shift > 0 and .25 * abs(shift) <= abs(along) <= 1.8 * abs(shift)
+                    and abs(across) <= .16 * min(a_size, b_size)
+                    and abs(a_size - b_size) <= .26 * min(a_size, b_size)):
+                pairs.append(((ax, ay), (bx, by)))
+    if len(pairs) != 1:
+        return None
+    return pairs[0], reference_pointer
+
+
 def cursor_overlay_pair(reference: bytes, before: bytes, after: bytes, near, shift, reach, *,
                         reference_pointer, report_reference=False, axis=0, caret_frames=(), context_regions=None):
     """Find motion of local cursor-sized overlays over a previously observed background."""

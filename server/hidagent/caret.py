@@ -210,7 +210,10 @@ def _current_template_matches(image, reference, caret, patch, low, high):
 
 
 def _amber_tone(r, g, b):
-    return r >= 165 and r - g >= 14 and g - b >= 48
+    # Lemon yellow (device Notes caret ~186,175,5; R-G 11) is still yellow:
+    # R>=G>>B. The r-g sign separates yellow from green-tinted colours;
+    # a 14-level gap wrongly excluded it.
+    return r >= 165 and r - g >= 0 and g - b >= 48
 
 
 def _template_cycle(caret, images, frames, current, *, allow_white=True, amber=False):

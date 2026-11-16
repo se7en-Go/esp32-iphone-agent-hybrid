@@ -1,9 +1,68 @@
 """Keep typing in its observed field, including while firmware ACKs are pending."""
 
+import io
+
+from PIL import Image
+
 from . import screen_compare
 from .caret import focused_region as _focused_region
 from .caret import temporal_focused_region
 from .freshness import require_fresh
+
+
+def keyboard_suggestion_bar(frame: bytes) -> tuple[float, float] | None:
+    """Return the (top, bottom) of the iOS keyboard suggestion bar, or None.
+
+    The keyboard is light grey (brightness 150-245); the white note is 255
+    and the dark AssistiveTouch menu is ~40, so that band separates the
+    keyboard from both. The suggestion bar is the top strip of the keyboard,
+    one key-height tall. The keyboard top is the first row band, scanning
+    down from mid-screen, whose grey share exceeds 0.40 with the region
+    below it sustained grey to the bottom; the 0.40 top threshold keeps the
+    dark menu (grey 0.15-0.23) from faking a keyboard top. A dark-mode
+    keyboard has no light-grey keys, so this returns None there and the
+    guard simply does not fire.
+    """
+    with Image.open(io.BytesIO(frame)) as image:
+        rgb = image.convert("RGB")
+    width, height = rgb.size
+    small = rgb.resize((120, max(1, round(120 * height / width))), Image.Resampling.BILINEAR)
+    sw, sh = small.size
+    band_h = max(1, round(0.02 * sh))
+    bands = []
+    for y0 in range(0, sh, band_h):
+        grey = total = 0
+        for y in range(y0, min(y0 + band_h, sh)):
+            for x in range(sw):
+                r, g, b = small.getpixel((x, y))
+                total += 1
+                if 150 <= (r + g + b) / 3 <= 245:
+                    grey += 1
+        bands.append(grey / total if total else 0)
+    for index in range(len(bands) // 2, len(bands)):
+        if bands[index] <= 0.40:
+            continue
+        below = bands[index:]
+        if sum(below) / len(below) <= 0.15:
+            continue
+        # A real keyboard is a bounded region at the bottom with different
+        # content above it. A uniform grey background (the legacy test
+        # scene, or a plain grey app) must not read as a keyboard: require
+        # a sharp top edge and non-grey content above it.
+        if index == 0 or bands[index] - bands[index - 1] <= 0.30:
+            continue
+        above = bands[:index]
+        if above and sum(above) / len(above) >= 0.50:
+            continue
+        top = index * band_h / sh
+        return (top, min(1.0, top + 0.06))
+    return None
+
+
+def point_in_suggestion_bar(frame: bytes, x: float, y: float) -> bool:
+    """Whether the point (x, y) falls inside the keyboard suggestion bar."""
+    bar = keyboard_suggestion_bar(frame)
+    return bar is not None and bar[0] <= y <= bar[1]
 
 
 class InputContextGuard:

@@ -662,6 +662,16 @@ class Phone:
                             caret_frames=getattr(self.screen, "recent_frames", ()), context_regions=context_regions)
                         if evidence is not None:
                             pair, prior_pointer = evidence
+                        if pair is None:
+                            # The return frame can match the reference (the
+                            # pointer came back to where it started), leaving
+                            # the reference-based overlay pair nothing to
+                            # pair. Diff the two motion frames directly.
+                            evidence = screen_compare.translucent_pointer_pair(
+                                frame, returned, near, -shift, reach,
+                                reference_pointer=prior_pointer, axis=int(vertical))
+                            if evidence is not None:
+                                pair, prior_pointer = evidence
                     else:
                         stable, detected = screen_compare.verify_cursor_reference(
                             prior_frame, frame, returned, pair, prior_pointer,
@@ -1236,6 +1246,8 @@ class Phone:
 
         if found is None:
             found = await escape_target((self._position_before, None))
+        if found is None:
+            found = self._menu_highlight_landing((x, y))
         miss = max(abs(found[0] - x), abs(found[1] - y)) if found is not None and all(
             math.isfinite(value) for value in found) else math.inf
         ble = self._pace == BLE_PACE
@@ -1325,6 +1337,38 @@ class Phone:
                     break
                 self._pointer_spots += (found,)
         return x, y
+
+    def _menu_highlight_landing(self, near):
+        """Confirm a menu Home landing from its hover highlight.
+
+        Over a dark AssistiveTouch menu the pointer disc is invisible, but
+        the hovered Home icon and label turn iOS blue. If the target was
+        unhighlighted before this positioning move and is highlighted now,
+        the pointer arrived at the target. Scoped to menu navigation
+        contexts only; the pre-click TextTargetGuard still runs before any
+        click is sent.
+        """
+        from .assistive_vision import menu_home_highlighted
+        from .navigation_context import NavigationContext
+
+        context = getattr(self, "_navigation_context", None)
+        if (not isinstance(context, NavigationContext) or context.action != "home"
+                or context.kind != "menu" or len(context.regions) != 1):
+            return None
+        panel = context.regions[0]
+        before = self._position_before or context.observation.frame
+        if not before:
+            return None
+        try:
+            current = freshness.require_fresh(self.screen)
+        except RuntimeError:
+            return None
+        if current.generation != context.observation.generation:
+            return None
+        if menu_home_highlighted(before, panel) or not menu_home_highlighted(current.frame, panel):
+            return None
+        self._pointer_overlay = (near, current.frame)
+        return near
 
     def _target_escape_probe(self, near, box):
         """One screen-bounded probe, at most 18% of width, sized to a known target."""
@@ -1688,6 +1732,18 @@ class Phone:
                     self._navigation_context = navigation_context
                     target_box = navigation_context.target.box
                     allow_estimated_landing = False
+                if target_box is None:
+                    # A bare tap must not land on the keyboard suggestion bar:
+                    # suggestion words are tapped via tap_text, never by a
+                    # guessed point. A bare tap aimed at the note body that
+                    # lands here is a mistake (round 3: (0.5, 0.6) tapped the
+                    # "xylem" suggestion and rewrote the note's last line
+                    # from "xYz" to "xylem"). Targeted taps carry a
+                    # target_box and are already contained by it.
+                    from .input_context import point_in_suggestion_bar
+
+                    if point_in_suggestion_bar(target_frame or observed.frame, x, y):
+                        raise PointerLandingError("点击落在键盘建议栏，未发送；请用 tap_text 点建议词，或把目标点移到正文。")
                 target = SimpleNamespace(center=(x, y))
                 if target_box is not None:
                     target.box = target_box

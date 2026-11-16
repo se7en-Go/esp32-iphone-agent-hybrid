@@ -200,3 +200,39 @@ def test_amber_content_at_either_end_cannot_be_learned_as_off_phase(y):
     history = tuple(SimpleNamespace(frame=frame, arrived=i * .4, generation=1)
                     for i, frame in enumerate((on, edited, on, edited)))
     assert observation_changed(on, edited, caret_frames=history)
+
+
+def lemon_editor_frame(level, *, edit=None):
+    """Borderless editor with the device Notes caret tone (186,175,5)."""
+    image = Image.new("RGB", (500, 1080), "white")
+    draw = ImageDraw.Draw(image)
+    draw.text((310, 197), "test editor", fill=(30, 30, 30))
+    draw.rectangle((0, 575, 499, 1079), fill=(211, 212, 221))
+    tone = tuple(round(255 + level * (channel - 255)) for channel in (186, 175, 5))
+    draw.line((361, 175, 361, 226), fill=tone, width=2)
+    if edit == "same_patch":
+        draw.rectangle((361, 193, 363, 197), fill=(39, 38, 35))
+    output = io.BytesIO()
+    image.save(output, "PNG")
+    return output.getvalue()
+
+
+def lemon_editor_history(levels=(1, 0, 1, 0)):
+    return tuple(SimpleNamespace(frame=lemon_editor_frame(level), arrived=i * .4, generation=1)
+                 for i, level in enumerate(levels))
+
+
+@pytest.mark.parametrize("levels", [(1, 0), (0, 1)])
+def test_lemon_yellow_caret_in_borderless_editor_can_blink(levels):
+    # Device Notes caret ~ (186,175,5): R-G is 11, below the old 14 floor,
+    # so the amber on-phase was never counted and the blink was never masked.
+    before, after = (lemon_editor_frame(level) for level in levels)
+    history = lemon_editor_history()
+    assert observation_changed(before, after)
+    assert not observation_changed(before, after, caret_frames=history)
+
+
+def test_lemon_yellow_caret_never_masks_new_content():
+    assert observation_changed(lemon_editor_frame(1),
+                               lemon_editor_frame(0, edit="same_patch"),
+                               caret_frames=lemon_editor_history())
