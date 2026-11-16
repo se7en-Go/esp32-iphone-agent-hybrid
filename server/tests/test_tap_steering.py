@@ -25,6 +25,26 @@ def test_signed_offsets_reach_left_and_above_home(tmp_path):
     assert phone._pointer_position() == pytest.approx((.08, .08), abs=.001)
 
 
+@pytest.mark.parametrize("axis,boundary", [("x", .85), ("x", 1.15), ("y", .85), ("y", 1.15)])
+def test_pointer_fit_does_not_jump_when_gain_crosses_a_limit(tmp_path, axis, boundary):
+    phone = calibrated_phone(tmp_path, LaggingMirror())
+    phone.span = {"w": 340, "h": 600}
+    offsets = []
+    for gain in (boundary - .00001, boundary + .00001):
+        phone._seen[axis].clear()
+        phone._seen[axis].extend((x, .47 + gain * (x - .45)) for x in (.16, .45, .74))
+        offsets.append((phone._dx if axis == "x" else phone._dy)(.95))
+    assert abs(offsets[0] - offsets[1]) <= 1
+
+
+def test_saturated_pointer_fit_does_not_admit_new_estimated_clicks(tmp_path):
+    phone = calibrated_phone(tmp_path, LaggingMirror())
+    for axis in ("x", "y"):
+        phone._seen[axis].extend([(.25, .1975), (.5, .5), (.75, .8025)])
+    with pytest.raises(RuntimeError, match="落点误差"):
+        phone._guard_blind_landing(.5, .5, (.45, .45, .55, .55), KEYPAD)
+
+
 def test_unknown_target_never_blind_clicks(tmp_path):
     mirror = LaggingMirror()
     phone = calibrated_phone(tmp_path, mirror)

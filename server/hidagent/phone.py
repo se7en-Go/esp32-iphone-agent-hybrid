@@ -1430,10 +1430,18 @@ class Phone:
             if len(samples) < 3 or not all(math.isfinite(v) for pair in samples for v in pair):
                 return None
             commands = [command for command, _ in samples]
-            if max(commands) - min(commands) < .02 or not min(commands) <= self._fix(target, axis) <= max(commands):
+            low, high = min(commands), max(commands)
+            if high - low < .02:
                 return None  # never extrapolate a blind landing beyond measured coverage
-            error = max(abs(self._fix(landed, axis) - command) for command, landed in samples)
-            errors.append(error + AIM_TOLERANCE)
+            # Preserve the prior coverage and error bounds for contacts that
+            # depend on estimation rather than a visually measured landing.
+            axis_errors = []
+            for legacy_gain in (False, True):
+                if not low <= self._fix(target, axis, legacy_gain=legacy_gain) <= high:
+                    return None
+                axis_errors.append(max(abs(self._fix(landed, axis, legacy_gain=legacy_gain) - command)
+                                       for command, landed in samples))
+            errors.append(max(axis_errors) + AIM_TOLERANCE)
         return tuple(errors)
 
     def _guard_blind_landing(self, x, y, target_box, target_frame):
@@ -1840,7 +1848,7 @@ class Phone:
         await self.device.send(f"move {dx} {dy}")
         self._pos = (self._pos[0] + dx, self._pos[1] + dy)
 
-    def _fix(self, t: float, axis: str) -> float:
+    def _fix(self, t: float, axis: str, *, legacy_gain: bool = False) -> float:
         """The fraction to aim at so the pointer lands on t, from the line through the observed landings."""
         pts = self._seen[axis]
         if len(pts) < 2:
@@ -1849,7 +1857,10 @@ class Phone:
         mc, mf = sum(c for c, _ in pts) / n, sum(f for _, f in pts) / n
         var = sum((c - mc) ** 2 for c, _ in pts)
         a = sum((c - mc) * (f - mf) for c, f in pts) / var if var > 1e-4 else 1.0  # landed = a * aimed + b
-        a = a if 0.85 < a < 1.15 else 1.0
+        # Constrain the fitted gain without jumping back to unit gain when a
+        # near-boundary sample changes the fit by a fraction of a percent.
+        if not .85 < a < 1.15:
+            a = 1.0 if legacy_gain else min(1.15, max(.85, a))
         b = mf - a * mc
         return (t - b) / a if abs(b) < 0.1 else t
 
