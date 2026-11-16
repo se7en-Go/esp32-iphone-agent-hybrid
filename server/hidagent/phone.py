@@ -1344,11 +1344,15 @@ class Phone:
         Over a dark AssistiveTouch menu the pointer disc is invisible, but
         the hovered Home icon and label turn iOS blue. If the target was
         unhighlighted before this positioning move and is highlighted now,
-        the pointer arrived at the target. Scoped to menu navigation
-        contexts only; the pre-click TextTargetGuard still runs before any
-        click is sent.
+        the pointer arrived at the target. The landing is the centroid of
+        the observed blue highlight, never the requested coordinates: the
+        request must not be written down as a measurement. Scoped to menu
+        navigation contexts only; the pre-click TextTargetGuard still runs
+        before any click is sent. The highlight evidence is recorded
+        separately in _menu_highlight_evidence, distinct from the pointer
+        calibration.
         """
-        from .assistive_vision import menu_home_highlighted
+        from .assistive_vision import menu_home_highlight
         from .navigation_context import NavigationContext
 
         context = getattr(self, "_navigation_context", None)
@@ -1365,10 +1369,21 @@ class Phone:
             return None
         if current.generation != context.observation.generation:
             return None
-        if menu_home_highlighted(before, panel) or not menu_home_highlighted(current.frame, panel):
+        before_hl = menu_home_highlight(before, panel)
+        current_hl = menu_home_highlight(current.frame, panel)
+        if before_hl.highlighted or not current_hl.highlighted or current_hl.centre is None:
             return None
-        self._pointer_overlay = (near, current.frame)
-        return near
+        measured = current_hl.centre
+        self._menu_highlight_evidence = {
+            "before_blue": before_hl.blue,
+            "after_blue": current_hl.blue,
+            "after_other_max": current_hl.other_max,
+            "centre": measured,
+            "requested": near,
+            "panel": panel,
+        }
+        self._pointer_overlay = (measured, current.frame)
+        return measured
 
     def _target_escape_probe(self, near, box):
         """One screen-bounded probe, at most 18% of width, sized to a known target."""
@@ -1804,6 +1819,18 @@ class Phone:
                         raise
                     if diagnostics:
                         diagnostics.event("write_validation", accepted=True)
+                    # A bare tap must not land on the keyboard suggestion
+                    # bar. The requested point may be outside the bar while
+                    # the pointer drifted into it during the move, so
+                    # re-check the MEASURED landing against the LATEST
+                    # frame here, just before sending. Targeted taps carry
+                    # a target_box and are already contained by it.
+                    if target_box is None and self._pointer_confirmed and landed is not None:
+                        from .input_context import point_in_suggestion_bar
+
+                        if point_in_suggestion_bar(current.frame, landed[0], landed[1]):
+                            raise PointerLandingError(
+                                "实测落点在键盘建议栏，未发送；请用 tap_text 点建议词，或把目标点移到正文。")
                     before = freshness.require_fresh(self.screen).frame
 
                 timing["positioning"] = (time.monotonic() - began) * 1000 - timing["firmware"]

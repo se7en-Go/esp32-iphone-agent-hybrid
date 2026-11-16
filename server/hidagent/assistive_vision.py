@@ -1,5 +1,6 @@
 """Small, dependency-free AssistiveTouch checks on mirrored screen images."""
 
+from typing import NamedTuple
 import io
 import math
 from statistics import median
@@ -233,8 +234,26 @@ def _highlighted_home_box(panel, white_boxes):
     return candidates[0] if len(candidates) == 1 else None
 
 
-def menu_home_highlighted(frame: bytes, panel: Box) -> bool:
-    """Whether the Home slot of an AssistiveTouch menu is hover-highlighted.
+class MenuHomeHighlight(NamedTuple):
+    """Hover-highlight evidence for the Home slot of an AssistiveTouch menu.
+
+    centre is the centroid of the blue pixels in the Home slot, in
+    normalised frame coordinates -- measured from the observed highlight,
+    never the requested coordinates. blue/other_max are the raw blue-pixel
+    counts per slot, so a caller can tell a real highlight from a blue app
+    icon elsewhere.
+    """
+
+    highlighted: bool
+    centre: tuple[float, float] | None
+    blue: int
+    home_area: int
+    ratio: float
+    other_max: int
+
+
+def menu_home_highlight(frame: bytes, panel: Box) -> MenuHomeHighlight:
+    """Measure the Home slot's hover highlight, with its observed centre.
 
     The hovered Home icon and its label turn iOS blue while the other five
     stay white. The blue Home icon is a hollow ring plus text, so the strict
@@ -262,11 +281,36 @@ def menu_home_highlighted(frame: bytes, panel: Box) -> bool:
                     blue += 1
         counts.append(blue)
     home_left, home_top, home_right, home_bottom = MENU_ICON_REGIONS[-1]
-    home_area = ((round(home_right * pw) - round(home_left * pw))
-                 * (round(home_bottom * ph) - round(home_top * ph)))
+    hx0, hy0 = round(home_left * pw), round(home_top * ph)
+    hx1, hy1 = round(home_right * pw), round(home_bottom * ph)
+    home_area = (hx1 - hx0) * (hy1 - hy0)
     home = counts[-1]
     others = max(counts[:-1]) if counts[:-1] else 0
-    return home_area > 0 and home / home_area >= 0.02 and home >= 5 * max(1, others)
+    highlighted = home_area > 0 and home / home_area >= 0.02 and home >= 5 * max(1, others)
+    centre = None
+    if highlighted:
+        xs, ys = [], []
+        for y in range(hy0, hy1):
+            for x in range(hx0, hx1):
+                r, g, b = cropped.getpixel((x, y))
+                if b >= 140 and b - r >= 35 and b >= g:
+                    xs.append(left + x)
+                    ys.append(top + y)
+        if xs:
+            centre = (sum(xs) / len(xs) / width, sum(ys) / len(ys) / height)
+    return MenuHomeHighlight(
+        highlighted=highlighted,
+        centre=centre,
+        blue=home,
+        home_area=home_area,
+        ratio=home / home_area if home_area else 0.0,
+        other_max=others,
+    )
+
+
+def menu_home_highlighted(frame: bytes, panel: Box) -> bool:
+    """Whether the Home slot of an AssistiveTouch menu is hover-highlighted."""
+    return menu_home_highlight(frame, panel).highlighted
 
 
 def _menu_icons(image: Image.Image, box: tuple[int, int, int, int]) -> bool:
