@@ -54,7 +54,97 @@ def test_confirm_retries_permission_sheet_from_recent_frames(monkeypatch):
             observed_text="你好00123", confirmed=True))
         assert receipt["phase"] == "completed" and receipt["effect_verified"]
         assert receipt["confirmation_evidence"] == "paste_permission_dismissed"
-        assert calls[0] == before and sheet in calls
+        # Only the in-window sheet frame was tried; the first post-paste frame
+        # (a plain field) is no longer a candidate, and the evidence carries
+        # the sheet's own timestamp and session generation.
+        assert calls == [sheet]
+        sheet_snapshot = next(s for s in screen.recent_frames if s.frame == sheet)
+        assert receipt["sheet_frame_updated"] == sheet_snapshot.updated
+        assert receipt["sheet_frame_generation"] == sheet_snapshot.generation
+        assert provider.current() == {"active": False, "needs_resolution": False}
+
+    asyncio.run(scenario())
+
+
+def test_confirm_ignores_sheet_from_before_this_paste(monkeypatch):
+    """A stale sheet from an earlier run must never verify a new transaction.
+
+    The old sheet sits in recent_frames, but it predates this Cmd+V, so the
+    window filter excludes it and confirm refuses even though the (mocked)
+    verifier would accept that exact frame.
+    """
+    from hidagent import feedback, paste_confirmation
+
+    async def scenario():
+        screen, provider, phone, control, manager = setup(monkeypatch)
+        old_sheet = changed_scene("blue")
+        screen._on_jpeg(old_sheet)  # published before this transaction's Cmd+V
+
+        async def capture(_screen, _completed_at):
+            return screen.frame
+
+        calls = []
+
+        async def verify(original, presented, selected, region, text):
+            calls.append(presented)
+            return presented == old_sheet
+
+        monkeypatch.setattr(feedback, "wait_after_action", capture)
+        monkeypatch.setattr(paste_confirmation, "verify_after_paste_permission", verify)
+        prepared = await manager.prepare(prepare_body(control))
+        copied(provider, screen)
+        await manager.paste(PasteTransaction(transaction_id=prepared["transaction_id"],
+                                             screen_id=control.observation()["screen_id"], focused=True))
+        screen._on_jpeg(changed_scene("orange"))  # result frame; the guard rejects it
+        with pytest.raises(RuntimeError):
+            await manager.confirm(ConfirmPaste(
+                transaction_id=prepared["transaction_id"],
+                screen_id=control.observation()["screen_id"],
+                observed_text="你好00123", confirmed=True))
+        assert old_sheet not in calls
+        assert provider.current()["active"]
+
+    asyncio.run(scenario())
+
+
+def test_confirm_finds_sheet_buried_under_later_frames(monkeypatch):
+    """A valid sheet must still be found after many ordinary frames arrive.
+
+    The old candidate list capped at the 4 most recent frames, so a sheet
+    followed by 6 ordinary frames was pushed out and confirm refused. The
+    window scan tries every same-session frame after Cmd+V.
+    """
+    from hidagent import feedback, paste_confirmation
+
+    async def scenario():
+        screen, provider, phone, control, manager = setup(monkeypatch)
+        before, sheet, after = field_image(), changed_scene("blue"), changed_scene("orange")
+        calls = []
+
+        async def capture(_screen, _completed_at):
+            return before
+
+        async def verify(original, presented, selected, region, text):
+            calls.append(presented)
+            return presented == sheet
+
+        monkeypatch.setattr(feedback, "wait_after_action", capture)
+        monkeypatch.setattr(paste_confirmation, "verify_after_paste_permission", verify)
+        prepared = await manager.prepare(prepare_body(control))
+        copied(provider, screen)
+        await manager.paste(PasteTransaction(transaction_id=prepared["transaction_id"],
+                                             screen_id=control.observation()["screen_id"], focused=True))
+        screen._on_jpeg(sheet)  # sheet visible briefly after paste
+        for color in ("red", "green", "purple", "yellow", "cyan", "magenta"):
+            screen._on_jpeg(changed_scene(color))  # ordinary frames after the sheet
+        screen._on_jpeg(after)  # then the pasted field
+        receipt = await manager.confirm(ConfirmPaste(
+            transaction_id=prepared["transaction_id"],
+            screen_id=control.observation()["screen_id"],
+            observed_text="你好00123", confirmed=True))
+        assert receipt["phase"] == "completed" and receipt["effect_verified"]
+        assert receipt["confirmation_evidence"] == "paste_permission_dismissed"
+        assert calls == [sheet]
         assert provider.current() == {"active": False, "needs_resolution": False}
 
     asyncio.run(scenario())

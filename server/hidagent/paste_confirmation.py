@@ -118,11 +118,17 @@ def _same_field_outline(before, after, region):
                                           (False, left, top, bottom), (False, right, top, bottom)):
         first = _edge_profile(a, horizontal, edge, start + inset, stop - inset, radius)
         second = _edge_profile(b, horizontal, edge, start + inset, stop - inset, radius)
-        if min(max(map(abs, first)), max(map(abs, second))) < 22:
+        if max(map(abs, first)) < 22:
+            # No visible border on this side in the original frame (a
+            # borderless field): nothing to compare here.
+            continue
+        if max(map(abs, second)) < 22:
             return False
         score = sum(x * y for x, y in zip(first, second, strict=True)) / (math.hypot(*first) * math.hypot(*second))
         if score < .98:
             return False
+    # A fully borderless field has no outline to compare; the context and
+    # line checks still guard the field identity.
     return True
 
 
@@ -148,9 +154,18 @@ async def verify_after_paste_permission(before, sheet, after, region, observed_t
         original = await ocr.read_text_async(before)
         current = await ocr.read_text_async(after)
         original_lines = _field_lines(original, region)
+        current_lines = _field_lines(current, region)
+        # The pasted text must be new and appear after the existing field
+        # text: the current lines end with the expected lines, and the lines
+        # before them are exactly the lines that were there before the paste.
+        # This covers an empty field and appending after existing borderless
+        # body text, and still rejects text that was already present.
+        appended = (original_lines is not None and current_lines is not None
+                    and len(current_lines) >= len(expected)
+                    and current_lines[-len(expected):] == expected
+                    and current_lines[:len(current_lines) - len(expected)] == original_lines)
         return (not _is_permission_prompt(original) and not _is_permission_prompt(current)
-                and original_lines is not None and original_lines != expected
-                and _field_lines(current, region) == expected
+                and appended
                 and _same_context(original, current, region)
                 and _same_field_outline(original_image, current_image, region))
     except (ocr.OCRError, OSError, ValueError):

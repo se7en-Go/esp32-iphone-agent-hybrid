@@ -55,7 +55,6 @@ class _Transaction:
     expected_digest: bytes
     focus_verified_by: str
     completed_at: float | None = None
-    first_post_paste_frame: bytes | None = None
 
 
 class StagedClipboardControls:
@@ -194,7 +193,7 @@ class StagedClipboardControls:
                 await item.phone.key("cmd+v", before_action=validate)
             item.provider.stage_paste_sent(item.nonce)
             item.completed_at = time.time()
-            item.first_post_paste_frame = await feedback.wait_after_action(controls.screen, item.completed_at)
+            await feedback.wait_after_action(controls.screen, item.completed_at)
         except asyncio.CancelledError:
             self._abandon(item)
             raise
@@ -226,35 +225,41 @@ class StagedClipboardControls:
         try:
             item.guard(stage="accept")  # allow text changes only inside the original observed input area
         except RuntimeError:
-            if item.first_post_paste_frame is None:
-                raise
             # A native paste permission sheet can re-render the original page.
             # This evidence only records the effect of a paste that already ran.
-            # The first post-paste frame may have missed the sheet entirely
-            # (it appears after cmd+v, or was already dismissed), so retry
-            # with the most recent frames that could still show it.
+            # Accept only same-session frames from after this Cmd+V and before
+            # the result frame. Each candidate carries its own timestamp and
+            # generation, so a stale sheet from an earlier transaction can
+            # never verify a new one, and a sheet is not pushed out of the
+            # candidate list by later ordinary frames.
             from .paste_confirmation import verify_after_paste_permission
 
-            after = controls._observation.frame
-            candidates = [item.first_post_paste_frame]
-            seen = {item.guard.original.frame, after, item.first_post_paste_frame}
-            for snapshot in reversed(getattr(controls.screen, "recent_frames", ())):
-                frame = getattr(snapshot, "frame", snapshot)
-                if frame and frame not in seen:
-                    seen.add(frame)
-                    candidates.append(frame)
-                if len(candidates) >= 4:
-                    break
-            verified = False
-            for sheet in candidates:
+            result = controls._observation
+            after = result.frame
+            original = item.guard.original
+            seen = {original.frame, after}
+            verified = None
+            for snapshot in getattr(controls.screen, "recent_frames", ()):
+                frame = getattr(snapshot, "frame", None)
+                updated = getattr(snapshot, "updated", None)
+                generation = getattr(snapshot, "generation", None)
+                if (not frame or frame in seen or updated is None or generation is None
+                        or generation != original.generation
+                        or updated <= item.completed_at
+                        or updated > result.updated):
+                    continue
+                seen.add(frame)
                 if await verify_after_paste_permission(
-                        item.guard.original.frame, sheet, after,
+                        original.frame, frame, after,
                         item.guard.region, request.observed_text):
-                    verified = True
+                    verified = (frame, updated, generation)
                     break
-            if not verified:
+            if verified is None:
                 raise
+            _sheet_frame, sheet_updated, sheet_generation = verified
             evidence["confirmation_evidence"] = "paste_permission_dismissed"
+            evidence["sheet_frame_updated"] = sheet_updated
+            evidence["sheet_frame_generation"] = sheet_generation
         if evidence:
             if self._lookup(item.nonce) is not item:
                 raise ValueError("clipboard transaction changed during confirmation")
