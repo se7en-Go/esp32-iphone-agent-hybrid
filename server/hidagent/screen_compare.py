@@ -261,10 +261,17 @@ def _faded_pointer_disc(visible, background, points, width):
             and .75 <= w / h <= 1.33 and .60 <= len(points) / (w * h) <= .90):
         return False
     cx, cy, radius = (left + right) / 2, (top + bottom) / 2, (w + h) / 4
+    # Horizontal text strokes can shave 2-3 px off the vertical delta while
+    # preserving the full horizontal diameter (e.g. w=29, h=26); bound rim
+    # outliers by the major radius so a true disc edge is kept, while ideal^fp
+    # and the aspect ratio still guard circularity.
+    max_radius = max(w, h) / 2
     footprint = set(points)
     ideal = {(x, y) for y in range(top, bottom + 1) for x in range(left, right + 1)
              if math.hypot(x - cx, y - cy) <= radius}
-    if (any(math.hypot(x - cx, y - cy) > radius + 1 for x, y in footprint)
+    outliers = [d for x, y in footprint if (d := math.hypot(x - cx, y - cy)) > max_radius + 1]
+    if (any(d > max_radius + 2.5 for d in outliers)
+            or len(outliers) > max(4, round(.01 * len(footprint)))
             or len(footprint ^ ideal) > .25 * len(ideal)):
         return False
     margin = 4
@@ -290,7 +297,7 @@ def _faded_pointer_disc(visible, background, points, width):
     if not 24 <= min(color) <= max(color) <= 100 or max(color) - min(color) > 20:
         return False
     pixels = [(x, y) for y in range(a.height) for x in range(a.width)]
-    around = [p for p in pixels if math.hypot(p[0] - cx, p[1] - cy) > radius + 2]
+    around = [p for p in pixels if math.hypot(p[0] - cx, p[1] - cy) > max_radius + 2.5]
     ring_errors = [max(abs(u - v) for u, v in zip(a.getpixel(p), b.getpixel(p), strict=True)) for p in around]
     if max(ring_errors) > 24 or sum(ring_errors) / len(ring_errors) > 6:
         return False
