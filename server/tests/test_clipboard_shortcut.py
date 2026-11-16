@@ -51,3 +51,23 @@ def test_template_has_import_settings_and_no_embedded_credentials(tmp_path):
     assert {q["DefaultValue"] for q in questions} == {"http://computer.local:8891", ""}
     assert b"HIDAGENT_CLIPBOARD_KEY" not in output.read_bytes()
     assert b"focused" not in output.read_bytes() and b"pasted" not in output.read_bytes()
+
+
+def test_template_conditions_match_the_shortcuts_operand_types():
+    actions = builder().build_template()["WFWorkflowActions"]
+    start_blocks = [action["WFWorkflowActionParameters"] for action in actions
+                    if action["WFWorkflowActionIdentifier"] == "is.workflow.actions.conditional"
+                    and action["WFWorkflowActionParameters"]["WFControlFlowMode"] == 0]
+    protocol, allowed = start_blocks
+    assert protocol["WFCondition"] == 4
+    assert protocol["WFConditionalActionString"] == "staged-v1"
+    assert protocol["WFInput"]["Variable"]["Value"]["OutputName"] == "Protocol text"
+    assert "WFNumberValue" not in protocol
+    assert allowed["WFCondition"] == 2
+    assert allowed["WFNumberValue"] == "0"
+    assert "WFConditionalActionString" not in allowed
+    allowed_reference = allowed["WFInput"]["Variable"]["Value"]
+    assert allowed_reference["OutputName"] == "Copy allowed"
+    assert allowed_reference["Aggrandizements"] == [
+        {"Type": "WFCoercionVariableAggrandizement", "CoercionItemClass": "WFNumberContentItem"}
+    ]

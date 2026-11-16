@@ -17,6 +17,11 @@ import uuid
 from pathlib import Path
 
 
+# WorkflowKit conditional operators for these operand types.
+TEXT_EQUALS = 4
+NUMBER_GREATER_THAN = 2
+
+
 def _uuid(name):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, "esp32-iphone-agent/clipboard-staged-v1/" + name)).upper()
 
@@ -57,10 +62,13 @@ def build_template():
     def value(name, source, key):
         action("getvalueforkey", name, WFInput=_attachment(source), WFDictionaryKey=key)
 
-    def begin_if(name, source, condition, comparison=None):
-        extra = {"WFConditionalActionString": comparison} if comparison is not None else {}
+    def begin_if(name, source, condition, *, coercion=None, **comparison):
+        variable = _attachment(source)
+        if coercion is not None:
+            variable["Value"]["Aggrandizements"] = [{"Type": "WFCoercionVariableAggrandizement",
+                                                     "CoercionItemClass": coercion}]
         action("conditional", name, GroupingIdentifier=_uuid(name + "-group"), WFControlFlowMode=0,
-               WFCondition=condition, WFInput={"Type": "Variable", "Variable": _attachment(source)}, **extra)
+               WFCondition=condition, WFInput={"Type": "Variable", "Variable": variable}, **comparison)
 
     def end_if(name):
         action("conditional", name + "-end", GroupingIdentifier=_uuid(name + "-group"), WFControlFlowMode=2)
@@ -75,12 +83,15 @@ def build_template():
            WFHTTPMethod="GET", ShowHeaders=True,
            WFHTTPHeaders=_dictionary({"Authorization": _text("Bearer ", output="Pairing key")}))
     value("Protocol", "Pending", "protocol")
-    begin_if("Staged protocol", "Protocol", 0, "staged-v1")
+    action("gettext", "Protocol text", WFTextActionText=_text(output="Protocol"))
+    begin_if("Staged protocol", "Protocol text", TEXT_EQUALS, WFConditionalActionString="staged-v1")
     value("Payload URL", "Pending", "payload_url")
     value("Copy receipt URL", "Pending", "ack_url")
     action("downloadurl", "Payload", WFURL=_text(output="Payload URL"), WFHTTPMethod="GET")
     value("Copy allowed", "Payload", "copy_allowed")
-    begin_if("Valid payload", "Copy allowed", 999)
+    # Convert the JSON boolean to 0 or 1 before comparing the number.
+    begin_if("Valid payload", "Copy allowed", NUMBER_GREATER_THAN, coercion="WFNumberContentItem",
+             WFNumberValue="0")
     value("Payload text", "Payload", "text")
     # Text coercion preserves leading zeroes; never pass through a Number action.
     action("gettext", "Exact text", WFTextActionText=_text(output="Payload text"))
