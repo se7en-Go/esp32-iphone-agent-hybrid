@@ -24,7 +24,7 @@ def menu_frame(*, above=False, below=True, bottom=988):
     draw.rounded_rectangle((left, top, right, bottom), radius=42, fill="#282628")
     for sx, sy in ((.5, .18), (.2, .45), (.8, .45), (.2, .77), (.8, .77), (.52, .77)):
         x, y = round(left + sx * (right-left)), round(top + sy * (bottom-top))
-        draw.ellipse((x-16, y-16, x+16, y+16), outline="white", width=5)
+        draw.ellipse((x-16, y-16, x+16, y+16), fill="white")
     x, y = round(left + .52 * (right-left)), round(top + .77 * (bottom-top))
     for enabled, side in ((above, -1), (below, 1)):
         if enabled:

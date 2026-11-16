@@ -23,7 +23,7 @@ def _discs(image):
     return [(x / scale, y / scale, diameter / scale)
             for x, y, diameter, color in vision._discs(small, small.width)
             if .025 * small.width <= diameter <= .065 * small.width
-            and 90 <= min(color) <= max(color) <= 210 and max(color) - min(color) <= 25]
+            and 40 <= min(color) <= max(color) <= 210 and max(color) - min(color) <= 25]
 
 
 def _cursor_patch_matches(image, reference, center):
@@ -137,7 +137,7 @@ class TextTargetGuard:
         new = [(x + bounds[0], y + bounds[1], diameter)
                for x, y, diameter, color in vision._discs(cropped, width)
                if .025 * width <= diameter <= .065 * width
-               and 90 <= min(color) <= max(color) <= 210 and max(color) - min(color) <= 25]
+               and 40 <= min(color) <= max(color) <= 210 and max(color) - min(color) <= 25]
         if len(new) > 1:
             return True
         morphed = (len(highlights) == 1 and abs(highlights[0][0] - tx) <= reach

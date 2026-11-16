@@ -1,10 +1,12 @@
-"""Occluded Home-icon return: a correctly returned pointer is a crescent, never a pair.
+"""Occluded Home-icon return must refuse without a pairable pointer.
 
 The Home icon is smaller than the pointer disc, so the pointer sitting on it
-cannot pair a full disc in the return frame. The occluded branch may accept
-the return only on the outward leg + no-other-change evidence, Home-menu only.
-The hovered icon turns blue with a rounded body larger than the glyph, which
-is why the normal pairing finds no overlay to pair with in the return frame.
+cannot pair a full disc in the return frame. There used to be an occluded
+branch that accepted the return on outward-leg + no-other-change evidence;
+it is removed: a return frame with no pointer at all passed it, so the
+requested coordinates became the measurement and a click was sent. Now the
+return must pair a disc displaced by the return move, or the landing stays
+unconfirmed and tap_verified sends zero clicks.
 """
 
 import asyncio
@@ -118,43 +120,6 @@ def rig(tmp_path, monkeypatch, *, returned, stuck=False, point_first=False):
     return phone, mirror, context, probe
 
 
-def move_total(commands):
-    total_x = total_y = 0
-    for command in commands:
-        dx, dy = (int(v) for v in command.split()[1:3])
-        total_x += dx
-        total_y += dy
-    return total_x, total_y
-
-
-def test_occluded_return_accepts_home_icon_landing(tmp_path, monkeypatch):
-    base = menu_frame()
-    phone, mirror, context, probe = rig(tmp_path, monkeypatch, returned=None)
-    mirror.returned_frame = with_occluded_pointer(base, context.target.center)
-    result = asyncio.run(phone._localize_pointer(
-        context.target.center, 0, reference=(base, None), probe=probe))
-    assert result == pytest.approx(context.target.center, abs=.003)
-    assert phone._pointer_pair_verified
-    # Outward, maybe one extension, then the exact inverse: never a blind click.
-    assert move_total(mirror.commands) == (0, 0)
-    assert len(mirror.commands) in (2, 3)
-
-
-def test_occluded_return_confirms_through_point_verified(tmp_path, monkeypatch):
-    base = menu_frame()
-    phone, mirror, context, _probe = rig(tmp_path, monkeypatch, returned=None, point_first=True)
-    mirror.returned_frame = with_occluded_pointer(base, context.target.center)
-
-    async def missing(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(phone, "_find_pointer", missing)
-    found = asyncio.run(phone.point_verified(*context.target.center, target_box=context.target.box))
-    assert found == pytest.approx(context.target.center, abs=.003)
-    assert phone._pointer_confirmed
-    assert "click" not in mirror.commands
-
-
 def test_occluded_return_refuses_pointer_left_at_escape_spot(tmp_path, monkeypatch):
     base = menu_frame()
     phone, mirror, context, probe = rig(tmp_path, monkeypatch, returned=None, stuck=True)
@@ -203,7 +168,9 @@ def test_occluded_return_refuses_static_disc_at_escape_spot(tmp_path, monkeypatc
     assert not phone._pointer_pair_verified
 
 
-def test_occluded_return_needs_home_menu_context(tmp_path, monkeypatch):
+def test_occluded_pointer_in_return_frame_is_not_pairable(tmp_path, monkeypatch):
+    # The grey disc hidden under the blue hover body is not a pointer-sized
+    # disc in the return frame, so no displacement can be paired to it.
     base = menu_frame()
     phone, mirror, context, probe = rig(tmp_path, monkeypatch, returned=None)
     mirror.returned_frame = with_occluded_pointer(base, context.target.center)
