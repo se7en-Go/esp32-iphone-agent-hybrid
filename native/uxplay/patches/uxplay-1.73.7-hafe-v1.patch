@@ -176,8 +176,8 @@
 +        session->h265 = data->is_h265;
 +        const std::string codec = session->h265 ? "h265" : "h264";
 +        std::string pipeline = "appsrc name=hafe_source is-live=true format=time do-timestamp=true "
-+            "max-bytes=8388608 block=false ! queue max-size-buffers=2 max-size-bytes=8388608 "
-+            "max-size-time=0 leaky=downstream ! " + codec + "parse ! avdec_" + codec +
++            "max-bytes=8388608 block=false ! queue max-size-buffers=16 max-size-bytes=8388608 "
++            "max-size-time=0 leaky=no ! " + codec + "parse config-interval=-1 ! avdec_" + codec +
 +            " ! videoconvert ! jpegenc quality=75 ! appsink name=hafe_sink "
 +            "emit-signals=true sync=false max-buffers=1 drop=true";
 +        GError *error = nullptr;

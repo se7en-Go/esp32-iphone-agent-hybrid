@@ -51,6 +51,48 @@ int main(int argc, char **argv) {
     HafeSession *current=static_cast<HafeSession*>(hafe_begin(nullptr));assert(current&&current->epoch==2);
     // The old decoder is still alive, but never receives current's epoch.
     hafe_process(old,&packet);hafe_process(current,&packet);wait(2);
+    // Burst regression: 30 distinct frames fed back-to-back must all survive
+    // the pre-decode queue. With leaky=downstream + 2 buffers the oldest
+    // compressed AUs (possibly the IDR carrying SPS/PPS) were silently
+    // dropped while the decoder drained, stalling decode until the next IDR
+    // and freezing the web mirror on a stale frame. With leaky=no + 16
+    // buffers the queue applies bounded backpressure instead of dropping.
+    // allow-frame-reordering=false: without an EOS the decoder would hold
+    // back B-frames, which would look like drops; the queue is what is
+    // under test here, not decoder latency. 720p makes decode+convert+JPEG
+    // slow enough that a back-to-back burst actually fills the pre-decode
+    // queue: at 128x96 the decoder kept up and even the old 2-buffer queue
+    // passed, so the burst proved nothing there.
+    error=nullptr;
+    GstElement *burst_encoder=gst_parse_launch("videotestsrc num-buffers=30 pattern=ball ! "
+        "video/x-raw,width=1280,height=720,framerate=8/1 ! videoconvert ! "
+        "vtenc_h264 realtime=true allow-frame-reordering=false ! h264parse config-interval=-1 ! "
+        "video/x-h264,stream-format=byte-stream,alignment=au ! appsink name=encoded sync=false",&error);
+    if(error) { std::cerr<<error->message<<'\n'; return 2; }
+    assert(burst_encoder);
+    GstElement *burst_sink=gst_bin_get_by_name(GST_BIN(burst_encoder),"encoded");
+    assert(gst_element_set_state(burst_encoder,GST_STATE_PLAYING)!=GST_STATE_CHANGE_FAILURE);
+    std::vector<std::vector<unsigned char>> burst;
+    for (int i=0;i<30;++i) {
+        GstSample *sample=gst_app_sink_try_pull_sample(GST_APP_SINK(burst_sink),5*GST_SECOND);
+        assert(sample);
+        GstMapInfo info;assert(gst_buffer_map(gst_sample_get_buffer(sample),&info,GST_MAP_READ));
+        burst.emplace_back(info.data,info.data+info.size);
+        gst_buffer_unmap(gst_sample_get_buffer(sample),&info);gst_sample_unref(sample);
+    }
+    gst_element_set_state(burst_encoder,GST_STATE_NULL);gst_object_unref(burst_sink);gst_object_unref(burst_encoder);
+    HafeSession *burst_session=static_cast<HafeSession*>(hafe_begin(nullptr));assert(burst_session);
+    const uint64_t burst_epoch=burst_session->epoch;
+    for (auto &frame : burst) {
+        video_decode_struct burst_packet={};burst_packet.data=frame.data();
+        burst_packet.data_len=frame.size();burst_packet.nal_count=3;
+        hafe_process(burst_session,&burst_packet);
+    }
+    { auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+      while(frames(burst_epoch)<29&&std::chrono::steady_clock::now()<deadline)
+          std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+    assert(frames(burst_epoch)>=29);
+    hafe_end(nullptr,burst_session);
     hafe_end(nullptr,old);assert(frames(1)==old_count);
     hafe_end(nullptr,current);writer.reset();reader.join();
     size_t pos=0;uint64_t active=0;int count=0;
