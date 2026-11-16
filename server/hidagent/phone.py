@@ -228,6 +228,22 @@ def _serialized(method):
     return run
 
 
+def _pointer_discs_near(frame, point, radius):
+    """Pointer-sized discs near a normalized point: (x, y, diameter) in screen fractions."""
+    with Image.open(io.BytesIO(frame)) as image:
+        width, height = image.size
+        cx, cy = point[0] * width, point[1] * height
+        box = (max(0, round(cx - radius * width)), max(0, round(cy - radius * height)),
+               min(width, round(cx + radius * width)), min(height, round(cy + radius * height)))
+        if box[2] - box[0] < 8 or box[3] - box[1] < 8:
+            return []
+        crop = image.convert("RGB").crop(box)
+        return [((px + box[0]) / width, (py + box[1]) / height, diameter / width)
+                for px, py, diameter, color in vision._discs(crop, width)
+                if .025 <= diameter / width <= .065
+                and 90 <= min(color) <= max(color) <= 210 and max(color) - min(color) <= 25]
+
+
 class Phone:
     operation_timeout = OPERATION_TIMEOUT
 
@@ -511,6 +527,63 @@ class Phone:
             await asyncio.sleep(0.005)
         return None
 
+    def _occluded_home_outward(self, outward_frames, near, shift, vertical, baseline, reach):
+        """Outward leg of an occluded Home return: (frame, disc, icon box) or None.
+
+        Home-menu only. The outward leg must show one full pointer disc at the
+        escape spot, and the same spot must be empty in the baseline frame, so
+        the disc is the moved pointer and not a static round control. Computed
+        once per probe: the outward frames are fixed before the return leg.
+        """
+        if not shift:
+            return None
+        context = getattr(self, "_navigation_context", None)
+        if context is None or getattr(context, "action", None) != "home" or getattr(context, "kind", None) != "menu":
+            return None
+        left, top, right, bottom = context.target.box
+        margin = .015  # the hover highlight can bleed just past the glyph box
+        icon = (max(0., left - margin), max(0., top - margin),
+                min(1., right + margin), min(1., bottom + margin))
+        escape = (near[0] + shift, near[1]) if not vertical else (near[0], near[1] + shift)
+        reach_x, reach_y = reach
+
+        def at_escape(frame):
+            found = [disc for disc in _pointer_discs_near(frame, escape, max(reach_x, reach_y))
+                     if abs(disc[0] - escape[0]) <= reach_x and abs(disc[1] - escape[1]) <= reach_y]
+            return found[0] if len(found) == 1 else None
+
+        for frame in outward_frames:
+            disc = at_escape(frame)
+            if disc is None:
+                continue
+            if at_escape(baseline) is not None:
+                # A static round control sits at the escape spot; it proves nothing.
+                continue
+            return frame, disc, icon
+        return None
+
+    def _occluded_home_accept(self, evidence, returned, near, shift):
+        """Accept an occluded Home return from precomputed outward evidence.
+
+        The pointer is smaller than the check only when it is back on the icon:
+        no pointer-sized disc may sit anywhere on the return path outside the
+        icon, and nothing may have changed between the outward and returned
+        frames outside the icon box and the escape spot. Anything else leaves
+        the landing unconfirmed, exactly as before.
+        """
+        outward_frame, escape_disc, icon = evidence
+        path_radius = abs(shift) + .07
+        for disc in _pointer_discs_near(returned, near, path_radius):
+            x, y, _diameter = disc
+            if not (icon[0] <= x <= icon[2] and icon[1] <= y <= icon[3]):
+                return None
+        if screen_compare.observation_changed(
+                outward_frame, returned, input_region=icon, moved_pointer=(escape_disc[:2],),
+                caret_frames=getattr(self.screen, "recent_frames", ()),
+                context_regions=self._pointer_context_regions()):
+            return None
+        return near
+
     async def _localize_pointer(self, near, epoch, *, reference=None, probe=None, before_probe=None):
         """Required localization pairs a deliberate move and return, never a lone round UI element."""
         if before_probe is not None:
@@ -644,6 +717,9 @@ class Phone:
             if diagnostics:
                 diagnostics.event("result", pointer=None, reason="no_outward_or_stopped")
             return None
+        occluded_outward = self._occluded_home_outward(
+            [*reversed(outward), *reversed(early)],
+            near, shift, vertical, baseline, reach) if ble else None
 
         def locate(returned):
             context_regions = self._pointer_context_regions()
@@ -686,6 +762,16 @@ class Phone:
                     if self._pointer_reference is None and prior_pointer is not None:
                         self._pointer_reference = prior_pointer, prior_frame, returned
                 return pair[1]
+            if ble and occluded_outward is not None:
+                occluded = self._occluded_home_accept(occluded_outward, returned, near, shift)
+                if occluded is not None:
+                    if diagnostics:
+                        diagnostics.event("pair", matched=True, coordinates=(near, occluded),
+                                          occluded=True)
+                    self._pointer_pair_verified = True
+                    self._pos = position
+                    self._pointer_overlay = occluded, returned
+                    return occluded
             return None
 
         if sample_limit == 1:
