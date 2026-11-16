@@ -118,14 +118,14 @@ def test_prepare_returns_before_copy_and_host_can_observe_then_commit_once(monke
             await manager.paste(PasteTransaction(
                 transaction_id=transaction, screen_id=pasted["screen_id"], focused=True))
         assert phone.sent.count("cmd+v") == 1
-        confirmed = manager.confirm(ConfirmPaste(
+        confirmed = await manager.confirm(ConfirmPaste(
             transaction_id=transaction, screen_id=control.observation()["screen_id"],
             observed_text="你好00123", confirmed=True))
         assert confirmed["verified_by"] == "host_observation"
         assert confirmed["server_content_verified"] is False
         assert provider.current() == {"active": False, "needs_resolution": False}
         with pytest.raises((ValueError, RuntimeError, HTTPException)):
-            manager.confirm(ConfirmPaste(transaction_id=transaction, screen_id="old",
+            await manager.confirm(ConfirmPaste(transaction_id=transaction, screen_id="old",
                                          observed_text="你好00123", confirmed=True))
 
     asyncio.run(scenario())
@@ -228,10 +228,74 @@ def test_host_confirmation_requires_exact_text_and_post_paste_frame(monkeypatch)
         pasted = await manager.paste(PasteTransaction(transaction_id=prepared["transaction_id"],
                                                      screen_id=control.observation()["screen_id"], focused=True))
         with pytest.raises(ValueError, match="exact"):
-            manager.confirm(ConfirmPaste(transaction_id=prepared["transaction_id"],
+            await manager.confirm(ConfirmPaste(transaction_id=prepared["transaction_id"],
                                          screen_id=pasted["screen_id"], observed_text="你好123", confirmed=True))
         assert provider.current()["active"]
         manager.cancel(prepared["transaction_id"])
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("transition", ["accepted", "unproved", "new_page", "new_session", "new_device", "new_screen"])
+def test_permission_confirmation_keeps_the_original_transaction_and_current_ticket(monkeypatch, transition):
+    from hidagent import feedback, paste_confirmation
+    from hidagent.clipboard_control import ConfirmPaste, PasteTransaction
+
+    def changed_scene(color):
+        with Image.open(io.BytesIO(field_image(text=True))) as image:
+            ImageDraw.Draw(image).rectangle((50, 80, 350, 155), fill=color)
+            output = io.BytesIO()
+            image.save(output, "PNG")
+            return output.getvalue()
+
+    async def scenario():
+        screen, provider, phone, control, manager = setup(monkeypatch)
+        before, sheet, after = field_image(), changed_scene("blue"), changed_scene("orange")
+
+        async def capture(_screen, _completed_at):
+            screen._on_jpeg(sheet)
+            return sheet
+
+        async def verify(original, presented, selected, region, text):
+            assert (original, presented, selected, text) == (before, sheet, after, "你好00123")
+            assert region == manager.transaction.guard.region
+            if transition == "new_page":
+                screen._on_jpeg(changed_scene("green"))
+            if transition == "new_session":
+                phone.device.links += 1
+            if transition == "new_device":
+                phone.device = SimpleNamespace(**vars(phone.device))
+            if transition == "new_screen":
+                replacement = Screen()
+                replacement._on_jpeg(after)
+                assert replacement.generation == screen.generation
+                phone.screen = control.screen = replacement
+            return transition != "unproved"
+
+        monkeypatch.setattr(feedback, "wait_after_action", capture)
+        monkeypatch.setattr(paste_confirmation, "verify_after_paste_permission", verify)
+        prepared = await manager.prepare(prepare_body(control))
+        copied(provider, screen)
+        await manager.paste(PasteTransaction(transaction_id=prepared["transaction_id"],
+                                             screen_id=control.observation()["screen_id"], focused=True))
+        screen._on_jpeg(after)
+        request = ConfirmPaste(transaction_id=prepared["transaction_id"],
+                               screen_id=control.observation()["screen_id"],
+                               observed_text="你好00123", confirmed=True)
+        if transition == "accepted":
+            receipt = await manager.confirm(request)
+            assert receipt["phase"] == "completed" and receipt["effect_verified"]
+            assert receipt["confirmation_evidence"] == "paste_permission_dismissed"
+            assert receipt["verified_by"] == "host_observation" and not receipt["server_content_verified"]
+            assert provider.current() == {"active": False, "needs_resolution": False}
+        else:
+            with pytest.raises((ValueError, RuntimeError, HTTPException)):
+                await manager.confirm(request)
+            if transition in {"new_session", "new_device", "new_screen"}:
+                assert provider.current() == {"active": False, "needs_resolution": True}
+            else:
+                assert provider.current()["active"]
+        assert phone.sent == ["ctrl+alt+p", "cmd+v"]
 
     asyncio.run(scenario())
 
@@ -451,10 +515,7 @@ def test_idle_transaction_does_not_authorize_a_stale_input_stage(monkeypatch, ph
         now = time.time()
         monkeypatch.setattr(time, "time", lambda: now + 6)
         with pytest.raises((ValueError, RuntimeError), match="新鲜"):
-            if phase == "confirm":
-                manager.confirm(request)
-            else:
-                await getattr(manager, phase)(request)
+            await getattr(manager, phase)(request)
         assert phone.sent == sent
         if phase == "prepare":
             assert provider._pending is None and manager.transaction is None
@@ -516,7 +577,7 @@ def test_host_access_after_abort_cleans_transaction_without_waiting_for_ttl(monk
                 await manager.paste(PasteTransaction(transaction_id=nonce,
                     screen_id=control.observation()["screen_id"], focused=True))
             else:
-                manager.confirm(ConfirmPaste(transaction_id=nonce,
+                await manager.confirm(ConfirmPaste(transaction_id=nonce,
                     screen_id=control.observation()["screen_id"], observed_text="你好00123", confirmed=True))
         assert provider.current() == {"active": False, "needs_resolution": True}
         assert manager.transaction is None and "cmd+v" not in phone.sent
@@ -661,7 +722,7 @@ def test_confirmation_cannot_use_frame_still_in_post_paste_pipeline(monkeypatch)
         screen._on_jpeg(screen.frame)
         monkeypatch.setattr(freshness, "MIRROR_LAG_SECONDS", 1.7)
         with pytest.raises(ValueError, match="post-paste"):
-            manager.confirm(ConfirmPaste(transaction_id=prepared["transaction_id"],
+            await manager.confirm(ConfirmPaste(transaction_id=prepared["transaction_id"],
                 screen_id=selected["screen_id"], observed_text="你好00123", confirmed=True))
         assert provider.current()["active"]
         manager.cancel(prepared["transaction_id"])

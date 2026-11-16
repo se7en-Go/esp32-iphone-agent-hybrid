@@ -48,12 +48,14 @@ class _Transaction:
     nonce: str
     provider: object
     phone: object
+    device: object
     guard: InputContextGuard
     links: int
     epoch: int
     expected_digest: bytes
     focus_verified_by: str
     completed_at: float | None = None
+    first_post_paste_frame: bytes | None = None
 
 
 class StagedClipboardControls:
@@ -80,10 +82,12 @@ class StagedClipboardControls:
             # runs. Preserve its copy transaction, not its input eligibility:
             # prepare/paste/confirm still require fresh action evidence.
             observed = snapshot(current.screen)
+            device = item.phone.device
             if (current.phone is not item.phone or current.phone.clipboard is not item.provider
-                    or getattr(item.phone.device, "links", 0) != item.links
-                    or getattr(item.phone.device, "abort_epoch", 0) != item.epoch
-                    or not getattr(item.phone.device, "connected", False)
+                    or current.screen is not item.guard.screen or device is not item.device
+                    or getattr(device, "links", 0) != item.links
+                    or getattr(device, "abort_epoch", 0) != item.epoch
+                    or not getattr(device, "connected", False)
                     or not observed.live or not observed.frame
                     or observed.generation != item.guard.original.generation):
                 raise RuntimeError("clipboard input session changed or stopped; do not paste")
@@ -140,8 +144,9 @@ class StagedClipboardControls:
         if anchor.region is None:
             raise ValueError("no bounded focused field detected; supply an observed target_box with focused=true")
         nonce = provider.stage_begin(request.text, validate_session=lambda: self._session(item))
-        item = _Transaction(nonce, provider, phone, anchor, getattr(phone.device, "links", 0),
-                            getattr(phone.device, "abort_epoch", 0), hashlib.sha256(request.text.encode()).digest(),
+        device = phone.device
+        item = _Transaction(nonce, provider, phone, device, anchor, getattr(device, "links", 0),
+                            getattr(device, "abort_epoch", 0), hashlib.sha256(request.text.encode()).digest(),
                             focus_source)
         self.transaction = item
 
@@ -189,7 +194,7 @@ class StagedClipboardControls:
                 await item.phone.key("cmd+v", before_action=validate)
             item.provider.stage_paste_sent(item.nonce)
             item.completed_at = time.time()
-            await feedback.wait_after_action(controls.screen, item.completed_at)
+            item.first_post_paste_frame = await feedback.wait_after_action(controls.screen, item.completed_at)
         except asyncio.CancelledError:
             self._abandon(item)
             raise
@@ -204,7 +209,7 @@ class StagedClipboardControls:
         return {**result, "command_acknowledged": True, "effect_verified": False,
                 "verification_required": "Inspect the inserted text in the original field; confirm separately."}
 
-    def confirm(self, request):
+    async def confirm(self, request):
         item = self._lookup(request.transaction_id)
         if request.confirmed is not True:
             raise ValueError("confirm only after visually checking the complete inserted text")
@@ -217,12 +222,32 @@ class StagedClipboardControls:
         controls._validate_ticket(controls.ticket, request.screen_id)
         if not self._post_event_evidence(controls, item.completed_at):
             raise ValueError("confirmation requires a fresh post-paste observation")
-        item.guard(stage="accept")  # allow text changes only inside the original observed input area
+        evidence = {}
+        try:
+            item.guard(stage="accept")  # allow text changes only inside the original observed input area
+        except RuntimeError:
+            if item.first_post_paste_frame is None:
+                raise
+            # A native paste permission sheet can re-render the original page.
+            # This evidence only records the effect of a paste that already ran.
+            from .paste_confirmation import verify_after_paste_permission
+
+            if not await verify_after_paste_permission(
+                    item.guard.original.frame, item.first_post_paste_frame,
+                    controls._observation.frame, item.guard.region, request.observed_text):
+                raise
+            evidence["confirmation_evidence"] = "paste_permission_dismissed"
+        if evidence:
+            if self._lookup(item.nonce) is not item:
+                raise ValueError("clipboard transaction changed during confirmation")
+            self._session(item)
+            if not self._post_event_evidence(controls, item.completed_at):
+                raise ValueError("confirmation requires a fresh post-paste observation")
         controls.consume(request.screen_id)
         state = item.provider.stage_finish(item.nonce, confirmed=True)
         self.transaction = None
         return {**state, **self._evidence(), "phase": "completed", "effect_verified": True,
-                "verified_by": "host_observation", "server_content_verified": False}
+                "verified_by": "host_observation", "server_content_verified": False, **evidence}
 
     def cancel(self, nonce):
         item = self._lookup(nonce)
