@@ -170,6 +170,21 @@ def _bounded_field(image, box):
     return None
 
 
+def _editor_caret(image, box):
+    """Local verification area for an amber caret on a white editor canvas."""
+    x0, y0, x1, y1 = box
+    w, h = image.size
+    pad_x, pad_y = round(.06 * w), round(.02 * h)
+    if not (pad_x < x0 < x1 < w - pad_x
+            and .06 * h + pad_y < y0 < y1 < h - pad_y):
+        return None
+    background_x = x1 + max(3, round(.012 * w))
+    light = [min(image.getpixel((background_x, y))) >= 232 for y in range(y0, y1)]
+    if sum(light) >= .95 * len(light):
+        return FieldCaret(box, (x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y), background_x)
+    return None
+
+
 def _field_difference(image, reference, caret, patch):
     left, top, _, _ = caret.field
     channels = ImageChops.difference(image.crop(caret.field), reference.crop(caret.field)).split()
@@ -194,7 +209,11 @@ def _current_template_matches(image, reference, caret, patch, low, high):
             and sum(v > 55 for v in errors) < 3)
 
 
-def _template_cycle(caret, images, frames, current, *, allow_white=True):
+def _amber_tone(r, g, b):
+    return r >= 165 and r - g >= 14 and g - b >= 48
+
+
+def _template_cycle(caret, images, frames, current, *, allow_white=True, amber=False):
     """Use complete periodic templates, including unchanged preedit underline."""
     x0, y0, x1, y1 = caret.box
     patch = x0 - 1, y0 - 1, x1 + 2, y1 + 1
@@ -208,13 +227,25 @@ def _template_cycle(caret, images, frames, current, *, allow_white=True):
         on, off = [], []
         for i, image in enumerate(images):
             colors = [image.getpixel((x, y)) for y in rows]
-            blue = sum(b >= 150 and b - r >= 60 and b - g >= 25 and g >= 50 for r, g, b in colors)
-            white = sum(min(c) >= 215 and max(c) - min(c) <= 65 for c in colors) if allow_white else 0
+            if amber:
+                on_pixels = sum(_amber_tone(*color) for color in colors)
+            else:
+                blue = sum(b >= 150 and b - r >= 60 and b - g >= 25 and g >= 50 for r, g, b in colors)
+                white = sum(min(c) >= 215 and max(c) - min(c) <= 65 for c in colors) if allow_white else 0
+                on_pixels = max(blue, white)
             contrasts = [max(abs(a - b) for a, b in zip(image.getpixel((x, y)),
                          image.getpixel((caret.background_x, y)), strict=True)) for y in upper]
-            if max(blue, white) >= .85 * len(colors) and sum(v >= 60 for v in contrasts) >= .85 * len(contrasts):
+            if on_pixels >= .85 * len(colors) and sum(v >= 60 for v in contrasts) >= .85 * len(contrasts):
                 on.append(i)
             if statistics.median(contrasts) <= 12 and sum(v <= 20 for v in contrasts) >= .85 * len(contrasts):
+                # An amber line on a white canvas must disappear completely.
+                # Its endpoints cannot become part of a new learned off phase.
+                if amber:
+                    clearance = max(3, round(.006 * image.height))
+                    pixels = image.crop((x0 - 1, y0 - clearance, x1 + 1, y1 + clearance)).tobytes()
+                    colors = zip(pixels[::3], pixels[1::3], pixels[2::3], strict=True)
+                    if any(_amber_tone(*color) for color in colors):
+                        continue
                 off.append(i)
         if not on or not off:
             continue
@@ -302,7 +333,7 @@ def _matching_cycle(caret, patch, images, frames, current, off_index, on_index, 
     return False
 
 
-def _temporal_carets(first, second, frames, regions, *, images=None, allow_white=True):
+def _temporal_carets(first, second, frames, regions, *, images=None, allow_white=True, allow_editor=False):
     images = images if images is not None else [_image(frame.frame) for frame in frames]
     if any(image.size != first.size for image in images):
         return []
@@ -320,13 +351,19 @@ def _temporal_carets(first, second, frames, regions, *, images=None, allow_white
             bw, bh = x1 - x0, y1 - y0
             if not (0 < x0 < x1 < dynamic.width and 0 < y0 < y1 < dynamic.height
                     and 1 <= bw <= max(3, .012 * first.width)
-                    and max(6, .008 * first.height) <= bh <= .05 * first.height
-                    and bh >= 3 * bw and len(points) >= .65 * bw * bh):
+                    and max(6, .008 * first.height) <= bh <= .05 * first.height and bh >= 3 * bw):
                 continue
             box = x0 + bounds[0], y0 + bounds[1], x1 + bounds[0], y1 + bounds[1]
-            caret = _bounded_field(first, box)
+            dense = len(points) >= .65 * bw * bh
+            caret = _bounded_field(first, box) if dense else None
             if caret and _template_cycle(caret, images, frames, (first, second), allow_white=allow_white):
                 found.append(caret)
+            elif allow_editor and (dense or max(xs.count(x) for x in set(xs)) >= .95 * bh):
+                # JPEG fringes can widen the component with little extra area.
+                # The complete box still has to match the learned phases.
+                editor = _editor_caret(first, box)
+                if editor and _template_cycle(editor, images, frames, (first, second), amber=True):
+                    found.append(editor)
     return list(dict.fromkeys(found))
 
 
@@ -466,7 +503,9 @@ def mask_caret_blink(before, after, diff, frames=()):
             if _periodic(caret, bright, frames, (first, second)):
                 candidates.append(scaled)
     if not candidates:
-        for caret in _temporal_carets(first, second, frames, regions):
+        # Editor evidence can exempt the thin blink from a comparison. It does
+        # not provide a bounded field to callers that are trying to locate focus.
+        for caret in _temporal_carets(first, second, frames, regions, allow_editor=True):
             x0, y0, x1, y1 = caret.box
             candidates.append(tuple(round(v * diff.size[i % 2] / first.size[i % 2])
                                     for i, v in enumerate((x0 - 1, y0 - 1, x1 + 1, y1))))

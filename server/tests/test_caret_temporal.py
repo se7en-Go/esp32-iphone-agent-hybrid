@@ -135,3 +135,68 @@ def test_temporal_focus_does_not_borrow_white_caret_permission():
     from test_caret_blink import history, spotlight_frame
 
     assert temporal_focused_region(spotlight_frame(1), history(0, 1, 0, 1)) is None
+
+
+def editor_frame(level, *, edit=None, fringe=False):
+    image = Image.new("RGB", (500, 1080), "white")
+    draw = ImageDraw.Draw(image)
+    draw.text((310, 197), "test editor", fill=(30, 30, 30))
+    draw.rectangle((0, 575, 499, 1079), fill=(211, 212, 221))
+    tone = tuple(round(255 + level * (channel - 255)) for channel in (208, 169, 61))
+    draw.line((361, 175, 361, 226), fill=tone, width=2)
+    if fringe:
+        pale = tuple(round(255 + level * (channel - 255)) for channel in (238, 215, 181))
+        draw.rectangle((359, 178, 363, 181), fill=pale)
+        draw.line((361, 178, 361, 181), fill=tone, width=2)
+    if edit == "same_patch":
+        draw.rectangle((361, 193, 363, 197), fill=(39, 38, 35))
+    elif edit == "beside_caret":
+        draw.line((366, 200, 367, 210), fill=(30, 30, 30), width=2)
+    elif edit == "elsewhere":
+        draw.rectangle((190, 290, 205, 310), fill=(0, 0, 0))
+    output = io.BytesIO()
+    image.save(output, "PNG")
+    return output.getvalue()
+
+
+def editor_history(levels=(1, 0, 1, 0), **kwargs):
+    return tuple(SimpleNamespace(frame=editor_frame(level, **kwargs), arrived=i * .4, generation=1)
+                 for i, level in enumerate(levels))
+
+
+@pytest.mark.parametrize("levels", [(1, 0), (.25, .8), (0, 1)])
+def test_proved_amber_caret_in_borderless_editor_can_blink(levels):
+    before, after = (editor_frame(level) for level in levels)
+    history = editor_history()
+    assert observation_changed(before, after)
+    assert not observation_changed(before, after, caret_frames=history)
+    assert temporal_focused_region(before, history) is None
+
+
+@pytest.mark.parametrize("edit", ["same_patch", "beside_caret", "elsewhere"])
+def test_borderless_editor_caret_never_masks_new_content(edit):
+    assert observation_changed(editor_frame(1), editor_frame(0, edit=edit), caret_frames=editor_history())
+
+
+def test_borderless_editor_requires_complete_amber_blink():
+    assert observation_changed(editor_frame(1), editor_frame(0), caret_frames=editor_history((1, 1, 0)))
+
+
+def test_editor_blink_retains_sparse_fringes_in_the_same_template():
+    history = editor_history(fringe=True)
+    assert not observation_changed(editor_frame(1, fringe=True), editor_frame(0), caret_frames=history)
+    assert observation_changed(editor_frame(1, fringe=True), editor_frame(0, edit="same_patch"),
+                               caret_frames=history)
+
+
+@pytest.mark.parametrize("y", [174, 225])
+def test_amber_content_at_either_end_cannot_be_learned_as_off_phase(y):
+    on, off = editor_frame(1), editor_frame(0)
+    image = Image.open(io.BytesIO(off)).convert("RGB")
+    ImageDraw.Draw(image).rectangle((361, y, 362, y + 3), fill=(208, 169, 61))
+    output = io.BytesIO()
+    image.save(output, "PNG")
+    edited = output.getvalue()
+    history = tuple(SimpleNamespace(frame=frame, arrived=i * .4, generation=1)
+                    for i, frame in enumerate((on, edited, on, edited)))
+    assert observation_changed(on, edited, caret_frames=history)
