@@ -1246,8 +1246,10 @@ class Phone:
 
         if found is None:
             found = await escape_target((self._position_before, None))
+        highlight_landing = False
         if found is None:
             found = self._menu_highlight_landing((x, y))
+            highlight_landing = found is not None
         miss = max(abs(found[0] - x), abs(found[1] - y)) if found is not None and all(
             math.isfinite(value) for value in found) else math.inf
         ble = self._pace == BLE_PACE
@@ -1266,6 +1268,16 @@ class Phone:
             px, py = point
             if abs(px - x) <= AIM_TOLERANCE and abs(py - y) <= AIM_TOLERANCE:
                 return True
+            if highlight_landing and target_box is not None:
+                # The blue highlight only appears while the pointer hovers the
+                # Home item, so a measured highlight centroid inside the target
+                # box is itself the landing evidence. Do not demand paired BLE
+                # verification for it: the disc is invisible over the blue
+                # highlight and was never pair-verified. The centroid sits
+                # near the bottom of the box (the label), so use plain box
+                # containment, not the AIM_TOLERANCE safe interior.
+                left, top, right, bottom = target_box
+                return left <= px <= right and top <= py <= bottom
             if not paired_ble or target_box is None:
                 return False
             left, top, right, bottom = target_box

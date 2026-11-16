@@ -99,6 +99,28 @@ def test_valid_highlight_sends_exactly_one_click(tmp_path):
     assert phone._seen["x"] and phone._seen["y"]
 
 
+def test_highlight_centroid_inside_box_but_outside_aim_tolerance_sends_one_click(tmp_path):
+    # Live diagnosis: the highlight centroid (0.584, 0.838) can sit 0.009
+    # from the requested target centre in y, just outside AIM_TOLERANCE
+    # (0.008), while the disc was never pair-verified over the blue
+    # highlight. The centroid is still inside the Home target box, and the
+    # blue highlight only appears while the pointer hovers Home, so the
+    # landing must be accepted and exactly one click sent.
+    phone, device, mirror, context = rig(
+        tmp_path, "unhighlighted.jpg", "highlighted.jpg")
+    # Request a point inside the Home box but 0.010 above the highlight
+    # centroid in y, so the miss exceeds AIM_TOLERANCE.
+    near = (context.target.center[0], 0.828)
+
+    result = asyncio.run(phone.tap_verified(
+        *near, target_frame=mirror.frame, navigation_context=context))
+
+    assert result["clicked"] is True
+    assert device.commands.count("click") == 1
+    centre = phone._menu_highlight_evidence["centre"]
+    assert centre == pytest.approx((0.584, 0.838), abs=0.01)
+
+
 def test_static_highlight_sends_zero_clicks(tmp_path):
     # Home is already blue before the move: there is no highlight change
     # caused by this move, so no landing is found and nothing is sent.
