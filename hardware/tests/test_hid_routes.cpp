@@ -12,6 +12,7 @@
 static int pref = HID_PREF_AUTO;
 static bool usbMounted, usbSuspended, bleConnected, bleSession;
 static bool bleButton, bleKey, bleConsumerHeld, usbButton, usbKey, usbConsumer;
+static uint8_t bleButtons;
 static int wakeups, usbMoves;
 static bool failBleRelease;
 static bool failUsbReport;
@@ -35,17 +36,23 @@ void tud_remote_wakeup() { wakeups++; usbSuspended = false; }
 bool ble_hid_connected() { return bleConnected; }
 bool ble_hid_session_active() { return bleSession; }
 bool ble_hid_bonded() { return bleConnected; }
+uint32_t ble_hid_peer_id() { return bleConnected ? 1 : 0; }
+uint32_t ble_hid_pair_seq() { return 1; }
 bool ble_app_advertising() { return true; }
 bool ble_hid_pair_window_open() { return false; }
 int ble_hid_pref() { return pref; }
 void ble_hid_arm_interval(int) {}
 bool ble_hid_mouse(int8_t, int8_t, int8_t, int8_t) { return bleConnected; }
-bool ble_hid_button(bool down) {
-  if (!bleConnected || (!down && failBleRelease)) return false;
-  events.push_back(down ? "ble mouse down" : "ble mouse up");
-  bleButton = down;
+bool ble_hid_buttons(uint8_t mask) {
+  if (!bleConnected || (!mask && failBleRelease)) return false;
+  if (!mask) events.push_back("ble mouse up");
+  else if (mask == 0x04) events.push_back("ble middle down");
+  else events.push_back("ble mouse down");
+  bleButtons = mask;
+  bleButton = mask != 0;
   return true;
 }
+bool ble_hid_button(bool down) { return ble_hid_buttons(down ? 0x01 : 0x00); }
 bool ble_hid_keyboard(uint8_t mod, const uint8_t *, int n) {
   bool down = mod || n;
   if (!bleConnected || (!down && failBleRelease)) return false;
@@ -70,7 +77,7 @@ struct Mouse {
     usbReportAttempts++;
     if (failUsbReport || !usbMounted || usbSuspended) return false;
     usbAcceptedButtons.push_back(report.buttons);
-    usbButton = (report.buttons & MOUSE_LEFT) != 0;
+    usbButton = report.buttons != 0;
     if (report.x || report.y || report.wheel || report.pan) {
       usbMoves++;
       events.push_back("usb move");
@@ -109,6 +116,7 @@ static void reset() {
   usbMounted = bleConnected = bleSession = true;
   usbSuspended = false;
   bleButton = bleKey = bleConsumerHeld = usbButton = usbKey = usbConsumer = false;
+  bleButtons = 0;
   failBleRelease = failUsbReport = suspendUsbDuringDelay = false;
   delayHook = nullptr;
   usbReconnectReportStart = 0;
@@ -499,6 +507,52 @@ static void release_timeout_survives_millis_wrap() {
   puts("ok release wait and retry deadlines survive millis wraparound");
 }
 
+static void middle_button_and_checked_release() {
+  reset();
+  pref = HID_PREF_BLE;
+  assert(run("middleclick") == "ok");
+  assert(events.size() == 2 && events[0] == "ble middle down" && events[1] == "ble mouse up");
+  assert(!bleButton && bleButtons == 0 && !heldReports[HID_PATH_BLE]);
+
+  events.clear();
+  assert(run("middlepress") == "ok" && bleButtons == 0x04 && heldReports[HID_PATH_BLE] == HELD_MOUSE);
+  assert(run("release") == "ok" && !bleButton && bleButtons == 0 && !heldReports[HID_PATH_BLE]);
+  bool sawBleMouseUp = false;
+  for (const auto &ev : events) if (ev == "ble mouse up") sawBleMouseUp = true;
+  assert(!events.empty() && events[0] == "ble middle down" && sawBleMouseUp);
+
+  failBleRelease = true;
+  assert(run("middleclick") == "err phone not connected over ble");
+  assert(bleButton && bleButtons == 0x04 && heldReports[HID_PATH_BLE] == HELD_MOUSE);
+  assert(!hid_prepare_pref(HID_PREF_USB));
+  failBleRelease = false;
+  assert(run("release") == "ok" && !bleButton && bleButtons == 0);
+
+  pref = HID_PREF_USB;
+  usbAcceptedButtons.clear();
+  assert(run("middleclick") == "ok");
+  assert(usbAcceptedButtons.size() == 2 && usbAcceptedButtons[0] == 0x04 && usbAcceptedButtons[1] == 0x00);
+  assert(run("middlepress") == "ok" && usbMouseButtons == 0x04 && heldReports[HID_PATH_USB] == HELD_MOUSE);
+  assert(run("move 3 4") == "ok" && usbAcceptedButtons.back() == 0x04);
+  assert(run("release") == "ok" && !usbButton && usbMouseButtons == 0);
+
+  events.clear();
+  usbAcceptedButtons.clear();
+  // Backward compatibility: reject parameterized `click middle` / `press middle` rather than left-clicking.
+  assert(run("click middle") == "err usage: click");
+  assert(run("press middle") == "err usage: press");
+  assert(run("middleclick extra") == "err usage: middleclick");
+  assert(run("middlepress extra") == "err usage: middlepress");
+  assert(events.empty() && usbAcceptedButtons.empty());
+
+  assert(run("press") == "ok" && usbAcceptedButtons.back() == MOUSE_LEFT);
+  assert(run("move 1 2") == "ok" && usbAcceptedButtons.back() == MOUSE_LEFT);
+  assert(run("release") == "ok" && usbAcceptedButtons.back() == 0);
+  assert(run("click") == "ok");
+  assert(run("homescreen") == "ok");
+  puts("ok middleclick/middlepress, checked release, arg rejection, and left/homescreen preserved");
+}
+
 int main(int argc, char **argv) {
   // Individual cases allow recording both regressions against the old sketch.
   if (argc == 2 && std::string(argv[1]) == "detach") { detached_routes_stop_blocking(); return 0; }
@@ -526,4 +580,5 @@ int main(int argc, char **argv) {
   emergency_release_all_routes();
   keyboard_consumer_failures();
   accepted_behaviors();
+  middle_button_and_checked_release();
 }

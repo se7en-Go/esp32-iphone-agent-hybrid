@@ -190,3 +190,25 @@ def test_staged_paste_commands_keep_separate_evidence_boundaries(remote, capsys,
     assert cli.main(argv) == 0
     assert json.loads(capsys.readouterr().out)["effect_verified"] is False
     assert remote == [("POST", f"/api/control/clipboard/{stage}", body)]
+
+
+def test_middle_click_home_cli_status_enable_and_revoke(remote, tmp_path, capsys):
+    assert cli.main(["middle-click-home", "status"]) == 0
+    capsys.readouterr()
+
+    out_img = tmp_path / "home.jpg"
+    assert cli.main(["middle-click-home", "enable", "--screen-id", "seen-1", "--image-output", str(out_img)]) == 0
+    enabled = json.loads(capsys.readouterr().out)
+    assert out_img.read_bytes() == b"test jpeg"
+    assert enabled["image_path"] == str(out_img)
+
+    assert cli.main(["middle-click-home", "revoke", "--all"]) == 0
+    capsys.readouterr()
+
+    assert remote == [
+        ("GET", "/api/control/middle-click-home", None),
+        ("POST", "/api/control/middle-click-home/enable", {
+            "screen_id": "seen-1", "include_diff": True, "ocr_diff": False,
+        }),
+        ("POST", "/api/control/middle-click-home/revoke", {"all_devices": True}),
+    ]

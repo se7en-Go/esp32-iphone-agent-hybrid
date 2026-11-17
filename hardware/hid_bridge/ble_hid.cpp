@@ -36,7 +36,9 @@ struct Bond {
 
 static Preferences store;
 static Bond bonds[8];
+static uint32_t bondIds[8];
 static int bondCount;
+static std::atomic<uint32_t> pairSeq{0};
 static int pref = HID_PREF_AUTO;
 static bool pairArmed;
 static uint32_t pairUntil;
@@ -67,11 +69,33 @@ bool ble_hid_session_active() {
 bool ble_hid_bonded() { return bondCount > 0; }
 int ble_hid_pref() { return pref; }
 
+static uint32_t nextPairSeq(uint32_t cur) {
+  uint32_t next = cur + 1;
+  return next ? next : 1;
+}
+
+uint32_t ble_hid_peer_id() {
+  if (unpairing || !ble_hid_connected()) return 0;
+  ble_gap_conn_desc d;
+  if (ble_gap_conn_find(connHandle, &d) != 0 || !d.sec_state.encrypted) return 0;
+  for (int i = 0; i < bondCount && i < 8; i++) {
+    if (bonds[i].type == d.peer_id_addr.type && memcmp(bonds[i].val, d.peer_id_addr.val, 6) == 0) {
+      return bondIds[i];
+    }
+  }
+  return 0;
+}
+
+uint32_t ble_hid_pair_seq() { return pairSeq.load(); }
+
 static void savePref() { store.putUChar("mode", (uint8_t)pref); }
 
 static void saveBonds() {
   store.putUChar("nb", (uint8_t)bondCount);
   store.putBytes("bonds", bonds, sizeof bonds);
+  store.putBytes("bids", bondIds, sizeof bondIds);
+  uint32_t seq = pairSeq.load();
+  store.putBytes("pseq", &seq, sizeof seq);
 }
 
 bool ble_hid_set_pref(int next) {
@@ -111,8 +135,11 @@ void ble_hid_remember(uint8_t type, const uint8_t addr[6]) {
   for (int i = 0; i < bondCount; i++)
     if (bonds[i].type == type && memcmp(bonds[i].val, addr, 6) == 0) return;
   if (bondCount >= 8) return;
+  uint32_t seq = nextPairSeq(pairSeq.load());
+  pairSeq.store(seq);
   bonds[bondCount].type = type;
   memcpy(bonds[bondCount].val, addr, 6);
+  bondIds[bondCount] = seq;
   bondCount++;
   saveBonds();
 }
@@ -128,6 +155,8 @@ static void clearLatch() {
 
 void ble_hid_bonds_cleared() {
   bondCount = 0;
+  memset(bondIds, 0, sizeof bondIds);
+  pairSeq.store(nextPairSeq(pairSeq.load()));
   saveBonds();
   mouseOn = keyOn = consOn = haveConn = false;
   clearLatch();
@@ -181,7 +210,10 @@ bool ble_hid_unpair() {
       }
     }
     memmove(bonds + i, bonds + i + 1, (bondCount - i - 1) * sizeof(Bond));
+    memmove(bondIds + i, bondIds + i + 1, (bondCount - i - 1) * sizeof(uint32_t));
     bondCount--;
+    bondIds[bondCount] = 0;
+    pairSeq.store(nextPairSeq(pairSeq.load()));
     saveBonds();
   }
   if (!bondCount) ble_hid_bonds_cleared();
@@ -246,8 +278,8 @@ bool ble_hid_mouse(int8_t x, int8_t y, int8_t wheel, int8_t pan) {
   return emit(mouseIn, report, sizeof report);
 }
 
-bool ble_hid_button(bool left_down) {
-  uint8_t next = left_down ? 0x01 : 0x00;
+bool ble_hid_buttons(uint8_t mask) {
+  uint8_t next = mask & 0x07;
   if (next == buttons) return true;
   uint8_t report[5] = {next, 0, 0, 0, 0};
   // Commit only accepted state. A disconnect while emit waits clears the latch;
@@ -255,6 +287,10 @@ bool ble_hid_button(bool left_down) {
   if (!emit(mouseIn, report, sizeof report)) return false;
   buttons = next;
   return true;
+}
+
+bool ble_hid_button(bool left_down) {
+  return ble_hid_buttons(left_down ? 0x01 : 0x00);
 }
 
 bool ble_hid_keyboard(uint8_t modifier, const uint8_t *keys, int nkeys) {
@@ -278,7 +314,7 @@ bool ble_hid_consumer(uint16_t usage) {
 }
 
 void ble_hid_release_all() {
-  ble_hid_button(false);
+  ble_hid_buttons(0);
   ble_hid_keyboard(0, NULL, 0);
   ble_hid_consumer(0);
 }
@@ -310,13 +346,35 @@ String ble_hid_command(const char *arg) {
   return "err usage: hid usb|ble|auto|pair|unpair";
 }
 
+static void loadHidBondsFromStore() {
+  memset(bonds, 0, sizeof bonds);
+  memset(bondIds, 0, sizeof bondIds);
+  uint32_t savedSeq = 0;
+  store.getBytes("pseq", &savedSeq, sizeof savedSeq);
+  pairSeq.store(savedSeq);
+  bondCount = store.getUChar("nb", 0);
+  if (bondCount > 8) bondCount = 0;
+  if (bondCount) {
+    store.getBytes("bonds", bonds, sizeof bonds);
+    store.getBytes("bids", bondIds, sizeof bondIds);
+    bool migrated = false;
+    for (int i = 0; i < bondCount; i++) {
+      if (bondIds[i] == 0) {
+        uint32_t seq = nextPairSeq(pairSeq.load());
+        pairSeq.store(seq);
+        bondIds[i] = seq;
+        migrated = true;
+      }
+    }
+    if (migrated) saveBonds();
+  }
+}
+
 void ble_hid_begin(NimBLEServer *server) {
   store.begin("hid", false);
   uint8_t saved = store.getUChar("mode", HID_PREF_AUTO);
   pref = saved > HID_PREF_AUTO ? HID_PREF_AUTO : saved;
-  bondCount = store.getUChar("nb", 0);
-  if (bondCount > 8) bondCount = 0;
-  if (bondCount) store.getBytes("bonds", bonds, sizeof bonds);
+  loadHidBondsFromStore();
 
   auto *hid = new NimBLEHIDDevice(server);
   hid->setManufacturer("ESP32 Agent");

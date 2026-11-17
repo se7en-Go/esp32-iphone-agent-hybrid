@@ -329,6 +329,11 @@ static void test_arbiter(void) {
   arb_after(&s, ARB_APP, "press", true);
   arb_after(&s, ARB_APP, "click", true);
   CHECK(!arb_gone(&s, ARB_APP));
+  arb_after(&s, ARB_APP, "middlepress", true);
+  CHECK(arb_gone(&s, ARB_APP));
+  arb_after(&s, ARB_APP, "middlepress", true);
+  arb_after(&s, ARB_APP, "middleclick", true);
+  CHECK(!arb_gone(&s, ARB_APP));
   arb_after(&s, ARB_APP, "press", false);  // failed: nothing held
   CHECK(!arb_gone(&s, ARB_APP));
 }

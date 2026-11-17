@@ -201,7 +201,7 @@ class ServerCb : public NimBLEServerCallbacks {
     }
     if ((ble_pair_window_open() || hidWindow) && knownCount < 8) {
       known[knownCount++] = a;
-      if (hidWindow) ble_hid_remember(a.getType(), a.getVal());
+      if (hidWindow || ble_hid_using(ci.getConnHandle())) ble_hid_remember(a.getType(), a.getVal());
       return;
     }
     BLE_LOG("conn %u: new phone outside the pairing window, refused\n", ci.getConnHandle());

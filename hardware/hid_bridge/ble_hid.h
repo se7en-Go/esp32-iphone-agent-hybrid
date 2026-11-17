@@ -14,6 +14,8 @@ bool ble_hid_connected(); // encrypted and subscribed to an input report
 bool ble_hid_session_active(); // owning ACL still exists, even while reports are unavailable
 bool ble_hid_using(uint16_t handle); // this connection is the one holding an input subscription
 bool ble_hid_bonded();    // a HID bond is stored
+uint32_t ble_hid_peer_id(); // non-zero opaque NVS id of the currently active bonded HID peer
+uint32_t ble_hid_pair_seq(); // monotonic NVS pairing/unpair generation counter
 bool ble_hid_pair_window_open();
 void ble_hid_allow_pairing(uint32_t window_ms);
 void ble_hid_deny_pairing();
@@ -26,6 +28,7 @@ bool hid_prepare_pref(int pref); // bridge releases held inputs before changing 
 bool ble_hid_unpair();
 
 bool ble_hid_mouse(int8_t x, int8_t y, int8_t wheel, int8_t pan);
+bool ble_hid_buttons(uint8_t mask);
 bool ble_hid_button(bool left_down);
 void ble_hid_release_all();
 bool ble_hid_keyboard(uint8_t modifier, const uint8_t *keys, int nkeys);

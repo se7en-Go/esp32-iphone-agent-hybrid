@@ -8,7 +8,7 @@
 // iOS app on the same phone. It holds no logic; the app decides. Protocol: docs/ble-protocol.md.
 //
 // HID commands (unchanged from the old TCP protocol, the board answers "ok" or "err <why>"):
-//   ping | pace | home | move <dx> <dy> [speed] | press | release | click
+//   ping | pace | home | move <dx> <dy> [speed] | press | release | click | middlepress | middleclick
 //   scroll <v> <h> | type <ascii text> | key <combo, e.g. cmd+h, enter>
 //   homescreen (the consumer-control Home key, "AC Home": iOS goes to the Home Screen, like a keyboard's home key)
 
@@ -68,6 +68,8 @@ static hid_link_t hidFacts() {
   link.ble_bonded = ble_hid_bonded() ? 1 : 0;
   link.ble_advertising = ble_app_advertising() ? 1 : 0;
   link.ble_pairing = ble_hid_pair_window_open() ? 1 : 0;
+  link.ble_peer = ble_hid_peer_id();
+  link.ble_pair_seq = ble_hid_pair_seq();
   return link;
 }
 
@@ -75,7 +77,9 @@ static hid_link_t hidFacts() {
 // path until its release is accepted or that connection ends. A failed release
 // quarantines only its own route after a short grace period, never the other host.
 enum { HELD_MOUSE = 1, HELD_KEYS = 2, HELD_CONSUMER = 4, HELD_ALL = 7 };
+static const uint8_t HID_MOUSE_MIDDLE_BTN = 0x04;
 static uint8_t heldReports[3];
+static uint8_t usbMouseButtons = 0;
 static bool releasePending[3];
 static uint32_t releaseStarted[3], releaseLastTry[3];
 // statusTask only reads the quarantine flags; release bookkeeping stays on loop().
@@ -91,6 +95,7 @@ static void usbHidStopped(void *, esp_event_base_t, int32_t, void *) {
 
 static void clearReleaseState(int path) {
   heldReports[path] = 0;
+  if (path == HID_PATH_USB) usbMouseButtons = 0;
   releasePending[path] = releaseDeferred[path] = false;
 }
 
@@ -119,7 +124,7 @@ static bool sendUsbMouseReport(uint8_t buttons, int8_t x = 0, int8_t y = 0,
 }
 
 static void moveUsbMouse(int8_t x, int8_t y, int8_t wheel = 0, int8_t pan = 0) {
-  sendUsbMouseReport(heldReports[HID_PATH_USB] & HELD_MOUSE ? MOUSE_LEFT : 0,
+  sendUsbMouseReport(heldReports[HID_PATH_USB] & HELD_MOUSE ? usbMouseButtons : 0,
                      x, y, wheel, pan);
 }
 
@@ -155,12 +160,13 @@ static bool releaseReports(int path, uint8_t reports) {
     if (!(reports & bit)) continue;
     bool sent = true;
     if (path == HID_PATH_BLE) {
-      if (bit == HELD_MOUSE) sent = ble_hid_button(false);
+      if (bit == HELD_MOUSE) sent = ble_hid_buttons(0);
       else if (bit == HELD_KEYS) sent = ble_hid_keyboard(0, NULL, 0);
       else sent = ble_hid_consumer(0);
     } else {
       if (bit == HELD_MOUSE) {
         sent = sendUsbMouseReport(0);
+        if (sent) usbMouseButtons = 0;
       }
       else if (bit == HELD_KEYS) keyboard.releaseAll();
       else sent = consumer.release() != 0;
@@ -243,16 +249,28 @@ static int activePath() {
   return prepareHidPath(ble_hid_pref(), link, next) ? next : HID_PATH_NONE;
 }
 
-static bool buttonOn(int path, bool down) {
+static bool hasNonSpaceArg(const String &raw) {
+  for (const char *s = raw.c_str(); *s; s++) {
+    if (*s != ' ' && *s != '\t' && *s != '\r' && *s != '\n') return true;
+  }
+  return false;
+}
+
+static bool buttonMask(int path, uint8_t mask) {
   if (path == HID_PATH_NONE) return false;
-  if (!down) return releaseReports(path, HELD_MOUSE);
+  if (!mask) return releaseReports(path, HELD_MOUSE);
   if (path == HID_PATH_BLE) {
-    if (!ble_hid_button(true)) return false;
+    if (!ble_hid_buttons(mask)) return false;
   } else {
-    sendUsbMouseReport(MOUSE_LEFT);
+    usbMouseButtons = mask;
+    sendUsbMouseReport(mask);
   }
   heldReports[path] |= HELD_MOUSE;
   return true;
+}
+
+static bool buttonOn(int path, bool down) {
+  return buttonMask(path, down ? MOUSE_LEFT : 0);
 }
 
 static bool bleKeyboard(uint8_t mod, const uint8_t *keys, int n) {
@@ -449,11 +467,25 @@ String run(const String &line) {
     if (step > 40) step = 40;
     return movePaced(a, b, step) ? "ok" : down;
   }
-  if (cmd == "press") return buttonOn(path, true) ? "ok" : down;
+  if (cmd == "press") {
+    if (hasNonSpaceArg(arg)) return "err usage: press";
+    return buttonOn(path, true) ? "ok" : down;
+  }
   if (cmd == "click") {
+    if (hasNonSpaceArg(arg)) return "err usage: click";
     if (!buttonOn(path, true)) return down;
     delay(60);
     return buttonOn(path, false) ? "ok" : down;
+  }
+  if (cmd == "middlepress") {
+    if (hasNonSpaceArg(arg)) return "err usage: middlepress";
+    return buttonMask(path, HID_MOUSE_MIDDLE_BTN) ? "ok" : down;
+  }
+  if (cmd == "middleclick") {
+    if (hasNonSpaceArg(arg)) return "err usage: middleclick";
+    if (!buttonMask(path, HID_MOUSE_MIDDLE_BTN)) return down;
+    delay(60);
+    return buttonMask(path, 0) ? "ok" : down;
   }
   if (cmd == "scroll") {
     if (path == HID_PATH_BLE) return ble_hid_mouse(0, 0, clamp8(a), clamp8(b)) ? "ok" : down;
@@ -676,7 +708,7 @@ String statusJson(bool full, char who) {
     snprintf(s + len - 1, sizeof s - len + 1, ",\"busy\":%d}", app);
   }
   {
-    char frag[180];
+    char frag[224];
     hid_link_t facts = hidFacts();
     int prefNow = ble_hid_pref();
     int path = selectHidPath(prefNow, facts);

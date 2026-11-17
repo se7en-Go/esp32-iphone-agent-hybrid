@@ -727,6 +727,69 @@ class Controls:
         return await self._respond(before, completed_at or time.time(), began, ready, acknowledged, error,
                                    plan["extra"], request.include_diff, request.ocr_diff, response_session, **options)
 
+    def middle_click_home_status(self) -> dict:
+        return self.phone.assistive_touch.middle_click_home_status()
+
+    def revoke_middle_click_home(self, *, all_devices: bool = False) -> dict:
+        return self.phone.assistive_touch.revoke_middle_click_home(all_devices=all_devices)
+
+    async def enable_middle_click_home(
+        self, screen_id: str, *, include_diff: bool = True, ocr_diff: bool = False
+    ) -> dict:
+        """Verify live BLE `middleclick` -> Home from a clean observed non-Home screen and persist per device."""
+        began = time.perf_counter()
+        response_session = self._response_session()
+        with input_attempt() as admission:
+            ticket, original, inputs = self.ticket, getattr(self, "_observation", None), self._input_observation
+            self.invalidate()
+            self._check_ticket(ticket, screen_id)
+            if original is None:
+                original = freshness.snapshot(self.screen)
+            assistive = self.phone.assistive_touch
+            await assistive.check_middle_click_enable_preconditions(ticket[2])
+
+            def same_session():
+                self._check_ticket(ticket, screen_id, admission=admission)
+                device = getattr(self.phone, "device", None)
+                if inputs is not None and (
+                        device is not inputs.device
+                        or getattr(device, "links", None) != inputs.links
+                        or getattr(device, "abort_epoch", None) != inputs.epoch):
+                    raise RuntimeError("device session changed since observation; observe again")
+                if freshness.snapshot(self.screen).generation != original.generation:
+                    raise RuntimeError("screen changed since observation; observe again")
+
+            def before_refresh():
+                same_session()
+                current = require_fresh(self.screen, max_age=float("inf"))
+                if self._frame_size(current.frame)[1:] != ticket[3:]:
+                    raise ValueError("screen changed since observation; observe again")
+                if screen_compare.observation_changed(
+                        original.frame, current.frame,
+                        caret_frames=getattr(self.screen, "recent_frames", ())):
+                    raise ValueError("screen changed since observation; observe again")
+
+            admission.before_write = same_session
+            same_session()
+            ensure = getattr(self.phone, "ensure_observation", None)
+            if ensure is not None and fresh_frame(self.screen, max_age=OBSERVATION_ENTRY_MAX_AGE) is None:
+                before_refresh()
+                await ensure(before_refresh=before_refresh)
+                same_session()
+            before, _, _ = self._validate_ticket(ticket, screen_id, observation=original, admission=admission)
+            await assistive.check_middle_click_enable_preconditions(before)
+            ready = time.perf_counter()
+            completed_at = await assistive.verify_and_enable_middle_click_home(
+                observation=original, before_write=same_session
+            )
+        result = await self._respond(
+            before, completed_at, began, ready, True, None,
+            {"middle_click_home": self.middle_click_home_status()},
+            include_diff, ocr_diff, response_session,
+        )
+        result["effect_verified"] = True
+        return result
+
     async def click_observed(self, request):
         """Consume a host's explicit pointer observation for one stationary click."""
         qualified = self._host_observation

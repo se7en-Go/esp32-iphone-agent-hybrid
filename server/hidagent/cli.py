@@ -118,6 +118,19 @@ def parser() -> argparse.ArgumentParser:
     _context(batch, required=True)
     calibration = sub.add_parser("calibrate")
     calibration.add_argument("--pointer", nargs=2, type=float, metavar=("X", "Y"))
+    middle = sub.add_parser(
+        "middle-click-home",
+        help="inspect, verify+enable, or revoke BLE mouse middle-button Home routing",
+    )
+    middle_sub = middle.add_subparsers(dest="middle_action", required=True)
+    middle_sub.add_parser("status", help="show firmware support and per-device verification status")
+    middle_enable = middle_sub.add_parser(
+        "enable",
+        help="verify `middleclick` -> Home from an observed non-Home screen and persist for this device",
+    )
+    _context(middle_enable, required=True)
+    middle_revoke = middle_sub.add_parser("revoke", help="disable and forget middle-click Home routing")
+    middle_revoke.add_argument("--all", action="store_true", help="revoke verification for all stored devices")
     sub.add_parser("task").add_argument("goal")
     return root
 
@@ -221,6 +234,13 @@ def main(argv=None) -> int:
                     result = (client.control(name, args.screen_id, **fields) if args.screen_id
                               else client.action(name, **fields))
                 case "calibrate": result = client.calibrate(*(args.pointer or []))
+                case "middle-click-home":
+                    if args.middle_action == "status":
+                        result = client.middle_click_home_status()
+                    elif args.middle_action == "enable":
+                        result = client.enable_middle_click_home(args.screen_id)
+                    else:
+                        result = client.revoke_middle_click_home(all_devices=args.all)
                 case "task": result = client.delegate(args.goal)
                 case "task-status": result = client.task_status()
                 case "stop": result = client.stop()

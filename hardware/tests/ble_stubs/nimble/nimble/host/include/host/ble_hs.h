@@ -17,11 +17,12 @@ struct ble_gap_conn_desc {
   struct { uint8_t type; uint8_t val[6]; } peer_id_addr;
 };
 inline bool connected = true, link_encrypted = true;
+inline uint8_t active_peer_addr = 0;
 inline int ble_gap_conn_find(uint16_t h, ble_gap_conn_desc *d) {
   if (!connected || h != 1) return 1;
   *d = {};
   d->sec_state.encrypted = link_encrypted;
-  d->peer_id_addr.val[5] = (uint8_t)h;
+  d->peer_id_addr.val[5] = active_peer_addr ? active_peer_addr : (uint8_t)h;
   return 0;
 }
 inline int free_blocks = 64, allocation_failures, notify_failures, notify_rc;

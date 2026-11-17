@@ -76,11 +76,12 @@ int hid_pace_version(int pref, int path) {
 
 int hid_status_fragment(char *dst, size_t n, int pref, int path, const hid_link_t *link) {
   return snprintf(dst, n,
-                  "\"hid\":{\"mode\":\"%s\",\"path\":\"%s\",\"pace\":%d,"
-                  "\"ble\":{\"adv\":%d,\"conn\":%d,\"bond\":%d,\"pair\":%d}}",
+                  "\"hid\":{\"mode\":\"%s\",\"path\":\"%s\",\"pace\":%d,\"middle_click\":1,"
+                  "\"ble\":{\"adv\":%d,\"conn\":%d,\"bond\":%d,\"pair\":%d,\"peer\":%lu,\"pair_seq\":%lu}}",
                   hid_pref_name(pref), hid_path_name(path), hid_pace_version(pref, path),
                   link->ble_advertising ? 1 : 0, link->ble_connected ? 1 : 0, link->ble_bonded ? 1 : 0,
-                  link->ble_pairing ? 1 : 0);
+                  link->ble_pairing ? 1 : 0, (unsigned long)link->ble_peer,
+                  (unsigned long)link->ble_pair_seq);
 }
 
 int hid_status_compact(char *dst, size_t n, int path) {

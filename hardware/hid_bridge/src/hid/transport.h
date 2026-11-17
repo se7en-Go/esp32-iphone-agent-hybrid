@@ -24,6 +24,8 @@ typedef struct {
   int ble_bonded;      // a HID bond is stored, so the phone can reconnect after reboot
   int ble_advertising; // the public identity (the one carrying the HID UUID) is on air
   int ble_pairing;     // HID pairing window is open
+  uint32_t ble_peer;   // opaque non-zero id of the connected bonded central, or 0
+  uint32_t ble_pair_seq; // monotonic pairing/unpair generation persisted in NVS
 } hid_link_t;
 
 typedef struct {

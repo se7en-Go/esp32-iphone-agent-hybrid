@@ -45,6 +45,9 @@ int ble_store_read_peer_sec(const ble_store_key_sec *key, ble_store_value_sec *)
 
 static void reset() {
   gate.resume();
+  store.clear();
+  pairSeq.store(0);
+  active_peer_addr = 0;
   ble_hid_bonds_cleared();
   clock_ms = 0;
   delay_hook = nullptr;
@@ -259,6 +262,85 @@ static void test_disconnect_during_report_retry() {
   puts("ok a pending report cannot cross into a new BLE session with the same handle");
 }
 
+static void test_middle_button_mask() {
+  reset();
+  assert(ble_hid_buttons(0x04) && buttons == 0x04);
+  assert(sent.size() == 1 && sent.back().data.size() == 5 && sent.back().data[0] == 0x04);
+  assert(ble_hid_buttons(0x04) && sent.size() == 1);
+  free_blocks = 0;
+  assert(!ble_hid_buttons(0x00) && buttons == 0x04);
+  free_blocks = 64;
+  assert(ble_hid_buttons(0x00) && buttons == 0);
+  assert(sent.size() == 2 && sent.back().data[0] == 0x00);
+  assert(ble_hid_buttons(0x04) && buttons == 0x04);
+  connected = false;
+  ble_hid_on_disconnect(1);
+  assert(buttons == 0);
+  puts("ok BLE middle button report mask, checked release and disconnect cleanup");
+}
+
+static void test_peer_identity_and_repair_invalidation() {
+  reset();
+  uint32_t peer1 = ble_hid_peer_id();
+  uint32_t seq1 = ble_hid_pair_seq();
+  assert(peer1 > 0 && seq1 > 0);
+
+  // Reboot + reconnect with the same bonded iPhone preserves peer and pair_seq.
+  connected = false;
+  ble_hid_on_disconnect(1);
+  assert(ble_hid_peer_id() == 0 && ble_hid_pair_seq() == seq1);
+  memset(bonds, 0, sizeof bonds);
+  memset(bondIds, 0, sizeof bondIds);
+  bondCount = 0;
+  pairSeq.store(0);
+  loadHidBondsFromStore();
+  connected = true;
+  NimBLEConnInfo ci1(1, 1);
+  mouseIn->cb->onSubscribe(mouseIn, ci1, 1);
+  assert(ble_hid_peer_id() == peer1 && ble_hid_pair_seq() == seq1);
+
+  // Unpair + re-pair with another iPhone changes both peer and pair_seq.
+  assert(ble_hid_command("unpair") == "ok");
+  uint32_t seq_unpaired = ble_hid_pair_seq();
+  assert(seq_unpaired > seq1 && ble_hid_peer_id() == 0);
+  active_peer_addr = 2;
+  actual_bonds[2] = our_bonds[2] = true;
+  NimBLEConnInfo ci2(1, 2);
+  mouseIn->cb->onSubscribe(mouseIn, ci2, 1);
+  uint32_t peer2 = ble_hid_peer_id();
+  uint32_t seq2 = ble_hid_pair_seq();
+  assert(peer2 > 0 && peer2 != peer1 && seq2 > seq_unpaired);
+
+  // Even re-pairing Phone 1 after unpair produces a fresh peer and pair_seq.
+  assert(ble_hid_command("unpair") == "ok");
+  active_peer_addr = 1;
+  actual_bonds[1] = our_bonds[1] = true;
+  mouseIn->cb->onSubscribe(mouseIn, ci1, 1);
+  uint32_t peer1_repaired = ble_hid_peer_id();
+  uint32_t seq1_repaired = ble_hid_pair_seq();
+  assert(peer1_repaired > 0 && peer1_repaired != peer1 && peer1_repaired != peer2);
+  assert(seq1_repaired > seq2);
+
+  // Adding a second phone without unpair also advances pair_seq and switches active peer.
+  active_peer_addr = 3;
+  actual_bonds[3] = our_bonds[3] = true;
+  NimBLEConnInfo ci3(1, 3);
+  mouseIn->cb->onSubscribe(mouseIn, ci3, 1);
+  uint32_t peer3 = ble_hid_peer_id();
+  uint32_t seq3 = ble_hid_pair_seq();
+  assert(peer3 > 0 && peer3 != peer1_repaired && seq3 > seq1_repaired);
+
+  // Legacy NVS bond migration (nb=1 without bids/pseq) assigns non-zero ids cleanly.
+  store.blobs.erase("bids");
+  store.blobs.erase("pseq");
+  store.saved_count = 1;
+  memset(bondIds, 0, sizeof bondIds);
+  pairSeq.store(0);
+  loadHidBondsFromStore();
+  assert(bondIds[0] > 0 && ble_hid_pair_seq() > 0);
+  puts("ok BLE NVS peer id and monotonic pair_seq invalidate re-paired devices");
+}
+
 int main(int argc, char **argv) {
   gate.begin();
   ble_hid_begin(NimBLEDevice::getServer());
@@ -266,6 +348,8 @@ int main(int argc, char **argv) {
   if (argc == 1 || strcmp(argv[1], "send") == 0) {
     test_synchronous_mbuf_release();
     test_buffer_recovery();
+    test_middle_button_mask();
+    test_peer_identity_and_repair_invalidation();
   }
   if (argc == 1 || strcmp(argv[1], "unpair") == 0) {
     test_unpair_with_advertising();

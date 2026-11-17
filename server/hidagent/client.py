@@ -34,6 +34,25 @@ class IPhoneClient:
     def status(self) -> dict:
         return self.request("GET", "/api/status").json()
 
+    def middle_click_home_status(self) -> dict:
+        return self.request("GET", "/api/control/middle-click-home").json()
+
+    def enable_middle_click_home(
+        self, screen_id: str, *, include_diff: bool = True, ocr_diff: bool = False
+    ) -> dict:
+        return self.request(
+            "POST",
+            "/api/control/middle-click-home/enable",
+            {"screen_id": screen_id, "include_diff": include_diff, "ocr_diff": ocr_diff},
+        ).json()
+
+    def revoke_middle_click_home(self, *, all_devices: bool = False) -> dict:
+        return self.request(
+            "POST",
+            "/api/control/middle-click-home/revoke",
+            {"all_devices": bool(all_devices)},
+        ).json()
+
     def capabilities(self) -> dict:
         return self.request("GET", "/api/control/capabilities").json()
 
