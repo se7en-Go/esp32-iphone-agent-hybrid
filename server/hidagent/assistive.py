@@ -90,6 +90,10 @@ def _same_view(before, after) -> bool:
     return max(ImageStat.Stat(ImageChops.difference(old_image, image)).mean) <= 2.0
 
 
+def _positive_u32(value) -> int | None:
+    return value if type(value) is int and 0 < value < 2**32 else None
+
+
 class AssistiveTouch:
     def __init__(self, phone, path: Path, *, position: Point | None = None,
                  layout: Mapping[str, Point] | None = None, find_text: FindText | None = None):
@@ -170,65 +174,146 @@ class AssistiveTouch:
     def _device_key(self) -> str:
         return (getattr(self.phone.device, "port_name", "") or "").strip()
 
-    def _verified_middle_click_devices(self) -> list[str]:
-        raw = self._saved.get("middle_click_home_devices")
-        if not isinstance(raw, list):
-            return []
-        seen: list[str] = []
-        for item in raw:
-            key = str(item).strip()
-            if key and key not in seen:
-                seen.append(key)
-        return seen
+    def _ble_pairing_facts(self) -> tuple[dict, dict, bool, int | None, int | None]:
+        hid = (getattr(self.phone.device, "board_status", None) or {}).get("hid")
+        hid = hid if isinstance(hid, dict) else {}
+        ble = hid.get("ble")
+        ble = ble if isinstance(ble, dict) else {}
+        has_peer_fields = "peer" in ble and "pair_seq" in ble
+        return hid, ble, has_peer_fields, _positive_u32(ble.get("peer")), _positive_u32(ble.get("pair_seq"))
+
+    def _verified_middle_click_bindings(self) -> dict[str, dict[str, int]]:
+        raw = self._saved.get("middle_click_home_bindings")
+        if not isinstance(raw, dict):
+            return {}
+        cleaned: dict[str, dict[str, int]] = {}
+        for key, entry in raw.items():
+            name = str(key).strip()
+            if not name or not isinstance(entry, Mapping):
+                continue
+            peer = _positive_u32(entry.get("peer"))
+            pair_seq = _positive_u32(entry.get("pair_seq"))
+            if peer is not None and pair_seq is not None:
+                cleaned[name] = {"peer": peer, "pair_seq": pair_seq}
+        return cleaned
+
+    def _sync_middle_click_binding(self) -> None:
+        """Drop legacy port-only records or bindings invalidated by firmware downgrade or BLE re-pairing."""
+        changed = False
+        for legacy in ("middle_click_home_devices", "middle_click_home_verified"):
+            if legacy in self._saved:
+                self._saved.pop(legacy, None)
+                changed = True
+        bindings = self._verified_middle_click_bindings()
+        raw = self._saved.get("middle_click_home_bindings")
+        if raw is not None and raw != bindings:
+            if bindings:
+                self._saved["middle_click_home_bindings"] = bindings
+            else:
+                self._saved.pop("middle_click_home_bindings", None)
+            changed = True
+        key = self._device_key()
+        hid, ble, has_peer_fields, peer, pair_seq = self._ble_pairing_facts()
+        if key in bindings and hid:
+            saved = bindings[key]
+            active_ble = ble.get("conn") == 1 or hid.get("path") == "ble"
+            invalid = (
+                hid.get("middle_click") != 1
+                or not has_peer_fields
+                or ble.get("bond") == 0
+                or ble.get("pair") == 1
+                or pair_seq != saved["pair_seq"]
+                or (active_ble and peer != saved["peer"])
+            )
+            if invalid:
+                bindings.pop(key, None)
+                if bindings:
+                    self._saved["middle_click_home_bindings"] = bindings
+                else:
+                    self._saved.pop("middle_click_home_bindings", None)
+                if self._saved.get("verified_route") == "middle-click":
+                    self._saved.pop("verified_route", None)
+                changed = True
+        if not bindings and self._saved.get("verified_route") == "middle-click":
+            self._saved.pop("verified_route", None)
+            changed = True
+        if changed:
+            try:
+                self._write_profile()
+            except OSError as exc:
+                log.warning("AssistiveTouch: 无法更新中键绑定状态：%s", exc)
 
     def _middle_click_supported_by_firmware(self) -> bool:
-        hid = (getattr(self.phone.device, "board_status", None) or {}).get("hid") or {}
-        return hid.get("path") == "ble" and hid.get("middle_click") == 1
+        hid, _, has_peer_fields, _, _ = self._ble_pairing_facts()
+        return hid.get("path") == "ble" and hid.get("middle_click") == 1 and has_peer_fields
 
     def _middle_click_verified_for_device(self) -> bool:
+        self._sync_middle_click_binding()
         key = self._device_key()
-        return bool(key) and key in self._verified_middle_click_devices()
+        if not key:
+            return False
+        saved = self._verified_middle_click_bindings().get(key)
+        if saved is None:
+            return False
+        hid, ble, has_peer_fields, peer, pair_seq = self._ble_pairing_facts()
+        if (not hid or not has_peer_fields or hid.get("middle_click") != 1
+                or hid.get("path") != "ble" or ble.get("conn") != 1
+                or ble.get("bond") != 1 or ble.get("pair") != 0):
+            return False
+        return peer == saved["peer"] and pair_seq == saved["pair_seq"]
 
     def _middle_click_home_enabled(self) -> bool:
-        """Enable mouse middle-button Home only for capable BLE firmware with a verified device mapping."""
+        """Enable mouse middle-button Home only when firmware, BLE peer id, and pairing generation all match."""
         return self._middle_click_supported_by_firmware() and self._middle_click_verified_for_device()
 
     def middle_click_home_status(self) -> dict:
-        hid = (getattr(self.phone.device, "board_status", None) or {}).get("hid") or {}
-        supported = hid.get("middle_click") == 1
-        ble_active = hid.get("path") == "ble"
+        self._sync_middle_click_binding()
+        hid, ble, has_peer_fields, peer, pair_seq = self._ble_pairing_facts()
+        supported = hid.get("middle_click") == 1 and has_peer_fields
+        ble_active = (
+            hid.get("path") == "ble"
+            and ble.get("conn") == 1
+            and ble.get("bond") == 1
+            and ble.get("pair") == 0
+        )
         device_key = self._device_key()
-        verified_devices = self._verified_middle_click_devices()
-        verified_for_device = bool(device_key) and device_key in verified_devices
+        bindings = self._verified_middle_click_bindings()
+        verified_for_device = bool(device_key) and device_key in bindings
         return {
             "supported_by_firmware": supported,
             "ble_active": ble_active,
             "device_key": device_key or None,
+            "ble_peer": peer,
+            "ble_pair_seq": pair_seq,
             "verified_for_device": verified_for_device,
-            "verified_devices_count": len(verified_devices),
-            "enabled": supported and ble_active and verified_for_device,
+            "verified_devices_count": len(bindings),
+            "enabled": supported and ble_active and self._middle_click_verified_for_device(),
             "command": "middleclick",
             "preferred_route": self._saved.get("verified_route"),
         }
 
     def set_middle_click_home_verified(self, verified: bool) -> None:
-        """Persist or clear verified middle-button Home support scoped strictly by device key."""
+        """Persist or clear verified middle-button Home scoped by serial port, BLE peer ID, and pair_seq."""
         key = self._device_key()
-        devices = set(self._verified_middle_click_devices())
-        self._saved.pop("middle_click_home_verified", None)
+        bindings = self._verified_middle_click_bindings()
+        for legacy in ("middle_click_home_devices", "middle_click_home_verified"):
+            self._saved.pop(legacy, None)
         if verified:
             if not key:
                 raise ValueError("当前设备没有可识别的串口设备标识，无法启用中键回主屏幕。")
-            devices.add(key)
-            self._saved["middle_click_home_devices"] = sorted(devices)
+            _, _, has_peer_fields, peer, pair_seq = self._ble_pairing_facts()
+            if not has_peer_fields or peer is None or pair_seq is None:
+                raise ValueError("当前蓝牙连接缺少对端绑定标识（peer/pair_seq），无法启用中键回主屏幕。")
+            bindings[key] = {"peer": peer, "pair_seq": pair_seq}
+            self._saved["middle_click_home_bindings"] = bindings
             self._saved["verified_route"] = "middle-click"
         else:
             if key:
-                devices.discard(key)
-            if devices:
-                self._saved["middle_click_home_devices"] = sorted(devices)
+                bindings.pop(key, None)
+            if bindings:
+                self._saved["middle_click_home_bindings"] = bindings
             else:
-                self._saved.pop("middle_click_home_devices", None)
+                self._saved.pop("middle_click_home_bindings", None)
             if self._saved.get("verified_route") == "middle-click":
                 self._saved.pop("verified_route", None)
         try:
@@ -238,9 +323,10 @@ class AssistiveTouch:
 
     def revoke_middle_click_home(self, *, all_devices: bool = False) -> dict:
         """Revoke verified middle-button Home for the current device or all devices."""
-        self._saved.pop("middle_click_home_verified", None)
+        for legacy in ("middle_click_home_devices", "middle_click_home_verified"):
+            self._saved.pop(legacy, None)
         if all_devices:
-            self._saved.pop("middle_click_home_devices", None)
+            self._saved.pop("middle_click_home_bindings", None)
             if self._saved.get("verified_route") == "middle-click":
                 self._saved.pop("verified_route", None)
             try:
@@ -260,50 +346,81 @@ class AssistiveTouch:
                 await res
 
     async def check_middle_click_enable_preconditions(self, frame: bytes) -> None:
-        """Verify device identity, firmware middle_click capability, BLE path, and open-app screen state."""
+        """Verify device identity, firmware capability, bonded BLE peer identity, and open-app screen state."""
         await self._refresh_board_status()
         if not self._device_key():
             raise ValueError("当前设备未报告稳定的设备标识（port_name 为空），不能启用中键回主屏幕。")
-        hid = (getattr(self.phone.device, "board_status", None) or {}).get("hid") or {}
-        if hid.get("middle_click") != 1:
-            raise ValueError("当前固件未声明支持独立中键命令（middle_click=1）；为防止旧固件误左键，拒绝启用。")
+        hid, ble, has_peer_fields, peer, pair_seq = self._ble_pairing_facts()
+        if hid.get("middle_click") != 1 or not has_peer_fields:
+            raise ValueError(
+                "当前固件未声明支持独立中键命令及绑定标识（middle_click=1）；为防止旧固件误左键，拒绝启用。"
+            )
         if hid.get("path") != "ble":
             raise ValueError("当前控制链路不是蓝牙 HID（path!=ble），iOS 辅助触控设备映射仅对蓝牙生效。")
+        if ble.get("bond") != 1 or ble.get("conn") != 1 or ble.get("pair") != 0 or peer is None or pair_seq is None:
+            raise ValueError("当前蓝牙 HID 未处于已绑定稳定连接状态（或配对窗口尚未关闭），不能启用中键回主屏幕。")
         if assistive_vision.is_home_visible(frame):
             raise ValueError("当前已在主屏幕；请先打开备忘录等普通 App 且关闭辅助触控菜单后再验证启用。")
         if assistive_vision.find_panel(frame) is not None:
             raise ValueError("辅助触控菜单当前已打开；请先关闭菜单后再验证中键回主屏幕。")
 
     async def _confirm_home_after_send(
-        self, epoch: int, since: float, expected_device, expected_generation: int | None
+        self,
+        epoch: int,
+        since: float,
+        expected_device,
+        expected_generation: int | None,
+        *,
+        link: int | None = None,
     ) -> bool:
-        verified = await self._wait(
-            epoch, since, RESULT_WAIT, assistive_vision.is_home_visible, stable=True
-        )
-        if verified or fresh_frame(self.phone.screen, clock=self._clock, since=since) is not None:
-            return bool(verified)
-        candidate = snapshot(self.phone.screen)
-        ensure_obs = getattr(self.phone, "ensure_observation", None)
-        if ensure_obs is None or not candidate.frame or not assistive_vision.is_home_visible(candidate.frame):
-            return False
+        expected_link = getattr(expected_device, "links", 0) if link is None else link
+        arrived = assistive_vision.is_home_visible
+        verified = await self._wait(epoch, since, RESULT_WAIT, arrived, stable=True)
+        refreshed = False
+        if not verified and fresh_frame(self.phone.screen, clock=self._clock, since=since) is None:
+            candidate = snapshot(self.phone.screen)
+            ensure_obs = getattr(self.phone, "ensure_observation", None)
+            if ensure_obs is not None and candidate.frame and arrived(candidate.frame):
+                def home_candidate():
+                    self.phone._check_operation()
+                    self._check(epoch)
+                    if self.phone.device is not expected_device:
+                        raise DeviceError("返回主屏幕期间设备连接已变化，未继续操作；请重新观察。")
+                    # Only wake admission may use an old receipt. A new source
+                    # frame must still satisfy the original click's causal gate.
+                    current = require_fresh(self.phone.screen, clock=self._clock, max_age=float("inf"))
+                    if expected_generation is not None and current.generation != expected_generation:
+                        raise RuntimeError("返回主屏幕期间画面连接已变化，请重新观察。")
+                    if not arrived(current.frame):
+                        raise RuntimeError("等待主屏幕新画面时页面已变化，未继续唤醒；请重新观察。")
 
-        def home_candidate():
-            self.phone._check_operation()
-            self._check(epoch)
-            if self.phone.device is not expected_device:
-                raise DeviceError("返回主屏幕期间设备连接已变化，未继续操作；请重新观察。")
-            current = require_fresh(self.phone.screen, clock=self._clock, max_age=float("inf"))
-            if expected_generation is not None and current.generation != expected_generation:
-                raise RuntimeError("返回主屏幕期间画面连接已变化，请重新观察。")
-            if not assistive_vision.is_home_visible(current.frame):
-                raise RuntimeError("等待主屏幕新画面时页面已变化，未继续唤醒；请重新观察。")
+                # An early Home frame can arrive inside the mirror allowance
+                # and then stop updating. Reacquire once; never click it again.
+                refreshed = True
+                await ensure_obs(before_refresh=home_candidate)
+                home_candidate()
+                verified = await self._wait(epoch, since, RESULT_WAIT, arrived, stable=True)
+                home_candidate()
+        if not verified and not refreshed:
+            def same_confirmation():
+                self.phone._check_operation()
+                self._check(epoch)
+                if (self.phone.device is not expected_device
+                        or getattr(expected_device, "links", 0) != expected_link
+                        or getattr(expected_device, "abort_epoch", 0) != epoch):
+                    raise DeviceError("等待主屏幕结果期间设备连接已变化，未确认返回；请重新观察。")
+                current = snapshot(self.phone.screen)
+                if (not current.live
+                        or (expected_generation is not None and current.generation != expected_generation)):
+                    raise RuntimeError("等待主屏幕结果期间画面连接已变化，未确认返回；请重新观察。")
 
-        await ensure_obs(before_refresh=home_candidate)
-        home_candidate()
-        verified = await self._wait(
-            epoch, since, RESULT_WAIT, assistive_vision.is_home_visible, stable=True
-        )
-        home_candidate()
+            same_confirmation()
+            # A late transition may arrive after the first window. Observe once
+            # more within the original budget, without another click or wake.
+            budget = min(LATE_HOME_WAIT, remaining_operation_time() - .05)
+            if budget >= STABLE_QUIET + .05:
+                verified = await self._wait(epoch, since, budget, arrived, stable=True)
+                same_confirmation()
         return bool(verified)
 
     async def verify_and_enable_middle_click_home(self, *, observation=None, before_write=None) -> float:
@@ -328,13 +445,17 @@ class AssistiveTouch:
             raise ValueError("当前已在主屏幕；请先打开备忘录等普通 App 且关闭辅助触控菜单后再验证启用。")
         if assistive_vision.find_panel(current.frame) is not None:
             raise ValueError("辅助触控菜单当前已打开；请先关闭菜单后再验证中键回主屏幕。")
+        _, _, _, expected_peer, expected_pair_seq = self._ble_pairing_facts()
 
         def write_guard():
             if before_write is not None:
                 before_write()
             self._require_frame()
-            if not self._middle_click_supported_by_firmware():
-                raise ValueError("写入前固件中键能力或蓝牙状态已失效，未发送命令。")
+            _, ble, _, peer_now, seq_now = self._ble_pairing_facts()
+            if (not self._middle_click_supported_by_firmware()
+                    or ble.get("conn") != 1 or ble.get("bond") != 1 or ble.get("pair") != 0
+                    or peer_now != expected_peer or seq_now != expected_pair_seq):
+                raise ValueError("写入前固件中键能力或蓝牙绑定状态已变化，未发送命令。")
 
         since = time.time()
         try:
@@ -351,6 +472,13 @@ class AssistiveTouch:
                 "已发送 middleclick，但动作后新画面未确认返回主屏幕；已拒绝启用。"
                 "请检查 iPhone「设置 → 辅助功能 → 触控 → 辅助触控 → 设备 → 按钮 3」是否已绑定「主屏幕」。"
             )
+        await self._refresh_board_status()
+        _, ble_after, _, peer_after, seq_after = self._ble_pairing_facts()
+        if (not self._middle_click_supported_by_firmware()
+                or ble_after.get("conn") != 1 or ble_after.get("bond") != 1 or ble_after.get("pair") != 0
+                or peer_after != expected_peer or seq_after != expected_pair_seq):
+            self.revoke_middle_click_home()
+            raise RuntimeError("验证期间蓝牙绑定状态已变化，未启用中键回主屏幕；请重新观察并验证。")
         self.set_middle_click_home_verified(True)
         return since
 
@@ -514,51 +642,9 @@ class AssistiveTouch:
                                      before_click=before_click, navigation_context=context)
         contact_input_at = getattr(device, "last_input_at", None)
 
-        arrived = assistive_vision.is_home_visible
-        verified = await self._wait(epoch, since, RESULT_WAIT, arrived, stable=True)
-        refreshed = False
-        if not verified and fresh_frame(self.phone.screen, clock=self._clock, since=since) is None:
-            candidate = snapshot(self.phone.screen)
-            ensure = getattr(self.phone, "ensure_observation", None)
-            if ensure is not None and candidate.frame and arrived(candidate.frame):
-                def home_candidate():
-                    self.phone._check_operation()
-                    self._check(epoch)
-                    if self.phone.device is not device:
-                        raise DeviceError("返回主屏幕期间设备连接已变化，未继续操作；请重新观察。")
-                    # Only wake admission may use an old receipt. A new source
-                    # frame must still satisfy the original click's causal gate.
-                    current = require_fresh(self.phone.screen, clock=self._clock, max_age=float("inf"))
-                    if current.generation != observation.generation:
-                        raise RuntimeError("返回主屏幕期间画面连接已变化，请重新观察。")
-                    if not arrived(current.frame):
-                        raise RuntimeError("等待主屏幕新画面时页面已变化，未继续唤醒；请重新观察。")
-
-                # An early Home frame can arrive inside the mirror allowance
-                # and then stop updating. Reacquire once; never click it again.
-                refreshed = True
-                await ensure(before_refresh=home_candidate)
-                home_candidate()
-                verified = await self._wait(epoch, since, RESULT_WAIT, arrived, stable=True)
-                home_candidate()
-        if not verified and not refreshed:
-            def same_confirmation():
-                self.phone._check_operation()
-                self._check(epoch)
-                if (self.phone.device is not device or getattr(device, "links", 0) != link
-                        or getattr(device, "abort_epoch", 0) != epoch):
-                    raise DeviceError("等待主屏幕结果期间设备连接已变化，未确认返回；请重新观察。")
-                current = snapshot(self.phone.screen)
-                if not current.live or current.generation != observation.generation:
-                    raise RuntimeError("等待主屏幕结果期间画面连接已变化，未确认返回；请重新观察。")
-
-            same_confirmation()
-            # A late transition may arrive after the first window. Observe once
-            # more within the original budget, without another click or wake.
-            budget = min(LATE_HOME_WAIT, remaining_operation_time() - .05)
-            if budget >= STABLE_QUIET + .05:
-                verified = await self._wait(epoch, since, budget, arrived, stable=True)
-                same_confirmation()
+        verified = await self._confirm_home_after_send(
+            epoch, since, device, observation.generation, link=link
+        )
         if verified:
             log.info("go_home: AssistiveTouch 主屏幕已确认：菜单消失、图标网格及 Dock 可见")
             return True
@@ -615,6 +701,9 @@ class AssistiveTouch:
                 self._set_verified_route("assistive-touch")
                 return
             raise RuntimeError("辅助触控菜单已打开，但未确认主屏幕图标或返回结果；请重新观察。")
+        if self._device_key() and self._device_key() in self._verified_middle_click_bindings():
+            await self._refresh_board_status()
+            self._check(epoch)
         middle_enabled = self._middle_click_home_enabled()
         routes = (["middle-click"] if middle_enabled else []) + ["assistive-touch", "swipe-up", "homescreen", "cmd+h"]
         preferred = self._saved.get("verified_route")
@@ -667,6 +756,13 @@ class AssistiveTouch:
                 if route == "swipe-up":
                     await self.phone.swipe(0.5, 0.995, 0.5, 0.6, hold=False,
                                            before_action=self._require_frame)
+                elif route == "middle-click":
+                    def middle_write_guard():
+                        self._require_frame()
+                        if not self._middle_click_home_enabled():
+                            raise DeviceError("蓝牙绑定或固件状态已变化，中键回主屏幕已失效；请重新验证。")
+
+                    await self.phone._send(epoch, command_routes[route], before_write=middle_write_guard)
                 else:
                     await self.phone._send(epoch, command_routes[route],
                                            before_write=self._require_frame)

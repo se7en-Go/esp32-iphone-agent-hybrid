@@ -808,7 +808,8 @@ class MiddleClickRevokeBody(BaseModel):
 
 
 @app.get("/api/control/middle-click-home")
-def middle_click_home_status():
+async def middle_click_home_status():
+    await controls.phone.assistive_touch._refresh_board_status()
     return controls.middle_click_home_status()
 
 

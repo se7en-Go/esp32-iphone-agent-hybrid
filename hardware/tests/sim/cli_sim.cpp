@@ -188,6 +188,8 @@ static hid_link_t simFacts() {
   }
   link.ble_advertising = 1;
   link.ble_pairing = simPair;
+  link.ble_peer = link.ble_connected ? 1 : 0;
+  link.ble_pair_seq = link.ble_bonded ? 1 : (simUnpaired ? 2 : 0);
   return link;
 }
 
@@ -323,12 +325,12 @@ int main(int argc, char **argv) {
     }
     if (now - lastStatus >= 1000) {
       lastStatus = now;
-      char s[480];
+      char s[560];
       const char *ap = ap_state ? ap_state : (aus.empty() ? "idle" : "streaming");
       hid_link_t facts = simFacts();
       int pref = loadPref();
       int path = hid_select(pref, &facts);
-      char frag[180];
+      char frag[224];
       hid_status_fragment(frag, sizeof frag, pref, path, &facts);
       int n = snprintf(s, sizeof s,
                        "{\"fw\":\"0.2.1\",\"up\":%u,\"usb\":\"ok\",\"net\":\"ap\",\"ap\":\"%s\",\"w\":480,\"h\":1040,\"fz\":%d,%s}",

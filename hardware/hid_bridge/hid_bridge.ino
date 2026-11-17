@@ -68,6 +68,8 @@ static hid_link_t hidFacts() {
   link.ble_bonded = ble_hid_bonded() ? 1 : 0;
   link.ble_advertising = ble_app_advertising() ? 1 : 0;
   link.ble_pairing = ble_hid_pair_window_open() ? 1 : 0;
+  link.ble_peer = ble_hid_peer_id();
+  link.ble_pair_seq = ble_hid_pair_seq();
   return link;
 }
 
@@ -706,7 +708,7 @@ String statusJson(bool full, char who) {
     snprintf(s + len - 1, sizeof s - len + 1, ",\"busy\":%d}", app);
   }
   {
-    char frag[180];
+    char frag[224];
     hid_link_t facts = hidFacts();
     int prefNow = ble_hid_pref();
     int path = selectHidPath(prefNow, facts);

@@ -36,6 +36,8 @@ void tud_remote_wakeup() { wakeups++; usbSuspended = false; }
 bool ble_hid_connected() { return bleConnected; }
 bool ble_hid_session_active() { return bleSession; }
 bool ble_hid_bonded() { return bleConnected; }
+uint32_t ble_hid_peer_id() { return bleConnected ? 1 : 0; }
+uint32_t ble_hid_pair_seq() { return 1; }
 bool ble_app_advertising() { return true; }
 bool ble_hid_pair_window_open() { return false; }
 int ble_hid_pref() { return pref; }

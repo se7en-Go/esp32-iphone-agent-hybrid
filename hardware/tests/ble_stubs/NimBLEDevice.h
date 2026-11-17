@@ -12,12 +12,13 @@ class NimBLEAddress {
 };
 class NimBLEConnInfo {
   uint16_t handle_;
+  uint8_t peer_id_;
  public:
-  explicit NimBLEConnInfo(uint16_t handle) : handle_(handle) {}
+  explicit NimBLEConnInfo(uint16_t handle, uint8_t peer_id = 0) : handle_(handle), peer_id_(peer_id) {}
   uint16_t getConnHandle() { return handle_; }
   bool isEncrypted() { return true; }
   NimBLEAddress getIdAddress() {
-    uint8_t val[6] = {0, 0, 0, 0, 0, (uint8_t)handle_};
+    uint8_t val[6] = {0, 0, 0, 0, 0, peer_id_ ? peer_id_ : (uint8_t)handle_};
     return NimBLEAddress(val, 0);
   }
 };

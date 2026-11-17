@@ -32,18 +32,76 @@ class MiddleHomeMirror(Mirror):
         firmware_middle_click=True,
         legacy_firmware_left_clicks_on_arg=False,
         port_name="/dev/cu.usbserial-TESTA",
+        peer_id=1,
+        pair_seq=1,
+        bonded=True,
+        pairing=False,
     ):
         super().__init__()
         self.middle_goes_home = middle_goes_home
         self.legacy_firmware_left_clicks_on_arg = legacy_firmware_left_clicks_on_arg
         self.unpositioned_left_clicks = 0
         self.port_name = port_name
-        hid = {"path": "ble" if ble else "usb", "pace": 4}
+        self._firmware_middle_click = firmware_middle_click
+        self._live_hid = self._make_hid_status(
+            ble=ble,
+            firmware_middle_click=firmware_middle_click,
+            peer_id=peer_id,
+            pair_seq=pair_seq,
+            bonded=bonded,
+            pairing=pairing,
+        )
+        self.board_status = {"hid": dict(self._live_hid, ble=dict(self._live_hid.get("ble", {})))}
+
+    @staticmethod
+    def _make_hid_status(
+        *,
+        ble: bool,
+        firmware_middle_click: bool,
+        peer_id: int,
+        pair_seq: int,
+        bonded: bool,
+        pairing: bool,
+    ) -> dict:
+        hid: dict = {"path": "ble" if ble else "usb", "pace": 4}
         if firmware_middle_click:
             hid["middle_click"] = 1
-        self.board_status = {"hid": hid}
+            hid["ble"] = {
+                "adv": 0,
+                "conn": 1 if ble else 0,
+                "bond": 1 if (ble or bonded) else 0,
+                "pair": 1 if pairing else 0,
+                "peer": peer_id if ble else 0,
+                "pair_seq": pair_seq,
+            }
+        return hid
+
+    def set_live_ble_state(
+        self,
+        *,
+        ble=True,
+        peer_id=1,
+        pair_seq=1,
+        bonded=True,
+        pairing=False,
+        middle_goes_home=None,
+        refresh_immediately=False,
+    ) -> None:
+        if middle_goes_home is not None:
+            self.middle_goes_home = middle_goes_home
+        self._live_hid = self._make_hid_status(
+            ble=ble,
+            firmware_middle_click=self._firmware_middle_click,
+            peer_id=peer_id,
+            pair_seq=pair_seq,
+            bonded=bonded,
+            pairing=pairing,
+        )
+        if refresh_immediately:
+            self.board_status = {"hid": dict(self._live_hid, ble=dict(self._live_hid.get("ble", {})))}
 
     async def refresh_hid_status(self):
+        self.board_status = {"hid": dict(self._live_hid, ble=dict(self._live_hid.get("ble", {})))}
         return None
 
     async def send(self, command):
@@ -74,9 +132,15 @@ def test_old_firmware_never_emits_left_click_or_allows_enable(tmp_path):
         legacy_firmware_left_clicks_on_arg=True,
         port_name="/dev/cu.wchusbserialOLD",
     )
-    # Even if an earlier profile persisted this port, lacking firmware capability disables it.
+    # Even if an earlier profile persisted this port, lacking firmware capability disables and clears it.
     (tmp_path / "calibration.assistive-touch.json").write_text(
-        json.dumps({"middle_click_home_devices": [mirror.port_name], "verified_route": "middle-click"}),
+        json.dumps(
+            {
+                "middle_click_home_devices": [mirror.port_name],
+                "middle_click_home_bindings": {mirror.port_name: {"peer": 1, "pair_seq": 1}},
+                "verified_route": "middle-click",
+            }
+        ),
         encoding="utf-8",
     )
     phone = make_phone(tmp_path, mirror)
@@ -107,7 +171,12 @@ def test_old_firmware_protocol_rejects_middleclick_with_zero_left_clicks_even_if
         port_name="/dev/cu.wchusbserialSTALE",
     )
     (tmp_path / "calibration.assistive-touch.json").write_text(
-        json.dumps({"middle_click_home_devices": [mirror.port_name], "verified_route": "middle-click"}),
+        json.dumps(
+            {
+                "middle_click_home_bindings": {mirror.port_name: {"peer": 1, "pair_seq": 1}},
+                "verified_route": "middle-click",
+            }
+        ),
         encoding="utf-8",
     )
     phone = make_phone(tmp_path, mirror)
@@ -181,7 +250,7 @@ def test_unverified_mapping_refuses_enable_and_never_uses_middle_click(tmp_path)
     assert mirror.sent == ["middleclick"]
     assert phone.assistive_touch.middle_click_home_status()["enabled"] is False
     profile = json.loads((tmp_path / "calibration.assistive-touch.json").read_text(encoding="utf-8"))
-    assert mirror.port_name not in (profile.get("middle_click_home_devices") or [])
+    assert mirror.port_name not in (profile.get("middle_click_home_bindings") or {})
 
     # Subsequent go_home still falls back safely to AssistiveTouch.
     mirror.show(frame())
@@ -315,3 +384,143 @@ def test_already_open_menu_clicks_visible_home_and_skips_middle_click(tmp_path):
 
     assert "middleclick" not in mirror.sent
     assert mirror.sent.count("click") == 1
+
+
+def test_same_esp32_same_port_repaired_to_another_iphone_invalidates_middle_click(tmp_path):
+    """Re-pairing the same ESP32 on the same serial port invalidates old verification and skips middleclick."""
+    port = "/dev/cu.usbserial-SAME-ESP32"
+    mirror = MiddleHomeMirror(
+        middle_goes_home=True,
+        ble=True,
+        firmware_middle_click=True,
+        port_name=port,
+        peer_id=1,
+        pair_seq=1,
+    )
+    phone = make_phone(tmp_path, mirror)
+    asyncio.run(phone.assistive_touch.verify_and_enable_middle_click_home())
+    st1 = phone.assistive_touch.middle_click_home_status()
+    assert st1["enabled"] is True
+    assert st1["ble_peer"] == 1
+    assert st1["ble_pair_seq"] == 1
+
+    # Confirm iPhone A uses middleclick normally.
+    mirror.show(frame())
+    mirror.sent.clear()
+    asyncio.run(phone.go_home())
+    assert mirror.sent == ["middleclick"]
+
+    # Case 1 (running worker / stale cached board_status):
+    # Same ESP32 on same port unpairs iPhone A and pairs iPhone B (middle button unbound).
+    # Even if board_status still holds iPhone A until go_home's refresh_hid_status(), go_home must
+    # invalidate the binding and emit zero middleclick commands.
+    mirror.set_live_ble_state(
+        ble=True,
+        peer_id=2,
+        pair_seq=3,
+        bonded=True,
+        pairing=False,
+        middle_goes_home=False,
+        refresh_immediately=False,
+    )
+    mirror.show(frame())
+    mirror.sent.clear()
+    mirror.clicks.clear()
+    asyncio.run(phone.go_home())
+    assert "middleclick" not in mirror.sent
+    assert mirror.sent.count("click") == 2
+
+    st2 = phone.assistive_touch.middle_click_home_status()
+    assert st2["verified_for_device"] is False
+    assert st2["enabled"] is False
+    assert st2["preferred_route"] == "assistive-touch"
+    saved = json.loads((tmp_path / "calibration.assistive-touch.json").read_text(encoding="utf-8"))
+    assert port not in (saved.get("middle_click_home_bindings") or {})
+
+    # Re-verify iPhone B after binding its Button 3 -> Home, then test Case 2 (offline worker restart):
+    mirror.middle_goes_home = True
+    mirror.show(frame())
+    asyncio.run(phone.assistive_touch.verify_and_enable_middle_click_home())
+    assert phone.assistive_touch.middle_click_home_status()["enabled"] is True
+
+    # Simulate worker restarting after same-port unpair+pair to iPhone C (or additional bond without unpair).
+    mirror_c = MiddleHomeMirror(
+        middle_goes_home=False,
+        ble=True,
+        firmware_middle_click=True,
+        port_name=port,
+        peer_id=3,
+        pair_seq=4,
+    )
+    phone_c = make_phone(tmp_path, mirror_c)
+    st3 = phone_c.assistive_touch.middle_click_home_status()
+    assert st3["verified_for_device"] is False
+    assert st3["enabled"] is False
+
+    mirror_c.sent.clear()
+    asyncio.run(phone_c.go_home())
+    assert "middleclick" not in mirror_c.sent
+    assert mirror_c.sent.count("click") == 2
+    saved_after = json.loads((tmp_path / "calibration.assistive-touch.json").read_text(encoding="utf-8"))
+    assert port not in (saved_after.get("middle_click_home_bindings") or {})
+    assert saved_after.get("verified_route") != "middle-click"
+
+
+def test_same_iphone_temporary_ble_disconnect_preserves_binding_until_reconnect(tmp_path):
+    """Temporary BLE link loss pauses middle-click while disconnected; unpair or pair window erases it."""
+    port = "/dev/cu.usbserial-RECONN"
+    mirror = MiddleHomeMirror(
+        middle_goes_home=True,
+        ble=True,
+        firmware_middle_click=True,
+        port_name=port,
+        peer_id=5,
+        pair_seq=7,
+    )
+    phone = make_phone(tmp_path, mirror)
+    asyncio.run(phone.assistive_touch.verify_and_enable_middle_click_home())
+    assert phone.assistive_touch.middle_click_home_status()["enabled"] is True
+
+    # Temporary disconnect of same bonded iPhone (conn=0, bond=1, pair=0, pair_seq=7).
+    mirror.set_live_ble_state(
+        ble=False, peer_id=0, pair_seq=7, bonded=True, pairing=False, refresh_immediately=True
+    )
+    disc = phone.assistive_touch.middle_click_home_status()
+    assert disc["ble_active"] is False
+    assert disc["verified_for_device"] is True
+    assert disc["enabled"] is False
+
+    # Same bonded iPhone reconnects cleanly.
+    mirror.set_live_ble_state(
+        ble=True, peer_id=5, pair_seq=7, bonded=True, pairing=False, refresh_immediately=True
+    )
+    reconn = phone.assistive_touch.middle_click_home_status()
+    assert reconn["enabled"] is True
+
+    # Opening pairing window (`pair=1`) invalidates existing verified middle-click binding immediately.
+    mirror.set_live_ble_state(
+        ble=True, peer_id=5, pair_seq=7, bonded=True, pairing=True, refresh_immediately=True
+    )
+    pairing_status = phone.assistive_touch.middle_click_home_status()
+    assert pairing_status["verified_for_device"] is False
+    assert pairing_status["enabled"] is False
+
+
+def test_enable_confirms_late_settled_home_frame(tmp_path):
+    """If Home finishes settling slightly past RESULT_WAIT (3.0s), enable confirms within LATE_HOME_WAIT."""
+    mirror = MiddleHomeMirror(
+        middle_goes_home=True,
+        ble=True,
+        firmware_middle_click=True,
+        port_name="/dev/cu.usbserial-LATE",
+        peer_id=2,
+        pair_seq=2,
+    )
+    mirror.delay = 3.2
+    phone = make_phone(tmp_path, mirror)
+
+    asyncio.run(phone.assistive_touch.verify_and_enable_middle_click_home())
+
+    status = phone.assistive_touch.middle_click_home_status()
+    assert status["enabled"] is True
+    assert mirror.sent == ["middleclick"]

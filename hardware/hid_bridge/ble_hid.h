@@ -14,6 +14,8 @@ bool ble_hid_connected(); // encrypted and subscribed to an input report
 bool ble_hid_session_active(); // owning ACL still exists, even while reports are unavailable
 bool ble_hid_using(uint16_t handle); // this connection is the one holding an input subscription
 bool ble_hid_bonded();    // a HID bond is stored
+uint32_t ble_hid_peer_id(); // non-zero opaque NVS id of the currently active bonded HID peer
+uint32_t ble_hid_pair_seq(); // monotonic NVS pairing/unpair generation counter
 bool ble_hid_pair_window_open();
 void ble_hid_allow_pairing(uint32_t window_ms);
 void ble_hid_deny_pairing();
