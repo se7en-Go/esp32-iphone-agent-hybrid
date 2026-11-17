@@ -8,6 +8,7 @@ import pytest
 pytest.importorskip("mcp")
 
 from hidagent import mcp as module  # noqa: E402
+from hidagent.client import IPhoneClient  # noqa: E402
 
 
 @pytest.mark.parametrize("region", [None, [.1, .2, .9, .8]])
@@ -15,7 +16,7 @@ def test_ocr_tools_forward_queries_and_preserve_image_and_diff(monkeypatch, regi
     calls = []
     scope = {"region": region} if region is not None else {}
 
-    class Client:
+    class Client(IPhoneClient):
         def __init__(self, *_):
             pass
 

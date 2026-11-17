@@ -90,6 +90,45 @@ def test_send_without_board_fails_fast():
         asyncio.run(Device().send("ping"))
 
 
+def test_status_clock_sample_is_bounded_by_serial_exchange_and_cleared_on_reconnect():
+    async def scenario():
+        device = Device()
+        link = MemoryLink()
+        device.attach(link)
+        pending = asyncio.create_task(device.refresh_hid_status())
+        before_write = time.monotonic()
+        assert await link.commands.get() == b"0 status\n"
+        before_reply = time.monotonic()
+        link.replies.put_nowait(b'0 {"up":4912,"hid":{"pace":4}}\n')
+        await pending
+
+        uptime, sent, received = device.board_clock_sample
+        assert uptime == 4912
+        assert before_write <= sent <= before_reply <= received <= time.monotonic()
+        device.attach(MemoryLink())
+        assert device.board_clock_sample is None
+        assert device.board_status == {}
+        device.close()
+
+    asyncio.run(scenario())
+
+
+def test_missing_hid_transport_does_not_look_like_a_switch_to_usb():
+    async def scenario():
+        device = Device()
+        link = MemoryLink()
+        device.attach(link)
+        for path, reported, expected in (("ble", 4, 4), ("none", 3, 4), ("usb", 3, 3)):
+            pending = asyncio.create_task(device.refresh_hid_status())
+            assert await link.commands.get() == b"0 status\n"
+            link.replies.put_nowait(f'0 {{"hid":{{"path":"{path}","pace":{reported}}}}}\n'.encode())
+            await pending
+            assert device.pace_version == expected
+        device.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("method", ["wait_connected", "keep_awake"])
 def test_device_exposes_connection_lifecycle_methods(method):
     assert callable(getattr(Device(), method, None)), f"Device.{method} is missing"
@@ -460,7 +499,7 @@ def test_stop_during_netinfo_leaves_maintain_alive_and_it_reconnects():
 class FakeSerial:
     """打开时吐一行启动日志，前几次 ping 不答，模拟克隆板一开串口就复位。"""
 
-    def __init__(self, replies_after: int = 3):
+    def __init__(self, replies_after: int = 3, *, read_delay: float = .01):
         self.port = ""
         self.baudrate = 115200
         self.timeout = 0.2
@@ -470,6 +509,7 @@ class FakeSerial:
         self.opens = 0
         self.pings = 0
         self.replies_after = replies_after
+        self.read_delay = read_delay
         self._buf = bytearray()
         self._lock = threading.Lock()
 
@@ -492,8 +532,16 @@ class FakeSerial:
     def flush(self) -> None:
         return None
 
+    @property
+    def in_waiting(self) -> int:
+        # Match pyserial: buffered boot logs/ACKs can be drained in one read.
+        # Without this, SerialLink's idle fallback incurs one scheduling delay
+        # per byte and can exhaust the handshake window on a loaded runner.
+        with self._lock:
+            return len(self._buf)
+
     def read(self, size: int) -> bytes:
-        time.sleep(0.01)
+        time.sleep(self.read_delay)
         with self._lock:
             if not self._buf:
                 return b""
@@ -502,8 +550,9 @@ class FakeSerial:
             return chunk
 
 
-def test_ping_stays_on_one_handle_and_skips_the_boot_log():
-    fake = FakeSerial(replies_after=3)
+@pytest.mark.parametrize("read_delay", [.01, .07])
+def test_ping_stays_on_one_handle_and_skips_the_boot_log(read_delay):
+    fake = FakeSerial(replies_after=3, read_delay=read_delay)
 
     async def scenario():
         opened = open_serial("COM9", impl=fake)

@@ -14,7 +14,7 @@ from hidagent.app import ControlAction
 from hidagent.control import Controls
 from hidagent.device import Device
 from hidagent.freshness import snapshot
-from hidagent.phone import Phone
+from hidagent.phone import Phone, TypingVerificationError
 from hidagent.screen import Screen
 
 
@@ -55,8 +55,8 @@ def test_chunk_ack_preserves_original_screen_context(tmp_path, monkeypatch, call
         else:
             controls = Controls(phone, screen)
 
-            async def respond(_before, _completed, _began, _ready, acknowledged, error, *_args):
-                return {"command_acknowledged": acknowledged, "error": error}
+            async def respond(_before, _completed, _began, _ready, acknowledged, error, extra, *_args):
+                return {"command_acknowledged": acknowledged, "error": error, **extra}
 
             monkeypatch.setattr(controls, "_respond", respond)
             operation = controls.perform(ControlAction(
@@ -69,12 +69,15 @@ def test_chunk_ack_preserves_original_screen_context(tmp_path, monkeypatch, call
             link.allow_ack.set()
             allowed = replacement == "field_only" and focused
             if caller == "agent" and not allowed:
-                with pytest.raises(ValueError, match="changed"):
+                with pytest.raises(TypingVerificationError, match="changed"):
                     await task
             else:
                 result = await task
                 if caller == "controls":
-                    assert result["command_acknowledged"] is allowed
+                    assert result["command_acknowledged"] is True  # the first type did receive its ACK
+                    assert bool(result["error"]) is not allowed
+                    if not allowed:
+                        assert result["requires_verification"] and not result["input_verified"]
             assert len(link.written) == (2 if allowed else 1)
         finally:
             if not task.done():

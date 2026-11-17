@@ -103,6 +103,11 @@ def make_phone(tmp_path, mirror, **kwargs):
     phone.span = {"w": 360, "h": 780}
     for samples in phone._seen.values():
         samples.extend([(0., 0.), (.5, .5), (.99, .99)])
+    async def measured_pointer(near, **kwargs):
+        # These fixtures exercise navigation routes/effects; scoped navigation
+        # now requires measured localization, covered separately by pixel tests.
+        return near
+    phone._find_pointer = measured_pointer
     return phone
 
 
@@ -110,10 +115,10 @@ def test_go_home_opens_assistive_touch_then_taps_home(tmp_path, monkeypatch):
     mirror = Mirror()
     phone = make_phone(tmp_path, mirror)
 
-    async def pointer_unavailable(*args, **kwargs):
-        return None  # guarded blind targets work with exact measured fake calibration
+    async def measured_pointer(near, **kwargs):
+        return near
 
-    monkeypatch.setattr(phone, "_find_pointer", pointer_unavailable)
+    monkeypatch.setattr(phone, "_find_pointer", measured_pointer)
 
     asyncio.run(phone.go_home())
 
@@ -122,6 +127,169 @@ def test_go_home_opens_assistive_touch_then_taps_home(tmp_path, monkeypatch):
     assert mirror.frame == frame(home=True)
     assert mirror.clicks[0] == pytest.approx((333, 598), abs=3)
     assert mirror.clicks[1] == pytest.approx((180, 458), abs=3)
+
+
+@pytest.mark.parametrize("target", ["menu", "bubble"])
+@pytest.mark.parametrize("transition", ["after_selection", "inside_tap"])
+def test_home_target_never_reanchors_on_reconnected_identical_screen(tmp_path, monkeypatch, target, transition):
+    from types import SimpleNamespace
+
+    async def scenario():
+        screen = Screen()
+        screen._on_ready()
+        screen._on_jpeg(frame(menu=target == "menu"))
+        selected = screen.frame
+        commands = []
+
+        async def send(command):
+            commands.append(command)
+
+        phone = Phone(SimpleNamespace(links=1, abort_epoch=0, send=send), tmp_path / "cal.json", screen)
+        home = phone.assistive_touch
+        home._generation = screen.generation
+
+        def reconnect():
+            screen._on_ready()
+            screen._on_jpeg(selected)
+
+        async def measured_pointer(x, y, **kwargs):
+            phone._pointer_confirmed = True
+            return x, y
+
+        async def unchanged_effect(*_args):
+            return False, True
+
+        phone.point_verified = measured_pointer
+        phone._tap_effect = unchanged_effect
+        if transition == "inside_tap":
+            original = phone.ensure_observation
+
+            async def reanchor():
+                reconnect()
+                return await original()
+
+            phone.ensure_observation = reanchor
+        elif target == "menu":
+            reconnect()
+        else:
+            original = assistive_vision.find_button_target
+
+            def select_then_reconnect(*args, **kwargs):
+                detected = original(*args, **kwargs)
+                reconnect()
+                return detected
+
+            monkeypatch.setattr(assistive_vision, "find_button_target", select_then_reconnect)
+        with pytest.raises(RuntimeError, match="画面连接已变化"):
+            if target == "menu":
+                await home._menu_home(0, selected, assistive_vision.find_panel(selected))
+            else:
+                await home._assistive_home(0)
+        assert "click" not in commands and "press" not in commands
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("menu", [False, True])
+@pytest.mark.parametrize("transition", ["link", "abort"])
+def test_home_keeps_original_device_session_inside_tap_observation(tmp_path, menu, transition):
+    from types import SimpleNamespace
+
+    from hidagent.freshness import require_fresh
+    from hidagent.navigation_context import for_phone
+
+    async def scenario():
+        screen = Screen()
+        screen._on_ready()
+        screen._on_jpeg(frame(menu=menu))
+        commands = []
+
+        async def send(command):
+            commands.append(command)
+            if command == "click":
+                raise RuntimeError("unexpected click across the original Home session")
+
+        device = SimpleNamespace(links=1, abort_epoch=0, send=send)
+        phone = Phone(device, tmp_path / "cal.json", screen)
+        context = for_phone(phone, "home", require_fresh(screen))
+        original = phone.ensure_observation
+        observations = 0
+
+        async def reconnect_inside_tap():
+            nonlocal observations
+            observations += 1
+            if observations == 2:
+                if transition == "link":
+                    device.links += 1
+                else:
+                    device.abort_epoch += 1
+            return await original()
+
+        async def measured(x, y, **kwargs):
+            phone._pointer_confirmed = True
+            return x, y
+
+        async def noop(*args, **kwargs):
+            return None
+
+        phone.ensure_observation = reconnect_inside_tap
+        phone.point_verified = measured
+        phone._catch_up = noop
+        with pytest.raises(RuntimeError):
+            await phone.go_home(navigation_context=context)
+        assert observations >= 2
+        assert not commands
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("menu", [False, True])
+def test_home_pins_mirror_generation_before_first_observation_await(tmp_path, menu):
+    from types import SimpleNamespace
+
+    async def scenario():
+        screen = Screen()
+        screen._on_ready()
+        screen._on_jpeg(frame(menu=menu))
+        selected = screen.frame
+        commands = []
+
+        async def send(command):
+            commands.append(command)
+
+        phone = Phone(SimpleNamespace(links=1, abort_epoch=0, send=send), tmp_path / "cal.json", screen)
+        original = phone.ensure_observation
+        observations = 0
+
+        async def reconnect_during_initial_observation():
+            nonlocal observations
+            observations += 1
+            if observations == 1:
+                screen._on_ready()
+                screen._on_jpeg(selected)
+            return await original()
+
+        async def measured(x, y, **kwargs):
+            phone._pointer_confirmed = True
+            return x, y
+
+        async def unchanged_effect(*args, **kwargs):
+            return False, True
+
+        async def noop(*args, **kwargs):
+            return None
+
+        phone.ensure_observation = reconnect_during_initial_observation
+        phone.point_verified = measured
+        phone._tap_effect = unchanged_effect
+        phone._catch_up = noop
+        phone.assistive_touch._wait = noop
+        with pytest.raises(RuntimeError, match="画面连接已变化"):
+            await phone.go_home()
+        assert not commands
+        assert observations == 1
+
+    asyncio.run(scenario())
 
 
 def test_timestamped_screen_uses_wall_clock_offset_during_home(tmp_path):
@@ -144,6 +312,9 @@ def test_timestamped_screen_uses_wall_clock_offset_during_home(tmp_path):
     phone.span = {"w": 360, "h": 780}
     for samples in phone._seen.values():
         samples.extend([(0., 0.), (.5, .5), (.99, .99)])
+    async def measured_pointer(near, **kwargs):
+        return near
+    phone._find_pointer = measured_pointer
 
     async def run():
         await phone.ensure_observation()
@@ -181,7 +352,9 @@ def test_position_survives_restart_as_a_search_hint(tmp_path, monkeypatch):
     asyncio.run(phone.go_home())
     data = json.loads((tmp_path / "calibration.assistive-touch.json").read_text())
     assert data["last_position"] == pytest.approx((333/360, 598/780), abs=.01)
-    assert not (tmp_path / "calibration.json").exists()
+    # Measured taps may update calibration; the AssistiveTouch hint belongs only
+    # to its own profile, never to the pointer calibration file.
+    assert "last_position" not in json.loads((tmp_path / "calibration.json").read_text())
     detect = assistive_vision.find_button_target
     hints = []
 

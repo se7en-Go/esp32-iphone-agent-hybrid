@@ -255,6 +255,56 @@ def test_keepalive_ack_is_not_a_frozen_screen():
     assert stream_is_dead(12.5, last_frame=0, last_ack=0) is True
 
 
+@pytest.mark.parametrize("traffic", ["ack_only", "goes_silent", "no_hello_ack"])
+def test_receiver_recovers_only_when_video_and_heartbeats_are_silent(monkeypatch, traffic):
+    from hidagent import video7201
+
+    clock = [0.0]
+    stop = threading.Event()
+    heartbeats, stalled = [], []
+
+    class Socket:
+        closed = False
+
+        def setsockopt(self, *_args):
+            pass
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, _data):
+            pass
+
+        def recv(self, _size):
+            clock[0] += 1
+            if clock[0] == 20:
+                stop.set()  # the test cannot hang if the receive deadline is broken
+            if traffic == "ack_only" or (traffic == "goes_silent" and clock[0] == 1):
+                return keepalive()
+            raise TimeoutError
+
+        def close(self):
+            self.closed = True
+
+    sock = Socket()
+    monkeypatch.setattr(video7201.socket, "create_connection", lambda *_args, **_kwargs: sock)
+    monkeypatch.setattr(video7201.time, "monotonic", lambda: clock[0])
+
+    def receive():
+        run_tcp("board", 7201, TOKEN, lambda _jpeg: pytest.fail("unexpected image"), stop,
+                on_heartbeat=heartbeats.append, on_stall=lambda: stalled.append(clock[0]))
+
+    if traffic == "ack_only":
+        receive()
+        assert not stalled and heartbeats == list(range(1, 21))
+    else:
+        with pytest.raises(video7201.StreamStalled):
+            receive()
+        assert len(stalled) == 1 and stalled[0] < 20
+        assert heartbeats == ([1] if traffic == "goes_silent" else [])
+    assert sock.closed
+
+
 def test_first_connection_uses_plain_hello_with_a_fresh_decoder():
     """第一次连接没有可续传的时间戳，发普通 hello，等板子重发 CONFIG/IDR。"""
     assert hello_line(TOKEN) == f"hello {TOKEN}\n".encode()

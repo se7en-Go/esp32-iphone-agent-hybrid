@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "prefixes": ["env", "plist"],
+  "tools": {
+    "cmake": "env/bin/cmake",
+    "pkg_config": "env/bin/pkg-config",
+    "ninja": "env/bin/ninja",
+    "cc": "/usr/bin/cc",
+    "cxx": "/usr/bin/c++",
+    "git": "/usr/bin/git"
+  },
+  "libraries": {
+    "plist": "plist/lib/libplist-2.0.a",
+    "crypto": "env/lib/libcrypto.3.dylib"
+  },
+  "gstreamer": {
+    "plugins": "env/lib/gstreamer-1.0",
+    "scanner": "env/libexec/gstreamer-1.0/gst-plugin-scanner"
+  }
+}

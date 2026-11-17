@@ -1,19 +1,21 @@
 # ESP32 iPhone Agent Hybrid
 
-一块 ESP32-S3 N16R8、一台 iPhone、一台电脑，让 Codex、Pi、Claude Code、Cursor 或任何带 MCP 的 Agent 操作真机。电脑端在 macOS 和 Windows 10/11 上是同一套 Python，不经过 Linux 子系统。
+一块 ESP32-S3 N16R8、一台 iPhone、一台电脑，让 Codex、Pi、Claude Code、Cursor 或任何带 MCP 的 Agent 操作真机。macOS 和 Windows 10/11 共用 Python 控制核心；Mac 还可使用独立的 AirPlay 接收器，不经过 Linux 子系统。
 
 基于 [ESP32 iPhone Agent by Henry Yuan](https://github.com/onehumanbeing/esp32-iphone-agent) 的板载 AirPlay 固件，以及 [Kz-Aven/esp32-to-iphone](https://github.com/Kz-Aven/esp32-to-iphone) 的 MCP 工具。固件按 GPL-3.0 分发，电脑端按 MIT 分发，边界写在 [NOTICE](NOTICE) 里。
 
-**还没有在真 iPhone 或真板子上跑过。** CI 能证明的是固件能编译、PyAV 能解 7201 的分帧、串口协议和 MCP 工具在假设备上能往返。真机清单在 [docs/hardware-test.md](docs/hardware-test.md)。
+**ESP32 蓝牙 HID + Mac AirPlay 已有真机实测，连续自主任务的完整验收仍待完成。** 已验证蓝牙输入、手机画面接收，以及重启网页 worker 时保留独立接收器和镜像连接。单次点击、连接成功或测试通过，不代表任意 App 都能连续自动操作。CI 的固件编译、模拟串口、视频与 MCP 测试和真机结果分别看待；验收清单见 [docs/hardware-test.md](docs/hardware-test.md)。
 
 ## 线怎么插
 
 | 板子上的口 | 接到 | 作用 |
 |---|---|---|
 | COM（USB 转串口，可能是 CH343 / FTDI / CP210x） | 电脑 | 刷机、命令、读 vtok、把 Wi-Fi 写进 NVS |
-| USB（GPIO19/20） | iPhone | USB 鼠标键盘。Lightning 要用相机转换器。不方便插线时，也可以在 iPhone 蓝牙里配对 **ESP32 Agent**，走蓝牙 HID。这一步还没有在真机上验证 |
+| USB（GPIO19/20） | iPhone（可选） | USB 鼠标键盘。Lightning 要用相机转换器。也可在 iPhone 蓝牙里配对 **ESP32 Agent**，走已实测的蓝牙 HID，手机不接此线 |
 
 默认是 STA：板子、手机、电脑连同一个 **2.4GHz** 路由器。换地方就再跑一次配网，不用重烧，也不会把密码放进仓库。板子自己的热点不提供互联网，只适合电脑另外插了网线的时候。
+
+蓝牙传控制动作，屏幕镜像走 Wi-Fi。Mac 接收器模式下，iPhone 与 Mac 在同一局域网，画面直接传给 Mac；ESP32 仍通过 COM 接收命令，再经蓝牙控制手机。
 
 刷机前看一下板子上的 **USB-OTG / IN-OUT** 焊盘。它必须是断开的。焊上之后，电脑的 5V 会倒灌进手机。
 
@@ -22,17 +24,17 @@
 1. 安装 Python 3.10+（python.org 的安装包即可），在仓库根目录运行 `./scripts/setup.sh`。
 2. 从 Actions 的 Firmware 作业下载 `esp32s3-n16r8-merged.bin` 放到 `hardware/dist/`。COM 口接电脑，运行 `./hardware/flash.sh`。
 3. `./scripts/wifi.sh --ssid '你家的2.4GHz'`，按提示输入密码。
-4. USB 口接手机，打开辅助触控，屏幕镜像选 **ESP32 Agent**。不方便插线时，COM 口仍接电脑，运行 `./scripts/hid-mode.sh pair`，在 iPhone 设置 → 蓝牙里选择 **ESP32 Agent**（名字后面可能有四位字母）。`./scripts/run-local.sh`，打开 `http://127.0.0.1:8890`。先等 device 和 screen 两盏灯变绿，再点校准，点中圆点后第三盏灯才绿。蓝牙 HID 还没有在真机上验证。
+4. 打开 iPhone 辅助触控。USB 口可接手机；使用蓝牙时，COM 口仍接电脑，运行 `./scripts/hid-mode.sh pair`，在 iPhone 设置 → 蓝牙里选择 **ESP32 Agent**（名字后面可能有四位字母）。运行 `./scripts/run-local.sh start`，打开 `http://127.0.0.1:8890`。屏幕镜像选择网页提示的接收器：板载模式是 **ESP32 Agent**，Mac 模式是 **ESP32 Agent Mac**。先等 device 和 screen 两盏灯变绿，再校准；第三盏灯变绿表示可以开始验证动作。
 5. `./scripts/mcp-config.sh`，让 Agent 把指针移到屏幕中央并停住。
 
-细节：[docs/setup-macos.md](docs/setup-macos.md)
+日常启动、状态、只重启网页及停止：[docs/RUNTIME.md](docs/RUNTIME.md)。已有本地 UxPlay runtime 时入口自动发现；无需服务端模型 Key 即可使用宿主 MCP。首次安装细节：[docs/setup-macos.md](docs/setup-macos.md)。
 
 ## Windows 10 / 11
 
 1. 安装 Python 3.10+，勾选 Add python.exe to PATH。`powershell -ExecutionPolicy Bypass -File scripts\setup.ps1`
 2. 下载同一个 `esp32s3-n16r8-merged.bin` 放到 `hardware\dist\`。COM 口接电脑。`powershell -ExecutionPolicy Bypass -File hardware\flash.ps1`
 3. `powershell -ExecutionPolicy Bypass -File scripts\wifi.ps1 --ssid "你家的2.4GHz"`
-4. USB 口接手机，辅助触控，屏幕镜像选 **ESP32 Agent**。不方便插线时，COM 口仍接电脑，运行 `powershell -ExecutionPolicy Bypass -File scripts\hid-mode.ps1 pair`，在 iPhone 设置 → 蓝牙里选择 **ESP32 Agent**。`powershell -ExecutionPolicy Bypass -File scripts\run-server.ps1`，打开 `http://127.0.0.1:8890`，先等 device 和 screen 两盏灯变绿，再点校准，点中圆点后第三盏灯才绿。蓝牙 HID 还没有在真机上验证。
+4. USB 口接手机，打开辅助触控，屏幕镜像选 **ESP32 Agent**。使用蓝牙时，COM 口仍接电脑，运行 `powershell -ExecutionPolicy Bypass -File scripts\hid-mode.ps1 pair`，在 iPhone 设置 → 蓝牙里选择 **ESP32 Agent**。运行 `powershell -ExecutionPolicy Bypass -File scripts\run-server.ps1`，打开 `http://127.0.0.1:8890`，先等 device 和 screen 两盏灯变绿，再校准。Windows 使用前台板载镜像路径；Mac 的蓝牙实测不等于 Windows 全链路已经验收。
 5. `powershell -ExecutionPolicy Bypass -File scripts\mcp-config.ps1`
 
 Mac 上端口可能是 `/dev/cu.usbserial-…` 或 `/dev/cu.wchusbserial…`，Windows 是 `COMx`。FTDI 在 macOS 上通常不用装驱动。Windows 没有 COM 口时，按芯片装驱动：FTDI 用 VCP 驱动 https://ftdichip.com/drivers/vcp-drivers/ ，沁恒用 CH343 驱动 https://www.wch.cn/downloads/CH343SER_EXE.html 。
@@ -43,13 +45,13 @@ Mac 上端口可能是 `/dev/cu.usbserial-…` 或 `/dev/cu.wchusbserial…`，W
 
 网页上 `device`、`screen`、`calibrated` 常亮。缺一个就写着缺什么、下一步是什么。三个都绿才算通。
 
-iPhone 用系统自带的屏幕镜像和辅助触控。不装测试 App，不用 TestFlight，不越狱，不开开发者模式。目标是 iOS 16.7 及以上。**iOS 16/17 能不能在镜像列表里看到这块板子的「ESP32 Agent」，上游没测过，这是第一道硬件关。** 看不到时：把系统升到 iOS 18，或只在 Mac 上改用 UxPlay（`SCREEN_BACKEND=uxplay`，要自己装 UxPlay 和 GStreamer）。Windows 不要设这个变量。
+iPhone 用系统自带的屏幕镜像和辅助触控。不装测试 App，不用 TestFlight，不越狱，不开开发者模式。目标是 iOS 16.7 及以上，但板载接收器仍需按机型、系统和网络验收。板载镜像不稳定时，Mac 可使用已安装的 UxPlay / GStreamer（`SCREEN_BACKEND=uxplay`）；Windows 保留板载后端。三个灯表示连接与校准状态，任务是否完成仍要核对动作后的新画面。
 
 ## 速度
 
-慢主要是因为视觉模型在看图，不是因为线。已经做了这些事：一次观察可以 `iphone_batch` 连续点好几下；固定按钮放在 skill 的 `layout.json` 里；`screen_id` 可以复用；视觉模型走 OpenAI 兼容接口，不写死。默认用宿主 Agent 自己的视觉模型，不必再配一把 key。
+每步耗时包括模型决策、蓝牙指针定位与纠偏、镜像传输和新画面核验。先看返回的 `timing_ms` 和画面新鲜度，再判断瓶颈；换模型不能解决指针漂移或旧画面。
 
-不要指望秒回。短回复大约 30–60 秒，长回复更久。这是经验范围，不是本仓库的真机测量。Kz-Aven 在 Mac 上的局部记录里，指针定位中位数大约 5 秒。群里几十条未读不要一次回完。换一个更快的视觉模型，是提速最直接的办法。
+`screen_id` 在 30 秒内单次有效，画面或连接变化会使它失效。动作返回的新图和**新** `screen_id` 可用于下一步，不可重复消费旧 ID。`iphone_batch` 最多执行 8 步，只适合不依赖新观察的动作；未验证的点击、跨页面变化、输入焦点变化会停止后续步骤。不要把「点输入框、输入、发送」作为一批盲续。默认由宿主 Agent 看图与决策，不必再配一把模型 Key；网页内置模型任务是可选入口。
 
 中文和数字可配置[快捷指令粘贴输入](docs/PASTE_INPUT.md)：服务端通过已绑定的组合键触发手机快捷指令，领取文本并确认复制与焦点后发送 `cmd+v`，等待粘贴完成确认后才允许下一次复制。未配置时，`type` 保留 ASCII 逐键输入；HID 本身没有剪贴板通道。
 
@@ -67,7 +69,7 @@ iPhone 用系统自带的屏幕镜像和辅助触控。不装测试 App，不用
 esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=default,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB
 ```
 
-`CDCOnBoot=default` 让串口留在 COM 口。协议相对 Handsy `5a4fddf` 没有改。决策写在 [ARCHITECTURE.md](ARCHITECTURE.md)。
+`CDCOnBoot=default` 让串口留在 COM 口。固件以 Handsy `5a4fddf` 为初始基线，保留 `<id> <cmd>` 串口命令帧。当前传输路径与限制写在 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 许可证
 

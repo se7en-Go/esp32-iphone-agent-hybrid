@@ -11,13 +11,21 @@ from runtime import SERVER, fail, require_venv  # noqa: E402
 
 
 def main() -> int:
+    if sys.platform == "win32" and any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+        print("用法: python scripts/run_server.py")
+        print("Windows 原生前台服务，板载 AirPlay；终端关闭后服务停止。")
+        print("请先运行 scripts/setup.ps1，然后运行 scripts/run-server.ps1。")
+        print("start / status / restart-worker / stop 后台管理仅用于 Unix。")
+        return 0
     python = require_venv()
     env = os.environ.copy()
     env.setdefault("HOST", "127.0.0.1")
     env.setdefault("PORT", "8890")
     env.setdefault("HIDAGENT_DATA", str(SERVER / ".local-data"))
+    if sys.platform != "win32":
+        os.chdir(SERVER)
+        os.execve(str(python), [str(python), "-m", "hidagent.local_runtime", *sys.argv[1:]], env)
     print("即将打开 http://127.0.0.1:8890")
-    print("若系统询问 Python 是否可以联网：这是连板子 7201 的出站连接，允许专用网络即可。")
     print("三个灯 device / screen / calibrated 都绿，才算通。")
     # execv 不带 env，HIDAGENT_DATA 不会进新进程，校准会写到家目录而不是 server/.local-data。
     os.execve(str(python), [str(python), "-m", "hidagent"], env)

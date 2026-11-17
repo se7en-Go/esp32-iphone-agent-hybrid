@@ -12,11 +12,14 @@ import os
 import socket
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
+from typing import Literal
 
-from . import video7201, vision
+from . import freshness, video7201, vision
 
 log = logging.getLogger(__name__)
+PREVIEW_HOLD_S = 15.0
 
 
 @dataclass(frozen=True)
@@ -33,14 +36,59 @@ class FrameSnapshot:
     updated: float = 0.0
     generation: int = 0
     observed_live: bool = False
+    # Seconds between iPhone capture and arrival at this host (HAFE v2);
+    # None when the frame carries no capture time (board path, legacy
+    # UxPlay, HAFE/1). `updated - capture_age_s` is the capture wall time.
+    capture_age_s: float | None = None
 
     def __call__(self):
         from .freshness import FrameSnapshot as ObservedFrame
 
-        return ObservedFrame(self.frame, self.updated, self.board_ts, self.generation, self.observed_live)
+        return ObservedFrame(self.frame, self.updated, self.board_ts, self.generation, self.observed_live,
+                             self.capture_age_s)
 
 
-class Screen:
+@dataclass(frozen=True)
+class PreviewStatus:
+    """The display state and corresponding pixels, independent of action eligibility."""
+
+    state: Literal["connecting", "waiting", "live", "idle", "replaying", "disconnected", "stalled", "unverified"]
+    frame_age_s: float | None
+    replay_lag_s: float | None
+    heartbeat_age_s: float | None
+    generation: int
+    frame: bytes | None = None
+
+
+class RecentFrameHistory:
+    """Bounded, session-local pixel history shared by board and Mac receivers."""
+
+    def _remember_snapshot(self, frame: FrameSnapshot) -> None:
+        """Retain only a few recent immutable frames for caret animation evidence."""
+        with self._frame_lock:
+            if self._recent_frames and self._recent_frames[-1].generation != frame.generation:
+                self._recent_frames.clear()
+            if frame.frame and frame.observed_live:
+                prev = self._recent_frames[-1] if self._recent_frames else None
+                if prev is None or frame.arrived > prev.arrived or (
+                        frame.arrived == prev.arrived
+                        and (frame.updated > prev.updated or frame.frame != prev.frame)):
+                    self._recent_frames.append(frame)
+            while self._recent_frames and frame.arrived - self._recent_frames[0].arrived > 4:
+                self._recent_frames.popleft()
+
+    @property
+    def recent_frames(self) -> tuple[FrameSnapshot, ...]:
+        with self._frame_lock:
+            now = time.monotonic()
+            while self._recent_frames and (self._recent_frames[0].generation != self.generation
+                    or now - self._recent_frames[0].arrived > 4):
+                self._recent_frames.popleft()
+            return tuple(frame for frame in self._recent_frames if frame.generation == self.generation
+                         and 0 <= now - frame.arrived <= 4)
+
+
+class Screen(RecentFrameHistory):
     def __init__(self, host: str = "", token: str = "", port: int = 7201,
                  fps: int | None = None, quality: int = 75):
         self._fixed_host = host
@@ -55,6 +103,7 @@ class Screen:
         self._next_ts: int | None = None
         self._snapshot: FrameSnapshot | None = None
         self._frame_lock = threading.RLock()
+        self._recent_frames = deque(maxlen=32)
         self.generation = 0
         # one decoder for the whole stream from this board, so a reconnect can go on from its last AU
         self._decoder = None
@@ -64,6 +113,10 @@ class Screen:
         self._started = False
         self._stopping = False
         self._session_ok = False
+        self._transport_stalled = False
+        self._last_heartbeat_at: float | None = None
+        self._clock_not_before = float("-inf")
+        self._preview_lag_bounds: tuple[float, float] | None = None
         self._stop = threading.Event()
         self._sockets: list = []
 
@@ -117,14 +170,15 @@ class Screen:
                 if self._stopping:
                     return
                 self._stop.clear()
-            if self._decoder_for != (host, token):  # another board or a rebooted one: nothing to go on from
-                self._decoder, self._decoder_for = video7201.H264Decoder(), (host, token)
+                if self._decoder_for != (host, token):  # another board or a rebooted one
+                    self._decoder, self._decoder_for = video7201.H264Decoder(), (host, token)
+                    self._clock_not_before = time.monotonic()
             try:
                 video7201.run_tcp(
                     host, self.port, token, self._on_jpeg, self._stop,
                     quality=self.quality, max_fps=max(1, self.fps),
                     on_ready=self._on_ready, on_stall=self._on_stall, sockets=self._sockets,
-                    on_ts=self._on_ts, decoder=self._decoder,
+                    on_ts=self._on_ts, decoder=self._decoder, on_heartbeat=self._on_heartbeat,
                 )
                 self.last_error = "7201 连接结束了，正在重连。"
             except Exception as exc:
@@ -148,11 +202,21 @@ class Screen:
             self.frame_ts = None
             self._next_ts = None
             self._session_ok = True
-            self._snapshot = FrameSnapshot(None, None, time.monotonic(), 0.0, self.generation, False)
+            self._transport_stalled = False
+            self._last_heartbeat_at = time.monotonic()
+            self._snapshot = FrameSnapshot(None, None, self._last_heartbeat_at, 0.0, self.generation, False)
+            self._preview_lag_bounds = None
         self.last_error = ""
 
     def _on_stall(self) -> None:
-        self.last_error = "画面停住了。请在控制中心重新选一次「屏幕镜像 → ESP32 Agent」。板子可能还留着旧缓冲。"
+        with self._frame_lock:
+            self._transport_stalled = True
+            self._session_ok = False
+
+    def _on_heartbeat(self, arrived: float) -> None:
+        with self._frame_lock:
+            if self._session_ok:
+                self._last_heartbeat_at = arrived
 
     def _on_ts(self, ts) -> None:
         with self._frame_lock:
@@ -172,8 +236,8 @@ class Screen:
             observed_live = jpeg is not None and not self._stopping and (not self._started or self._session_ok)
             self._snapshot = FrameSnapshot(
                 jpeg, board_ts, arrived, updated, self.generation, observed_live)
-        if self.last_error.startswith("画面停住了"):
-            self.last_error = ""
+            self._remember_snapshot(self._snapshot)
+            self._preview_lag_bounds = self._preview_lag(self._snapshot, arrived)
 
     @property
     def snapshot(self) -> FrameSnapshot | None:
@@ -190,6 +254,58 @@ class Screen:
             # 静止画面时 AirPlay 不推新帧。会话还在、最近 90 秒内有过帧，就算活着。
             snapshot = self._snapshot
             return self._session_ok and snapshot is not None and time.monotonic() - snapshot.arrived < 90
+
+    def _preview_lag(self, snapshot: FrameSnapshot, now: float) -> tuple[float, float] | None:
+        """Bound frame age at arrival using the interval enclosing a serial uptime sample."""
+        device = self._device
+        sample = getattr(device, "board_clock_sample", None)
+        if sample is None or snapshot.board_ts is None:
+            return None
+        device_host = getattr(device, "ip", "")
+        if device_host and self._decoder_for is not None and device_host != self._decoder_for[0]:
+            return None
+        up_ms, sent, received = sample
+        if sent < self._clock_not_before or not (0 <= received - sent <= 1 and 0 <= now - received <= PREVIEW_HOLD_S):
+            return None
+        lower = freshness.board_delta(up_ms + (snapshot.arrived - received) * 1000, snapshot.board_ts) / 1000
+        upper = lower + received - sent
+        # A substantially future stamp indicates an incompatible clock, e.g. around a board reboot.
+        if upper < -.1:
+            return None
+        return lower, upper
+
+    def preview(self) -> PreviewStatus:
+        with self._frame_lock:
+            now = time.monotonic()
+            snapshot = self._snapshot
+            frame_age = max(0.0, now - snapshot.arrived) if snapshot and snapshot.frame else None
+            heartbeat = self._last_heartbeat_at
+            heartbeat_age = max(0.0, now - heartbeat) if heartbeat is not None else None
+            lag = self._preview_lag_bounds
+            if snapshot and snapshot.frame and (lag is None or lag[0] <= freshness.MAX_REPLAY_LAG < lag[1]):
+                # A later serial sample can classify a frame that arrived before the clock was known.
+                # Retain a definite result for the frame even if serial status becomes unavailable.
+                lag = self._preview_lag(snapshot, now) or lag
+                self._preview_lag_bounds = lag
+            delay = max(0.0, sum(lag) / 2) if lag is not None else None
+            details = (frame_age, delay, heartbeat_age, self.generation)
+
+            if self._stopping:
+                return PreviewStatus("disconnected", *details)
+            if self._transport_stalled:
+                return PreviewStatus("stalled", *details)
+            if self._started and not self._session_ok:
+                return PreviewStatus("disconnected" if self.generation or self.last_error else "connecting", *details)
+            if heartbeat is not None and video7201.stream_is_dead(
+                    now, snapshot.arrived if frame_age is not None else heartbeat, heartbeat):
+                return PreviewStatus("stalled", *details)
+            if frame_age is None or frame_age > PREVIEW_HOLD_S:
+                return PreviewStatus("waiting" if self._session_ok else "connecting", *details)
+            if lag is not None and lag[0] > freshness.MAX_REPLAY_LAG:
+                return PreviewStatus("replaying", *details)
+            if lag is None or lag[1] > freshness.MAX_REPLAY_LAG:
+                return PreviewStatus("unverified", *details)
+            return PreviewStatus("live" if frame_age <= freshness.MAX_FRAME_AGE else "idle", *details, snapshot.frame)
 
     @property
     def aspect(self) -> float:
@@ -245,6 +361,8 @@ class Screen:
 
 def _friendly_video_error(exc: Exception) -> str:
     text = str(exc)
+    if isinstance(exc, video7201.StreamStalled):
+        return "板子的 7201 视频连接没有响应，正在自动重连。"
     if isinstance(exc, UnicodeEncodeError) or "ascii" in text.lower():
         return "vtok 里有非 ASCII 字符，hello 发不出去。请重新读一次 netinfo。"
     if "timed out" in text or "Timeout" in text:

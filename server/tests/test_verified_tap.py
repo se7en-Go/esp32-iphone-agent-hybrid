@@ -136,6 +136,19 @@ def test_missing_pointer_on_real_keypad_still_clicks_once(tmp_path):
     assert phone.last_tap == result
 
 
+def test_box_from_model_never_authorizes_an_estimated_click(tmp_path):
+    mirror = LaggingMirror()
+    phone = calibrated_phone(tmp_path, mirror)
+
+    async def no_disc(*args, **kwargs):
+        return None
+
+    phone._find_pointer = no_disc
+    with pytest.raises(RuntimeError, match="没有观察到"):
+        asyncio.run(observed_tap(phone, .5, .44, allow_estimated_landing=False))
+    assert "click" not in mirror.commands
+
+
 @pytest.mark.parametrize("found", [(.95, .90), (-.1, .44), (float("nan"), .44), (float("inf"), .44)])
 def test_implausible_pointer_never_moves_away_from_calibrated_target(tmp_path, found):
     mirror = LaggingMirror(effect=keypad_edit(digit=True))
@@ -169,6 +182,89 @@ def test_plausible_pointer_gets_at_most_one_correction_and_is_learned(tmp_path):
     assert result["pointer_seen"] is True
     assert phone._seen["x"][-1] == (.5, .54)
     assert phone._seen["y"][-1] == (.44, .42)
+
+
+@pytest.mark.parametrize("verified_after_correction", [False, True])
+def test_paired_ble_pointer_miss_is_corrected_before_click_without_learning(
+        tmp_path, verified_after_correction):
+    mirror = LaggingMirror(effect=keypad_edit(digit=True))
+    mirror.pace_version = 4
+    phone = calibrated_phone(tmp_path, mirror)
+    phone._pace = 4
+    expected_move = f"move {phone._dx(.5)} {phone._dy(.44)}"
+
+    async def locate(*args, **kwargs):
+        phone._pointer_pair_verified = True
+        return .52, .513
+
+    async def observe(*args):
+        return (.5, .44) if verified_after_correction else None
+
+    async def no_pair(*args, **kwargs):
+        return None
+
+    phone._find_pointer = locate
+    phone._observe_landing = observe
+    phone._localize_pointer = no_pair
+    if verified_after_correction:
+        result = asyncio.run(phone.tap_verified(.5, .44))
+        assert result["clicked"] and result["pointer_seen"]
+        assert mirror.commands == [expected_move, "move -14 -107", "click"]
+    else:
+        with pytest.raises(RuntimeError, match="落点"):
+            asyncio.run(phone.tap_verified(.5, .44))
+        assert mirror.commands == [expected_move, "move -14 -107"]
+    assert not phone._seen["x"] and not phone._seen["y"]
+
+
+def test_paired_ble_verifies_two_corrections_before_click(tmp_path):
+    mirror = LaggingMirror(effect=keypad_edit(digit=True))
+    mirror.pace_version = 4
+    phone = calibrated_phone(tmp_path, mirror)
+    phone._pace = 4
+
+    async def locate(*args, **kwargs):
+        phone._pointer_pair_verified = True
+        return .52, .55
+
+    landings = iter([(.501, .465), (.5, .44)])
+
+    async def observe(*args):
+        return next(landings)
+
+    phone._find_pointer = locate
+    phone._observe_landing = observe
+    result = asyncio.run(phone.tap_verified(.5, .44))
+
+    assert result["clicked"] and result["pointer_seen"]
+    assert mirror.commands[-3:] == ["move -14 -161", "move -1 -37", "click"]
+
+
+def test_ble_relocalizes_after_passive_landing_loses_the_corrected_pointer(tmp_path):
+    mirror = LaggingMirror(effect=keypad_edit(digit=True))
+    mirror.pace_version = 4
+    phone = calibrated_phone(tmp_path, mirror)
+    phone._pace = 4
+
+    async def initial_landing(*args, **kwargs):
+        return .55, .46
+
+    arrivals = iter([None, (.5, .44)])
+
+    async def observe(*args):
+        return next(arrivals)
+
+    async def localize(*args, **kwargs):
+        phone._pointer_pair_verified = True
+        return .516, .449
+
+    phone._find_pointer = initial_landing
+    phone._observe_landing = observe
+    phone._localize_pointer = localize
+    result = asyncio.run(phone.tap_verified(.5, .44))
+
+    assert result["clicked"] and result["pointer_seen"]
+    assert mirror.commands[-3:] == ["move -34 -29", "move -11 -13", "click"]
 
 
 @pytest.mark.parametrize("lag", [.2, 1.72])
@@ -263,11 +359,11 @@ def test_cold_controller_old_highlight_disappearing_is_inconclusive(tmp_path):
     assert result["warning"]
 
 
-def disc_frame(x):
+def disc_frame(x, *, image_format="PNG"):
     image = Image.new("RGB", (498, 1080), (40, 80, 120))
     ImageDraw.Draw(image).ellipse((x - 12, 488, x + 12, 512), fill=(150, 150, 150))
     buffer = io.BytesIO()
-    image.save(buffer, "PNG")
+    image.save(buffer, image_format)
     return buffer.getvalue()
 
 
@@ -352,6 +448,181 @@ def test_quick_finder_does_not_treat_receipt_stamps_as_capture_times(tmp_path):
     assert result is None  # receipt stamps cannot establish a capture within the 120 ms wake
     assert mirror.commands == ["move 2 0", "move -2 0"]
     assert mirror.settled_calls == 0
+
+
+def test_localize_uses_visible_pair_even_if_pointer_is_hidden_in_first_eligible_frame(tmp_path):
+    class FadingPointer(LaggingMirror):
+        def __init__(self):
+            super().__init__()
+            buffer = io.BytesIO()
+            Image.new("RGB", (498, 1080), (40, 80, 120)).save(buffer, "PNG")
+            self.hidden = buffer.getvalue()
+
+        async def send(self, command):
+            self.commands.append(command)
+            x = 262 if command == "move 12 0" else 250
+            self.pending.extend([(time.monotonic() + 1.74, self.hidden),
+                                 (time.monotonic() + 1.85, disc_frame(x))])
+
+    mirror = FadingPointer()
+    mirror.frame = disc_frame(250)
+    phone = calibrated_phone(tmp_path, mirror)
+    phone.span = {"w": 498, "h": 1080}
+    phone._pace = 4
+    found = asyncio.run(phone._localize_pointer((250 / 498, 500 / 1080), 0))
+    assert found is not None
+    assert found[0] * 498 == pytest.approx(250, abs=2)
+    assert mirror.commands == ["move 12 0", "move -12 0"]
+
+
+@pytest.mark.parametrize("ack_delay", [0.05, 0.20])
+def test_ble_localize_pairs_single_early_airplay_frame_per_move(tmp_path, paced_clock, ack_delay):
+    class StillAirPlayMirror(LaggingMirror):
+        async def send(self, command):
+            self.commands.append(command)
+            x = {"move 12 0": 263, "move -12 0": 250}[command]
+            paced_clock.call_later(0.15, self.publish, disc_frame(x, image_format="JPEG"))
+            await asyncio.sleep(ack_delay)
+
+        def publish(self, frame):
+            self.frame, self.updated = frame, time.time()
+
+    mirror = StillAirPlayMirror()
+    mirror.frame = disc_frame(250, image_format="JPEG")
+    phone = calibrated_phone(tmp_path, mirror)
+    phone.span, phone._pace = {"w": 498, "h": 1080}, 4
+
+    found = asyncio.run(phone._localize_pointer((250 / 498, 500 / 1080), 0))
+
+    assert mirror.commands == ["move 12 0", "move -12 0"]
+    assert found is not None
+    assert found == pytest.approx((250 / 498, 500 / 1080), abs=2 / 498)
+    assert phone._pointer_pair_verified
+
+
+def test_ble_localize_probes_up_from_bottom_left_pen_control(tmp_path, paced_clock):
+    width, height = 500, 1080
+    x, outward_y, landed_y = 38, 966, 1006
+    board = Image.new("RGB", (width, height), (249, 249, 249))
+    toolbar = ImageDraw.Draw(board)
+    toolbar.ellipse((20, 988, 56, 1024), fill=(42, 143, 182))
+    toolbar.line((31, 1013, 45, 999), fill="white", width=4)
+
+    def frame(pointer_y=None):
+        image = board
+        if pointer_y is not None:
+            pointer = Image.new("RGBA", board.size)
+            ImageDraw.Draw(pointer).ellipse((x - 12, pointer_y - 12, x + 12, pointer_y + 12),
+                                           fill=(110, 110, 110, 120))
+            image = Image.alpha_composite(board.convert("RGBA"), pointer).convert("RGB")
+        buffer = io.BytesIO()
+        image.save(buffer, "JPEG", quality=84)
+        return buffer.getvalue()
+
+    baseline, outward, landed = frame(), frame(outward_y), frame(landed_y)
+
+    class PenControlMirror(LaggingMirror):
+        async def send(self, command):
+            self.commands.append(command)
+            frame = {"move 0 -24": outward, "move 0 24": landed}.get(command)
+            if frame is not None:
+                paced_clock.call_later(0.15, self.publish, frame)
+            await asyncio.sleep(0.20)
+
+        def publish(self, frame):
+            self.frame, self.updated = frame, time.time()
+
+    mirror = PenControlMirror()
+    mirror.frame = landed
+    phone = calibrated_phone(tmp_path, mirror)
+    phone.span, phone._pace = {"w": 300, "h": 648}, 4
+    prior_position = phone._pos
+    target = (x / width, landed_y / height)
+
+    found = asyncio.run(phone._localize_pointer(target, 0, reference=(baseline, None)))
+
+    assert mirror.commands == ["move 0 -24", "move 0 24"]
+    assert found == pytest.approx(target, abs=.006)
+    assert phone._pointer_pair_verified
+    assert phone._pointer_overlay == (found, landed)
+    assert phone._pos == prior_position
+
+
+@pytest.mark.parametrize("arrival", ["restored", "changed", "reconnected", "too_early"])
+def test_drag_requires_fresh_original_screen_before_press(tmp_path, paced_clock, arrival):
+    changed = keypad_edit(digit=True)
+
+    class DragMirror(LaggingMirror):
+        generation = 1
+
+        async def send(self, command):
+            self.commands.append(command)
+            if len(self.commands) == 1:
+                self.publish(changed)
+                delay = .15 if arrival == "too_early" else feedback.MIRROR_LAG_SECONDS + .1
+                followup = changed if arrival == "changed" else KEYPAD
+                paced_clock.call_later(delay, self.publish, followup, arrival == "reconnected")
+            if command == "press":
+                assert self.frame == KEYPAD and self.generation == 1
+                assert paced_clock.elapsed > feedback.MIRROR_LAG_SECONDS
+
+        def publish(self, frame, reconnected=False):
+            self.frame, self.updated = frame, time.time()
+            self.generation += int(reconnected)
+
+    mirror = DragMirror()
+    phone = calibrated_phone(tmp_path, mirror)
+    points = [(.5, .5), (.55, .56)]
+
+    if arrival == "restored":
+        asyncio.run(phone.drag(points, hold=False))
+        move_in, press, move_stroke, release = mirror.commands
+        assert move_in.startswith("move ") and move_stroke.startswith("move ")
+        assert (press, release) == ("press", "release")
+    else:
+        with pytest.raises(RuntimeError):
+            asyncio.run(phone.drag(points, hold=False))
+        assert "press" not in mirror.commands
+        assert paced_clock.elapsed > feedback.MIRROR_LAG_SECONDS
+
+
+def test_ble_tap_verifies_departure_of_tinted_pointer_before_clicking(tmp_path):
+    width, height = 498, 1080
+    target = (250 / width, 475 / height)
+
+    def page(x, y, fill):
+        image = Image.new("RGB", (width, height), (30, 80, 160))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((145, 430, 360, 625), fill=(236, 235, 235))
+        draw.ellipse((x - 12, y - 12, x + 12, y + 12), fill=fill)
+        buffer = io.BytesIO()
+        image.save(buffer, "PNG")
+        return buffer.getvalue()
+
+    neutral = (150, 150, 150)
+    landed = page(250, 475, neutral)
+    outward = page(262, 475, neutral)
+    before = page(85, 400, (85, 116, 178))
+
+    class MixedPointerMirror(LaggingMirror):
+        pace_version = 4
+
+        async def send(self, command):
+            self.commands.append(command)
+            frames = {"move 250 475": landed, "move 12 0": outward, "move -12 0": landed}
+            if command in frames:
+                self.pending.append((time.monotonic() + .15, frames[command]))
+
+    mirror = MixedPointerMirror()
+    mirror.frame = before
+    phone = calibrated_phone(tmp_path, mirror)
+    phone.span, phone.origin, phone._pace = {"w": width, "h": height}, {"x": 0, "y": 0}, 4
+    phone._clock, phone._clock_link = 0.0, 0
+
+    result = asyncio.run(phone.tap_verified(*target))
+
+    assert result["clicked"] and result["pointer_seen"]
+    assert mirror.commands == ["move 250 475", "move 12 0", "move -12 0", "click"]
 
 
 def test_stop_during_pointer_check_prevents_click(tmp_path):

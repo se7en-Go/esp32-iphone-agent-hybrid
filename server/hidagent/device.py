@@ -14,9 +14,10 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import serial
 from serial.tools import list_ports
@@ -53,6 +54,29 @@ class DeviceError(RuntimeError):
     pass
 
 
+class _IdleNudgePaused(DeviceError):
+    pass
+
+
+@dataclass
+class HostObservationLease:
+    """A fixed, non-renewing pause of background idle motion, never other HID."""
+
+    device: object
+    expires_monotonic: float
+    _released: bool = False
+
+    @property
+    def active(self) -> bool:
+        return (not self._released and self.device._host_observation_lease is self
+                and time.monotonic() < self.expires_monotonic)
+
+    def release(self) -> None:
+        self._released = True
+        if self.device._host_observation_lease is self:
+            self.device._host_observation_lease = None
+
+
 @dataclass
 class ExchangeTiming:
     sent_at: float | None = None
@@ -62,21 +86,66 @@ _exchange_timing: ContextVar[ExchangeTiming | None] = ContextVar("exchange_timin
 
 
 @dataclass
-class InputAttempt:
+class _InputWriteState:
     written: bool = False
+    # Separate from potentially consequential input: even a positioning move
+    # starts an admitted action, while cleanup and status traffic never do.
+    started: bool = False
+
+
+@dataclass
+class InputAttempt:
+    before_write: Callable[[], None] | None = None
+    write_lock: object | None = None
+    _state: _InputWriteState = field(default_factory=_InputWriteState, repr=False)
+
+    @property
+    def written(self):
+        return self._state.written
+
+    @written.setter
+    def written(self, value):
+        self._state.written = value
+
+    @property
+    def started(self):
+        return self._state.started
+
+    @started.setter
+    def started(self, value):
+        self._state.started = value
 
 
 _input_attempt: ContextVar[InputAttempt | None] = ContextVar("input_attempt", default=None)
 
 
 @contextmanager
-def input_attempt():
+def input_attempt(*, before_write: Callable[[], None] | None = None, inherit: bool = False,
+                  write_lock=None):
     """Retain an input's write boundary across exchanges and ACK failures.
 
     Exchange tasks inherit this mutable observer. A later chunk, firmware error,
     or cancellation cannot erase the fact that an earlier write may have executed.
+    The optional session guard also follows nested pointer/navigation exchanges
+    and runs inside the actual device write lock. Emergency release stays possible.
     """
-    attempt = InputAttempt()
+    parent = _input_attempt.get() if inherit else None
+    if parent is None:
+        attempt = InputAttempt(before_write=before_write, write_lock=write_lock)
+    else:
+        if parent.write_lock is not None and write_lock is not None and parent.write_lock is not write_lock:
+            raise DeviceError("输入校验的画面来源锁已变化，未继续操作。")
+        def validate():
+            if parent.before_write is not None:
+                parent.before_write()
+            if before_write is not None:
+                before_write()
+
+        # Nested contact guards retain the outer observer's write/TTL boundary
+        # immediately, including failed writes and ACK loss. Do not mutate the
+        # parent's callback: sibling tasks keep their own ContextVar binding.
+        attempt = InputAttempt(before_write=validate, _state=parent._state,
+                               write_lock=parent.write_lock if parent.write_lock is not None else write_lock)
     token = _input_attempt.set(attempt)
     try:
         yield attempt
@@ -216,6 +285,11 @@ class Device:
         self._lock = asyncio.Lock()
         self._seq = 0
         self._last = self._beat = 0.0
+        self.input_sequence = 0
+        self.last_input_at = 0.0
+        self.session_started_at = 0.0
+        self._host_observation_lease: HostObservationLease | None = None
+        self._idle_nudge_inflight = False
         self.links = 0
         self.port_name = ""
         self.ip = ""
@@ -224,6 +298,7 @@ class Device:
         self.vtok = ""
         self.last_error = ""
         self.board_status: dict = {}
+        self.board_clock_sample: tuple[int, float, float] | None = None
         self.pace_version: int | None = None
         self._abort = False
         self._abort_epoch = 0
@@ -236,18 +311,27 @@ class Device:
         return self._link is not None and self._link.is_open()
 
     def attach(self, link, port_name: str = "") -> None:
+        if self._host_observation_lease is not None:
+            self._host_observation_lease.release()
         previous = self._link
         self._link = link
         if port_name:
             self.port_name = port_name
         self.links += 1
+        self.session_started_at = time.time()
+        self.board_status = {}
+        self.board_clock_sample = None
         self._last = self._beat = time.time()
         if previous is not None and previous is not link:
             previous.close()
 
     def close(self) -> None:
+        if self._host_observation_lease is not None:
+            self._host_observation_lease.release()
         link = self._link
         self._link = None
+        self.board_status = {}
+        self.board_clock_sample = None
         if link is not None:
             link.close()
 
@@ -306,12 +390,30 @@ class Device:
     def clear_abort(self) -> None:
         self._abort = False
 
+    def _mark_input_attempt(self) -> None:
+        """Invalidate earlier pointer evidence before any bytes may leave the host."""
+        self.input_sequence += 1
+        self.last_input_at = time.time()
+
     def _write_release(self, link) -> str:
         req_id = self._request_id("release")
         # Emergency cleanup must bypass both the operation deadline and the gate.
+        self._mark_input_attempt()
         link.write(f"{req_id} release\n".encode())
         self._pressed_link = None
         return req_id
+
+    def _release_held_nowait(self, link) -> None:
+        """Emergency cleanup of the original contact without a competing reply reader."""
+        if self._pressed_link is not link or link is None:
+            return
+        try:
+            self._write_release(link)
+        except OSError:
+            link.close()
+            self._pressed_link = None
+            if self._link is link:
+                self._link = None
 
     async def _release_held(self, link) -> None:
         """Called with the serial lock held and the previous reply reader stopped."""
@@ -349,11 +451,21 @@ class Device:
                 # 板子收到这一行之后才选 USB 或 BLE。两条路都先经过这把锁里的熔断复查，没有第二条写手机的路。
                 # 在 guard 的同一把锁内复查并写入；先释放它，再 await 应答。
                 with write_guard if write_guard is not None else nullcontext() as commit_write:
-                    with write_lock if write_lock is not None else nullcontext():
+                    attempt = _input_attempt.get()
+                    publication_lock = write_lock
+                    if (attempt is not None and attempt.write_lock is not None
+                            and name in HID_COMMANDS and name != "release"):
+                        if write_lock is not None and write_lock is not attempt.write_lock:
+                            raise DeviceError("输入校验的画面来源锁已变化，未继续操作。")
+                        publication_lock = attempt.write_lock
+                    with publication_lock if publication_lock is not None else nullcontext():
                         if name in HID_COMMANDS and name != "release":
                             check_operation()
                         if before_write is not None:
                             before_write()
+                        if (attempt is not None and attempt.before_write is not None
+                                and name in HID_COMMANDS and name != "release"):
+                            attempt.before_write()
                         # A gate may defer accounting until all evidence checks pass.
                         # Its callback and the write share the same locks, with no await.
                         if commit_write is not None:
@@ -363,9 +475,12 @@ class Device:
                             timing.sent_at = time.monotonic()
                         if name == "press":
                             self._pressed_link = link  # the write may succeed before its ACK arrives
-                        attempt = _input_attempt.get()
-                        if attempt is not None and name in {"click", "key", "type"}:
+                        if attempt is not None and name in {"click", "key", "type", "press"}:
                             attempt.written = True  # even a failing write may have delivered bytes
+                        if attempt is not None and name in HID_COMMANDS and name != "release":
+                            attempt.started = True  # all guards passed; an unknown ACK cannot undo this boundary
+                        if name in HID_COMMANDS:
+                            self._mark_input_attempt()
                         link.write(f"{req_id} {command}\n".encode())
                         if name == "release" and self._pressed_link is link:
                             self._pressed_link = None
@@ -411,12 +526,7 @@ class Device:
                     # Cancellation may have happened while queued behind a background
                     # query. Only emergency release may bypass the serial lock. Do not
                     # start another reader; its unique ACK can be ignored by that query.
-                    try:
-                        self._write_release(link)
-                    except OSError:
-                        link.close()
-                        if self._link is link:
-                            self._link = None
+                    self._release_held_nowait(link)
             raise
         finally:
             self._exchanges.discard(task)
@@ -454,16 +564,25 @@ class Device:
 
     async def refresh_hid_status(self) -> None:
         """Read `status`. The hid object carries the active transport and the pace number."""
+        link = getattr(self, "_link", None)
+        generation = getattr(self, "links", 0)
         try:
-            data = json.loads(await self.query("status"))
+            with exchange_timing() as timing:
+                raw = await self.query("status")
+            received = time.monotonic()
+            data = json.loads(raw)
         except (DeviceError, json.JSONDecodeError):
             return
-        if not isinstance(data, dict):
+        if (not isinstance(data, dict) or link is not getattr(self, "_link", None)
+                or generation != getattr(self, "links", 0)):
             return
         self.board_status = data
+        up = data.get("up")
+        self.board_clock_sample = ((up, timing.sent_at, received)
+                                   if type(up) is int and 0 <= up < 2**32 and timing.sent_at is not None else None)
         hid = data.get("hid")
         pace = hid.get("pace") if isinstance(hid, dict) else None
-        if type(pace) is int:
+        if type(pace) is int and hid.get("path") != "none":
             self.pace_version = pace
 
     async def configure_network(self, mode: str, ssid: str = "", password: str = "") -> None:
@@ -531,6 +650,43 @@ class Device:
             await asyncio.sleep(0.2)
         return self.connected
 
+    def acquire_host_observation_lease(self) -> HostObservationLease:
+        if self._idle_nudge_paused():
+            raise DeviceError("已有宿主观察正在等待使用；请先结束该观察。")
+        lease = HostObservationLease(self, time.monotonic() + 30.0)
+        self._host_observation_lease = lease
+        return lease
+
+    def _idle_nudge_paused(self) -> bool:
+        return self._host_observation_lease is not None and self._host_observation_lease.active
+
+    def _guard_idle_nudge(self) -> None:
+        # Recheck inside exchange's actual serial write lock: an idle move may
+        # already be queued when a host starts observing its stationary pointer.
+        if self._idle_nudge_paused() or self._pressed_link is not None:
+            raise _IdleNudgePaused("host observation temporarily paused background pointer motion")
+
+    async def _nudge_idle(self) -> None:
+        original = None
+
+        def forward():
+            nonlocal original
+            self._guard_idle_nudge()
+            original = self._link, self.links, self.abort_epoch
+            self._idle_nudge_inflight = True
+
+        def returning():
+            if original != (self._link, self.links, self.abort_epoch):
+                raise DeviceError("idle nudge session changed before return")
+
+        try:
+            await self.send_guarded("move 1 0", forward)
+            # A lease that started after the forward write must let this known
+            # return drain before capturing stationary pointer evidence.
+            await self.send_guarded("move -1 0", returning)
+        finally:
+            self._idle_nudge_inflight = False
+
     async def keep_awake(self, idle: float = 25, heartbeat: float = 2, screen=None) -> None:
         """netinfo 也会刷新 _beat，所以不能等“完全没流量”才去碰指针，否则手机会自己锁屏。"""
         while True:
@@ -538,11 +694,13 @@ class Device:
             if not self.connected:
                 continue
             try:
-                if time.time() - self._last > idle and (screen is None or screen.live):
-                    await self.send("move 1 0")
-                    await self.send("move -1 0")
+                if (time.time() - self._last > idle and (screen is None or screen.live)
+                        and not self._idle_nudge_paused()):
+                    await self._nudge_idle()
                 elif time.time() - self._beat >= heartbeat:
                     await self.send("ping")
+            except _IdleNudgePaused:
+                continue
             except DeviceError as exc:
                 log.info("board gone: %s", exc)
 

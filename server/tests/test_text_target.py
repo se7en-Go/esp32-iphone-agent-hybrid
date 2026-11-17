@@ -97,6 +97,31 @@ def test_target_guard_rejects_a_local_change_even_with_pointer_movement():
         TextTargetGuard(screen, before, target)()
 
 
+def test_target_guard_rechecks_the_crop_of_an_observed_cursor_overlay():
+    before = frame()
+    landing = frame((360, 624))
+    screen = SimpleNamespace(updated=time.time(), live=True, frame=landing)
+    guard = TextTargetGuard(screen, before, SimpleNamespace(center=(.5, .4)))
+    cursor = ((.5, .4), landing)
+    guard(cursor=cursor)
+
+    noisy = Image.open(io.BytesIO(landing))
+    for x in range(350, 371, 3):
+        noisy.putpixel((x, 624), (180, 180, 180))
+    out = io.BytesIO()
+    noisy.save(out, "PNG")
+    screen.frame = out.getvalue()
+    guard(cursor=cursor)
+
+    edited = Image.open(io.BytesIO(landing))
+    ImageDraw.Draw(edited).rectangle((354, 620, 366, 629), fill="black")
+    out = io.BytesIO()
+    edited.save(out, "PNG")
+    screen.frame = out.getvalue()
+    with pytest.raises(RuntimeError, match="未发送点击"):
+        guard(cursor=cursor)
+
+
 @pytest.mark.parametrize("live,content", [(False, frame()), (True, None), (True, b"invalid")])
 def test_target_guard_rejects_lost_or_invalid_frames(live, content):
     screen = SimpleNamespace(updated=time.time(), live=live, frame=content)
@@ -242,3 +267,57 @@ def test_real_tap_authorizes_highlight_only_and_preserves_content(tmp_path, monk
         assert result["clicked"] and not result["pointer_seen"]
         assert mirror.commands[-1] == "click" and mirror.commands.count("click") == 1
     assert any(command.startswith("move ") for command in mirror.commands)
+
+
+def _glyph_arrival_frames(*, pre_faded=False, edit_instead=False):
+    base = Image.new("RGB", (500, 1080), (255, 255, 255))
+    draw = ImageDraw.Draw(base)
+    for y in range(215, 275, 6):
+        draw.line((115, y, 225, y), fill=(25, 25, 25), width=2)
+    for x in range(135, 195, 7):
+        draw.line((x, 215, x, 275), fill=(25, 25, 25), width=2)
+
+    def png(image):
+        buf = io.BytesIO()
+        image.save(buf, "PNG")
+        return buf.getvalue()
+
+    def paint_faded_at(image, cx=162, cy=242, r=13, alpha=0.51, tint=(64, 62, 66)):
+        px = image.load()
+        for y in range(cy - r, cy + r + 1):
+            for x in range(cx - r, cx + r + 1):
+                if (x - cx) ** 2 + (y - cy) ** 2 <= r * r:
+                    px[x, y] = tuple(round((1 - alpha) * b + alpha * t)
+                                     for b, t in zip(px[x, y], tint, strict=True))
+
+    before = base.copy()
+    ImageDraw.Draw(before).ellipse((238, 522, 262, 546), fill=(150, 148, 150))
+    if pre_faded:
+        paint_faded_at(before)
+
+    after = base.copy()
+    if edit_instead:
+        ImageDraw.Draw(after).rectangle((148, 232, 174, 254), fill=(25, 25, 25))
+    else:
+        paint_faded_at(after)
+    return png(before), png(after)
+
+
+def test_target_guard_accepts_departed_clean_disc_landing_faded_over_glyphs():
+    before, after = _glyph_arrival_frames()
+    screen = SimpleNamespace(updated=time.time(), live=True, frame=after, generation=1, recent_frames=())
+    target = SimpleNamespace(center=(162 / 500, 242 / 1080))
+    guard = TextTargetGuard(screen, before, target)
+    guard(cursor=((162 / 500, 242 / 1080), after))
+    with pytest.raises(RuntimeError, match="未发送点击"):
+        guard()
+
+
+def test_target_guard_rejects_disappeared_disc_if_glyph_target_did_not_gain_cursor():
+    for kwargs in ({"pre_faded": True}, {"edit_instead": True}):
+        before, after = _glyph_arrival_frames(**kwargs)
+        screen = SimpleNamespace(updated=time.time(), live=True, frame=after, generation=1, recent_frames=())
+        target = SimpleNamespace(center=(162 / 500, 242 / 1080))
+        guard = TextTargetGuard(screen, before, target)
+        with pytest.raises(RuntimeError, match="未发送点击"):
+            guard(cursor=((162 / 500, 242 / 1080), after))

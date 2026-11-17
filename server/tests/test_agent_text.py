@@ -195,7 +195,8 @@ def test_every_tap_records_screen_diff_before_next_action(monkeypatch, request, 
         screen.frame = after
 
     async def actions():
-        return [{"action": name, "x": 200, "y": 350, "text": "通用", "_shot": before, "_observation": snapshot(screen)}]
+        return [{"action": name, "x": 200, "y": 350, "text": "通用", "_shot": before,
+                 "_observation": snapshot(screen), "_device_session": agent._device_session()}]
 
     monkeypatch.setattr(module.screen_diff, "summarize", summarize)
     monkeypatch.setattr(phone, "tap_verified", tap)
@@ -221,8 +222,10 @@ def test_tap_without_fresh_frame_does_not_continue_typing(monkeypatch, reason):
         return {"status": "stale"}
 
     async def actions():
-        return [{"action": "tap", "x": 200, "y": 350, "_shot": screen.frame, "_observation": snapshot(screen)},
-                {"action": "type", "text": "hello", "_shot": screen.frame, "_observation": snapshot(screen)}]
+        return [{"action": "tap", "x": 200, "y": 350, "_shot": screen.frame,
+                 "_observation": snapshot(screen), "_device_session": agent._device_session()},
+                {"action": "type", "text": "hello", "_shot": screen.frame,
+                 "_observation": snapshot(screen), "_device_session": agent._device_session()}]
 
     monkeypatch.setattr(module.screen_diff, "summarize", summarize)
     monkeypatch.setattr(agent, "_next_actions", actions)
@@ -237,8 +240,10 @@ def test_find_text_returns_to_actor_before_following_action(monkeypatch):
     monkeypatch.setattr(module.ocr, "find_matches", lambda *_, **__: [match()])
 
     async def actions():
-        return [{"action": "find_text", "text": "通用", "_shot": screen.frame, "_observation": snapshot(screen)},
-                {"action": "type", "text": "hello", "_shot": screen.frame, "_observation": snapshot(screen)}]
+        return [{"action": "find_text", "text": "通用", "_shot": screen.frame,
+                 "_observation": snapshot(screen), "_device_session": agent._device_session()},
+                {"action": "type", "text": "hello", "_shot": screen.frame,
+                 "_observation": snapshot(screen), "_device_session": agent._device_session()}]
 
     monkeypatch.setattr(agent, "_next_actions", actions)
     assert asyncio.run(agent._step()) is False
@@ -263,9 +268,11 @@ def test_text_tap_discards_queued_coordinates(monkeypatch, feedback, following):
         phone.calls.append(("swipe", *point))
 
     async def actions():
-        return [{"action": "tap_text", "text": "通用", "_shot": seen, "_observation": snapshot(screen)},
+        return [{"action": "tap_text", "text": "通用", "_shot": seen,
+                 "_observation": snapshot(screen), "_device_session": agent._device_session()},
                 {"action": following, "x": 500, "y": 500,
-                 "x1": 100, "y1": 100, "x2": 900, "y2": 900, "_shot": seen, "_observation": snapshot(screen)}]
+                 "x1": 100, "y1": 100, "x2": 900, "y2": 900, "_shot": seen,
+                 "_observation": snapshot(screen), "_device_session": agent._device_session()}]
 
     monkeypatch.setattr(phone, "tap_verified", tap_text)
     monkeypatch.setattr(phone, "swipe", swipe, raising=False)
@@ -296,7 +303,8 @@ def test_delayed_pointer_frame_is_not_tap_feedback(monkeypatch, name):
         return screen.frame if screen.updated > since else None
 
     async def actions():
-        return [{"action": name, "x": 200, "y": 350, "text": "通用", "_shot": seen, "_observation": snapshot(screen)}]
+        return [{"action": name, "x": 200, "y": 350, "text": "通用", "_shot": seen,
+                 "_observation": snapshot(screen), "_device_session": agent._device_session()}]
 
     monkeypatch.setattr(phone, "tap_verified", tap)
     monkeypatch.setattr(phone, "tap_verified", tap)
@@ -319,7 +327,7 @@ def test_actor_history_keeps_text_changes_when_diff_has_many_regions(monkeypatch
 
     async def ask(_role, _model, _system, prompt, *_):
         prompts.append(prompt)
-        return "DO: done connected", 0, snapshot(screen)
+        return "DO: done connected", 0, snapshot(screen), agent._device_session()
 
     monkeypatch.setattr(agent, "_ask", ask)
     asyncio.run(agent._next_actions())

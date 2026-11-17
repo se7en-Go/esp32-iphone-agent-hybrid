@@ -2,65 +2,98 @@
 
 import io
 
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image
 
 from . import screen_compare
+from .caret import focused_region as _focused_region
+from .caret import temporal_focused_region
 from .freshness import require_fresh
 
 
-def _focused_region(frame):
-    """Confirm a bounded field containing one blue insertion caret in the original image.
+def keyboard_suggestion_bar(frame: bytes) -> tuple[float, float] | None:
+    """Return the (top, bottom) of the iOS keyboard suggestion bar, or None.
 
-    An unbordered, hidden or ambiguous field grants no pixel exemption. Never infer
-    an input region from the changes caused by a command that has already run.
+    The keyboard is light grey (brightness 150-245); the white note is 255
+    and the dark AssistiveTouch menu is ~40, so that band separates the
+    keyboard from both. The suggestion bar is the top strip of the keyboard,
+    one key-height tall. The keyboard top is the first row band, scanning
+    down from mid-screen, whose grey share exceeds 0.40 with the region
+    below it sustained grey to the bottom; the 0.40 top threshold keeps the
+    dark menu (grey 0.15-0.23) from faking a keyboard top. A dark-mode
+    keyboard has no light-grey keys, so this returns None there and the
+    guard simply does not fire.
     """
-    with Image.open(io.BytesIO(frame)) as original:
-        w = min(360, original.width)
-        image = original.convert("RGB").resize((w, max(1, round(original.height * w / original.width))))
-    w, h = image.size
-    blue = Image.new("L", image.size)
-    pixels = image.tobytes()
-    blue.putdata([255 if b >= 150 and b - r >= 60 and b - g >= 25 and g >= 50 else 0
-                  for r, g, b in zip(pixels[0::3], pixels[1::3], pixels[2::3], strict=True)])
-    carets = []
-    for points in screen_compare._regions(blue, 0):
-        xs, ys = zip(*points, strict=True)
-        x0, y0, x1, y1 = min(xs), min(ys), max(xs) + 1, max(ys) + 1
-        if (1 <= x1 - x0 <= max(3, .012 * w) and max(6, .008 * h) <= y1 - y0 <= .05 * h
-                and y1 - y0 >= 3 * (x1 - x0) and y0 > .06 * h):
-            carets.append((x0, y0, x1, y1))
-    if len(carets) != 1:
-        return None
-    x0, y0, x1, y1 = carets[0]
-    for sx in (x1 + 3, x0 - 3):
-        if not 0 <= sx < w:
+    with Image.open(io.BytesIO(frame)) as image:
+        rgb = image.convert("RGB")
+    width, height = rgb.size
+    small = rgb.resize((120, max(1, round(120 * height / width))), Image.Resampling.BILINEAR)
+    sw, sh = small.size
+    band_h = max(1, round(0.02 * sh))
+    bands = []
+    for y0 in range(0, sh, band_h):
+        grey = total = 0
+        for y in range(y0, min(y0 + band_h, sh)):
+            for x in range(sw):
+                r, g, b = small.getpixel((x, y))
+                total += 1
+                if 150 <= (r + g + b) / 3 <= 245:
+                    grey += 1
+        bands.append(grey / total if total else 0)
+    for index in range(len(bands) // 2, len(bands)):
+        if bands[index] <= 0.40:
             continue
-        seed = (sx, (y0 + y1) // 2)
-        color = image.getpixel(seed)
-        delta = ImageChops.difference(image, Image.new("RGB", image.size, color))
-        channels = delta.split()
-        mask = ImageChops.lighter(ImageChops.lighter(channels[0], channels[1]), channels[2])
-        mask = mask.point(lambda value: 255 if value <= 12 else 0)
-        ImageDraw.floodfill(mask, seed, 128)
-        bounds = mask.point(lambda value: 255 if value == 128 else 0).getbbox()
-        if bounds is None:
+        below = bands[index:]
+        if sum(below) / len(below) <= 0.15:
             continue
-        left, top, right, bottom = bounds
-        if (0 < left < x0 < x1 < right < w and .06 * h < top < y0 < y1 < bottom < h
-                and .2 * w <= right - left <= .96 * w and .02 * h <= bottom - top <= .2 * h):
-            return left / w, top / h, (right - 1) / w, (bottom - 1) / h
+        # A real keyboard is a bounded region at the bottom with different
+        # content above it. A uniform grey background (the legacy test
+        # scene, or a plain grey app) must not read as a keyboard: require
+        # a sharp top edge and non-grey content above it.
+        if index == 0 or bands[index] - bands[index - 1] <= 0.30:
+            continue
+        above = bands[:index]
+        if above and sum(above) / len(above) >= 0.50:
+            continue
+        top = index * band_h / sh
+        return (top, min(1.0, top + 0.06))
     return None
 
 
+def point_in_suggestion_bar(frame: bytes, x: float, y: float) -> bool:
+    """Whether the point (x, y) falls inside the keyboard suggestion bar."""
+    bar = keyboard_suggestion_bar(frame)
+    return bar is not None and bar[0] <= y <= bar[1]
+
+
 class InputContextGuard:
-    def __init__(self, screen, observation):
+    def __init__(self, screen, observation, *, allow_white=False, accept_field=None):
         self.screen, self.original = screen, observation
-        self.region = _focused_region(observation.frame)
+        self.region = _focused_region(observation.frame, allow_white=allow_white, accept_field=accept_field)
+        # This guard may be created after the first chunk was acknowledged.
+        # Only history from the original observation can establish its field;
+        # newly typed text or a later connection must never supply that proof.
+        frames = tuple(frame for frame in getattr(screen, "recent_frames", ())
+                       if frame.generation == observation.generation
+                       and 0 <= observation.updated - frame.updated <= 4)
+        if self.region is None:
+            self.region = temporal_focused_region(observation.frame, frames, allow_white=allow_white,
+                                                 accept_field=accept_field)
+        if self.region is None and allow_white:
+            # Spotlight may be observed during the caret's dark phase. Only a
+            # proven blink on otherwise identical pixels can recover its field.
+            for recent in reversed(frames[-12:]):
+                candidate = _focused_region(recent.frame, allow_white=True, accept_field=accept_field)
+                if candidate is not None and not screen_compare.observation_changed(
+                        recent.frame, observation.frame, caret_frames=frames):
+                    self.region = candidate
+                    break
 
     def __call__(self, *, stage="context"):
         current = require_fresh(self.screen)
         region = self.region if stage in {"accept", "chunk"} else None
         if (current.generation != self.original.generation
-                or screen_compare.observation_changed(self.original.frame, current.frame, input_region=region)):
+                or screen_compare.observation_changed(
+                    self.original.frame, current.frame, input_region=region,
+                    caret_frames=getattr(self.screen, "recent_frames", ()))):
             raise RuntimeError("screen changed since the original observation; observe again before acting")
         return current

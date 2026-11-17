@@ -95,7 +95,7 @@ def test_observation_recovers_idle_without_external_touch(tmp_path, monkeypatch)
         async def send(self, command):
             await super().send(command)
             if command.startswith('move '):
-                self.pending.append((time.monotonic() + .01, self.frame))
+                self.pending.append((time.monotonic() + freshness.MIRROR_LAG_SECONDS + .01, self.frame))
 
         async def fresh(self, since, timeout):
             result = await super().fresh(since, timeout)

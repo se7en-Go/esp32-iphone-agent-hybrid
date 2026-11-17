@@ -42,6 +42,15 @@ def check_operation():
         current.check()
 
 
+def remaining_operation_time() -> float:
+    """Read the original request budget without creating or extending a scope."""
+    current = _current.get()
+    if current is None:
+        return float("inf")
+    current.check()
+    return max(0.0, current.deadline - time.monotonic())
+
+
 async def shield_cleanup(awaitable):
     """Finish bounded cleanup before propagating even repeated cancellation.
 
@@ -114,7 +123,8 @@ class ActionLifetimeMiddleware:
     """
 
     PATHS = {
-        "/api/control/action", "/api/control/batch", "/api/control/layout-tap",
+        "/api/control/action", "/api/control/batch", "/api/control/layout-tap", "/api/control/host-click",
+        "/api/control/clipboard/prepare", "/api/control/clipboard/paste",
         "/api/calibrate/start", "/api/tap", "/api/swipe", "/api/scroll",
         "/api/type", "/api/key", "/api/home", "/api/back", "/api/raw",
     }

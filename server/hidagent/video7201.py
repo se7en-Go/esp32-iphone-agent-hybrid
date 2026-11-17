@@ -22,12 +22,17 @@ import av
 
 START, END, IDR, CONFIG, AUDIO = 1, 2, 4, 8, 0x80
 PAYLOAD = 1380
+STREAM_TIMEOUT_S = 12.0
 
 
 class SequenceGap(Exception):
     def __init__(self, seq: int, expected: int):
         self.seq, self.expected = seq, expected
         super().__init__(f"video seq {seq} != {expected}")
+
+
+class StreamStalled(ConnectionError):
+    """The video connection stopped delivering both frames and heartbeat replies."""
 
 
 class RecordBuffer:
@@ -101,7 +106,7 @@ def _parameter_sets_only(au: bytes) -> bool:
     return not saw_vcl and bool(au)
 
 
-def stream_is_dead(now: float, last_frame: float, last_ack: float, limit: float = 12.0) -> bool:
+def stream_is_dead(now: float, last_frame: float, last_ack: float, limit: float = STREAM_TIMEOUT_S) -> bool:
     """静屏可以很久没有新帧，只要 keepalive 的应答还在，就不是断流。"""
     return now - last_frame > limit and now - last_ack > limit
 
@@ -227,12 +232,14 @@ def hello_line(token: str, resume_ts: int | None = None) -> bytes:
 def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
             quality: int = 75, max_fps: int = 8, connect_timeout: float = 5,
             on_ready=None, on_stall=None, sockets: list | None = None, on_ts=None,
-            decoder: H264Decoder | None = None) -> None:
+            decoder: H264Decoder | None = None, on_heartbeat=None) -> None:
     """阻塞读取一路 7201，直到 stop 或对端断开。on_jpeg(jpeg_bytes) 在解码线程里调用。
 
     同一板子/token 重连时保留解码器，以 hello <token> at <ts> 从已解码的最后一个 AU 续传；
     新解码器发普通 hello。静屏时板子可能不再推新帧，但 hello/ka 的零长度应答还在。
-    只有帧和应答都停了约 12 秒才调用 on_stall。序号断了就发 resync，让板子从 IDR 重来。
+    on_heartbeat 收到的是应答到达的单调时钟时间，不代表有新帧。
+    帧和应答都停约 12 秒，或迟迟没有握手应答，调用 on_stall 后退出，让上层重连。
+    序号断了就发 resync，让板子从 IDR 重来。
     on_ts(board_ms) 在每个 on_jpeg 之前调用：这张图对应的访问单元到达板子时的 millis()。
     普通 hello 或续传时间戳失效时，板子可能重放上一个 IDR 以来的 GOP（参考链完整时）；
     这段时间里的图都是旧的；拿它和板子当前的 millis() 比，就知道画面落后多少。
@@ -258,7 +265,6 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
         sock.sendall(hello_line(token, getattr(decoder, "last_ts", None)))
         records = RecordBuffer()
         authed = False
-        stalled = False
         last_ka = time.monotonic()
         last_frame = time.monotonic()
         last_ack = time.monotonic()
@@ -278,9 +284,10 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
                     break
                 now = time.monotonic()
             send_keepalive(now)
-            if authed and not stalled and stream_is_dead(now, last_frame, last_ack) and on_stall:
-                stalled = True
-                on_stall()
+            if stream_is_dead(now, last_frame, last_ack):
+                if on_stall is not None:
+                    on_stall()
+                raise StreamStalled("7201 did not deliver video or heartbeat replies")
             try:
                 sock.settimeout(gate.wait_timeout(time.monotonic()))
                 data = sock.recv(65536)
@@ -296,11 +303,12 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
                 send_keepalive(time.monotonic())
                 if record is None:
                     last_ack = time.monotonic()
-                    stalled = False
                     if not authed:
                         authed = True
                         if on_ready:
                             on_ready()
+                    if on_heartbeat is not None:
+                        on_heartbeat(last_ack)
                     continue
                 if not authed:
                     continue
@@ -316,7 +324,6 @@ def run_tcp(host: str, port: int, token: str, on_jpeg, stop: threading.Event, *,
                 if not frames:
                     continue
                 last_frame = time.monotonic()
-                stalled = False
                 # 只保留最新的解码帧，真正输出时才做昂贵的 JPEG 转换。
                 ready = gate.push((frames[-1], getattr(decoder, "last_ts", None)), last_frame)
                 if ready is not None:

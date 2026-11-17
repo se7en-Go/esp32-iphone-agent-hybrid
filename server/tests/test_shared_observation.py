@@ -4,22 +4,27 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from fake_clock import ManualClock
 from test_controls import FakePhone, Screen, jpeg
 
-from hidagent import feedback, ocr
+from hidagent import feedback, freshness, ocr
 from hidagent.app import ControlAction
 from hidagent.control import Controls
 from hidagent.freshness import snapshot
 
 
 @pytest.fixture(autouse=True)
-def clean_ocr():
+def clean_ocr(monkeypatch):
+    clock = ManualClock()
+    clock.install(monkeypatch)
+    monkeypatch.setattr(feedback, 'MIRROR_LAG_SECONDS', 0)
+    monkeypatch.setattr(freshness, 'MIRROR_LAG_SECONDS', 0)
     ocr.set_backend(None)
-    yield
+    yield clock
     ocr.set_backend(None)
 
 
-def test_text_resolution_guard_and_diff_share_ocr_and_exact_result_frame(monkeypatch):
+def test_text_resolution_guard_and_diff_share_ocr_and_current_result_frame(monkeypatch, clean_ocr):
     phone, screen = FakePhone(), Screen()
     before, after, advanced = screen.frame, jpeg('black'), jpeg('red')
     reads, waits = [], []
@@ -33,35 +38,42 @@ def test_text_resolution_guard_and_diff_share_ocr_and_exact_result_frame(monkeyp
     async def tap(x, y, *, before_click, target_box, target_frame):
         assert target_frame == before and target_box == (.2, .3, .8, .7)
         before_click()
+        completed_at = time.time()
+        clean_ocr.advance(.05)
         screen.frame, screen.updated = after, time.time()
         accepted = snapshot(screen)
         screen.frame = advanced  # video advances after A's final evidence check
         return {'clicked': True, 'screen_changed': True, 'fresh': True,
-                'effect_verified': False, 'completed_at': time.time(),
+                'effect_verified': False, 'completed_at': completed_at,
                 '_after_frame': after, '_after_snapshot': accepted}
 
     async def forbidden_wait(*args):
         waits.append(args)
-        raise AssertionError('A already waited for the result frame')
+        raise AssertionError('The current source already has causal post-action evidence')
 
     phone.tap_verified = tap
     monkeypatch.setattr(feedback, 'wait_after_action', forbidden_wait)
     controls = Controls(phone, screen)
     result = asyncio.run(controls.perform(ControlAction(
         action='tap_text', text='设置', screen_id=controls.observation()['screen_id'], ocr_diff=True)))
-    assert reads == [before, after]
+    assert reads == [before, advanced]
     assert not waits
-    assert base64.b64decode(result['image_base64']) == after
+    assert base64.b64decode(result['image_base64']) == advanced
+    assert controls.consume(result['screen_id'])[0] == advanced
     assert result['screen_diff']['texts_appeared'] == ['主页']
     assert result['effect_verified'] is False
     assert not any(key.startswith('_') for key in result)
 
 
-def test_default_coordinate_tap_never_starts_ocr(monkeypatch):
+def test_default_coordinate_tap_never_starts_ocr(monkeypatch, clean_ocr):
     phone, screen = FakePhone(), Screen()
     async def tap(*_, **kwargs):
+        completed_at = time.time()
+        clean_ocr.advance(.05)
+        screen.updated = time.time()
         accepted = snapshot(screen)
         return {'clicked': True, 'screen_changed': False, 'fresh': True,
+                'completed_at': completed_at,
                 '_after_frame': screen.frame, '_after_snapshot': accepted}
     phone.tap_verified = tap
     ocr.set_backend(SimpleNamespace(read_text=lambda _: pytest.fail('default tap ran OCR')))
@@ -81,7 +93,7 @@ def test_replay_is_rejected_before_observation_and_ocr():
         Controls(phone, screen).observation()
 
 
-def test_settling_cannot_replace_post_action_evidence_with_pre_action_frame(monkeypatch):
+def test_settling_cannot_replace_post_action_evidence_with_pre_action_frame(monkeypatch, clean_ocr):
     from hidagent.freshness import fresh_frame
 
     screen = Screen()
@@ -95,10 +107,11 @@ def test_settling_cannot_replace_post_action_evidence_with_pre_action_frame(monk
         screen.frame_ts = int(screen.updated*1000+screen._freshness_phone._clock)
         return screen.frame
 
-    async def settled(**_):
+    def replayed_frame():
         screen.frame, screen.updated, screen.frame_ts = jpeg('black'), time.time(), 9_300
 
-    screen.fresh, screen.settled = fresh, settled
+    screen.fresh = fresh
+    clean_ocr.call_later(.1, replayed_frame)
     monkeypatch.setattr(feedback, 'MIRROR_LAG_SECONDS', 0)
     controls = Controls(FakePhone(), screen)
     started = time.perf_counter()

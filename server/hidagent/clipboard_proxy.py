@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request, Response
 from .clipboard import NO_STORE
 
 _TOKEN = r"[A-Za-z0-9_-]{43}"
-_GET = re.compile(rf"/api/clipboard/(?:pending|current|{_TOKEN}(?:/status)?)\Z")
+_GET = re.compile(rf"/api/clipboard/(?:pending|current|{_TOKEN}(?:/(?:status|payload))?)\Z")
 _POST = re.compile(rf"/api/clipboard/(?:resolve|{_TOKEN}/(?:ack|complete))\Z")
 
 

@@ -274,6 +274,42 @@ def test_verified_tap_refuses_unmeasured_drift_or_unseen_pointer(tmp_path):
     assert commands == []
 
 
+@pytest.mark.parametrize("landing", [None, (.505, .497)], ids=["unconfirmed-correction", "confirmed-correction"])
+def test_point_reports_final_landing_not_an_earlier_pointer_sighting(tmp_path, monkeypatch, landing):
+    commands = []
+
+    async def send(command):
+        commands.append(command)
+
+    screen = Screen()
+    device = SimpleNamespace(send=send, links=0, abort_epoch=0, pace_version=4)
+    phone = Phone(device, tmp_path / "calibration.json", screen)
+    phone.span, phone._pos = {"w": 400, "h": 800}, (0, 0)
+    phone._pace, phone._link = 4, 0
+
+    async def first_sighting(*_args, **_kwargs):
+        phone._pointer_pair_verified = True
+        return .54, .5  # measured, but outside the requested final landing
+
+    async def after_correction(*_args, **_kwargs):
+        return landing
+
+    monkeypatch.setattr(phone, "_find_pointer", first_sighting)
+    monkeypatch.setattr(phone, "_observe_landing", after_correction)
+    monkeypatch.setattr(phone, "_localize_pointer", after_correction)
+    control = Controls(phone, screen)
+    result = asyncio.run(control.perform(ControlAction(
+        action="point", x=.5, y=.5, screen_id=control.observation()["screen_id"])))
+
+    assert commands == ["move 200 400", "move -16 0"]  # motion only; never click/press
+    assert phone._pointer_seen  # an earlier sighting does not confirm the correction
+    assert phone._pointer_confirmed is (landing is not None)
+    assert result["command_acknowledged"] and result["error"] is None
+    assert result["pointer_seen"] is (landing is not None)
+    expected = landing or (.5, .5)
+    assert result["pointer"] == {"x": expected[0], "y": expected[1]}
+
+
 def test_verified_tap_checks_once_before_using_calibrated_position(tmp_path):
     async def scenario():
         commands, attempts = [], []

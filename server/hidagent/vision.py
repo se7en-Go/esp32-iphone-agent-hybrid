@@ -63,11 +63,9 @@ def pointer_move(before: bytes, after: bytes, near: tuple[float, float], shift: 
         return None
     diff = ImageChops.difference(a.crop(box).convert("L"), b.crop(box).convert("L"))
     spots = _changed_spots(diff, w)
-    if spots is None:
-        return None
     saw_disc = False
     best = None
-    for sx0, sy0, sx1, sy1 in spots:
+    for sx0, sy0, sx1, sy1 in spots or ():
         margin = int(0.05 * w)
         win = (max(box[0], box[0] + sx0 - margin), max(box[1], box[1] + sy0 - margin),
                min(box[2], box[0] + sx1 + margin), min(box[3], box[1] + sy1 + margin))
@@ -84,16 +82,73 @@ def pointer_move(before: bytes, after: bytes, near: tuple[float, float], shift: 
                         best = (score, (ax, ay), (bx, by))
     if best:
         return best[1], best[2]
+    dim = _subtle_pointer_move(a, b, box, near, shift)
+    if dim is not None:
+        return dim
+    if not spots:
+        return None
     if saw_disc or strict:  # corrections require a paired disc, never just changed pixels
         return None
     return _centroid_move(diff, box, w, h, shift)
 
 
-def _changed_spots(diff: Image.Image, w: int):
+def _subtle_pointer_move(before, after, box, near, shift):
+    """Pair translucent discs using opposite signed changes at their exposed edges."""
+    w, h = before.size
+    left, top, right, bottom = box
+    # A translucent cursor can inherit the wallpaper hue and hardly affect luminance.
+    def peak(image):
+        red, green, blue = image.split()
+        return ImageChops.lighter(ImageChops.lighter(red, green), blue)
+
+    diff = peak(ImageChops.difference(before.crop(box), after.crop(box)))
+    best = None
+    for x0, y0, x1, y1 in _changed_spots(diff, w, threshold=10) or ():
+        margin = round(.075 * w)
+        window = (max(left, left + x0 - margin), max(top, top + y0 - margin),
+                  min(right, left + x1 + margin), min(bottom, top + y1 + margin))
+        a, b = before.crop(window), after.crop(window)
+
+        def visible_discs(image, other):
+            lighter = peak(ImageChops.subtract(image, other))
+            darker = peak(ImageChops.subtract(other, image))
+            matches = []
+            for tolerance in (8, 32):
+                for disc in _discs(image, w, tolerance=tolerance):
+                    x, y, size, color = disc
+                    dim_gray = 24 <= min(color) <= max(color) <= 90 and max(color) - min(color) <= 24
+                    if not .027 * w <= size <= .065 * w or (tolerance == 8 and not dim_gray):
+                        continue
+                    radius = size * .42
+                    delta, opposite = (lighter, darker) if dim_gray else (darker, lighter)
+                    evidence = [delta.getpixel((px, py)) - opposite.getpixel((px, py))
+                                for px in range(max(0, round(x - radius)), min(image.width, round(x + radius) + 1))
+                                for py in range(max(0, round(y - radius)), min(image.height, round(y + radius) + 1))
+                                if (px - x) ** 2 + (py - y) ** 2 <= radius ** 2]
+                    if sum(value > 8 for value in evidence) >= max(8, .07 * size ** 2):
+                        matches.append(disc)
+            return matches
+
+        old, new = visible_discs(a, b), visible_discs(b, a)
+        for pa in old:
+            for pb in new:
+                score = _pair(pa, pb, shift, w)
+                if score is None:
+                    continue
+                ox, oy = window[:2]
+                ax, ay = (pa[0] + ox) / w, (pa[1] + oy) / h
+                bx, by = (pb[0] + ox) / w, (pb[1] + oy) / h
+                score += abs(ax - near[0]) + abs(ay - near[1])
+                if best is None or score < best[0]:
+                    best = (score, (ax, ay), (bx, by))
+    return (best[1], best[2]) if best else None
+
+
+def _changed_spots(diff: Image.Image, w: int, *, threshold=30):
     """Bounding boxes (in `diff`) of compact clusters of changed pixels, ignoring JPEG noise; None if nothing."""
     cell = max(4, w // 90)
     cw, ch = (diff.size[0] + cell - 1) // cell, (diff.size[1] + cell - 1) // cell
-    mask = diff.point(lambda v: 255 if v > 30 else 0)
+    mask = diff.point(lambda v: 255 if v > threshold else 0)
     counts = mask.resize((cw, ch), Image.BOX).tobytes()  # mean of the mask per cell
     least = 255 * 3 / (cell * cell)  # a cell needs about three changed pixels
     hot = {(i % cw, i // cw) for i, v in enumerate(counts) if v >= least}
@@ -119,7 +174,7 @@ def _changed_spots(diff: Image.Image, w: int):
     return spots
 
 
-def _discs(img: Image.Image, w: int) -> list[tuple[float, float, float, tuple]]:
+def _discs(img: Image.Image, w: int, *, tolerance=26) -> list[tuple[float, float, float, tuple]]:
     """Filled round blobs of one flat colour, pointer sized: (cx, cy, diameter, colour) in `img` pixels."""
     iw, ih = img.size
     px = img.load()
@@ -150,7 +205,8 @@ def _discs(img: Image.Image, w: int) -> list[tuple[float, float, float, tuple]]:
                     if seen[i]:
                         continue
                     p = px[nx, ny]
-                    if (abs(p[0] - seed[0]) <= 26 and abs(p[1] - seed[1]) <= 26 and abs(p[2] - seed[2]) <= 26):
+                    if (abs(p[0] - seed[0]) <= tolerance and abs(p[1] - seed[1]) <= tolerance
+                            and abs(p[2] - seed[2]) <= tolerance):
                         seen[i] = 1
                         stack.append((nx, ny))
             bw, bh = x1 - x0 + 1, y1 - y0 + 1

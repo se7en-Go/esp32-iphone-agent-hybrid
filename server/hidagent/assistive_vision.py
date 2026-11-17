@@ -3,8 +3,9 @@
 import io
 import math
 from statistics import median
+from typing import NamedTuple
 
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageFilter
 
 Point = tuple[float, float]
 Box = tuple[float, float, float, float]
@@ -57,6 +58,57 @@ def _circle(gray: Image.Image, x: float, y: float, radius: float) -> list[int]:
             for a in range(12)]
 
 
+def _translucent_buttons(image, gray, near):
+    """Pale AT overlay on a light list: three grey concentric levels, not a flat disc.
+
+    App text can show through the centre. Require the same radial ordering on most
+    rays and a grey outer annulus; hints never manufacture a candidate.
+    """
+    w, h = image.size
+    short = min(w, h)
+    data = gray.tobytes()
+    found = []
+    for threshold in (190, 210, 225):
+        mask = bytearray(value <= threshold for value in data)
+        for left, top, right, bottom, count in _components(mask, w, h):
+            bw, bh = right-left, bottom-top
+            if not (.10*short <= bh <= .20*short and .7 <= bw/bh <= 1.4
+                    and .25 <= count/(bw*bh) <= .95):
+                continue
+            radius = bh/2
+            # Adjacent list glyphs can join the inward side. The outward arc is
+            # clear, so derive its centre from that boundary, not the joined mass.
+            if right > .83*w:
+                x = right-.5-radius
+            elif left < .17*w:
+                x = left-.5+radius
+            else:
+                continue
+            y = (top+bottom-1)/2
+            if not radius < x < w-radius or not radius < y < h-radius:
+                continue
+            core = _circle(gray, x, y, radius*.25)
+            inner = _circle(gray, x, y, radius*.58)
+            outer = _circle(gray, x, y, radius*.87)
+            outside = _circle(gray, x, y, radius*1.22)
+            c, i, o, beyond = map(median, (core, inner, outer, outside))
+            if not (c-i >= 8 and i-o >= 5 and beyond-o >= 18):
+                continue
+            coherent = sum(a-b > 5 and b-d > 2 and e-d > 12
+                           for a, b, d, e in zip(core, inner, outer, outside, strict=True))
+            if coherent < 7 or sum(abs(v-o) <= 18 for v in outer) < 9:
+                continue
+            colors = [_circle(channel, x, y, radius*.87) for channel in image.split()]
+            if sum(max(rgb)-min(rgb) <= 40 for rgb in zip(*colors, strict=True)) < 9:
+                continue
+            point = x/w, y/h
+            distance = math.dist(point, near) if near is not None else 0
+            r = radius*.85
+            box = ((x-r)/w, (y-r)/h, (x+r)/w, (y+r)/h)
+            found.append((beyond-o+c-i-distance*80, point, box))
+    return found
+
+
 def find_button_target(frame: bytes, near: Point | None = None) -> tuple[Point, Box] | None:
     """Find an edge button by its concentric rings; `near` only ranks real candidates.
 
@@ -69,7 +121,7 @@ def find_button_target(frame: bytes, near: Point | None = None) -> tuple[Point, 
     short = min(w, h)
     data = gray.tobytes()
     edge = [i for i in range(w*h) if min(i % w, w-1-i % w, i // w, h-1-i // w) < short * .2]
-    candidates = []
+    candidates = _translucent_buttons(image, gray, near)
     for threshold in (70, 110, 150, 190, 225, 245):
         mask = bytearray(w*h)
         for i in edge:
@@ -119,7 +171,7 @@ def find_button(frame: bytes, near: Point | None = None) -> Point | None:
 def _icon_boxes(image: Image.Image, box: tuple[int, int, int, int]):
     panel = image.crop(box)
     w, h = panel.size
-    data = panel.tobytes()
+    data = panel.convert("L").tobytes()
     threshold = max(140, median(data) + 55)
     mask = bytearray(value >= threshold for value in data)
     boxes = []
@@ -128,7 +180,137 @@ def _icon_boxes(image: Image.Image, box: tuple[int, int, int, int]):
         if (.045*w <= bw <= .24*w and .045*h <= bh <= .24*h
                 and .4 <= bw/bh <= 2.4 and count >= .001*w*h):
             boxes.append((left/w, top/h, right/w, bottom/h))
+    if panel.mode == "RGB":
+        highlighted = _highlighted_home_box(panel, boxes)
+        if highlighted is not None:
+            boxes.append(highlighted)
     return boxes
+
+
+def _highlighted_home_box(panel, white_boxes):
+    """A hovered Home can turn blue, but never supplies the other five slots.
+
+    This is visible icon evidence only, not evidence of the pointer's location.
+    Keep the original white icons and require one compact Home-slot component.
+    """
+    centres = [((left+right)/2, (top+bottom)/2) for left, top, right, bottom in white_boxes]
+    present = [any(left < x < right and top < y < bottom for x, y in centres)
+               for left, top, right, bottom in MENU_ICON_REGIONS]
+    if not all(present[:-1]) or present[-1]:
+        return None
+    w, h = panel.size
+    pixels = zip(*[channel.tobytes() for channel in panel.split()], strict=True)
+    blue = bytes(b >= 140 and b-r >= 35 and b >= g for r, g, b in pixels)
+    home_left, home_top, home_right, home_bottom = MENU_ICON_REGIONS[-1]
+    candidates = []
+    for left, top, right, bottom, count in _components(bytearray(blue), w, h):
+        bw, bh = right-left, bottom-top
+        if not (.045*w <= bw <= .24*w and .045*h <= bh <= .24*h
+                and .75 <= bw/bh <= 1.33 and .35 <= count/(bw*bh) <= .85
+                and count >= .001*w*h):
+            continue
+        if not (home_left < left/w < right/w < home_right
+                and home_top < top/h < bottom/h < home_bottom):
+            continue
+        # Require the whole rounded body: hollow/pointed glyphs lack its interior,
+        # while a thick plus sign protrudes beyond its curved outer silhouette.
+        cx, cy = (left+right)/2, (top+bottom)/2
+        ellipse = outside = 0
+        for y in range(top, bottom):
+            for x in range(left, right):
+                inside = ((x+.5-cx)/(bw/2))**2 + ((y+.5-cy)/(bh/2))**2 <= 1
+                ellipse += inside
+                outside += bool(blue[y*w+x] and not inside)
+        if outside > .02*bw*bh or count-outside < .8*ellipse:
+            continue
+        # Rounded silhouettes change gradually on both axes. A narrower cross
+        # may fit inside the ellipse but still has abrupt, straight shoulders.
+        rows = [sum(blue[y*w+x] for x in range(left, right)) for y in range(top, bottom)]
+        columns = [sum(blue[y*w+x] for y in range(top, bottom)) for x in range(left, right)]
+        if (any(abs(a-b) > .35*bw for a, b in zip(rows, rows[1:], strict=False))
+                or any(abs(a-b) > .35*bh for a, b in zip(columns, columns[1:], strict=False))):
+            continue
+        candidates.append((left/w, top/h, right/w, bottom/h))
+    return candidates[0] if len(candidates) == 1 else None
+
+
+class MenuHomeHighlight(NamedTuple):
+    """Hover-highlight evidence for the Home slot of an AssistiveTouch menu.
+
+    centre is the centroid of the blue pixels in the Home slot, in
+    normalised frame coordinates -- measured from the observed highlight,
+    never the requested coordinates. blue/other_max are the raw blue-pixel
+    counts per slot, so a caller can tell a real highlight from a blue app
+    icon elsewhere.
+    """
+
+    highlighted: bool
+    centre: tuple[float, float] | None
+    blue: int
+    home_area: int
+    ratio: float
+    other_max: int
+
+
+def menu_home_highlight(frame: bytes, panel: Box) -> MenuHomeHighlight:
+    """Measure the Home slot's hover highlight, with its observed centre.
+
+    The hovered Home icon and its label turn iOS blue while the other five
+    stay white. The blue Home icon is a hollow ring plus text, so the strict
+    solid-disc shape check in _highlighted_home_box rejects it; count blue
+    pixels in the Home slot instead. Highlighted iff the Home slot holds a
+    substantial blue share and dominates every other slot, so a blue app
+    icon elsewhere cannot fake a highlight. This is hover evidence only,
+    not a click target: the caller still runs the pre-click guard.
+    """
+    image = _small(frame)
+    width, height = image.size
+    left, top, right, bottom = (round(panel[0] * width), round(panel[1] * height),
+                                round(panel[2] * width), round(panel[3] * height))
+    cropped = image.crop((left, top, right, bottom))
+    pw, ph = cropped.size
+    counts = []
+    for rl, rt, rr, rb in MENU_ICON_REGIONS:
+        x0, y0 = round(rl * pw), round(rt * ph)
+        x1, y1 = round(rr * pw), round(rb * ph)
+        blue = 0
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                r, g, b = cropped.getpixel((x, y))
+                if b >= 140 and b - r >= 35 and b >= g:
+                    blue += 1
+        counts.append(blue)
+    home_left, home_top, home_right, home_bottom = MENU_ICON_REGIONS[-1]
+    hx0, hy0 = round(home_left * pw), round(home_top * ph)
+    hx1, hy1 = round(home_right * pw), round(home_bottom * ph)
+    home_area = (hx1 - hx0) * (hy1 - hy0)
+    home = counts[-1]
+    others = max(counts[:-1]) if counts[:-1] else 0
+    highlighted = home_area > 0 and home / home_area >= 0.02 and home >= 5 * max(1, others)
+    centre = None
+    if highlighted:
+        xs, ys = [], []
+        for y in range(hy0, hy1):
+            for x in range(hx0, hx1):
+                r, g, b = cropped.getpixel((x, y))
+                if b >= 140 and b - r >= 35 and b >= g:
+                    xs.append(left + x)
+                    ys.append(top + y)
+        if xs:
+            centre = (sum(xs) / len(xs) / width, sum(ys) / len(ys) / height)
+    return MenuHomeHighlight(
+        highlighted=highlighted,
+        centre=centre,
+        blue=home,
+        home_area=home_area,
+        ratio=home / home_area if home_area else 0.0,
+        other_max=others,
+    )
+
+
+def menu_home_highlighted(frame: bytes, panel: Box) -> bool:
+    """Whether the Home slot of an AssistiveTouch menu is hover-highlighted."""
+    return menu_home_highlight(frame, panel).highlighted
 
 
 def _menu_icons(image: Image.Image, box: tuple[int, int, int, int]) -> bool:
@@ -140,7 +322,7 @@ def _menu_icons(image: Image.Image, box: tuple[int, int, int, int]) -> bool:
 
 def find_icon_box(frame: bytes, panel: Box, point: Point) -> Box | None:
     """Return a visible menu icon's bounds only when it contains the chosen target."""
-    image = _small(frame).convert("L")
+    image = _small(frame)
     left, top, right, bottom = panel
     pixels = (round(left*image.width), round(top*image.height),
               round(right*image.width), round(bottom*image.height))
@@ -152,13 +334,35 @@ def find_icon_box(frame: bytes, panel: Box, point: Point) -> Box | None:
     return None
 
 
+def find_icon_target(frame: bytes, panel: Box, slot: Point) -> tuple[Point, Box] | None:
+    """Use a menu slot to choose one nearby visible icon, then target its actual centre.
+
+    The six-icon panel is verified by find_panel before this lookup. A slot is not
+    a click coordinate: missing or ambiguous icon bounds provide no target.
+    """
+    image = _small(frame)
+    left, top, right, bottom = panel
+    pixels = (round(left*image.width), round(top*image.height),
+              round(right*image.width), round(bottom*image.height))
+    sx, sy = (slot[0]-left)/(right-left), (slot[1]-top)/(bottom-top)
+    candidates = []
+    for x0, y0, x1, y1 in _icon_boxes(image, pixels):
+        x, y = (x0+x1)/2, (y0+y1)/2
+        if abs(x-sx) <= .10 and abs(y-sy) <= .10:
+            box = (left+x0*(right-left), top+y0*(bottom-top),
+                   left+x1*(right-left), top+y1*(bottom-top))
+            candidates.append(((left+x*(right-left), top+y*(bottom-top)), box))
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def find_panel(frame: bytes, before: bytes | None = None) -> Box | None:
     """Locate a rounded dark panel with the default six-icon arrangement.
 
     Supplying `before` rejects unchanged app panels. Ambiguous/custom layouts are
     rejected; a dark rectangle alone must never authorize a Home click.
     """
-    image = _small(frame).convert("L")
+    rgb = _small(frame)
+    image = rgb.convert("L")
     w, h = image.size
     short = min(w, h)
     data = image.tobytes()
@@ -189,7 +393,7 @@ def find_panel(frame: bytes, before: bytes | None = None) -> Box | None:
                 continue
             box = left, top, right, bottom
             if box not in icons:
-                icons[box] = _menu_icons(image, box)
+                icons[box] = _menu_icons(rgb, box)
             if not icons[box]:
                 continue
             if difference:
@@ -200,6 +404,10 @@ def find_panel(frame: bytes, before: bytes | None = None) -> Box | None:
     return max(candidates)[1] if candidates else None
 
 
+def is_home_visible(frame: bytes) -> bool:
+    return find_panel(frame) is None and is_home_screen(frame)
+
+
 def is_home_screen(frame: bytes) -> bool:
     """Conservative portrait Home signature: aligned app icons and a separate dock.
 
@@ -207,18 +415,20 @@ def is_home_screen(frame: bytes) -> bool:
     App Library. Unknown layouts fail closed. A dismissed menu or a changed app
     alone supplies none of this evidence.
     """
-    from PIL import ImageFilter
-
-    image = _small(frame).convert("L")
+    image = _small(frame)
     w, h = image.size
     if not 1.4 < h/w < 2.5:
         return False
-    edges = image.filter(ImageFilter.FIND_EDGES)
+    edges = image.convert("L").filter(ImageFilter.FIND_EDGES)
     data = edges.tobytes()
     # A full-width toolbar separator below the status bar is application chrome.
     if any(sum(data[y*w+x] > 45 for x in range(round(.05*w), round(.95*w))) > .72*w
            for y in range(round(.075*h), round(.16*h))):
         return False
+    return _home_with_dock_outline(data, w, h) or _home_with_translucent_dock(image)
+
+
+def _home_with_dock_outline(data, w, h):
     mask = bytearray(value > 18 for value in data)
     icons, docks = [], []
     for left, top, right, bottom, count in _components(mask, w, h):
@@ -252,3 +462,48 @@ def is_home_screen(frame: bytes) -> bool:
                     / min(icon[2] for icon in row+other+dock_icons) < 1.35):
                 return True
     return False
+
+
+def _home_with_translucent_dock(image: Image.Image) -> bool:
+    """A translucent dock may have disconnected edges over colorful wallpaper."""
+    w, h = image.size
+    red, green, blue = (channel.filter(ImageFilter.FIND_EDGES) for channel in image.split())
+    edges = ImageChops.lighter(red, ImageChops.lighter(green, blue))
+    data = edges.tobytes()
+    # The dock's upper rim must span both halves; four bottom controls alone
+    # could also be an app toolbar. Require a distinct row of square dock icons.
+    dock_line = next((y/h for y in range(round(.825*h), round(.89*h))
+                      if sum(value > 18 for value in data[y*w+round(.05*w):y*w+round(.95*w)]) > .55*w
+                      and all(sum(value > 18 for value in data[y*w+left:y*w+right]) > .11*w
+                              for left, right in ((round(.07*w), w//2), (w//2, round(.93*w))))), None)
+    if dock_line is None:
+        return False
+
+    columns = (.15, .385, .615, .85)
+    rows = []
+    dock_columns = set()
+    for left, top, right, bottom, count in _components(bytearray(pixel > 55 for pixel in data), w, h):
+        width, height = right-left, bottom-top
+        if not (.12*w <= width <= .20*w and .8 <= width/height <= 1.25 and count > .08*width*height):
+            continue
+        x, y = (left+right)/(2*w), (top+bottom)/(2*h)
+        column = min(columns, key=lambda value: abs(x-value))
+        if abs(x-column) > .045:
+            continue
+        # The dock rim must be separate from its icons. Aligned icon top edges
+        # can themselves span both halves after JPEG decoding; their component
+        # bounds must clear the supposed rim and its two-pixel JPEG/resize halo.
+        if .025 < y-dock_line < .09 and y < .96 and top > round(dock_line*h) + 2:
+            dock_columns.add(column)
+        elif .13 < y < .76:
+            row = next((row for center, row in rows if abs(y-center) < .025), None)
+            if row is None:
+                row = set()
+                rows.append((y, row))
+            row.add(column)
+    if len(dock_columns) < 3:
+        return False
+    rows = [(y, columns) for y, columns in rows if len(columns) >= 3]
+    return any(.08 < bottom_y-top_y < .22 and len(top & bottom & dock_columns) >= 2
+               and len(top | bottom) == 4
+               for index, (top_y, top) in enumerate(rows) for bottom_y, bottom in rows[index+1:])

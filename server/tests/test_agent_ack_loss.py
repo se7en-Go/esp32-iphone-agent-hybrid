@@ -85,8 +85,9 @@ def test_click_ack_loss_is_retained_across_reconnect_and_replan(tmp_path, monkey
 @pytest.mark.parametrize("command,written_suffix", [
     ("key enter", b" key enter\n"),
     ("type hello", b" type hello\n"),
+    ("path 300 500 400 550", b" press\n"),
 ])
-def test_lost_text_ack_is_not_replayed(tmp_path, monkeypatch, command, written_suffix):
+def test_lost_input_ack_is_not_replayed(tmp_path, monkeypatch, command, written_suffix):
     async def scenario():
         class LostAck(Link):
             async def readline(self):
@@ -99,6 +100,15 @@ def test_lost_text_ack_is_not_replayed(tmp_path, monkeypatch, command, written_s
         screen._on_jpeg(jpeg())
         device.attach(original)
         phone = Phone(device, tmp_path / "calibration.json", screen)
+        phone.span = {"w": 500, "h": 1080}
+
+        async def positioned(x, y, **kwargs):
+            await phone.point(x, y)
+            phone._pointer_confirmed = True
+            return x, y
+
+        # This test exercises an ACK lost after press, past the separately tested landing gate.
+        monkeypatch.setattr(phone, "point_verified", positioned)
         actor = Model([f"DO: {command}", f"DO: {command}", "DO: done"])
         planner = Model(["1. Send the text", "1. Inspect after reconnect"])
         agent = Agent(phone, screen, actor, planner, Trace(None))
@@ -118,7 +128,7 @@ def test_lost_text_ack_is_not_replayed(tmp_path, monkeypatch, command, written_s
             await agent._run()
             writes = original.written + replacement.written
             assert sum(line.endswith(written_suffix) for line in writes) == 1
-            attempts = [step for step in agent.steps if step["action"] in {"key", "type"}]
+            attempts = [step for step in agent.steps if step["action"] == command.split()[0]]
             assert len(attempts) == 1
             assert attempts[0]["outcome"] == "unknown"
             assert attempts[0]["changed"] is None and attempts[0]["fresh"] is False

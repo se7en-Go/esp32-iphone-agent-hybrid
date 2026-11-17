@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 from test_agent_text import frame, match, setup
+from test_gesture_evidence import SOURCE, TARGET, image_at
 
 from hidagent import agent as module
 from hidagent.agent import _key
@@ -23,6 +24,23 @@ class Model:
         if self.during:
             self.during()
         return next(self.replies)
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_agent_gesture_context_preserves_measured_pointer_evidence(changed):
+    agent, _, screen = setup()
+    before = image_at(SOURCE)
+    screen.frame, screen.updated = before, time.time()
+    original = snapshot(screen)
+    action = {"action": "path", "_observation": original, "_shot": before}
+    verified = image_at(TARGET)
+    screen.frame, screen.updated = image_at(TARGET, changed=changed), time.time()
+    evidence = {"cursor": (TARGET, verified), "reference": (SOURCE, before, verified)}
+    if changed:
+        with pytest.raises(module.ObservationContentChanged, match="变化"):
+            agent._validate_context(action, **evidence)
+    else:
+        assert agent._validate_context(action, **evidence).frame == verified
 
 
 @pytest.mark.parametrize("name", ["tap_text", "tap", "type", "key", "swipe"])
@@ -51,8 +69,8 @@ def test_planned_actions_reject_changed_original_context(monkeypatch, name, tran
     monkeypatch.setattr(module.ocr, "find_matches", lambda *_, **__: [match()])
 
     async def scenario():
-        actions = await agent._next_actions()
         with pytest.raises((RuntimeError, ValueError), match="changed|变化"):
+            actions = await agent._next_actions()
             await agent._do(actions[0])
 
     asyncio.run(scenario())
@@ -155,6 +173,80 @@ def test_action_identity_uses_arguments_not_result_fields():
     agent.steps = [recorded, recorded]
     assert agent._repeating(action)
     assert not agent._repeating({**action, "x": 201})
+
+
+def test_actor_tap_uses_the_observed_control_box_without_estimating_landing(monkeypatch):
+    agent, phone, screen = setup()
+    agent.actor = Model(['DO: tap {"x":200,"y":350,"box":[100,300,700,400]}'])
+    targets = []
+
+    async def tap(*point, **options):
+        options["before_click"]()
+        targets.append((point, options))
+
+    monkeypatch.setattr(phone, "tap_verified", tap)
+
+    async def scenario():
+        actions = await agent._next_actions()
+        await agent._do(actions[0])
+
+    asyncio.run(scenario())
+    point, options = targets[0]
+    assert point == (.2, .35)
+    assert options["target_box"] == (.1, .3, .7, .4)
+    assert options["target_frame"] == screen.frame
+    assert options["allow_estimated_landing"] is False
+
+
+@pytest.mark.parametrize("name", ["path", "circle"])
+def test_drawing_stroke_ends_round_and_keeps_ink_feedback(monkeypatch, name):
+    agent, phone, screen = setup()
+    command = "path 200 350 300 400" if name == "path" else "circle 200 350 30"
+    agent.actor = Model([f"DO: {command}\nDO: path 300 400 400 500"])
+
+    async def drag(points, *, before_action, verify_start):
+        assert verify_start is True
+        before_action()
+        phone.calls.append(points)
+        screen.frame = frame("black")
+        screen.updated = time.time()
+
+    async def wait_after_action(current, since):
+        assert current is screen
+        return screen.frame
+
+    phone.drag = drag
+    monkeypatch.setattr(module.feedback, "wait_after_action", wait_after_action)
+    assert asyncio.run(agent._step()) is False
+    assert len(phone.calls) == 1
+    assert agent.steps[-1]["action"] == name
+    assert agent.steps[-1]["changed"] is True
+
+
+def test_drawing_without_a_new_frame_does_not_repeat_the_stroke(monkeypatch):
+    agent, phone, _ = setup()
+    command = "DO: path 200 350 300 400"
+    agent.actor = Model([command, command, "DO: fail Unable to verify stroke"])
+
+    async def drag(points, *, before_action, verify_start):
+        assert verify_start is True
+        before_action()
+        phone.calls.append(points)
+
+    async def wait_after_action(*_):
+        return None
+
+    phone.drag = drag
+    monkeypatch.setattr(module.feedback, "wait_after_action", wait_after_action)
+
+    async def scenario():
+        assert await agent._step() is False
+        assert await agent._step() is True
+
+    asyncio.run(scenario())
+    assert len(phone.calls) == 1
+    assert agent.steps[0]["changed"] is None
+    assert "outcome is unknown" in agent.actor.prompts[-1]
 
 
 def test_unknown_tap_cannot_repeat_after_queued_wait(monkeypatch):

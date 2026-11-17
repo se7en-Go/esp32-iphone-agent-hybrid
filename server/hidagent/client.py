@@ -34,11 +34,21 @@ class IPhoneClient:
     def status(self) -> dict:
         return self.request("GET", "/api/status").json()
 
+    def capabilities(self) -> dict:
+        return self.request("GET", "/api/control/capabilities").json()
+
     def screenshot(self) -> bytes:
         return self.request("GET", "/api/frame.jpg").content
 
-    def observe(self) -> dict:
-        return self.request("GET", "/api/control/observe").json()
+    def observe(self, *, for_click: bool = False) -> dict:
+        return self.request("GET", "/api/control/observe" + ("?for_click=true" if for_click else "")).json()
+
+    def find_text(self, text: str, screen_id: str, *, nth: int = 1,
+                  exact: bool = False, region: list[float] | None = None) -> dict:
+        return self.request("POST", "/api/control/find_text", {
+            "screen_id": screen_id, "text": text, "nth": nth, "exact": exact,
+            **({"region": region} if region is not None else {}),
+        }).json()
 
     def control(self, name: str, screen_id: str, **arguments) -> dict:
         return self.request("POST", "/api/control/action",
@@ -46,6 +56,20 @@ class IPhoneClient:
 
     def batch(self, screen_id: str, steps: list[dict]) -> dict:
         return self.request("POST", "/api/control/batch", {"screen_id": screen_id, "steps": steps}).json()
+
+    def click_observed(self, screen_id: str, pointer_x: float, pointer_y: float,
+                       target_box: tuple[float, float, float, float], *, target_label: str = "",
+                       duration: float | None = None) -> dict:
+        return self.request("POST", "/api/control/host-click", {
+            "screen_id": screen_id, "pointer_x": pointer_x, "pointer_y": pointer_y,
+            "target_box": target_box, "target_label": target_label,
+            **({"duration": duration} if duration is not None else {}),
+        }).json()
+
+    def clipboard_stage(self, stage: str, **fields) -> dict:
+        if stage not in {"prepare", "paste", "confirm", "status", "cancel"}:
+            raise ValueError("unknown clipboard stage")
+        return self.request("POST", f"/api/control/clipboard/{stage}", fields).json()
 
     def layouts(self) -> dict:
         return self.request("GET", "/api/layouts").json()

@@ -18,6 +18,11 @@ from hidagent.phone import Phone
 from hidagent.screen import Screen
 
 
+async def measured_pointer(near, **kwargs):
+    # Isolate write-lock and session checks after successful visual localization.
+    return near
+
+
 @pytest.mark.parametrize("lost", ["disconnect", "generation", "replay"])
 def test_home_lost_during_positioning_never_presses_or_drags(tmp_path, monkeypatch, lost):
     monkeypatch.setattr(assistive, "RESULT_WAIT", .01)
@@ -71,6 +76,7 @@ def test_gesture_revalidates_at_write_after_device_lock_wait(tmp_path, gesture, 
         phone = Phone(device, tmp_path / "calibration.json", screen)
         phone.span = {"w": 360, "h": 780}
         phone._link, phone._pos = device.links, (0, 0)
+        phone._find_pointer = measured_pointer
         original_point = phone.point
 
         async def point_then_block(*args, **kwargs):
@@ -172,6 +178,7 @@ def test_gesture_validation_and_actual_write_hold_publication_lock(tmp_path, ges
         phone = Phone(device, tmp_path / "calibration.json", screen)
         phone.span = {"w": 360, "h": 780}
         phone._link, phone._pos = device.links, (0, 0)
+        phone._find_pointer = measured_pointer
         validated_under_lock = []
 
         def validate():

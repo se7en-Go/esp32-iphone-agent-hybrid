@@ -7,6 +7,7 @@ import socket
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -179,15 +180,15 @@ def send_routes(tmp_path, monkeypatch):
     from hidagent.control import Controls
     from hidagent.device import Device
     from hidagent.phone import Phone
+    from hidagent.screen import Screen as MirrorScreen
 
     image = io.BytesIO()
     Image.new("RGB", (100, 200), "white").save(image, format="JPEG")
 
-    class Screen:
-        live, frame = True, image.getvalue()
-
+    class Screen(MirrorScreen):
         def __init__(self):
-            self.updated = time.time()
+            super().__init__()
+            self._on_jpeg(image.getvalue())
 
         async def fresh(self, *_args):
             return self.frame
@@ -314,7 +315,7 @@ def test_invalid_send_button_observation_does_not_reserve_quota(send_routes):
 
 
 def test_send_button_rate_limit_returns_409_without_second_click(send_routes):
-    _clock, guard, link, _phone = send_routes
+    _clock, guard, link, phone = send_routes
 
     async def scenario():
         transport = httpx.ASGITransport(app=module.app)
@@ -326,7 +327,18 @@ def test_send_button_rate_limit_returns_409_without_second_click(send_routes):
             assert first.status_code == 200 and first.json()["command_acknowledged"]
             # A stale action result no longer grants a token; observe again to test the send quota.
             assert first.json()["screen_id"] is None
+            # This fixture publishes no click feedback. Deliver a new synthetic
+            # capture through the production receiver before requesting a new ticket.
+            previous_receipt = phone.screen.updated
+            capture = Image.new("RGB", (100, 200), "white")
+            capture.putpixel((4, 4), (0, 0, 0))
+            payload = io.BytesIO()
+            capture.save(payload, format="JPEG")
+            phone.screen._on_jpeg(payload.getvalue())
+            assert phone.screen.updated > previous_receipt
             observed = await client.get("/api/control/observe")
+            assert observed.status_code == 200, observed.text
+            assert observed.json()["frame_received_at"] == phone.screen.updated
             second = await client.post("/api/control/layout-tap", json={
                 "layout": "demo", "point": "send", "screen_id": observed.json()["screen_id"],
             })
@@ -423,33 +435,78 @@ def _not_unsupported(call):
         return exc
 
 
+@contextmanager
+def _running_test_app(*, timeout=10):
+    """Keep ownership of the ephemeral listener through startup and shutdown."""
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(128)
+        listener.setblocking(False)
+        port = listener.getsockname()[1]
+        url = f"http://127.0.0.1:{port}"
+        server = uvicorn.Server(uvicorn.Config(module.app, host="127.0.0.1", port=port, log_level="error"))
+        failures = []
+
+        def run():
+            try:
+                server.run(sockets=[listener])
+            except BaseException as exc:
+                failures.append(f"{type(exc).__name__}: {exc}")
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        try:
+            deadline = time.monotonic() + timeout
+            last_probe = "server has not reported startup"
+            with httpx.Client(base_url=url, timeout=.3, trust_env=False) as probe:
+                while time.monotonic() < deadline:
+                    if not thread.is_alive():
+                        break
+                    if server.started:
+                        try:
+                            response = probe.get("/api/status")
+                            last_probe = f"HTTP {response.status_code}"
+                            if response.status_code == 200:
+                                break
+                        except httpx.HTTPError as exc:
+                            last_probe = f"{type(exc).__name__}: {exc}"
+                    time.sleep(.05)
+                else:
+                    raise AssertionError(
+                        f"real app not ready: started={server.started}, alive={thread.is_alive()}, "
+                        f"last_probe={last_probe}, errors={failures}")
+            if not thread.is_alive():
+                raise AssertionError(f"real app thread exited before ready: {failures}; {last_probe}")
+            yield url
+        finally:
+            server.should_exit = True
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "real app test thread did not stop"
+
+
 def test_real_client_stop_calibrate_home_back_not_415(tmp_path, monkeypatch):
     monkeypatch.setenv("HIDAGENT_PORT", str(tmp_path / "missing-port"))
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    server = uvicorn.Server(uvicorn.Config(module.app, host="127.0.0.1", port=port, log_level="error"))
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-    try:
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            try:
-                httpx.get(f"http://127.0.0.1:{port}/api/status", timeout=0.3)
-                break
-            except httpx.HTTPError:
-                time.sleep(0.1)
-        else:
-            raise AssertionError("real app did not start")
-        with IPhoneClient(f"http://127.0.0.1:{port}") as client:
+    original_run = uvicorn.Server.run
+    owned = []
+
+    def run_with_owned_socket(self, sockets=None):
+        # The old bind/close/start sequence allows another process to claim the
+        # port here. The listener must stay bound before the server thread runs.
+        assert sockets and len(sockets) == 1
+        address = sockets[0].getsockname()
+        with socket.socket() as competitor, pytest.raises(OSError):
+            competitor.bind(address)
+        owned.append(address)
+        return original_run(self, sockets=sockets)
+
+    monkeypatch.setattr(uvicorn.Server, "run", run_with_owned_socket)
+    with _running_test_app() as url:
+        with IPhoneClient(url) as client:
             assert client.stop()["ok"] is True
             _not_unsupported(lambda: client.calibrate())
             _not_unsupported(lambda: client.action("home"))
             _not_unsupported(lambda: client.action("back"))
-    finally:
-        server.should_exit = True
-        thread.join(timeout=5)
+    assert len(owned) == 1
 
 
 def test_mcp_stop_task_against_the_real_app(tmp_path, monkeypatch):
@@ -458,41 +515,65 @@ def test_mcp_stop_task_against_the_real_app(tmp_path, monkeypatch):
     saved = (module.guard.tripped, module.guard.reason, list(module.guard.sends), module.guard._path)
     module.guard._path = tmp_path / "guard.json"
     module.guard.tripped = False
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    server = uvicorn.Server(uvicorn.Config(module.app, host="127.0.0.1", port=port, log_level="error"))
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
     try:
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            try:
-                httpx.get(f"http://127.0.0.1:{port}/api/status", timeout=0.3)
-                break
-            except httpx.HTTPError:
-                time.sleep(0.1)
-        else:
-            raise AssertionError("real app did not start")
+        with _running_test_app() as url:
+            async def scenario():
+                params = StdioServerParameters(
+                    command=sys.executable,
+                    args=["-m", "hidagent.cli", "--url", url, "mcp"],
+                    env={k: v for k, v in os.environ.items()
+                         if not k.startswith(("LLM_", "ACTOR_", "PLANNER_"))},
+                )
+                async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
+                    await session.initialize()
+                    names = {tool.name for tool in (await session.list_tools()).tools}
+                    assert "guard_reset" not in names
+                    result = await session.call_tool("stop_task", {})
+                    assert not result.isError
 
-        async def scenario():
-            params = StdioServerParameters(
-                command=sys.executable,
-                args=["-m", "hidagent.cli", "--url", f"http://127.0.0.1:{port}", "mcp"],
-                env={k: v for k, v in os.environ.items()
-                     if not k.startswith(("LLM_", "ACTOR_", "PLANNER_"))},
-            )
-            async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
-                await session.initialize()
-                names = {tool.name for tool in (await session.list_tools()).tools}
-                assert "guard_reset" not in names
-                result = await session.call_tool("stop_task", {})
-                assert not result.isError
-
-        asyncio.run(asyncio.wait_for(scenario(), 25))
+            asyncio.run(asyncio.wait_for(scenario(), 25))
     finally:
-        server.should_exit = True
-        thread.join(timeout=5)
         module.guard.tripped, module.guard.reason, module.guard.sends, module.guard._path = saved
         assert _real_guard_bytes() == before
+
+
+def test_real_app_probe_reports_thread_startup_failure(monkeypatch):
+    def failed_start(*_args, **_kwargs):
+        raise RuntimeError("synthetic startup failure")
+
+    monkeypatch.setattr(uvicorn.Server, "run", failed_start)
+    with pytest.raises(AssertionError, match="thread exited.*synthetic startup failure"):
+        with _running_test_app(timeout=.2):
+            pytest.fail("failed startup was accepted")
+
+
+def test_real_app_probe_does_not_treat_http_503_as_ready(monkeypatch):
+    class UnhealthyServer:
+        started = True
+        should_exit = False
+
+        def __init__(self, *_args):
+            pass
+
+        def run(self, **_kwargs):
+            while not self.should_exit:
+                time.sleep(.001)
+
+    class Probe:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def get(self, *_args):
+            return httpx.Response(503)
+
+    monkeypatch.setattr(uvicorn, "Server", UnhealthyServer)
+    monkeypatch.setattr(httpx, "Client", Probe)
+    with pytest.raises(AssertionError, match="started=True, alive=True, last_probe=HTTP 503"):
+        with _running_test_app(timeout=.02):
+            pytest.fail("unhealthy HTTP response was accepted")

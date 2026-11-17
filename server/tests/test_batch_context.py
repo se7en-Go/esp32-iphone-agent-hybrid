@@ -25,6 +25,7 @@ def test_batch_stops_after_unverified_coordinate_tap(evidence, next_action, text
     async def tap(x, y, **kwargs):
         phone.calls.append(("tap", x, y))
         completed_at = time.time()
+        screen.new_frame = evidence != "missing"
         if evidence == "changed":
             screen.frame = jpeg("black")
         screen.updated = time.time()

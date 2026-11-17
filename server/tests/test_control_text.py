@@ -112,26 +112,48 @@ def test_text_batch_rejected_before_any_hid(matches):
     assert not phone.calls
 
 
-def test_diff_describes_exact_returned_image_even_if_feed_advances(monkeypatch):
-    phone, screen = FakePhone(), Screen()
+def test_diff_describes_exact_returned_image_even_if_feed_advances(monkeypatch, request):
+    from hidagent.screen import Screen as ReceivedScreen
+
+    clock = request.getfixturevalue("instant_mirror")
+    phone, screen = FakePhone(), ReceivedScreen()
+    screen._started = True
+    screen._on_ready()
+    original_frame, first_effect = jpeg("white"), jpeg("black")
+    screen._on_jpeg(original_frame)
     controls = Controls(phone, screen)
     token = controls.observation()["screen_id"]
-    returned_frame = jpeg("black")
+    actual_summarize = screen_diff.summarize
+    compared = []
 
     async def tap(x, y, **kwargs):
-        screen.frame = returned_frame
+        completed = clock.time()
+        clock.advance(.01)
+        screen._on_jpeg(first_effect)
+        return completed
 
     async def summarize(before, after, **kwargs):
-        assert after == returned_frame and kwargs["fresh"]
-        screen.frame = before
-        return {"changed_fraction": 1}
+        assert before == original_frame and kwargs["fresh"]
+        compared.append(after)
+        result = await actual_summarize(before, after, **kwargs)
+        if len(compared) == 1:
+            # Publish a real later receiver event while A's diff is computed.
+            clock.advance(.01)
+            screen._on_jpeg(original_frame)
+        return result
 
     phone.tap_verified = tap
     monkeypatch.setattr(screen_diff, "summarize", summarize)
     result = asyncio.run(controls.perform(ControlAction(action="tap", screen_id=token, x=.5, y=.5)))
-    assert base64.b64decode(result["image_base64"]) == returned_frame
-    assert result["changed"] is True
-    assert result["screen_diff"]["changed_fraction"] == 1
+    assert compared == [first_effect, original_frame]
+    assert result["fresh"] and result["screen_id"] != token
+    assert base64.b64decode(result["image_base64"]) == original_frame
+    assert result["changed"] is False
+    assert result["screen_diff"]["changed_fraction"] == 0
+    assert controls._observation.frame == controls.ticket[2] == original_frame
+    assert controls.ticket[2] != first_effect  # Historical A never authorizes the next action.
+    with pytest.raises(ValueError, match="invalid or consumed"):
+        controls.consume(token)  # Equal pixels do not revive the consumed pre-action ticket.
 
 
 def test_screen_diff_can_be_disabled(monkeypatch):
