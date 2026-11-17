@@ -7,7 +7,7 @@
 与主分支未提交的指针检测改动（`assistive_vision.py` / `phone.py` /
 `text_target.py`）没有文件重叠。
 
-## 1. 上一轮故障判断：事务 8BPX4…，120 秒 copied=false
+## 1. 上一轮故障判断：事务 <paste_tx_round3>，120 秒 copied=false
 
 ### 能确定的事
 
@@ -109,7 +109,7 @@ mock）验证；权限弹窗只保留在**同一事务** `paste()` 时的帧里�
 前置：确认工作树已是含本分支代码的服务并已 `restart-worker`
 （改了 `clipboard.py`，旧 worker 跑的是旧代码；`replay_lag_s` 为 null
 就是旧 worker 的信号）。以下步骤用的都是新事务，旧事务
-`8BPX4…` 已过期，不要对它重发触发键。
+`<paste_tx_round3>` 已过期，不要对它重发触发键。
 
 1. **先核对绑定，不要先发 prepare。** 在 iPhone 上：
    设置 → 辅助功能 → 键盘与键入 → 全键盘控制 → 打开 → 命令 →
