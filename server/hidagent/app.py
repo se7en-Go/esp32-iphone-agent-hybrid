@@ -793,8 +793,12 @@ async def raw(t: Text):
     return await act(lambda: device.send(t.text))
 
 
+class CalibrationStartBody(BaseModel):
+    multipoint: bool = False
+
+
 @app.post("/api/calibrate/start")
-async def calibrate_start():
+async def calibrate_start(body: CalibrationStartBody | None = None):
     """Calibrate the pointer. {"auto": true}: done by itself; otherwise the user clicks the pointer next."""
     refuse_if_tripped()
     check_manual()
@@ -802,8 +806,8 @@ async def calibrate_start():
         async with manual_lock:
             with _legacy_input_session():
                 controls.invalidate()
-                auto = await phone.start_calibration()
-            return {"ok": True, "auto": auto, "span": phone.span}
+                auto = await phone.start_calibration(multipoint=bool(body and body.multipoint))
+            return {"ok": True, "auto": auto, "span": phone.span, "multipoint": phone._affine is not None}
     except asyncio.CancelledError as e:
         raise HTTPException(409, "已紧急停止，校准没有继续。") from e
     except (DeviceError, RuntimeError) as e:

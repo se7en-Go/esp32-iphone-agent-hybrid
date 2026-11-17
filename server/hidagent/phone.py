@@ -27,7 +27,14 @@ from . import assistive_vision, feedback, freshness, ocr, screen_compare, vision
 from .assistive import AssistiveTouch, HomeUnconfirmed
 from .device import RELEASE_TIMEOUT, Device, DeviceError, exchange_timing, input_attempt
 from .input_context import InputContextGuard
-from .operation import OPERATION_TIMEOUT, OperationDeadline, bounded_operation, check_operation, shield_cleanup
+from .operation import (
+    OPERATION_TIMEOUT,
+    OperationDeadline,
+    bounded_operation,
+    check_operation,
+    remaining_operation_time,
+    shield_cleanup,
+)
 from .pointer_diagnostics import PointerDiagnostics
 from .screen import FrameSnapshot
 from .text_input import ClipboardWriter, TypeMode, clipboard_mode_options, select_type_mode
@@ -228,6 +235,134 @@ def _serialized(method):
     return run
 
 
+MULTIPOINT_GRID_TARGETS = tuple(
+    (tx, ty) for ty in (0.20, 0.50, 0.76) for tx in (0.20, 0.50, 0.80)
+)
+
+
+def _solve_3x3(matrix: list[list[float]], rhs: list[float]) -> tuple[float, float, float] | None:
+    """Solve a 3x3 linear system with partial pivoting; return None if near-singular."""
+    aug = [row[:] + [val] for row, val in zip(matrix, rhs, strict=True)]
+    for col in range(3):
+        pivot = max(range(col, 3), key=lambda row: abs(aug[row][col]))
+        if abs(aug[pivot][col]) <= 1e-12:
+            return None
+        aug[col], aug[pivot] = aug[pivot], aug[col]
+        scale = aug[col][col]
+        for j in range(col, 4):
+            aug[col][j] /= scale
+        for row in range(3):
+            if row == col:
+                continue
+            factor = aug[row][col]
+            if factor:
+                for j in range(col, 4):
+                    aug[row][j] -= factor * aug[col][j]
+    result = (aug[0][3], aug[1][3], aug[2][3])
+    return result if all(math.isfinite(val) for val in result) else None
+
+
+@dataclass(frozen=True)
+class PointerAffineFit:
+    """Six-parameter 2D affine mapping from mouse units (u, v) to screen fractions (x, y)."""
+
+    a_xx: float
+    a_xy: float
+    a_yx: float
+    a_yy: float
+    x0: float
+    y0: float
+
+    @property
+    def det(self) -> float:
+        return self.a_xx * self.a_yy - self.a_xy * self.a_yx
+
+    def is_valid(self) -> bool:
+        vals = (self.a_xx, self.a_xy, self.a_yx, self.a_yy, self.x0, self.y0)
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in vals):
+            return False
+        if self.a_xx <= 0 or self.a_yy <= 0 or self.det <= 1e-12:
+            return False
+        w, h = 1.0 / self.a_xx, 1.0 / self.a_yy
+        if not (60.0 <= w <= 2500.0 and 120.0 <= h <= 5000.0):
+            return False
+        if abs(self.a_xy) >= 0.25 * self.a_xx or abs(self.a_yx) >= 0.25 * self.a_yy:
+            return False
+        return -0.08 < self.x0 < 0.35 and -0.08 < self.y0 < 0.25
+
+    def forward(self, u: float, v: float) -> tuple[float, float]:
+        return (self.a_xx * u + self.a_xy * v + self.x0,
+                self.a_yx * u + self.a_yy * v + self.y0)
+
+    def delta_units(self, dx: float, dy: float) -> tuple[float, float]:
+        det = self.det
+        return ((self.a_yy * dx - self.a_xy * dy) / det,
+                (-self.a_yx * dx + self.a_xx * dy) / det)
+
+    def inverse(self, x: float, y: float) -> tuple[float, float]:
+        return self.delta_units(x - self.x0, y - self.y0)
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "a_xx": self.a_xx, "a_xy": self.a_xy,
+            "a_yx": self.a_yx, "a_yy": self.a_yy,
+            "x0": self.x0, "y0": self.y0,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "PointerAffineFit | None":
+        if not isinstance(raw, dict):
+            return None
+        keys = ("a_xx", "a_xy", "a_yx", "a_yy", "x0", "y0")
+        if not all(k in raw for k in keys):
+            return None
+        try:
+            fit = cls(*(float(raw[k]) for k in keys))
+        except (TypeError, ValueError):
+            return None
+        return fit if fit.is_valid() else None
+
+
+def fit_affine_samples(samples: list[tuple[float, float, float, float]]) -> PointerAffineFit | None:
+    """Fit a robust IRLS 2D affine mapping from (u, v, x, y) pointer calibration observations."""
+    if len(samples) < 6:
+        return None
+    weights = [1.0] * len(samples)
+    fit: PointerAffineFit | None = None
+    for iteration in range(3):
+        mat = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+        rx = [0.0, 0.0, 0.0]
+        ry = [0.0, 0.0, 0.0]
+        for (u, v, x, y), w in zip(samples, weights, strict=True):
+            vec = (u, v, 1.0)
+            for i in range(3):
+                vi_w = w * vec[i]
+                rx[i] += vi_w * x
+                ry[i] += vi_w * y
+                for j in range(3):
+                    mat[i][j] += vi_w * vec[j]
+        cx = _solve_3x3(mat, rx)
+        cy = _solve_3x3(mat, ry)
+        if cx is None or cy is None:
+            return None
+        candidate = PointerAffineFit(cx[0], cx[1], cy[0], cy[1], cx[2], cy[2])
+        if not candidate.is_valid():
+            return None
+        fit = candidate
+        if iteration == 2:
+            break
+        residuals = [
+            math.hypot(x - (fit.a_xx * u + fit.a_xy * v + fit.x0),
+                       y - (fit.a_yx * u + fit.a_yy * v + fit.y0))
+            for u, v, x, y in samples
+        ]
+        ordered = sorted(residuals)
+        mid = ordered[len(ordered) // 2]
+        delta = max(0.015, 2.0 * mid)
+        weights = [1.0 if r <= delta else delta / r for r in residuals]
+    return fit
+
+
 class Phone:
     operation_timeout = OPERATION_TIMEOUT
 
@@ -245,6 +380,7 @@ class Phone:
         body = saved if isinstance(saved, dict) else {}
         has_span = "w" in body and "h" in body
         self.span = {"w": body["w"], "h": body["h"]} if has_span else None
+        self._affine = PointerAffineFit.from_dict(body.get("affine")) if has_span else None
         # where `home` leaves the pointer, as a screen fraction: not the corner itself on iPhones with rounded
         # corners (the 15 Pro Max stops 91 of 720 px right of it), so every move is counted from there
         self.origin = {"x": body.get("x0", 0.0), "y": body.get("y0", 0.0)}
@@ -350,14 +486,16 @@ class Phone:
 
     @_serialized
     @bounded_operation
-    async def start_calibration(self) -> bool:
-        """Find the pointer on screen at two known distances from the corner and fit the mapping from both.
+    async def start_calibration(self, *, multipoint: bool = False) -> bool:
+        """Find the pointer on screen at known distances and fit the coordinate mapping.
 
-        Two points give the scale and the offset, which one point cannot (iOS pointer motion is not exactly
-        proportional). Returns True when it calibrated itself; otherwise the user clicks the pointer
-        (finish_calibration).
+        By default uses two diagonal stops (`span`, `origin`). When `multipoint=True`,
+        performs the coarse two-point bootstrap and then measures a 3x3 grid across the
+        screen to fit a robust 6-parameter affine mapping, falling back cleanly to the
+        two-point fit if too few grid stops confirm.
         """
         self._pos = None
+        self._affine = None
         epoch = getattr(self.device, "abort_epoch", 0)
         await self._pull_pace()
         stops = BLE_CALIBRATION_STOPS if self._pace == BLE_PACE else CALIBRATION_STOPS
@@ -380,6 +518,7 @@ class Phone:
             return False
         span, origin = fit
         self.span, self.origin = span, origin
+        self._affine = None
         for samples in self._seen.values():
             samples.clear()
         for units, x, y in seen:  # where each stop landed, so later landings correct any residual drift
@@ -387,11 +526,60 @@ class Phone:
             self._seen["y"].append((origin["y"] + units / span["h"], y))
         self._pos = (seen[-1][0], seen[-1][0])
         self._moves, self._link = 0, getattr(self.device, "links", 0)
+        if multipoint and self.screen is not None and self.screen.live:
+            affine_samples = await self._collect_multipoint_samples(epoch, (seen[-1][1], seen[-1][2]))
+            affine = fit_affine_samples(affine_samples)
+            if affine is not None:
+                self._affine = affine
+                self.span = {"w": round(1.0 / affine.a_xx), "h": round(1.0 / affine.a_yy)}
+                self.origin = {"x": affine.x0, "y": affine.y0}
+                for samples in self._seen.values():
+                    samples.clear()
+                for u_val, v_val, fx, fy in affine_samples[-12:]:
+                    px, py = affine.forward(u_val, v_val)
+                    self._seen["x"].append((px, fx))
+                    self._seen["y"].append((py, fy))
+                log.info(
+                    "multipoint calibration: %d samples, affine=%s",
+                    len(affine_samples),
+                    {k: round(v, 5) for k, v in affine.to_dict().items()},
+                )
+            else:
+                log.info(
+                    "multipoint calibration fell back to two-point fit (%d grid samples)",
+                    len(affine_samples),
+                )
         self._save()
         log.info("calibration: pointer at %s, span %s, origin %s",
                  [(round(x, 3), round(y, 3)) for _, x, y in seen], span,
                  {k: round(v, 3) for k, v in origin.items()})
         return True
+
+    async def _collect_multipoint_samples(
+        self, epoch: int, last_pointer: tuple[float, float] | None
+    ) -> list[tuple[float, float, float, float]]:
+        """Probe the 3x3 calibration grid from home using coarse scale and record (u, v, x, y)."""
+        samples: list[tuple[float, float, float, float]] = []
+        prev_found = last_pointer
+        for tx, ty in MULTIPOINT_GRID_TARGETS:
+            if self._stopped(epoch) or not self.screen.live or remaining_operation_time() < 5.0:
+                break
+            tu, tv = self._dx(tx), self._dy(ty)
+            self._position_before = getattr(self.screen, "frame", None)
+            self._position_from = prev_found
+            # Re-home before each grid probe so cumulative multi-hop BLE drift
+            # matches single-move execution from (0, 0).
+            self._pos = None
+            await self._move_to(tu, tv)
+            self._position_completed = time.time()
+            u_sent, v_sent = self._pos if self._pos is not None else (tu, tv)
+            found = await self._find_pointer((tx, ty), epoch=epoch, quick=True, required=True)
+            if found is not None and max(abs(found[0] - tx), abs(found[1] - ty)) <= 0.15:
+                samples.append((float(u_sent), float(v_sent), float(found[0]), float(found[1])))
+                prev_found = found
+            else:
+                prev_found = None
+        return samples
 
     @staticmethod
     def _fit(seen: list) -> tuple[dict, dict] | None:
@@ -1164,6 +1352,7 @@ class Phone:
             if 0 <= x0 < 0.25:  # otherwise the point is odd; fall back to the plain one point scale
                 span["w"], origin["x"] = w, x0
         self.span, self.origin = span, origin
+        self._affine = None
         for samples in self._seen.values():
             samples.clear()
         self._pos = (move, move)
@@ -1184,6 +1373,7 @@ class Phone:
         log.info("calibration cleared: pace %s -> %s", self._pace, version)
         self._pace = version
         self.span = None
+        self._affine = None
         self.origin = {"x": 0.0, "y": 0.0}
         self._pos = None
         self._moves = 0
@@ -1197,6 +1387,8 @@ class Phone:
                 "seen": {k: list(v) for k, v in self._seen.items()}}
         if self.span:
             body.update(self.span)
+        if self._affine is not None:
+            body["affine"] = self._affine.to_dict()
         if self._pace is not None:
             body["pace"] = self._pace
         self._file.write_text(json.dumps(body))
@@ -1209,7 +1401,9 @@ class Phone:
         self._position_before = getattr(self.screen, "frame", None)
         self._position_from = self._pointer_position()
         self._position_started = time.time()
-        await self._move_to(self._dx(x), self._dy(y))
+        if self._affine is not None:
+            self._pos = None
+        await self._move_to(*self._target_units(x, y))
         self._position_completed = time.time()
         if aim and self.screen is not None:
             await self._aim(x, y)
@@ -1332,7 +1526,7 @@ class Phone:
                     guard(cursor=cursor, reference=reference)
 
             fx, fy = found
-            dx, dy = round((x - fx) * self.span["w"]), round((y - fy) * self.span["h"])
+            dx, dy = self._delta_units(x - fx, y - fy)
             if not (dx or dy):
                 break
             position, self._pos = self._pos, None
@@ -1505,6 +1699,8 @@ class Phone:
     def _pointer_position(self) -> tuple[float, float] | None:
         if self._pos is None or self.span is None:
             return None
+        if self._affine is not None:
+            return self._affine.forward(*self._pos)
         return (self.origin["x"] + self._pos[0] / self.span["w"],
                 self.origin["y"] + self._pos[1] / self.span["h"])
 
@@ -1884,6 +2080,10 @@ class Phone:
                 same_session()
                 timing["total"] = (time.monotonic() - began) * 1000
                 result = {"clicked": True, "pointer_seen": self._pointer_seen, "screen_changed": changed,
+                          "initial_pointer": list(self._pointer_spots[1]) if len(self._pointer_spots) >= 2 else None,
+                          "measured_pointer": list(self._pointer_spots[-1]) if len(self._pointer_spots) >= 2 else None,
+                          "correction_moves": max(0, len(self._pointer_spots) - 2),
+                          "calibration_mode": "affine" if self._affine is not None else "two_point",
                           "click_count": click_count if not duration else 0, "hold_seconds": duration,
                           "effect_observed": changed if fresh else None, "effect_verified": False,
                           "fresh": fresh, "completed_at": sent, "latency": round(timing["total"] / 1000, 3),
@@ -1959,7 +2159,7 @@ class Phone:
             self._save()
         if abs(fx - x) <= AIM_TOLERANCE and abs(fy - y) <= AIM_TOLERANCE:
             return
-        dx, dy = round((x - fx) * self.span["w"]), round((y - fy) * self.span["h"])  # fix this miss right away
+        dx, dy = self._delta_units(x - fx, y - fy)  # fix this miss right away
         await self.device.send(f"move {dx} {dy}")
         self._pos = (self._pos[0] + dx, self._pos[1] + dy)
 
@@ -2091,9 +2291,9 @@ class Phone:
         anchor = self._pos
         if anchor is None or self._link != link:
             raise DeviceError("拖动起点的指针位置或设备连接已变化，未按下。")
-        origin = self._dx(points[0][0]), self._dy(points[0][1])
-        targets = [(anchor[0] + self._dx(x) - origin[0], anchor[1] + self._dy(y) - origin[1])
-                   for x, y in points[1:]]
+        origin = self._target_units(points[0][0], points[0][1])
+        targets = [(anchor[0] + tx - origin[0], anchor[1] + ty - origin[1])
+                   for tx, ty in (self._target_units(x, y) for x, y in points[1:])]
 
         def validate_press():
             same_session()
@@ -2428,6 +2628,19 @@ class Phone:
         await self.tap_verified(*target.center, target_box=target.box,
                                 target_frame=observed.frame, before_click=lambda: validate_back(positioned=True),
                                 navigation_context=navigation_context)
+
+    def _target_units(self, x: float, y: float) -> tuple[int, int]:
+        if self._affine is not None:
+            ax, ay = self._fix(x, "x"), self._fix(y, "y")
+            u, v = self._affine.inverse(ax, ay)
+            return round(u), round(v)
+        return self._dx(x), self._dy(y)
+
+    def _delta_units(self, dx: float, dy: float) -> tuple[int, int]:
+        if self._affine is not None:
+            du, dv = self._affine.delta_units(dx, dy)
+            return round(du), round(dv)
+        return round(dx * self.span["w"]), round(dy * self.span["h"])
 
     def _dx(self, x: float) -> int:
         return round((self._fix(x, "x") - self.origin["x"]) * self.span["w"])
