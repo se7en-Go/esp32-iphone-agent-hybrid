@@ -6,9 +6,9 @@ import re
 import unicodedata
 from statistics import median
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
-from . import ocr
+from . import assistive_vision, input_context, ocr, screen_compare
 
 _ALLOW = {"allowpaste", "allow", "允许粘贴", "允许", "允許貼上", "允許"}
 _DENY = {"don'tallowpaste", "don’tallowpaste", "don'tallow", "don’tallow",
@@ -65,12 +65,72 @@ def _field_lines(items, region):
                  for row in rows)
 
 
-def _same_context(before, after, region):
+def _located_suggestion_bar(before: bytes, after: bytes,
+                            region: tuple[float, float, float, float]) -> tuple[float, float] | None:
+    """Locate the shared QuickType suggestion strip above the software keyboard."""
+    before_bar = input_context.keyboard_suggestion_bar(before)
+    after_bar = input_context.keyboard_suggestion_bar(after)
+    if (before_bar is None or after_bar is None
+            or abs(before_bar[0] - after_bar[0]) > .02
+            or abs(before_bar[1] - after_bar[1]) > .02):
+        return None
+    suggestion_bar = min(before_bar[0], after_bar[0]), max(before_bar[1], after_bar[1])
+    return None if region[3] > suggestion_bar[0] else suggestion_bar
+
+
+def _in_suggestion_bar(item, suggestion_bar: tuple[float, float] | None) -> bool:
+    if suggestion_bar is None:
+        return False
+    bar_top, bar_bottom = suggestion_bar
+    _, top, _, bottom = item.box
+    return bar_top <= item.center[1] <= bar_bottom and top >= bar_top - .005 and bottom <= bar_bottom + .008
+
+
+def _mask_normalized_box(draw: ImageDraw.ImageDraw, box: tuple[float, float, float, float],
+                         size: tuple[int, int]) -> None:
+    width, height = size
+    draw.rectangle((round(box[0] * width), round(box[1] * height),
+                    round(box[2] * width), round(box[3] * height)), fill=0)
+
+
+def _outside_visual_changed(before: bytes, after: bytes, region: tuple[float, float, float, float],
+                            suggestion_bar: tuple[float, float]) -> bool:
+    """Verify no unintended UI outside the field, suggestion strip, clock, pointer, or bubble changed."""
+    diff = screen_compare._difference(before, after, 360)
+    if diff is None:
+        return True
+    draw = ImageDraw.Draw(diff)
+    _mask_normalized_box(draw, region, diff.size)
+    _mask_normalized_box(draw, (0., suggestion_bar[0], 1., suggestion_bar[1]), diff.size)
+    for frame in (before, after):
+        if assistive_vision.find_panel(frame) is not None:
+            return True
+        button = assistive_vision.find_button_target(frame)
+        if button is not None:
+            _, (left, top, right, bottom) = button
+            pad = .015
+            _mask_normalized_box(
+                draw,
+                (max(0., left - pad), max(0., top - pad), min(1., right + pad), min(1., bottom + pad)),
+                diff.size,
+            )
+    screen_compare.mask_caret_blink(before, after, diff, ())
+    screen_compare.mask_clock_ticks(before, after, diff)
+    screen_compare.mask_pointer_highlights(before, after, diff)
+    screen_compare._mask_pointer_discs(before, after, diff, max_discs=2)
+    screen_compare._mask_translucent_pointer_fade(before, after, diff)
+    values = diff.tobytes()
+    return sum(values) / len(values) > .8 or any(len(points) >= 6 for points in screen_compare._regions(diff, 24))
+
+
+def _same_context(before, after, region, *, suggestion_bar=None):
     def anchors(items):
         result = {}
         for item in items:
             left, top, right, bottom = item.box
             outside = right < region[0] or left > region[2] or bottom < region[1] or top > region[3]
+            if outside and _in_suggestion_bar(item, suggestion_bar):
+                continue
             label = _visible_text(item.text)
             if outside and item.center[1] > .06 and item.conf >= _MIN_CONFIDENCE and len(label) >= 2:
                 result.setdefault(label, []).append(item.center)
@@ -168,9 +228,14 @@ async def verify_after_paste_permission(before, sheet, after, region, observed_t
                     and len(current_lines) >= len(expected)
                     and current_lines[-len(expected):] == expected
                     and current_lines[:len(current_lines) - len(expected)] == original_lines)
-        return (not _is_permission_prompt(original) and not _is_permission_prompt(current)
-                and appended
-                and _same_context(original, current, region)
-                and _same_field_outline(original_image, current_image, region))
+        if (_is_permission_prompt(original) or _is_permission_prompt(current)
+                or not appended or not _same_field_outline(original_image, current_image, region)):
+            return False
+        if _same_context(original, current, region):
+            return True
+        suggestion_bar = _located_suggestion_bar(before, after, region)
+        return (suggestion_bar is not None
+                and _same_context(original, current, region, suggestion_bar=suggestion_bar)
+                and not _outside_visual_changed(before, after, region, suggestion_bar))
     except (ocr.OCRError, OSError, ValueError):
         return False

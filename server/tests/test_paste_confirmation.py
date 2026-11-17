@@ -143,3 +143,124 @@ def test_permission_confirmation_accepts_append_starting_with_newline(monkeypatc
     proof = verify_after_paste_permission(original, sheet, after, REGION,
                                           "\n第二次：你好00042\n校验：XYZabc")
     assert asyncio.run(proof) is True
+
+
+KB_REGION = (.08, .11, .92, .53)
+
+
+def keyboard_frame(bars, *, suggestion_variant=0, sheet=False, header_tamper=False, keyboard=True, moved=False):
+    image = Image.new("RGB", (500, 1000), (248, 248, 245))
+    draw = ImageDraw.Draw(image)
+    offset = 10 if moved else 0
+    draw.rectangle((40 + offset, 110, 460 + offset, 530), fill="white", outline=(20, 20, 20), width=3)
+    for y in bars:
+        draw.rectangle((60 + offset, y - 2, 240 + offset, y + 2), fill=(20, 20, 20))
+    if keyboard:
+        draw.rectangle((0, 580, 500, 1000), fill=(210, 212, 216))
+        if suggestion_variant == 0:
+            draw.rectangle((60, 608, 140, 624), fill=(60, 60, 60))
+        else:
+            draw.rectangle((200, 608, 310, 624), fill=(60, 60, 60))
+    if header_tamper:
+        draw.rectangle((200, 70, 300, 95), fill=(255, 140, 0))
+    if sheet:
+        draw.rounded_rectangle((90, 350, 410, 600), radius=20, fill=(240, 240, 240))
+    result = io.BytesIO()
+    image.save(result, "PNG")
+    return result.getvalue()
+
+
+def _kb_context_boxes(*, nav_top_label="返回", nav_top_y=.08, key_bottom_label="return"):
+    return [
+        label(nav_top_label, .12, nav_top_y),
+        label("完成", .91, .08),
+        label("123", .06, .88),
+        label("space", .50, .88),
+        label(key_bottom_label, .88, .88),
+    ]
+
+
+def _kb_suggestion_boxes(variant):
+    if variant == 0:
+        return [label("effort", .50, .619), label("efforts", .83, .619)]
+    return [label('“kLm"', .16, .619), label("part", .50, .620), label("parents", .83, .620)]
+
+
+def test_permission_confirmation_accepts_located_suggestion_bar_refresh(monkeypatch):
+    existing = [label("已有第一行", .25, .20), label("第二行 AbD eFg", .25, .25)]
+    pasted = [label("修验通过：云海00417", .25, .30), label("末行 GhJ kLm", .25, .35)]
+    dialog = [label("“备忘录”想从“快捷指令”粘贴", .5, .44), label("你允许这样做吗？", .5, .48),
+              label("不允许粘贴", .27, .55), label("允许粘贴", .7, .55)]
+    original = keyboard_frame([200, 250], suggestion_variant=0)
+    sheet = keyboard_frame([200, 250], suggestion_variant=0, sheet=True)
+    after = keyboard_frame([200, 250, 300, 350], suggestion_variant=1)
+    frames = {
+        original: _kb_context_boxes() + _kb_suggestion_boxes(0) + existing,
+        sheet: dialog,
+        after: _kb_context_boxes() + _kb_suggestion_boxes(1) + existing + pasted,
+    }
+
+    async def read(image):
+        return frames[image]
+
+    monkeypatch.setattr(ocr, "read_text_async", read)
+    proof = verify_after_paste_permission(original, sheet, after, KB_REGION,
+                                          "\n修验通过：云海00417\n末行 GhJ kLm")
+    assert asyncio.run(proof) is True
+
+
+@pytest.mark.parametrize("defect", [
+    "header_label_changed",
+    "header_visual_tamper",
+    "keyboard_key_changed",
+    "field_moved",
+    "existing_text_modified",
+    "duplicate_append",
+    "keyboard_dismissed",
+    "unlocated_bar",
+    "region_overlaps_bar",
+])
+def test_permission_confirmation_rejects_defects_with_suggestion_bar(monkeypatch, defect):
+    existing = [label("已有第一行", .25, .20), label("第二行 AbD eFg", .25, .25)]
+    pasted = [label("修验通过：云海00417", .25, .30), label("末行 GhJ kLm", .25, .35)]
+    dialog = [label("“备忘录”想从“快捷指令”粘贴", .5, .44), label("你允许这样做吗？", .5, .48),
+              label("不允许粘贴", .27, .55), label("允许粘贴", .7, .55)]
+    kb_before = defect != "unlocated_bar"
+    kb_after = defect not in {"keyboard_dismissed", "unlocated_bar"}
+    original = keyboard_frame([200, 250], suggestion_variant=0, keyboard=kb_before)
+    sheet = keyboard_frame([200, 250], suggestion_variant=0, sheet=True)
+    after = keyboard_frame(
+        [200, 250, 300, 350],
+        suggestion_variant=1,
+        header_tamper=(defect == "header_visual_tamper"),
+        keyboard=kb_after,
+        moved=(defect == "field_moved"),
+    )
+    after_ctx = _kb_context_boxes(
+        nav_top_label="群聊" if defect == "header_label_changed" else "返回",
+        key_bottom_label="前往" if defect == "keyboard_key_changed" else "return",
+    )
+    after_existing = (
+        [label("已改第一行", .25, .20), label("第二行 AbD eFg", .25, .25)]
+        if defect == "existing_text_modified"
+        else existing
+    )
+    after_pasted = (
+        pasted + [label("修验通过：云海00417", .25, .40), label("末行 GhJ kLm", .25, .45)]
+        if defect == "duplicate_append"
+        else pasted
+    )
+    frames = {
+        original: _kb_context_boxes() + _kb_suggestion_boxes(0) + existing,
+        sheet: dialog,
+        after: after_ctx + _kb_suggestion_boxes(1) + after_existing + after_pasted,
+    }
+
+    async def read(image):
+        return frames[image]
+
+    monkeypatch.setattr(ocr, "read_text_async", read)
+    region = (.08, .11, .92, .60) if defect == "region_overlaps_bar" else KB_REGION
+    proof = verify_after_paste_permission(original, sheet, after, region,
+                                          "\n修验通过：云海00417\n末行 GhJ kLm")
+    assert asyncio.run(proof) is False
