@@ -259,6 +259,23 @@ static void test_disconnect_during_report_retry() {
   puts("ok a pending report cannot cross into a new BLE session with the same handle");
 }
 
+static void test_middle_button_mask() {
+  reset();
+  assert(ble_hid_buttons(0x04) && buttons == 0x04);
+  assert(sent.size() == 1 && sent.back().data.size() == 5 && sent.back().data[0] == 0x04);
+  assert(ble_hid_buttons(0x04) && sent.size() == 1);
+  free_blocks = 0;
+  assert(!ble_hid_buttons(0x00) && buttons == 0x04);
+  free_blocks = 64;
+  assert(ble_hid_buttons(0x00) && buttons == 0);
+  assert(sent.size() == 2 && sent.back().data[0] == 0x00);
+  assert(ble_hid_buttons(0x04) && buttons == 0x04);
+  connected = false;
+  ble_hid_on_disconnect(1);
+  assert(buttons == 0);
+  puts("ok BLE middle button report mask, checked release and disconnect cleanup");
+}
+
 int main(int argc, char **argv) {
   gate.begin();
   ble_hid_begin(NimBLEDevice::getServer());
@@ -266,6 +283,7 @@ int main(int argc, char **argv) {
   if (argc == 1 || strcmp(argv[1], "send") == 0) {
     test_synchronous_mbuf_release();
     test_buffer_recovery();
+    test_middle_button_mask();
   }
   if (argc == 1 || strcmp(argv[1], "unpair") == 0) {
     test_unpair_with_advertising();

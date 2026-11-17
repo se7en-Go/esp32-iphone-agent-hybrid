@@ -26,6 +26,7 @@ bool hid_prepare_pref(int pref); // bridge releases held inputs before changing 
 bool ble_hid_unpair();
 
 bool ble_hid_mouse(int8_t x, int8_t y, int8_t wheel, int8_t pan);
+bool ble_hid_buttons(uint8_t mask);
 bool ble_hid_button(bool left_down);
 void ble_hid_release_all();
 bool ble_hid_keyboard(uint8_t modifier, const uint8_t *keys, int nkeys);

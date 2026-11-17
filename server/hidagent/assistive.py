@@ -166,6 +166,54 @@ class AssistiveTouch:
         except OSError as exc:
             log.warning("AssistiveTouch: 无法清除回主屏幕方式：%s", exc)
 
+    def _device_key(self) -> str:
+        return (getattr(self.phone.device, "port_name", "") or "").strip()
+
+    def _middle_click_home_enabled(self) -> bool:
+        """Enable mouse middle-button Home only for BLE devices opted in or verified."""
+        hid = (getattr(self.phone.device, "board_status", None) or {}).get("hid") or {}
+        if hid.get("path") != "ble":
+            return False
+        if os.environ.get("HIDAGENT_MIDDLE_CLICK_HOME") == "1":
+            return True
+        key = self._device_key()
+        if key:
+            devices = self._saved.get("middle_click_home_devices") or []
+            return isinstance(devices, list) and key in devices
+        return self._saved.get("middle_click_home_verified") is True
+
+    def set_middle_click_home_verified(self, verified: bool) -> None:
+        """Persist or clear verified middle-button Home support for this profile."""
+        key = self._device_key()
+        raw_devices = self._saved.get("middle_click_home_devices") or []
+        devices = (
+            {str(item).strip() for item in raw_devices if str(item).strip()}
+            if isinstance(raw_devices, list)
+            else set()
+        )
+        if verified:
+            if key:
+                devices.add(key)
+                self._saved["middle_click_home_devices"] = sorted(devices)
+            self._saved["middle_click_home_verified"] = True
+            self._saved["verified_route"] = "middle-click"
+        else:
+            if key:
+                devices.discard(key)
+                if devices:
+                    self._saved["middle_click_home_devices"] = sorted(devices)
+                else:
+                    self._saved.pop("middle_click_home_devices", None)
+                    self._saved.pop("middle_click_home_verified", None)
+            else:
+                self._saved.pop("middle_click_home_verified", None)
+            if self._saved.get("verified_route") == "middle-click":
+                self._saved.pop("verified_route", None)
+        try:
+            self._write_profile()
+        except OSError as exc:
+            log.warning("AssistiveTouch: 无法保存中键回主屏幕状态：%s", exc)
+
     async def _wait(self, epoch: int, since: float, timeout: float, accept, *, stable=False):
         deadline = time.monotonic() + timeout
         action_since = since
@@ -427,15 +475,24 @@ class AssistiveTouch:
                 self._set_verified_route("assistive-touch")
                 return
             raise RuntimeError("辅助触控菜单已打开，但未确认主屏幕图标或返回结果；请重新观察。")
-        routes = ["assistive-touch", "swipe-up", "homescreen", "cmd+h"]
+        middle_enabled = self._middle_click_home_enabled()
+        routes = (["middle-click"] if middle_enabled else []) + ["assistive-touch", "swipe-up", "homescreen", "cmd+h"]
         preferred = self._saved.get("verified_route")
-        if preferred in routes:
+        if os.environ.get("HIDAGENT_MIDDLE_CLICK_HOME") == "1" and "middle-click" in routes:
+            routes.remove("middle-click")
+            routes.insert(0, "middle-click")
+        elif preferred in routes:
             routes.remove(preferred)
             routes.insert(0, preferred)
         acknowledged = False
         last_error = None
         pointer_error = None
         pointer_rejected = False
+        command_routes = {
+            "middle-click": "click middle",
+            "homescreen": "homescreen",
+            "cmd+h": "key cmd+h",
+        }
         for route in routes:
             self._check(epoch)
             self._require_frame()
@@ -459,7 +516,10 @@ class AssistiveTouch:
             if route == "swipe-up" and not self.phone.calibrated:
                 log.info("go_home: 指针未校准，跳过上滑退路")
                 continue
-            log.warning("go_home: HID 退路 %s", route)
+            if route == "middle-click":
+                log.info("go_home: 尝试已启用的 BLE 鼠标中键 (%s)", command_routes[route])
+            else:
+                log.warning("go_home: HID 退路 %s", route)
             try:
                 # Start the effect window before the gesture. Release waits for its ACK,
                 # and the mirror may publish the resulting frame during that wait.
@@ -468,7 +528,7 @@ class AssistiveTouch:
                     await self.phone.swipe(0.5, 0.995, 0.5, 0.6, hold=False,
                                            before_action=self._require_frame)
                 else:
-                    await self.phone._send(epoch, "homescreen" if route == "homescreen" else "key cmd+h",
+                    await self.phone._send(epoch, command_routes[route],
                                            before_write=self._require_frame)
                 acknowledged = True
             except (DeviceError, OSError, PointerLandingError, TargetChangedError) as exc:
@@ -483,10 +543,36 @@ class AssistiveTouch:
             verified = await self._wait(
                 epoch, since, RESULT_WAIT,
                 assistive_vision.is_home_visible, stable=True)
+            if not verified and route == "middle-click" and fresh_frame(
+                    self.phone.screen, clock=self._clock, since=since) is None:
+                candidate = snapshot(self.phone.screen)
+                ensure_obs = getattr(self.phone, "ensure_observation", None)
+                if ensure_obs is not None and candidate.frame and assistive_vision.is_home_visible(candidate.frame):
+                    original_device = self.phone.device
+
+                    def middle_home_candidate(expected_device=original_device):
+                        self.phone._check_operation()
+                        self._check(epoch)
+                        if self.phone.device is not expected_device:
+                            raise DeviceError("返回主屏幕期间设备连接已变化，未继续操作；请重新观察。")
+                        current = require_fresh(self.phone.screen, clock=self._clock, max_age=float("inf"))
+                        if self._generation is not None and current.generation != self._generation:
+                            raise RuntimeError("返回主屏幕期间画面连接已变化，请重新观察。")
+                        if not assistive_vision.is_home_visible(current.frame):
+                            raise RuntimeError("等待主屏幕新画面时页面已变化，未继续唤醒；请重新观察。")
+
+                    await ensure_obs(before_refresh=middle_home_candidate)
+                    middle_home_candidate()
+                    verified = await self._wait(
+                        epoch, since, RESULT_WAIT,
+                        assistive_vision.is_home_visible, stable=True)
+                    middle_home_candidate()
             if verified:
                 log.info("go_home: %s 后已确认主屏幕图标网格及 Dock", route)
                 self._set_verified_route(route)
                 return
+            if route == "middle-click":
+                log.warning("go_home: middle-click 已发送但未确认主屏幕，回退常规路径")
         if not acknowledged and last_error is not None:
             raise last_error
         if self._frame() is not None:

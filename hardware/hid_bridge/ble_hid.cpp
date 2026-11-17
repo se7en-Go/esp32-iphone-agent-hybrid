@@ -246,8 +246,8 @@ bool ble_hid_mouse(int8_t x, int8_t y, int8_t wheel, int8_t pan) {
   return emit(mouseIn, report, sizeof report);
 }
 
-bool ble_hid_button(bool left_down) {
-  uint8_t next = left_down ? 0x01 : 0x00;
+bool ble_hid_buttons(uint8_t mask) {
+  uint8_t next = mask & 0x07;
   if (next == buttons) return true;
   uint8_t report[5] = {next, 0, 0, 0, 0};
   // Commit only accepted state. A disconnect while emit waits clears the latch;
@@ -255,6 +255,10 @@ bool ble_hid_button(bool left_down) {
   if (!emit(mouseIn, report, sizeof report)) return false;
   buttons = next;
   return true;
+}
+
+bool ble_hid_button(bool left_down) {
+  return ble_hid_buttons(left_down ? 0x01 : 0x00);
 }
 
 bool ble_hid_keyboard(uint8_t modifier, const uint8_t *keys, int nkeys) {
@@ -278,7 +282,7 @@ bool ble_hid_consumer(uint16_t usage) {
 }
 
 void ble_hid_release_all() {
-  ble_hid_button(false);
+  ble_hid_buttons(0);
   ble_hid_keyboard(0, NULL, 0);
   ble_hid_consumer(0);
 }
