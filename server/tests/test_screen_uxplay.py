@@ -255,3 +255,36 @@ def test_remote_snapshot_carries_capture_age_with_transit(monkeypatch):
     assert observed.frame == b"remote JPEG"
     assert observed.capture_age_s is not None
     assert abs(observed.capture_age_s - 0.17) < 0.02
+
+
+def test_recent_frames_retains_distinct_same_tick_frames_and_ignores_duplicates(monkeypatch):
+    """Coarse timer ticks must not drop distinct frames, while duplicate polls stay ignored."""
+    clock = ManualClock()
+    clock.install(monkeypatch)
+    screen = UxPlayScreen()
+    screen._proc = ReceiverProcess()
+    monkeypatch.setattr(screen, "_clients", lambda: None)
+
+    base = clock.time()
+    arrived = clock.monotonic()
+    screen._accept_remote({
+        "instance": "a" * 32, "generation": 0, "running": True, "live": True,
+        "updated": base, "arrived": arrived, "capture_age_s": 0.01,
+    }, b"frame-1")
+    # Repeated poll of the exact same snapshot is ignored.
+    screen._accept_remote({
+        "instance": "a" * 32, "generation": 0, "running": True, "live": True,
+        "updated": base, "arrived": arrived, "capture_age_s": 0.01,
+    }, b"frame-1")
+    # Out-of-order arrived tick is rejected.
+    screen._accept_remote({
+        "instance": "a" * 32, "generation": 0, "running": True, "live": True,
+        "updated": base + 0.01, "arrived": arrived - 0.01, "capture_age_s": 0.01,
+    }, b"frame-old-arrived")
+    # Distinct frame sharing the same coarse arrived tick is retained.
+    screen._accept_remote({
+        "instance": "a" * 32, "generation": 0, "running": True, "live": True,
+        "updated": base + 0.01, "arrived": arrived, "capture_age_s": 0.01,
+    }, b"frame-2")
+
+    assert [snap.frame for snap in screen.recent_frames] == [b"frame-1", b"frame-2"]

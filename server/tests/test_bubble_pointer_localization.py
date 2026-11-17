@@ -5,6 +5,7 @@ import io
 import time
 from pathlib import Path
 
+from fake_clock import ManualClock
 from PIL import Image, ImageDraw
 from test_pointer_session import setup_phone
 
@@ -107,8 +108,10 @@ def test_verify_cursor_reference_accepts_bubble_edge_straddling_pointer():
     assert ok_bad is False
 
 
-def _uxplay_publisher(screen):
+def _uxplay_publisher(screen, clock=None):
     def publish(jpeg, *, capture_age_s):
+        if clock is not None:
+            clock.advance(0.03)
         screen._accept_remote({
             "instance": "a" * 32, "generation": 0, "running": True, "live": True,
             "updated": time.time(), "arrived": time.monotonic(),
@@ -119,9 +122,11 @@ def _uxplay_publisher(screen):
 
 
 def test_localize_pointer_skips_hafe2_stale_early_frame_and_uses_post_return(tmp_path, monkeypatch):
+    clock = ManualClock()
+    clock.install(monkeypatch)
     phone, device, _ = setup_phone(tmp_path)
     screen = UxPlayScreen(socket_path=tmp_path / "airplay.sock")
-    publish = _uxplay_publisher(screen)
+    publish = _uxplay_publisher(screen, clock)
     base = _bubble_frame(pointer=(0.659, 0.941))
     outward = _bubble_frame(pointer=(0.758, 0.892))
     returned = _bubble_frame(pointer=(0.758, 0.950))
@@ -174,9 +179,11 @@ def test_localize_pointer_skips_hafe2_stale_early_frame_and_uses_post_return(tmp
 
 
 def test_localize_pointer_recovers_frame_arriving_right_at_capture_deadline(tmp_path, monkeypatch):
+    clock = ManualClock()
+    clock.install(monkeypatch)
     phone, device, _ = setup_phone(tmp_path)
     screen = UxPlayScreen(socket_path=tmp_path / "airplay.sock")
-    publish = _uxplay_publisher(screen)
+    publish = _uxplay_publisher(screen, clock)
     base = _bubble_frame(pointer=(0.659, 0.941))
     outward = _bubble_frame(pointer=(0.758, 0.892))
     returned = _bubble_frame(pointer=(0.758, 0.950))

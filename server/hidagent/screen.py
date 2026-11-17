@@ -68,9 +68,12 @@ class RecentFrameHistory:
         with self._frame_lock:
             if self._recent_frames and self._recent_frames[-1].generation != frame.generation:
                 self._recent_frames.clear()
-            if frame.frame and frame.observed_live and (not self._recent_frames
-                    or frame.arrived > self._recent_frames[-1].arrived):
-                self._recent_frames.append(frame)
+            if frame.frame and frame.observed_live:
+                prev = self._recent_frames[-1] if self._recent_frames else None
+                if prev is None or frame.arrived > prev.arrived or (
+                        frame.arrived == prev.arrived
+                        and (frame.updated > prev.updated or frame.frame != prev.frame)):
+                    self._recent_frames.append(frame)
             while self._recent_frames and frame.arrived - self._recent_frames[0].arrived > 4:
                 self._recent_frames.popleft()
 

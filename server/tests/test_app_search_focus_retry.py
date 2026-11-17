@@ -6,6 +6,7 @@ import time
 from dataclasses import replace
 
 import pytest
+from fake_clock import ManualClock
 from PIL import Image
 from test_app_search_home import setup
 from test_controls import jpeg
@@ -15,8 +16,25 @@ from hidagent import feedback, ocr
 from hidagent.phone import AppSearchError
 
 
+def _setup_with_frame_clock(tmp_path, monkeypatch, *, on_home=True):
+    # Adjacent synthetic frames need distinct wall-clock stamps even when
+    # the host clock ticks coarsely (~15.6 ms on Windows); keep monotonic
+    # time real so asyncio.wait_for timeout tests keep their real budgets.
+    clock = ManualClock()
+    monkeypatch.setattr(time, "time", clock.time)
+    phone, device, link, screen = setup(tmp_path, monkeypatch, on_home=on_home)
+    publish = screen._on_jpeg
+
+    def next_frame(image):
+        clock.advance(.01)
+        publish(image)
+
+    monkeypatch.setattr(screen, "_on_jpeg", next_frame)
+    return phone, device, link, screen
+
+
 def rig(tmp_path, monkeypatch, *, first_focused=False, first_labels=None, later=None, later_labels=None):
-    phone, device, link, screen = setup(tmp_path, monkeypatch, on_home=True)
+    phone, device, link, screen = _setup_with_frame_clock(tmp_path, monkeypatch, on_home=True)
     first = spotlight(caret=first_focused, extra=True)
     later = spotlight(caret=True, extra=True) if later is None else later
     events = []
@@ -73,7 +91,7 @@ def test_already_valid_first_observation_keeps_single_read_and_no_added_wait(tmp
 @pytest.mark.parametrize("change", ["suggestions", "field", "labels", "again", "generation"])
 def test_focused_spotlight_rechecks_one_newer_frame_before_typing(tmp_path, monkeypatch, change):
     async def scenario():
-        phone, device, link, screen = setup(tmp_path, monkeypatch, on_home=True)
+        phone, device, link, screen = _setup_with_frame_clock(tmp_path, monkeypatch, on_home=True)
         first = spotlight(extra=True)
         later = spotlight(extra=True, edit="field" if change == "field" else "sibling")
         inspected = []
