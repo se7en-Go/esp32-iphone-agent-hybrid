@@ -89,6 +89,7 @@ static void test_status_and_cmd(void) {
   int n = hid_status_fragment(buf, sizeof buf, HID_PREF_AUTO, HID_PATH_BLE, &link);
   CHECK(n > 0 && (size_t)n < sizeof buf);
   CHECK(strstr(buf, "\"mode\":\"auto\"") && strstr(buf, "\"path\":\"ble\"") && strstr(buf, "\"pace\":4"));
+  CHECK(strstr(buf, "\"middle_click\":1"));
   CHECK(strstr(buf, "\"adv\":1") && strstr(buf, "\"conn\":1") && strstr(buf, "\"bond\":1") && strstr(buf, "\"pair\":1"));
   CHECK(hid_status_compact(buf, sizeof buf, HID_PATH_NONE) > 0 && strcmp(buf, "\"hid\":\"none\"") == 0);
   CHECK(strcmp(hid_pref_name(hid_pref_parse("usb")), "usb") == 0);

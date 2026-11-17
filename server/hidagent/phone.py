@@ -381,6 +381,7 @@ class Phone:
         has_span = "w" in body and "h" in body
         self.span = {"w": body["w"], "h": body["h"]} if has_span else None
         self._affine = PointerAffineFit.from_dict(body.get("affine")) if has_span else None
+        self._rehome_each_move = bool(body.get("rehome_each_move", False)) if has_span else False
         # where `home` leaves the pointer, as a screen fraction: not the corner itself on iPhones with rounded
         # corners (the 15 Pro Max stops 91 of 720 px right of it), so every move is counted from there
         self.origin = {"x": body.get("x0", 0.0), "y": body.get("y0", 0.0)}
@@ -486,7 +487,7 @@ class Phone:
 
     @_serialized
     @bounded_operation
-    async def start_calibration(self, *, multipoint: bool = False) -> bool:
+    async def start_calibration(self, *, multipoint: bool = False, rehome_each_move: bool = False) -> bool:
         """Find the pointer on screen at known distances and fit the coordinate mapping.
 
         By default uses two diagonal stops (`span`, `origin`). When `multipoint=True`,
@@ -498,6 +499,7 @@ class Phone:
         self._affine = None
         epoch = getattr(self.device, "abort_epoch", 0)
         await self._pull_pace()
+        self._rehome_each_move = bool(rehome_each_move)
         stops = BLE_CALIBRATION_STOPS if self._pace == BLE_PACE else CALIBRATION_STOPS
         await self._send(epoch, "home")
         seen = []
@@ -535,10 +537,8 @@ class Phone:
                 self.origin = {"x": affine.x0, "y": affine.y0}
                 for samples in self._seen.values():
                     samples.clear()
-                for u_val, v_val, fx, fy in affine_samples[-12:]:
-                    px, py = affine.forward(u_val, v_val)
-                    self._seen["x"].append((px, fx))
-                    self._seen["y"].append((py, fy))
+                # Fit training samples parameterize the affine model only; never
+                # treat them as independent runtime landing evidence in `_seen`.
                 log.info(
                     "multipoint calibration: %d samples, affine=%s",
                     len(affine_samples),
@@ -1353,6 +1353,7 @@ class Phone:
                 span["w"], origin["x"] = w, x0
         self.span, self.origin = span, origin
         self._affine = None
+        self._rehome_each_move = False
         for samples in self._seen.values():
             samples.clear()
         self._pos = (move, move)
@@ -1374,6 +1375,7 @@ class Phone:
         self._pace = version
         self.span = None
         self._affine = None
+        self._rehome_each_move = False
         self.origin = {"x": 0.0, "y": 0.0}
         self._pos = None
         self._moves = 0
@@ -1389,6 +1391,8 @@ class Phone:
             body.update(self.span)
         if self._affine is not None:
             body["affine"] = self._affine.to_dict()
+        if self._rehome_each_move:
+            body["rehome_each_move"] = True
         if self._pace is not None:
             body["pace"] = self._pace
         self._file.write_text(json.dumps(body))
@@ -1401,7 +1405,7 @@ class Phone:
         self._position_before = getattr(self.screen, "frame", None)
         self._position_from = self._pointer_position()
         self._position_started = time.time()
-        if self._affine is not None:
+        if self._affine is not None or self._rehome_each_move:
             self._pos = None
         await self._move_to(*self._target_units(x, y))
         self._position_completed = time.time()
@@ -2083,7 +2087,10 @@ class Phone:
                           "initial_pointer": list(self._pointer_spots[1]) if len(self._pointer_spots) >= 2 else None,
                           "measured_pointer": list(self._pointer_spots[-1]) if len(self._pointer_spots) >= 2 else None,
                           "correction_moves": max(0, len(self._pointer_spots) - 2),
-                          "calibration_mode": "affine" if self._affine is not None else "two_point",
+                          "calibration_mode": (
+                              "affine" if self._affine is not None
+                              else ("two_point_homed" if self._rehome_each_move else "two_point")
+                          ),
                           "click_count": click_count if not duration else 0, "hold_seconds": duration,
                           "effect_observed": changed if fresh else None, "effect_verified": False,
                           "fresh": fresh, "completed_at": sent, "latency": round(timing["total"] / 1000, 3),

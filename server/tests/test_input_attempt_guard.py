@@ -66,7 +66,9 @@ def test_every_noncleanup_hid_starts_only_at_the_actual_write(command):
                 link.write = record
                 await device.send(command)
                 assert attempt.started and states == [False]
-                assert attempt.written is (command in {"click", "key", "type", "press"})
+                assert attempt.written is (
+                    command in {"click", "middleclick", "key", "type", "press", "middlepress"}
+                )
         finally:
             device.close()
     asyncio.run(scenario())
@@ -94,7 +96,8 @@ def test_gate_commit_failure_does_not_mark_started():
     asyncio.run(scenario())
 
 
-def test_unknown_press_ack_is_started_and_released_without_retry(monkeypatch):
+@pytest.mark.parametrize("command", ["press", "middlepress"])
+def test_unknown_press_ack_is_started_and_released_without_retry(monkeypatch, command):
     async def scenario():
         device, link = Device(), Link()
         device.attach(link)
@@ -103,16 +106,18 @@ def test_unknown_press_ack_is_started_and_released_without_retry(monkeypatch):
         try:
             with input_attempt() as attempt:
                 def no_press_ack(data):
-                    if b" press" in data:
+                    if f" {command}".encode() in data:
                         assert attempt.started and attempt.written
                         link.written.append(data)
                     else:
                         write(data)
                 link.write = no_press_ack
                 with pytest.raises(RuntimeError):
-                    await device.send("press")
+                    await device.send(command)
                 assert attempt.started and attempt.written
-                assert [line.split(b" ", 1)[1].strip() for line in link.written] == [b"press", b"release"]
+                assert [line.split(b" ", 1)[1].strip() for line in link.written] == [
+                    command.encode(), b"release"
+                ]
         finally:
             device.close()
     asyncio.run(scenario())

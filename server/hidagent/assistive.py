@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import io
 import json
 import logging
@@ -169,50 +170,189 @@ class AssistiveTouch:
     def _device_key(self) -> str:
         return (getattr(self.phone.device, "port_name", "") or "").strip()
 
-    def _middle_click_home_enabled(self) -> bool:
-        """Enable mouse middle-button Home only for BLE devices opted in or verified."""
+    def _verified_middle_click_devices(self) -> list[str]:
+        raw = self._saved.get("middle_click_home_devices")
+        if not isinstance(raw, list):
+            return []
+        seen: list[str] = []
+        for item in raw:
+            key = str(item).strip()
+            if key and key not in seen:
+                seen.append(key)
+        return seen
+
+    def _middle_click_supported_by_firmware(self) -> bool:
         hid = (getattr(self.phone.device, "board_status", None) or {}).get("hid") or {}
-        if hid.get("path") != "ble":
-            return False
-        if os.environ.get("HIDAGENT_MIDDLE_CLICK_HOME") == "1":
-            return True
+        return hid.get("path") == "ble" and hid.get("middle_click") == 1
+
+    def _middle_click_verified_for_device(self) -> bool:
         key = self._device_key()
-        if key:
-            devices = self._saved.get("middle_click_home_devices") or []
-            return isinstance(devices, list) and key in devices
-        return self._saved.get("middle_click_home_verified") is True
+        return bool(key) and key in self._verified_middle_click_devices()
+
+    def _middle_click_home_enabled(self) -> bool:
+        """Enable mouse middle-button Home only for capable BLE firmware with a verified device mapping."""
+        return self._middle_click_supported_by_firmware() and self._middle_click_verified_for_device()
+
+    def middle_click_home_status(self) -> dict:
+        hid = (getattr(self.phone.device, "board_status", None) or {}).get("hid") or {}
+        supported = hid.get("middle_click") == 1
+        ble_active = hid.get("path") == "ble"
+        device_key = self._device_key()
+        verified_devices = self._verified_middle_click_devices()
+        verified_for_device = bool(device_key) and device_key in verified_devices
+        return {
+            "supported_by_firmware": supported,
+            "ble_active": ble_active,
+            "device_key": device_key or None,
+            "verified_for_device": verified_for_device,
+            "verified_devices_count": len(verified_devices),
+            "enabled": supported and ble_active and verified_for_device,
+            "command": "middleclick",
+            "preferred_route": self._saved.get("verified_route"),
+        }
 
     def set_middle_click_home_verified(self, verified: bool) -> None:
-        """Persist or clear verified middle-button Home support for this profile."""
+        """Persist or clear verified middle-button Home support scoped strictly by device key."""
         key = self._device_key()
-        raw_devices = self._saved.get("middle_click_home_devices") or []
-        devices = (
-            {str(item).strip() for item in raw_devices if str(item).strip()}
-            if isinstance(raw_devices, list)
-            else set()
-        )
+        devices = set(self._verified_middle_click_devices())
+        self._saved.pop("middle_click_home_verified", None)
         if verified:
-            if key:
-                devices.add(key)
-                self._saved["middle_click_home_devices"] = sorted(devices)
-            self._saved["middle_click_home_verified"] = True
+            if not key:
+                raise ValueError("当前设备没有可识别的串口设备标识，无法启用中键回主屏幕。")
+            devices.add(key)
+            self._saved["middle_click_home_devices"] = sorted(devices)
             self._saved["verified_route"] = "middle-click"
         else:
             if key:
                 devices.discard(key)
-                if devices:
-                    self._saved["middle_click_home_devices"] = sorted(devices)
-                else:
-                    self._saved.pop("middle_click_home_devices", None)
-                    self._saved.pop("middle_click_home_verified", None)
+            if devices:
+                self._saved["middle_click_home_devices"] = sorted(devices)
             else:
-                self._saved.pop("middle_click_home_verified", None)
+                self._saved.pop("middle_click_home_devices", None)
             if self._saved.get("verified_route") == "middle-click":
                 self._saved.pop("verified_route", None)
         try:
             self._write_profile()
         except OSError as exc:
             log.warning("AssistiveTouch: 无法保存中键回主屏幕状态：%s", exc)
+
+    def revoke_middle_click_home(self, *, all_devices: bool = False) -> dict:
+        """Revoke verified middle-button Home for the current device or all devices."""
+        self._saved.pop("middle_click_home_verified", None)
+        if all_devices:
+            self._saved.pop("middle_click_home_devices", None)
+            if self._saved.get("verified_route") == "middle-click":
+                self._saved.pop("verified_route", None)
+            try:
+                self._write_profile()
+            except OSError as exc:
+                log.warning("AssistiveTouch: 无法撤销所有设备的中键回主屏幕状态：%s", exc)
+        else:
+            self.set_middle_click_home_verified(False)
+        return self.middle_click_home_status()
+
+    async def _refresh_board_status(self) -> None:
+        device = self.phone.device
+        refresh = getattr(device, "refresh_hid_status", None)
+        if callable(refresh):
+            res = refresh()
+            if inspect.isawaitable(res):
+                await res
+
+    async def check_middle_click_enable_preconditions(self, frame: bytes) -> None:
+        """Verify device identity, firmware middle_click capability, BLE path, and open-app screen state."""
+        await self._refresh_board_status()
+        if not self._device_key():
+            raise ValueError("当前设备未报告稳定的设备标识（port_name 为空），不能启用中键回主屏幕。")
+        hid = (getattr(self.phone.device, "board_status", None) or {}).get("hid") or {}
+        if hid.get("middle_click") != 1:
+            raise ValueError("当前固件未声明支持独立中键命令（middle_click=1）；为防止旧固件误左键，拒绝启用。")
+        if hid.get("path") != "ble":
+            raise ValueError("当前控制链路不是蓝牙 HID（path!=ble），iOS 辅助触控设备映射仅对蓝牙生效。")
+        if assistive_vision.is_home_visible(frame):
+            raise ValueError("当前已在主屏幕；请先打开备忘录等普通 App 且关闭辅助触控菜单后再验证启用。")
+        if assistive_vision.find_panel(frame) is not None:
+            raise ValueError("辅助触控菜单当前已打开；请先关闭菜单后再验证中键回主屏幕。")
+
+    async def _confirm_home_after_send(
+        self, epoch: int, since: float, expected_device, expected_generation: int | None
+    ) -> bool:
+        verified = await self._wait(
+            epoch, since, RESULT_WAIT, assistive_vision.is_home_visible, stable=True
+        )
+        if verified or fresh_frame(self.phone.screen, clock=self._clock, since=since) is not None:
+            return bool(verified)
+        candidate = snapshot(self.phone.screen)
+        ensure_obs = getattr(self.phone, "ensure_observation", None)
+        if ensure_obs is None or not candidate.frame or not assistive_vision.is_home_visible(candidate.frame):
+            return False
+
+        def home_candidate():
+            self.phone._check_operation()
+            self._check(epoch)
+            if self.phone.device is not expected_device:
+                raise DeviceError("返回主屏幕期间设备连接已变化，未继续操作；请重新观察。")
+            current = require_fresh(self.phone.screen, clock=self._clock, max_age=float("inf"))
+            if expected_generation is not None and current.generation != expected_generation:
+                raise RuntimeError("返回主屏幕期间画面连接已变化，请重新观察。")
+            if not assistive_vision.is_home_visible(current.frame):
+                raise RuntimeError("等待主屏幕新画面时页面已变化，未继续唤醒；请重新观察。")
+
+        await ensure_obs(before_refresh=home_candidate)
+        home_candidate()
+        verified = await self._wait(
+            epoch, since, RESULT_WAIT, assistive_vision.is_home_visible, stable=True
+        )
+        home_candidate()
+        return bool(verified)
+
+    async def verify_and_enable_middle_click_home(self, *, observation=None, before_write=None) -> float:
+        """Send one `middleclick` from a non-Home app, confirm Home via fresh video, then persist."""
+        device = self.phone.device
+        epoch = getattr(device, "abort_epoch", 0)
+        self._home_link, self._home_epoch = getattr(device, "links", 0), epoch
+        self._check(epoch)
+        self._clock = None
+        self._generation = (
+            observation.generation if observation is not None else snapshot(self.phone.screen).generation
+        )
+        ensure = getattr(self.phone, "ensure_observation", None)
+        if ensure is not None:
+            await ensure()
+        initial_frame = self._require_frame().frame
+        await self.check_middle_click_enable_preconditions(initial_frame)
+        await self.phone._catch_up(epoch)
+        self._clock = self.phone._clock
+        current = self._require_frame()
+        if assistive_vision.is_home_visible(current.frame):
+            raise ValueError("当前已在主屏幕；请先打开备忘录等普通 App 且关闭辅助触控菜单后再验证启用。")
+        if assistive_vision.find_panel(current.frame) is not None:
+            raise ValueError("辅助触控菜单当前已打开；请先关闭菜单后再验证中键回主屏幕。")
+
+        def write_guard():
+            if before_write is not None:
+                before_write()
+            self._require_frame()
+            if not self._middle_click_supported_by_firmware():
+                raise ValueError("写入前固件中键能力或蓝牙状态已失效，未发送命令。")
+
+        since = time.time()
+        try:
+            await self.phone._send(epoch, "middleclick", before_write=write_guard)
+        except (DeviceError, OSError) as exc:
+            self.revoke_middle_click_home()
+            raise RuntimeError(f"ESP32 中键命令发送被拒绝或失败，未启用：{exc}") from exc
+
+        self._check(epoch)
+        verified = await self._confirm_home_after_send(epoch, since, device, self._generation)
+        if not verified:
+            self.revoke_middle_click_home()
+            raise RuntimeError(
+                "已发送 middleclick，但动作后新画面未确认返回主屏幕；已拒绝启用。"
+                "请检查 iPhone「设置 → 辅助功能 → 触控 → 辅助触控 → 设备 → 按钮 3」是否已绑定「主屏幕」。"
+            )
+        self.set_middle_click_home_verified(True)
+        return since
 
     async def _wait(self, epoch: int, since: float, timeout: float, accept, *, stable=False):
         deadline = time.monotonic() + timeout
@@ -478,7 +618,7 @@ class AssistiveTouch:
         middle_enabled = self._middle_click_home_enabled()
         routes = (["middle-click"] if middle_enabled else []) + ["assistive-touch", "swipe-up", "homescreen", "cmd+h"]
         preferred = self._saved.get("verified_route")
-        if os.environ.get("HIDAGENT_MIDDLE_CLICK_HOME") == "1" and "middle-click" in routes:
+        if middle_enabled:
             routes.remove("middle-click")
             routes.insert(0, "middle-click")
         elif preferred in routes:
@@ -489,7 +629,7 @@ class AssistiveTouch:
         pointer_error = None
         pointer_rejected = False
         command_routes = {
-            "middle-click": "click middle",
+            "middle-click": "middleclick",
             "homescreen": "homescreen",
             "cmd+h": "key cmd+h",
         }
@@ -540,39 +680,20 @@ class AssistiveTouch:
                 log.warning("go_home: %s 失败：%s", route, exc)
                 continue
             self._check(epoch)
-            verified = await self._wait(
-                epoch, since, RESULT_WAIT,
-                assistive_vision.is_home_visible, stable=True)
-            if not verified and route == "middle-click" and fresh_frame(
-                    self.phone.screen, clock=self._clock, since=since) is None:
-                candidate = snapshot(self.phone.screen)
-                ensure_obs = getattr(self.phone, "ensure_observation", None)
-                if ensure_obs is not None and candidate.frame and assistive_vision.is_home_visible(candidate.frame):
-                    original_device = self.phone.device
-
-                    def middle_home_candidate(expected_device=original_device):
-                        self.phone._check_operation()
-                        self._check(epoch)
-                        if self.phone.device is not expected_device:
-                            raise DeviceError("返回主屏幕期间设备连接已变化，未继续操作；请重新观察。")
-                        current = require_fresh(self.phone.screen, clock=self._clock, max_age=float("inf"))
-                        if self._generation is not None and current.generation != self._generation:
-                            raise RuntimeError("返回主屏幕期间画面连接已变化，请重新观察。")
-                        if not assistive_vision.is_home_visible(current.frame):
-                            raise RuntimeError("等待主屏幕新画面时页面已变化，未继续唤醒；请重新观察。")
-
-                    await ensure_obs(before_refresh=middle_home_candidate)
-                    middle_home_candidate()
-                    verified = await self._wait(
-                        epoch, since, RESULT_WAIT,
-                        assistive_vision.is_home_visible, stable=True)
-                    middle_home_candidate()
+            if route == "middle-click":
+                verified = await self._confirm_home_after_send(
+                    epoch, since, self.phone.device, self._generation
+                )
+            else:
+                verified = await self._wait(
+                    epoch, since, RESULT_WAIT,
+                    assistive_vision.is_home_visible, stable=True)
             if verified:
                 log.info("go_home: %s 后已确认主屏幕图标网格及 Dock", route)
                 self._set_verified_route(route)
                 return
             if route == "middle-click":
-                log.warning("go_home: middle-click 已发送但未确认主屏幕，回退常规路径")
+                log.warning("go_home: middleclick 已发送但未确认主屏幕，回退常规路径")
         if not acknowledged and last_error is not None:
             raise last_error
         if self._frame() is not None:

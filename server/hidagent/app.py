@@ -149,7 +149,8 @@ def _hid_write_guard(current: Guard, name: str, enter_evidence=None, *, count_se
 
 def _hid_gate(command: str):
     name = command.split(" ", 1)[0].strip().lower()
-    if name not in {"home", "move", "press", "release", "click", "scroll", "type", "key", "homescreen"}:
+    if name not in {"home", "move", "press", "release", "click", "middlepress", "middleclick",
+                    "scroll", "type", "key", "homescreen"}:
         return None
     clipboard = getattr(phone, "clipboard", None)
     check_input = getattr(clipboard, "check_input", None)
@@ -488,6 +489,7 @@ def control_capabilities():
             "multitouch": {"supported": False,
                            "reason": "This firmware exposes one relative mouse pointer, not multitouch contacts."},
             "drawing": {"supported": True, "verified_start": True, "closed_loop_during_stroke": False},
+            "middle_click_home": controls.middle_click_home_status(),
             "host_observed_click": {
                 "supported": True, "endpoint": "/api/control/host-click", "evidence_source": "host_observed",
                 "moves_pointer": False, "requires_calibration": False, "single_click_only": False,
@@ -793,8 +795,54 @@ async def raw(t: Text):
     return await act(lambda: device.send(t.text))
 
 
+class MiddleClickEnableBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    screen_id: str = Field(min_length=1)
+    include_diff: bool = True
+    ocr_diff: bool = False
+
+
+class MiddleClickRevokeBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    all_devices: bool = False
+
+
+@app.get("/api/control/middle-click-home")
+def middle_click_home_status():
+    return controls.middle_click_home_status()
+
+
+@app.post("/api/control/middle-click-home/enable")
+async def middle_click_home_enable(request: MiddleClickEnableBody, http_request: Request):
+    refuse_if_tripped()
+    check_manual()
+    async with manual_lock:
+        controls.job = asyncio.current_task()
+        try:
+            return await while_connected(
+                http_request,
+                controls.enable_middle_click_home(
+                    request.screen_id, include_diff=request.include_diff, ocr_diff=request.ocr_diff
+                ),
+            )
+        except (ValueError, RuntimeError) as e:
+            raise HTTPException(409, str(e)) from e
+        except asyncio.CancelledError as e:
+            raise HTTPException(409, "验证已停止，请重新观察。") from e
+        finally:
+            controls.job = None
+
+
+@app.post("/api/control/middle-click-home/revoke")
+async def middle_click_home_revoke(body: MiddleClickRevokeBody | None = None):
+    check_manual()
+    async with manual_lock:
+        return controls.revoke_middle_click_home(all_devices=bool(body and body.all_devices))
+
+
 class CalibrationStartBody(BaseModel):
     multipoint: bool = False
+    rehome_each_move: bool = False
 
 
 @app.post("/api/calibrate/start")
@@ -806,8 +854,17 @@ async def calibrate_start(body: CalibrationStartBody | None = None):
         async with manual_lock:
             with _legacy_input_session():
                 controls.invalidate()
-                auto = await phone.start_calibration(multipoint=bool(body and body.multipoint))
-            return {"ok": True, "auto": auto, "span": phone.span, "multipoint": phone._affine is not None}
+                auto = await phone.start_calibration(
+                    multipoint=bool(body and body.multipoint),
+                    rehome_each_move=bool(body and body.rehome_each_move),
+                )
+            return {
+                "ok": True,
+                "auto": auto,
+                "span": phone.span,
+                "multipoint": phone._affine is not None,
+                "rehome_each_move": phone._rehome_each_move,
+            }
     except asyncio.CancelledError as e:
         raise HTTPException(409, "已紧急停止，校准没有继续。") from e
     except (DeviceError, RuntimeError) as e:

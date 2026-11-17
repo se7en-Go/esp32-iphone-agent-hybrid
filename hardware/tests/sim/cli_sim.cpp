@@ -192,7 +192,8 @@ static hid_link_t simFacts() {
 }
 
 static bool simHidAction(const std::string &rest) {
-  return rest == "home" || rest == "press" || rest == "release" || rest == "click" || rest == "homescreen" ||
+  return rest == "home" || rest == "press" || rest == "release" || rest == "click" ||
+         rest == "middlepress" || rest == "middleclick" || rest == "homescreen" ||
          rest.rfind("move", 0) == 0 || rest.rfind("scroll", 0) == 0 || rest.rfind("type", 0) == 0 ||
          rest.rfind("key", 0) == 0;
 }

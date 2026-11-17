@@ -8,7 +8,7 @@
 // iOS app on the same phone. It holds no logic; the app decides. Protocol: docs/ble-protocol.md.
 //
 // HID commands (unchanged from the old TCP protocol, the board answers "ok" or "err <why>"):
-//   ping | pace | home | move <dx> <dy> [speed] | press [left|middle] | release | click [left|middle]
+//   ping | pace | home | move <dx> <dy> [speed] | press | release | click | middlepress | middleclick
 //   scroll <v> <h> | type <ascii text> | key <combo, e.g. cmd+h, enter>
 //   homescreen (the consumer-control Home key, "AC Home": iOS goes to the Home Screen, like a keyboard's home key)
 
@@ -247,14 +247,11 @@ static int activePath() {
   return prepareHidPath(ble_hid_pref(), link, next) ? next : HID_PATH_NONE;
 }
 
-static uint8_t parseMouseButton(const String &raw) {
-  const char *s = raw.c_str();
-  while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
-  size_t n = strlen(s);
-  while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r' || s[n - 1] == '\n')) n--;
-  if (n == 0 || (n == 4 && memcmp(s, "left", 4) == 0)) return MOUSE_LEFT;
-  if (n == 6 && memcmp(s, "middle", 6) == 0) return HID_MOUSE_MIDDLE_BTN;
-  return 0;
+static bool hasNonSpaceArg(const String &raw) {
+  for (const char *s = raw.c_str(); *s; s++) {
+    if (*s != ' ' && *s != '\t' && *s != '\r' && *s != '\n') return true;
+  }
+  return false;
 }
 
 static bool buttonMask(int path, uint8_t mask) {
@@ -469,14 +466,22 @@ String run(const String &line) {
     return movePaced(a, b, step) ? "ok" : down;
   }
   if (cmd == "press") {
-    uint8_t mask = parseMouseButton(arg);
-    if (!mask) return "err unknown button";
-    return buttonMask(path, mask) ? "ok" : down;
+    if (hasNonSpaceArg(arg)) return "err usage: press";
+    return buttonOn(path, true) ? "ok" : down;
   }
   if (cmd == "click") {
-    uint8_t mask = parseMouseButton(arg);
-    if (!mask) return "err unknown button";
-    if (!buttonMask(path, mask)) return down;
+    if (hasNonSpaceArg(arg)) return "err usage: click";
+    if (!buttonOn(path, true)) return down;
+    delay(60);
+    return buttonOn(path, false) ? "ok" : down;
+  }
+  if (cmd == "middlepress") {
+    if (hasNonSpaceArg(arg)) return "err usage: middlepress";
+    return buttonMask(path, HID_MOUSE_MIDDLE_BTN) ? "ok" : down;
+  }
+  if (cmd == "middleclick") {
+    if (hasNonSpaceArg(arg)) return "err usage: middleclick";
+    if (!buttonMask(path, HID_MOUSE_MIDDLE_BTN)) return down;
     delay(60);
     return buttonMask(path, 0) ? "ok" : down;
   }

@@ -218,6 +218,8 @@ def test_multipoint_start_calibration_persists_affine_and_falls_back_cleanly(tmp
 
     saved = json.loads((tmp_path / "calibration.json").read_text(encoding="utf-8"))
     assert "affine" in saved and "w" in saved and "h" in saved
+    assert saved["seen"] == {"x": [], "y": []}
+    assert list(phone._seen["x"]) == [] and list(phone._seen["y"]) == []
 
     # Reload from disk preserves affine mapping, and pace change clears it cleanly.
     reloaded = Phone(mirror, tmp_path / "calibration.json", mirror)
@@ -324,3 +326,74 @@ def test_affine_calibration_preserves_safety_and_suggestion_bar_guards(tmp_path)
     # Ensure Controls import cleanly alongside affine Phone.
     controls = Controls(phone3, mirror)
     assert isinstance(SimpleNamespace(controls=controls).controls, Controls)
+
+
+def test_multipoint_calibration_never_authorizes_blind_click_when_pointer_invisible(tmp_path, monkeypatch):
+    """Calibration fit training samples in multipoint mode must never authorize a blind click."""
+    monkeypatch.setattr(phone_module, "POINTER_WAIT", 1.0)
+    monkeypatch.setattr(phone_module, "TAP_POINTER_WAIT", 0.05)
+    monkeypatch.setattr("hidagent.freshness.MIRROR_LAG_SECONDS", 0.0)
+    monkeypatch.setattr("hidagent.feedback.MIRROR_LAG_SECONDS", 0.0)
+    mirror = _FakeAffineMirror()
+    phone = Phone(mirror, tmp_path / "calibration.json", mirror)
+    phone._clock = 0.0
+    phone._clock_link = mirror.links
+
+    ok = asyncio.run(phone.start_calibration(multipoint=True))
+    assert ok is True
+    assert phone._affine is not None
+    assert len(phone._seen["x"]) == 0 and len(phone._seen["y"]) == 0
+    assert phone._landing_error(0.5, 0.5) is None
+
+    # Hide pointer so landing cannot be visually measured: default allow_estimated_landing=True
+    # must still raise PointerLandingError and send ZERO clicks instead of passing on fit samples.
+    mirror.commands.clear()
+    mirror.visible = False
+    mirror.square = (0.1, 0.1, 0.9, 0.9)
+    mirror._publish(immediate=True)
+    with pytest.raises(PointerLandingError, match="校准与已测落点不足"):
+        asyncio.run(
+            phone.tap_verified(0.5, 0.5, target_box=(0.1, 0.1, 0.9, 0.9), target_frame=mirror.frame)
+        )
+    assert "click" not in mirror.commands and "press" not in mirror.commands
+
+    # Reload from disk and verify the blind click remains blocked until real post-calibration landings exist.
+    mirror.commands.clear()
+    reloaded = Phone(mirror, tmp_path / "calibration.json", mirror)
+    reloaded._clock = 0.0
+    reloaded._clock_link = mirror.links
+    mirror._publish(immediate=True)
+    with pytest.raises(PointerLandingError, match="校准与已测落点不足"):
+        asyncio.run(
+            reloaded.tap_verified(0.5, 0.5, target_box=(0.1, 0.1, 0.9, 0.9), target_frame=mirror.frame)
+        )
+    assert "click" not in mirror.commands and "press" not in mirror.commands
+
+
+def test_two_point_rehome_each_move_control_group(tmp_path, monkeypatch):
+    """`rehome_each_move=True` clears `_pos` per point under two-point fit without altering defaults."""
+    monkeypatch.setattr(phone_module, "POINTER_WAIT", 1.0)
+    monkeypatch.setattr("hidagent.freshness.MIRROR_LAG_SECONDS", 0.0)
+    monkeypatch.setattr("hidagent.feedback.MIRROR_LAG_SECONDS", 0.0)
+    mirror = _FakeAffineMirror()
+    phone = Phone(mirror, tmp_path / "calibration.json", mirror)
+    phone._clock = 0.0
+    phone._clock_link = mirror.links
+
+    ok = asyncio.run(phone.start_calibration(multipoint=False, rehome_each_move=True))
+    assert ok is True
+    assert phone._affine is None
+    assert phone._rehome_each_move is True
+    saved = json.loads((tmp_path / "calibration.json").read_text(encoding="utf-8"))
+    assert saved["rehome_each_move"] is True and "affine" not in saved
+
+    mirror.commands.clear()
+    asyncio.run(phone.point(0.3, 0.3))
+    asyncio.run(phone.point(0.7, 0.6))
+    assert mirror.commands.count("home") == 2
+
+    # Recalibrating with default options clears rehome_each_move and omits it from calibration.json.
+    assert asyncio.run(phone.start_calibration()) is True
+    assert phone._rehome_each_move is False
+    saved_default = json.loads((tmp_path / "calibration.json").read_text(encoding="utf-8"))
+    assert "rehome_each_move" not in saved_default

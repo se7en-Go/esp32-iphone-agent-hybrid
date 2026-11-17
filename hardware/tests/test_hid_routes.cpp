@@ -508,19 +508,19 @@ static void release_timeout_survives_millis_wrap() {
 static void middle_button_and_checked_release() {
   reset();
   pref = HID_PREF_BLE;
-  assert(run("click middle") == "ok");
+  assert(run("middleclick") == "ok");
   assert(events.size() == 2 && events[0] == "ble middle down" && events[1] == "ble mouse up");
   assert(!bleButton && bleButtons == 0 && !heldReports[HID_PATH_BLE]);
 
   events.clear();
-  assert(run("press middle") == "ok" && bleButtons == 0x04 && heldReports[HID_PATH_BLE] == HELD_MOUSE);
+  assert(run("middlepress") == "ok" && bleButtons == 0x04 && heldReports[HID_PATH_BLE] == HELD_MOUSE);
   assert(run("release") == "ok" && !bleButton && bleButtons == 0 && !heldReports[HID_PATH_BLE]);
   bool sawBleMouseUp = false;
   for (const auto &ev : events) if (ev == "ble mouse up") sawBleMouseUp = true;
   assert(!events.empty() && events[0] == "ble middle down" && sawBleMouseUp);
 
   failBleRelease = true;
-  assert(run("click middle") == "err phone not connected over ble");
+  assert(run("middleclick") == "err phone not connected over ble");
   assert(bleButton && bleButtons == 0x04 && heldReports[HID_PATH_BLE] == HELD_MOUSE);
   assert(!hid_prepare_pref(HID_PREF_USB));
   failBleRelease = false;
@@ -528,23 +528,27 @@ static void middle_button_and_checked_release() {
 
   pref = HID_PREF_USB;
   usbAcceptedButtons.clear();
-  assert(run("click middle") == "ok");
+  assert(run("middleclick") == "ok");
   assert(usbAcceptedButtons.size() == 2 && usbAcceptedButtons[0] == 0x04 && usbAcceptedButtons[1] == 0x00);
-  assert(run("press middle") == "ok" && usbMouseButtons == 0x04 && heldReports[HID_PATH_USB] == HELD_MOUSE);
+  assert(run("middlepress") == "ok" && usbMouseButtons == 0x04 && heldReports[HID_PATH_USB] == HELD_MOUSE);
   assert(run("move 3 4") == "ok" && usbAcceptedButtons.back() == 0x04);
   assert(run("release") == "ok" && !usbButton && usbMouseButtons == 0);
 
   events.clear();
   usbAcceptedButtons.clear();
-  assert(run("click right") == "err unknown button");
-  assert(run("press right") == "err unknown button");
+  // Backward compatibility: reject parameterized `click middle` / `press middle` rather than left-clicking.
+  assert(run("click middle") == "err usage: click");
+  assert(run("press middle") == "err usage: press");
+  assert(run("middleclick extra") == "err usage: middleclick");
+  assert(run("middlepress extra") == "err usage: middlepress");
   assert(events.empty() && usbAcceptedButtons.empty());
 
   assert(run("press") == "ok" && usbAcceptedButtons.back() == MOUSE_LEFT);
   assert(run("move 1 2") == "ok" && usbAcceptedButtons.back() == MOUSE_LEFT);
   assert(run("release") == "ok" && usbAcceptedButtons.back() == 0);
+  assert(run("click") == "ok");
   assert(run("homescreen") == "ok");
-  puts("ok middle button click/press, checked release, unknown reject, and left/homescreen preserved");
+  puts("ok middleclick/middlepress, checked release, arg rejection, and left/homescreen preserved");
 }
 
 int main(int argc, char **argv) {

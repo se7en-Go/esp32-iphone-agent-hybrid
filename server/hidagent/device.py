@@ -46,7 +46,8 @@ COM_BRIDGES = {
 PING_EVERY = 0.3
 PING_WINDOW = 8.0
 RELEASE_TIMEOUT = 1.0
-HID_COMMANDS = {"home", "move", "press", "release", "click", "scroll", "type", "key", "homescreen"}
+HID_COMMANDS = {"home", "move", "press", "release", "click", "middlepress", "middleclick",
+                "scroll", "type", "key", "homescreen"}
 FIXED_ID = {"netinfo", "status", "net"}
 
 
@@ -473,9 +474,10 @@ class Device:
                         timing = _exchange_timing.get()
                         if timing is not None:
                             timing.sent_at = time.monotonic()
-                        if name == "press":
+                        if name in {"press", "middlepress"}:
                             self._pressed_link = link  # the write may succeed before its ACK arrives
-                        if attempt is not None and name in {"click", "key", "type", "press"}:
+                        if attempt is not None and name in {
+                                "click", "middleclick", "key", "type", "press", "middlepress"}:
                             attempt.written = True  # even a failing write may have delivered bytes
                         if attempt is not None and name in HID_COMMANDS and name != "release":
                             attempt.started = True  # all guards passed; an unknown ACK cannot undo this boundary
