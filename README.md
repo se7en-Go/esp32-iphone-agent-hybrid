@@ -108,7 +108,7 @@ Windows 自动化测试已经通过，物理 Windows 主机连接 ESP32 和 iPho
 
 - **网页**可以看实时画面、手动点击和校准。使用网页内置的模型任务时，按 [模型配置](docs/RUNTIME.md#配置位置) 填写模型信息。
 - **MCP** 在 Mac 运行 `./scripts/mcp-config.sh`，在 Windows 使用 `scripts/mcp-config.ps1`，把输出的配置加到你的 Agent。由 Agent 自己读图和判断时，无需再给网页后端配置一把模型 Key。
-- **CLI** 安装完成后，在虚拟环境中运行 `iphone-agent --help` 查看命令。截图、操作和粘贴步骤见 [MCP 和 CLI 指南](docs/MCP_CLI.md)。
+- **CLI** 安装完成后，在虚拟环境中运行 `iphone-agent --help` 查看命令。截图、操作和粘贴步骤见 [MCP 和 CLI 指南](docs/MCP_CLI.md)；`Pi` / 本地 CLI Agent 速查见 [Pi 与本地 CLI 快速用法](docs/PI_CLI.md)。
 
 第一次可以让 Agent「截图，把指针移到屏幕中央并停住」。启用中文粘贴后，在测试备忘录验完内容和结果，再测试社交 App 的发送。发送前核对会话和消息，发送后用新画面确认结果。
 

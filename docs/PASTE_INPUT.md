@@ -13,10 +13,11 @@ USB/BLE HID 只能发送键盘、鼠标事件，**不能直接设置 iPhone 剪�
 | MCP 工具 | CLI | 行为 |
 | --- | --- | --- |
 | `iphone_paste_prepare` | `paste-prepare 文本 --screen-id ID --focused` | 保留原输入画面，发布一次性任务并可选触发快捷指令；尚未粘贴。 |
-| `iphone_paste_status` | `paste-status 事务ID` | 返回复制阶段、当前图和新的观察凭证；不会确认输入成功。 |
+| `iphone_paste_status` | `paste-status 事务ID [--no-include-observation]` | 返回复制阶段、可选当前图和新的观察凭证；轮询复制状态时可关闭带图以节省开销。 |
 | `iphone_paste` | `paste 事务ID --screen-id ID --focused` | 实际复制完成、原输入上下文复查通过后，只发送一次 Cmd+V，返回新图。 |
 | `iphone_paste_confirm` | `paste-confirm 事务ID --screen-id ID --observed-text 完整文字 --confirmed` | 宿主已经看清文字完整进入原输入框后确认，结束事务。 |
 | `iphone_paste_cancel` | `paste-cancel 事务ID` | 作废正文和事务凭证。已领取或粘贴结果不明时仍须核对旧任务后解除阻止。 |
+| — | `paste-flow 文本 --target-box l t r b [--expect-title 标题]` | 本机 CLI 编排：串联分阶段粘贴、记录 `trigger_configured` / `copy_trigger` / `stages_ms`；默认停在发送前。 |
 
 这些工具使用 `/api/control/clipboard/{prepare,status,paste,confirm,cancel}`，只在本机控制端口提供。不要将它们开放到局域网代理。CLI 可加 `--image-output 文件` 保存阶段返回图片。
 
