@@ -10,7 +10,7 @@ import io
 import time
 from dataclasses import dataclass, field
 
-from PIL import Image
+from PIL import Image, ImageChops
 
 PRE_DISPATCH = ("未发送原地点击", "未发送点击", "等待点击期间原画面已变化")
 ALLOW_LABELS = ("允许粘贴", "Allow Paste")
@@ -95,6 +95,42 @@ def _field_lines(raw, box):
             if left <= item.box[0] and item.box[2] <= right and top <= item.box[1] and item.box[3] <= bottom]
 
 
+def _stray_cursor_outside_bubble(before: bytes | None, after: bytes | None, point: tuple[float, float],
+                                 box: tuple[float, float, float, float]) -> tuple[float, float] | None:
+    """Locate an arriving grey pointer disc near (but outside) the AssistiveTouch box."""
+    if not before or not after:
+        return None
+    try:
+        with Image.open(io.BytesIO(before)) as first, Image.open(io.BytesIO(after)) as second:
+            if first.size != second.size:
+                return None
+            w = min(360, first.width)
+            h = max(1, round(first.height * w / first.width))
+            dark = ImageChops.subtract(
+                first.convert("L").resize((w, h), Image.Resampling.BILINEAR),
+                second.convert("L").resize((w, h), Image.Resampling.BILINEAR),
+            )
+    except (OSError, ValueError):
+        return None
+    x0, x1 = max(0, round((box[0] - .12) * w)), min(w, round((box[2] + .06) * w))
+    y0, y1 = max(round(.06 * h), round((box[1] - .12) * h)), min(h, round((box[3] + .12) * h))
+    bx0, by0, bx1, by1 = box[0] - .008, box[1] - .008, box[2] + .008, box[3] + .008
+    pixels = dark.load()
+    pts = []
+    for py in range(y0, y1):
+        yn = py / h
+        for px in range(x0, x1):
+            if pixels[px, py] > 16:
+                xn = px / w
+                if not (bx0 <= xn <= bx1 and by0 <= yn <= by1):
+                    pts.append((xn, yn))
+    if not 40 <= len(pts) <= 600:
+        return None
+    sx = sum(px for px, _ in pts) / len(pts)
+    sy = sum(py for _, py in pts) / len(pts)
+    return (sx, sy) if abs(sx - point[0]) <= .10 and abs(sy - point[1]) <= .10 else None
+
+
 def _hold(client, report, point, box, caret_box, stage):
     for _ in range(5):
         if caret_box:
@@ -151,7 +187,11 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
         if bubble is None:
             raise RuntimeError("AssistiveTouch button not visible")
         point, box = bubble
-        with _Stage(report, "point_bubble"):
+
+        def point_to_bubble(aim_x, aim_y, *, rehome_flag):
+            fields = {"target_box": list(box)}
+            if rehome_flag:
+                fields["rehome"] = True
             for attempt in range(4):
                 if caret_box:
                     with _Stage(report, "caret_sync"):
@@ -159,18 +199,42 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
                 observed = client.observe()
                 try:
                     with _Stage(report, "point_bubble_action"):
-                        moved = client.control("point", observed["screen_id"], x=point[0], y=point[1])
+                        try:
+                            moved = client.control("point", observed["screen_id"], x=aim_x, y=aim_y, **fields)
+                        except RuntimeError as exc:
+                            if "422" not in str(exc) or not fields:
+                                raise
+                            fields.clear()  # older server: plain point without target_box/rehome
+                            moved = client.control("point", observed["screen_id"], x=aim_x, y=aim_y)
                     report.server_timing_ms.setdefault("point_bubble", []).append(moved.get("timing_ms"))
-                    break
+                    return base64.b64decode(observed["image_base64"]) if observed.get("image_base64") else None
                 except RuntimeError as exc:
                     if "409" not in str(exc) or attempt == 3:
                         raise
                     report.retry("point_bubble")
+
+        with _Stage(report, "point_bubble"):
+            before_point = point_to_bubble(point[0], point[1], rehome_flag=True)
         time.sleep(.8)
+        after_point = client.screenshot()
         # The hovered button is opaque; refine its centre and bounds from a fresh frame.
-        hovered = assistive_vision.find_button_target(client.screenshot())
+        hovered = assistive_vision.find_button_target(after_point)
         if hovered is not None and box[0] < hovered[0][0] < box[2]:
             point, box = hovered
+        stray = _stray_cursor_outside_bubble(before_point, after_point, point, box)
+        if stray is not None:
+            report.retry("point_bubble_miss")
+            cx = min(.99, max(.01, point[0] + (point[0] - stray[0])))
+            cy = min(.99, max(.01, point[1] + (point[1] - stray[1])))
+            with _Stage(report, "point_bubble"):
+                point_to_bubble(cx, cy, rehome_flag=False)
+            time.sleep(.8)
+            after_point = client.screenshot()
+            hovered = assistive_vision.find_button_target(after_point)
+            if hovered is not None and box[0] < hovered[0][0] < box[2]:
+                point, box = hovered
+            if _stray_cursor_outside_bubble(before_point, after_point, point, box) is not None:
+                raise RuntimeError("pointer landed outside AssistiveTouch button; nothing was pasted")
         if prewarm:
             _hold(client, report, point, box, caret_box, "prewarm_hold")
             time.sleep(2.5)

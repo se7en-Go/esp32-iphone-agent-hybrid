@@ -57,7 +57,9 @@ def parser() -> argparse.ArgumentParser:
         for key in keys:
             action.add_argument(key, type=int if key == "lines" else float)
         _context(action, required=name in {"point", "long-press", "double-tap", "circle"},
-                 coordinates=True, target=name in {"tap", "long-press", "double-tap"})
+                 coordinates=True, target=name in {"point", "tap", "long-press", "double-tap"})
+        if name == "point":
+            action.add_argument("--rehome", action="store_true", help="re-home pointer to origin before moving")
         if name == "long-press":
             action.add_argument("--duration", type=float, default=.8, help="hold duration, 0.3..3 seconds")
         if name == "circle":
@@ -200,7 +202,10 @@ def _action_fields(args):
             value = getattr(args, key, None)
             if value is not None:
                 fields[key] = value
+        if args.command == "point" and getattr(args, "rehome", False):
+            fields["rehome"] = True
     elif (getattr(args, "target_box", None) is not None
+          or getattr(args, "rehome", False)
           or getattr(args, "coordinate_space", "normalized") != "normalized"
           or getattr(args, "repeat", 1) != 1 or getattr(args, "enter_intent", None) is not None
           or args.image_output is not None):

@@ -267,6 +267,7 @@ class ActionStep(BaseModel):
     radius_y: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     segments: int = Field(default=48, ge=12, le=128, strict=True)
     hold: bool = True
+    rehome: bool = False
     duration: float = Field(default=.8, ge=.3, le=3, allow_inf_nan=False)
 
 

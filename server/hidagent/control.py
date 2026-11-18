@@ -376,12 +376,14 @@ class Controls:
                 raise ValueError("x and y required")
             planned["xy"] = point(request.x, request.y)
             box = getattr(request, "target_box", None)
-            if name in {"tap", "long_press", "double_tap"} and box is not None:
+            if name in {"point", "tap", "long_press", "double_tap"} and box is not None:
                 x, y = planned["xy"]
                 if (not all(math.isfinite(v) for v in box)
                         or not (0 <= box[0] < x < box[2] <= 1 and 0 <= box[1] < y < box[3] <= 1)):
                     raise ValueError("target_box must contain the tap in normalized observed coordinates")
                 planned["target_box"] = box
+            if name == "point" and getattr(request, "rehome", False):
+                planned["rehome"] = True
             if name == "scroll":
                 planned["lines"] = request.lines
             if name == "long_press":
@@ -497,11 +499,18 @@ class Controls:
                 return completed_at
             return result
         elif name == "point":
-            located = await self.phone.point_verified(*planned["xy"])
+            kwargs = {}
+            if "target_box" in planned:
+                kwargs["target_box"] = planned["target_box"]
+            if planned.get("rehome"):
+                kwargs["rehome"] = True
+            located = await self.phone.point_verified(*planned["xy"], **kwargs)
+            confirmed = getattr(self.phone, "_pointer_confirmed", False)
             extra["pointer"] = {"x": located[0], "y": located[1]}
+            extra["measured_pointer"] = {"x": located[0], "y": located[1]} if confirmed else None
             # point_verified returns the request when its final correction is
             # unconfirmed, even if it saw a pointer earlier in the movement.
-            extra["pointer_seen"] = getattr(self.phone, "_pointer_confirmed", False)
+            extra["pointer_seen"] = confirmed
         elif name == "swipe":
             x1, y1, x2, y2 = planned["swipe"]
             await self.phone.swipe(x1, y1, x2, y2, hold=planned["hold"],
