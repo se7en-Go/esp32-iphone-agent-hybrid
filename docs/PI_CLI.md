@@ -24,8 +24,11 @@
 ```
 
 1. 先核对目标窗口/会话标题唯一准确（日常排查优先用本机 OCR 读取，减少大图拷贝）。
-2. 从当前最新观察确定空输入框的归一化边界 `--target-box LEFT TOP RIGHT BOTTOM`（若光标在闪烁，记下左侧光标区 `--caret-box`）。
-3. **已有草稿保护**：若输入框内已经存在文字，核对是否完全等于本轮预期清理的测试草稿；发现其他未发送草稿时**原样保留并报告**，不得清空或覆盖。
+2. 打开 App 避坑：优先用 `search-app` 走 Spotlight（查询词仅限英文 ASCII，例如 `WeChat`）；若在桌面直接点击图标，必须点击文字标题上方的图标本体（点文字中心不会启动 App）。
+3. 底部输入框避坑：点击底部收起态输入框时，避开最底端 `y > 0.95`（`x ≈ 0.32..0.68`）的 iOS 主屏幕指示条吸附区（优先点击白色输入框偏左文字起点区域），并以「原生键盘弹出 + 光标出现」确认聚焦成功。
+4. `point` 与 `click-observed` 落点核对：`point` 仅在 `pointer_seen == true` 时返回非空 `measured_pointer`；若 `pointer_seen == false`（`measured_pointer: null`），`pointer` 字段只是请求坐标回显，**严禁直接把请求坐标传给 `click-observed`**。发生偏位（如曾触碰底部系统指示条）时加 `--rehome` 重新定位，并用 `observe --for-click` 实拍图确认灰点已落在目标框内。
+5. 从当前最新观察确定空输入框的归一化边界 `--target-box LEFT TOP RIGHT BOTTOM`（若光标在闪烁，记下左侧光标区 `--caret-box`）。
+6. **已有草稿保护**：若输入框内已经存在文字，核对是否完全等于本轮预期清理的测试草稿；发现其他未发送草稿时**原样保留并报告**，不得清空或覆盖。
 
 ## 3. 一次 `paste-flow` 与回执判读
 
@@ -58,7 +61,7 @@
    ```
 3. **观察并显式带标签发送一次**：用新凭证确认会话标题与输入框全文无误后，使用带可见发送标签（如 `发送`、`Send`）的已验证点击发送一次；绝不手动重试：
    ```sh
-   # 方式 A：先 point 再 observe --for-click，确认指针落在发送按钮框内后原地点击
+   # 方式 A：先 point（可带 --target-box，确认 measured_pointer 非空）再 observe --for-click，从实拍图确认指针在框内后点击
    ./server/.venv/bin/iphone-agent click-observed <px> <py> --screen-id <id> \
      --target-box <l> <t> <r> <b> --target-label 发送 --image-output server/.local-data/runs/sent.jpg
    # 方式 B：紧区域 OCR 精确匹配发送标签后点击

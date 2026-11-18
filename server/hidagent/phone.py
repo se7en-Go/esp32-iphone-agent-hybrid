@@ -1398,14 +1398,14 @@ class Phone:
         self._file.write_text(json.dumps(body))
 
     @_serialized
-    async def point(self, x: float, y: float, aim: bool = False) -> None:
+    async def point(self, x: float, y: float, aim: bool = False, *, rehome: bool = False) -> None:
         self.adopt_pace(getattr(self.device, "pace_version", None))
         if not self.calibrated:
             raise RuntimeError("pointer not calibrated")
         self._position_before = getattr(self.screen, "frame", None)
         self._position_from = self._pointer_position()
         self._position_started = time.time()
-        if self._affine is not None or self._rehome_each_move:
+        if rehome or self._affine is not None or self._rehome_each_move:
             self._pos = None
         await self._move_to(*self._target_units(x, y))
         self._position_completed = time.time()
@@ -1414,7 +1414,7 @@ class Phone:
 
     @bounded_operation
     @_serialized
-    async def point_verified(self, x: float, y: float, *, target_box=None) -> tuple[float, float]:
+    async def point_verified(self, x: float, y: float, *, target_box=None, rehome: bool = False) -> tuple[float, float]:
         """Use measured landings and verify every correction before it can authorize a click."""
         observed = freshness.require_fresh(self.screen)
         epoch = getattr(self.device, "abort_epoch", 0)
@@ -1433,7 +1433,19 @@ class Phone:
         self._pointer_overlay = None
         self._pointer_reference = None
         self._menu_highlight_landing_active = False
+        if rehome:
+            self._pos = None
         await self.point(x, y)
+        try:
+            return await self._confirm_point_landing(x, y, epoch, observed, same_session, target_box=target_box)
+        finally:
+            if not self._pointer_confirmed:
+                # An unconfirmed landing leaves the relative accumulator untrusted;
+                # re-home before the next move rather than carrying drift forward.
+                self._pos = None
+
+    async def _confirm_point_landing(self, x: float, y: float, epoch: int, observed, same_session,
+                                     *, target_box=None) -> tuple[float, float]:
         same_session()
         self._pointer_spots = ((x, y),)
         found = await self._find_pointer((x, y), epoch=epoch, quick=True, required=True)

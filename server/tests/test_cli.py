@@ -404,3 +404,25 @@ def test_cli_labeled_send_clicks_enforce_guard_and_emit_zero_clicks_when_refused
             device.close()
 
     asyncio.run(scenario())
+
+
+def test_point_cli_forwards_rehome_and_target_box(monkeypatch, capsys):
+    seen = []
+
+    class FakeClient:
+        def __init__(self, _url): pass
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+
+        def control(self, name, screen_id, **fields):
+            seen.append((name, screen_id, fields))
+            return {"command_acknowledged": True, "pointer_seen": True}
+
+    monkeypatch.setattr(cli, "IPhoneClient", FakeClient)
+    code = cli.main(["point", "0.25", "0.92", "--screen-id", "s1",
+                     "--rehome", "--target-box", "0.13", "0.90", "0.76", "0.95"])
+    assert code == 0 and json.loads(capsys.readouterr().out)["pointer_seen"] is True
+    assert seen == [("point", "s1", {
+        "x": 0.25, "y": 0.92, "coordinate_space": "normalized",
+        "target_box": [0.13, 0.9, 0.76, 0.95], "rehome": True,
+    })]

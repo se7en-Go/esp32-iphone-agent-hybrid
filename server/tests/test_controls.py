@@ -308,6 +308,50 @@ def test_point_reports_final_landing_not_an_earlier_pointer_sighting(tmp_path, m
     assert result["pointer_seen"] is (landing is not None)
     expected = landing or (.5, .5)
     assert result["pointer"] == {"x": expected[0], "y": expected[1]}
+    assert result["measured_pointer"] == ({"x": landing[0], "y": landing[1]} if landing is not None else None)
+    assert (phone._pos is None) is (landing is None)
+
+
+def test_unconfirmed_point_rehomes_next_move_and_explicit_rehome_forces_origin(tmp_path, monkeypatch):
+    commands = []
+
+    async def send(command):
+        commands.append(command)
+
+    screen = Screen()
+    device = SimpleNamespace(send=send, links=0, abort_epoch=0, pace_version=4)
+    phone = Phone(device, tmp_path / "calibration.json", screen)
+    phone.span, phone._pos = {"w": 400, "h": 800}, (100, 100)
+    phone._pace, phone._link = 4, 0
+
+    async def miss(*_args, **_kwargs):
+        return None
+
+    async def hit(near, *_args, **_kwargs):
+        phone._pointer_pair_verified = True
+        return near
+
+    monkeypatch.setattr(phone, "_find_pointer", miss)
+    control = Controls(phone, screen)
+    first = asyncio.run(control.perform(ControlAction(
+        action="point", x=.45, y=.96, screen_id=control.observation()["screen_id"])))
+    assert first["measured_pointer"] is None
+    assert phone._pos is None
+
+    monkeypatch.setattr(phone, "_find_pointer", hit)
+    second = asyncio.run(control.perform(ControlAction(
+        action="point", x=.25, y=.92, target_box=(.13, .90, .76, .95),
+        screen_id=control.observation()["screen_id"])))
+    assert second["pointer_seen"] is True and second["measured_pointer"] == {"x": .25, "y": .92}
+    assert commands[1:3] == ["home", "move 100 736"]
+    assert phone._pos == (100, 736)
+
+    commands.clear()
+    third = asyncio.run(control.perform(ControlAction(
+        action="point", x=.5, y=.5, rehome=True, target_box=(.4, .4, .6, .6),
+        screen_id=control.observation()["screen_id"])))
+    assert third["pointer_seen"] is True
+    assert commands == ["home", "move 200 400"]
 
 
 def test_verified_tap_checks_once_before_using_calibrated_position(tmp_path):

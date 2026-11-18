@@ -90,14 +90,21 @@ def create_server(url: str | None = None):
 
     @mcp.tool()
     def iphone_point(x: float, y: float, screen_id: str,
-                     coordinate_space: Literal["normalized", "pixels"] = "normalized"
+                     coordinate_space: Literal["normalized", "pixels"] = "normalized",
+                     target_box: tuple[float, float, float, float] | None = None,
+                     rehome: bool = False,
                      ) -> list[TextContent | ImageContent]:
         """Move without clicking. pointer_seen is true only after confirming the final landing.
 
-        When false, pointer contains the requested coordinates in normalized units.
-        Read a fresh image to locate the pointer before attempting a stationary click.
+        When false, measured_pointer is null and pointer echoes the requested coordinates in
+        normalized units. Read a fresh image to locate the actual pointer before clicking.
         """
-        return action("point", screen_id, x=x, y=y, coordinate_space=coordinate_space)
+        fields = {"x": x, "y": y, "coordinate_space": coordinate_space}
+        if target_box is not None:
+            fields["target_box"] = target_box
+        if rehome:
+            fields["rehome"] = True
+        return action("point", screen_id, **fields)
 
     @mcp.tool()
     def iphone_tap(x: float, y: float, screen_id: str,

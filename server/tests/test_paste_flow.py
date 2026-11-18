@@ -42,7 +42,8 @@ BANNER_JPEG = jpeg(banner=True)
 class FakeClient:
     def __init__(self, *, confirm_conflicts=1, sheet=True, trigger_configured=False,
                  copied_on_prepare=False, overlay_frames=0):
-        self.calls, self.confirm_conflicts, self.sheet, self.seen = [], confirm_conflicts, sheet, 0
+        self.calls, self.control_calls = [], []
+        self.confirm_conflicts, self.sheet, self.seen = confirm_conflicts, sheet, 0
         self.trigger_configured = trigger_configured
         self.copied_on_prepare = copied_on_prepare
         self.overlay_frames = overlay_frames
@@ -64,6 +65,7 @@ class FakeClient:
 
     def control(self, name, screen_id, **fields):
         self.calls.append(name)
+        self.control_calls.append((name, fields))
         return {"command_acknowledged": True}
 
     def click_observed(self, screen_id, x, y, box, **fields):
@@ -157,3 +159,57 @@ def test_flow_waits_for_transient_shortcut_banner_before_paste(vision):
     assert client.overlay_frames == 0
     assert "wait_overlay_clear" in report["stages_ms"]
     assert client.calls.count("paste") == 1 and report["phase"] == "completed"
+    assert client.control_calls[0] == ("point", {"x": .75, "y": .95, "target_box": [.69, .92, .83, .98],
+                                                  "rehome": True})
+
+
+@pytest.mark.parametrize("still_stray", [False, True])
+def test_flow_corrects_or_aborts_before_hold_when_stray_cursor_lands_below_bubble(monkeypatch, still_stray):
+    def bubble_scene(*, dot_xy=None):
+        image = Image.new("RGB", (360, 778), "white")
+        draw = ImageDraw.Draw(image)
+        if dot_xy is not None:
+            cx, cy = round(dot_xy[0] * 360), round(dot_xy[1] * 778)
+            draw.ellipse((cx - 9, cy - 9, cx + 9, cy + 9), fill=(110, 110, 110))
+        output = io.BytesIO()
+        image.save(output, "JPEG", quality=92)
+        return output.getvalue()
+
+    clean = bubble_scene()
+    stray = bubble_scene(dot_xy=(.89, .41))
+    inside = bubble_scene(dot_xy=(.89, .36))
+
+    monkeypatch.setattr(assistive_vision, "find_button_target",
+                        lambda _frame: ((.89, .36), (.82, .33, .96, .39)))
+    monkeypatch.setattr(paste_flow.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(ocr, "read_text", lambda _frame: [])
+
+    class StrayClient(FakeClient):
+        def observe(self, for_click=False):
+            self.seen += 1
+            return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(clean).decode()}
+
+        def screenshot(self):
+            self.screenshots += 1
+            if self.calls.count("point") == 1:
+                return stray
+            return stray if still_stray else inside
+
+    client = StrayClient()
+    if still_stray:
+        with pytest.raises(paste_flow.FlowStopped) as stopped:
+            paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58))
+        assert "outside AssistiveTouch" in str(stopped.value)
+        assert stopped.value.report.retries["point_bubble_miss"] == 1
+        assert ("click", "辅助触控", .9) not in client.calls
+        assert "prepare" not in client.calls and "paste" not in client.calls
+    else:
+        report = paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58)).as_dict()
+        assert report["retries"]["point_bubble_miss"] == 1
+        bubble_points = [fields for name, fields in client.control_calls if name == "point" and "target_box" in fields]
+        assert len(bubble_points) == 2
+        assert bubble_points[0]["rehome"] is True
+        assert "rehome" not in bubble_points[1]
+        assert bubble_points[1]["y"] < .36
+        assert ("click", "辅助触控", .9) in client.calls
+        assert report["phase"] == "completed"
