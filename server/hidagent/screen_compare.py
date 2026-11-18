@@ -739,11 +739,13 @@ def mask_pointer_highlights(before: bytes | Image.Image, after: bytes | Image.Im
 
 
 def observation_changed(before: bytes | None, after: bytes | None, *, input_region=None,
-                        moved_pointer: tuple = (), caret_frames=(), context_regions=None) -> bool:
+                        moved_pointer: tuple = (), caret_frames=(), context_regions=None,
+                        caret_scope=None) -> bool:
     """Reject content edits while tolerating clock and recognized pointer shapes.
 
     Recognized hover outlines and small compact discs may fade or move. Other larger
     regions, several edits, scrolling and broad low-contrast changes invalidate it.
+    `caret_scope` names a verified input field in which a green caret may blink.
     """
     if before and before == after:
         return False
@@ -757,7 +759,7 @@ def observation_changed(before: bytes | None, after: bytes | None, *, input_regi
         w, h = diff.size
         ImageDraw.Draw(diff).rectangle(tuple(round(v * (w if i % 2 == 0 else h))
                                              for i, v in enumerate(input_region)), fill=0)
-    mask_caret_blink(before, after, diff, caret_frames)
+    mask_caret_blink(before, after, diff, caret_frames, scope=caret_scope)
     mask_clock_ticks(before, after, diff)
     mask_pointer_highlights(before, after, diff)
     _mask_pointer_discs(before, after, diff, max_discs=2)

@@ -132,10 +132,11 @@ class Controls:
             self.invalidate()
             raise
 
-    def consume(self, screen_id, *, navigation_context=None):
+    def consume(self, screen_id, *, navigation_context=None, caret_scope=None):
         ticket = self.ticket
         self.invalidate()
-        return self._validate_ticket(ticket, screen_id, navigation_context=navigation_context)
+        return self._validate_ticket(ticket, screen_id, navigation_context=navigation_context,
+                                     caret_scope=caret_scope)
 
     @staticmethod
     def _check_ticket(ticket, screen_id, *, admission: InputAttempt | None = None):
@@ -145,7 +146,7 @@ class Controls:
             raise ValueError("screen_id expired; observe again")
 
     def _validate_ticket(self, ticket, screen_id, *, navigation_context=None, observation=None,
-                         on_reject=None, admission=None):
+                         on_reject=None, admission=None, caret_scope=None):
         def rejected(reason, current=None):
             if on_reject is not None:
                 on_reject(reason, current if current is not None else freshness.snapshot(self.screen))
@@ -176,7 +177,8 @@ class Controls:
                 rejected("navigation_context", freshness.snapshot(self.screen))
                 raise ValueError(str(exc)) from exc
         elif screen_compare.observation_changed(
-                ticket[2], frame, caret_frames=getattr(self.screen, "recent_frames", ())):
+                ticket[2], frame, caret_frames=getattr(self.screen, "recent_frames", ()),
+                caret_scope=caret_scope):
             rejected("layout_changed", current)
             raise ValueError("screen changed since observation; observe again")
         return ticket[2], width, height
