@@ -154,7 +154,7 @@ iphone-agent action @next-action.json --image-output /tmp/iphone-next.jpg
 
 普通蓝牙 HID 没有直接设置 iPhone 剪贴板的通道。快速粘贴依赖已配置的 iOS Shortcut/companion，检查 `capabilities` 的 clipboard 项并按 [PASTE_INPUT.md](PASTE_INPUT.md) 配置与验收。
 
-宿主 AI 优先使用分阶段 `paste-prepare` → `paste-status` → 看图确认原输入框 → `paste` → 看图核对全文 → `paste-confirm`。准备与复制期间不会长期占用观察锁。Shortcut 只确认实际复制，宿主确认焦点及插入文本，两者不互相代替。首次导入、设置快捷键及系统权限是一次配置；新模板没有每次粘贴的人为确认弹窗。`iphone_type` 的旧同步粘贴方式仍为兼容保留。
+宿主 AI 优先使用分阶段 `paste-prepare` → `paste-status` → 看图确认原输入框 → `paste` → 看图核对全文 → `paste-confirm`。准备与复制期间不会长期占用观察锁。Shortcut 确认实际复制，宿主确认焦点及插入文本。首次需要导入模板、选择触发方式并处理系统权限。辅助触控长按已通过真机验证，组合键是可选入口。新模板省掉了旧流程的自定义提醒，iOS 仍可能显示「允许粘贴」。`iphone_type` 保留旧同步粘贴方式以兼容已有配置。
 
 新模板对应 `HIDAGENT_CLIPBOARD_PROTOCOL=staged-v1`：普通 `type --mode auto` / `iphone_type(mode="auto")` 的可打印 ASCII 仍走键盘；Unicode/多行文本与显式同步 `mode="paste"` 立即返回分阶段指引，不能用新模板等待旧同步完成。默认 `legacy-v1` 不改变旧用户行为；查看 capabilities 中的协议、同步/分阶段可用性及触发键配置，不能把 `configured:true` 当成手机流程已验收。
 
