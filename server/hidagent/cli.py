@@ -105,11 +105,25 @@ def parser() -> argparse.ArgumentParser:
             _context(stage, required=True)
         else:
             stage.add_argument("--image-output", type=Path)
+        if name == "paste-status":
+            stage.add_argument("--include-observation", action=argparse.BooleanOptionalAction, default=True,
+                               help="include image_base64 and a new screen_id (disable while polling copied)")
         if name == "paste":
             stage.add_argument("--focused", action="store_true", required=True)
         if name == "paste-confirm":
             stage.add_argument("--observed-text", required=True, help="complete exact text verified in returned image")
             stage.add_argument("--confirmed", action="store_true", required=True)
+    flow = sub.add_parser("paste-flow", help="timed staged paste via AssistiveTouch Shortcut; stops before Send")
+    flow.add_argument("text", help="exact text, @file.txt or - for stdin")
+    flow.add_argument("--target-box", nargs=4, type=float, required=True,
+                      metavar=("LEFT", "TOP", "RIGHT", "BOTTOM"), help="observed empty input field")
+    flow.add_argument("--expect-title", help="exact conversation/page title that must be visible")
+    flow.add_argument("--caret-box", nargs=4, type=float, metavar=("LEFT", "TOP", "RIGHT", "BOTTOM"),
+                      help="schedule host clicks after a green caret blink edge in this box")
+    flow.add_argument("--prewarm", action="store_true", help="hold AssistiveTouch once before prepare")
+    flow.add_argument("--full-status", action="store_true", help="poll status with the image (old servers)")
+    flow.add_argument("--image-output", type=Path, help="save the confirmation evidence image")
+    flow.add_argument("--evidence-dir", type=Path, help="save each stage's observed frame here (local only)")
     action = sub.add_parser("action", help="guarded action JSON containing action and screen_id")
     action.add_argument("payload", help="JSON object, @file.json or - for stdin")
     action.add_argument("--image-output", type=Path)
@@ -214,6 +228,24 @@ def main(argv=None) -> int:
                             isinstance(step, dict) for step in steps):
                         raise ValueError("batch steps must be a JSON array of 1..8 action objects")
                     result = client.batch(args.screen_id, steps)
+                case "paste-flow":
+                    from .paste_flow import FlowStopped, run
+                    text = args.text
+                    if text == "-":
+                        text = sys.stdin.read()
+                    elif text.startswith("@"):
+                        text = Path(text[1:]).read_text(encoding="utf-8")
+                    try:
+                        report = run(client, text, tuple(args.target_box), expect_title=args.expect_title,
+                                     caret_box=tuple(args.caret_box) if args.caret_box else None,
+                                     prewarm=args.prewarm, light_status=not args.full_status,
+                                     evidence=args.image_output, evidence_dir=args.evidence_dir)
+                    except FlowStopped as stopped:
+                        print(json.dumps({"error": str(stopped), **stopped.report.as_dict()},
+                                         ensure_ascii=False), file=sys.stderr)
+                        return 2
+                    print(json.dumps(report.as_dict(), ensure_ascii=False))
+                    return 0
                 case "find-text":
                     result = client.find_text(args.text, args.screen_id, nth=args.nth,
                                               exact=args.exact, region=args.region)
@@ -225,6 +257,8 @@ def main(argv=None) -> int:
                     stage = "paste" if args.command == "paste" else args.command.removeprefix("paste-")
                     fields = {key: getattr(args, key) for key in (
                         "transaction_id", "screen_id", "focused", "observed_text", "confirmed") if hasattr(args, key)}
+                    if getattr(args, "include_observation", True) is False:
+                        fields["include_observation"] = False
                     result = client.clipboard_stage(stage, **fields)
                 case "point" | "tap" | "swipe" | "scroll" | "type" | "key" | "home" | "back" | \
                         "tap-text" | "compose-chinese" | "long-press" | "double-tap" | "circle" | "path" | \

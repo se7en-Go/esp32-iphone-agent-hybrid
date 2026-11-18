@@ -27,6 +27,11 @@ def keyboard_suggestion_bar(frame: bytes) -> tuple[float, float] | None:
         rgb = image.convert("RGB")
     width, height = rgb.size
     small = rgb.resize((120, max(1, round(120 * height / width))), Image.Resampling.BILINEAR)
+    found = _white_page_suggestion_bar(small)
+    return found if found is not None else _light_page_suggestion_bar(small)
+
+
+def _white_page_suggestion_bar(small):
     sw, sh = small.size
     band_h = max(1, round(0.02 * sh))
     bands = []
@@ -55,6 +60,39 @@ def keyboard_suggestion_bar(frame: bytes) -> tuple[float, float] | None:
         if above and sum(above) / len(above) >= 0.50:
             continue
         top = index * band_h / sh
+        return (top, min(1.0, top + 0.06))
+    return None
+
+
+def _light_page_suggestion_bar(small):
+    """Keyboard under a light-grey page (WeChat chat, ~238 brightness).
+
+    The white-page detector counts that page as keyboard grey (150-245), so the
+    keyboard never shows a top edge. Here the keyboard band is 150-232 and must
+    be clearly darker than the page above it; dark menus, uniform grey scenes
+    and screens without a keyboard still find nothing. The top is located to a
+    single row so the same keyboard reads the same strip in every frame.
+    """
+    sw, sh = small.size
+    rows, lumas = [], []
+    for y in range(sh):
+        values = [sum(small.getpixel((x, y))) / 3 for x in range(sw)]
+        rows.append(sum(150 <= value <= 232 for value in values) / sw)
+        lumas.append(sum(values) / sw)
+    run = max(3, round(.018 * sh))  # the strip starts with a solid, full-width keyboard band
+    page = max(3, round(.10 * sh))
+    for y in range(max(page, sh // 2 - round(.05 * sh)), min(sh - run, round(.72 * sh))):
+        if min(rows[y:y + run]) < .90:
+            continue
+        # Text lines in a grown input field are only partly grey; a keyboard
+        # is grey across the full width, darker than the page above it, and
+        # continues to the bottom of the screen.
+        above = lumas[y - run:y]
+        if sum(above) / run - sum(lumas[y:y + run]) / run < 12:
+            continue
+        if sum(rows[y:]) / (sh - y) <= .15 or sum(rows[:y]) / y >= .50:
+            continue
+        top = y / sh
         return (top, min(1.0, top + 0.06))
     return None
 
@@ -94,6 +132,6 @@ class InputContextGuard:
         if (current.generation != self.original.generation
                 or screen_compare.observation_changed(
                     self.original.frame, current.frame, input_region=region,
-                    caret_frames=getattr(self.screen, "recent_frames", ()))):
+                    caret_frames=getattr(self.screen, "recent_frames", ()), caret_scope=self.region)):
             raise RuntimeError("screen changed since the original observation; observe again before acting")
         return current

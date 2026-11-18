@@ -94,7 +94,7 @@ def _mask_normalized_box(draw: ImageDraw.ImageDraw, box: tuple[float, float, flo
 
 
 def _outside_visual_changed(before: bytes, after: bytes, region: tuple[float, float, float, float],
-                            suggestion_bar: tuple[float, float]) -> bool:
+                            suggestion_bar: tuple[float, float], extra=()) -> bool:
     """Verify no unintended UI outside the field, suggestion strip, clock, pointer, or bubble changed."""
     diff = screen_compare._difference(before, after, 360)
     if diff is None:
@@ -102,6 +102,8 @@ def _outside_visual_changed(before: bytes, after: bytes, region: tuple[float, fl
     draw = ImageDraw.Draw(diff)
     _mask_normalized_box(draw, region, diff.size)
     _mask_normalized_box(draw, (0., suggestion_bar[0], 1., suggestion_bar[1]), diff.size)
+    for box in extra:
+        _mask_normalized_box(draw, box, diff.size)
     for frame in (before, after):
         if assistive_vision.find_panel(frame) is not None:
             return True
@@ -197,6 +199,82 @@ def _image(frame):
         return image.convert("RGB")
 
 
+_RETURN_KEYS = {"发送", "發送", "send", "return", "换行", "換行", "前往", "go", "搜索", "search", "完成", "done"}
+
+
+def _field_span(image, left, right, bottom):
+    """Vertical extent of a white input field whose bottom edge is near `bottom`.
+
+    Rows count as field when enough of the row is page-white; glyph rows of
+    pasted text keep part of the row white. Returns (top, bottom) or None.
+    """
+    w, h = image.size
+    x0, x1 = max(0, round((left + .012) * w)), min(w, round((right - .012) * w))
+    if x1 - x0 < round(.20 * w):
+        return None
+    xs = range(x0, x1, max(1, (x1 - x0) // 64))
+    minimum = round(.025 * h)
+    start, stop = min(h - 2, round((bottom + .010) * h)), max(round(.08 * h), round((bottom - .22) * h))
+    rows = []
+    for y in range(start, stop - 1, -1):
+        if sum(sum(image.getpixel((x, y))) / 3 >= 251 for x in xs) / len(xs) >= .15:
+            rows.append(y)
+        elif len(rows) >= minimum:
+            break
+        else:
+            rows.clear()
+    if len(rows) < minimum:
+        return None
+    return min(rows) / h, (max(rows) + 1) / h
+
+
+def _grown_field(original_image, current_image, region, suggestion_bar):
+    """The same chat input field after it grew upward for multi-line text.
+
+    Its bottom edge must stay put just above the located suggestion strip, its
+    original top must match the observed field, and it may only grow upward by
+    a bounded amount. Returns (current_region, expand_control_box) or None.
+    """
+    if suggestion_bar is None or not 0 <= suggestion_bar[0] - region[3] <= .04:
+        return None
+    before = _field_span(original_image, region[0], region[2], region[3])
+    after = _field_span(current_image, region[0], region[2], region[3])
+    if (before is None or after is None or abs(before[1] - after[1]) > .006
+            or not region[1] - .012 <= before[0] <= region[1] + .020
+            or not .015 <= before[0] - after[0] <= .16):
+        return None
+    current = (region[0], min(region[1], max(.06, after[0] - .006)), region[2], region[3])
+    # The field's expand control appears left of the grown field, above the old top.
+    expand = (.02, max(.06, after[0] - .008), region[0], before[0])
+    # Right of the field the input bar's own background now covers the page. It
+    # must be a flat bar colour; any content there is still a change.
+    band = (min(1., region[2] + .01), expand[1], 1., before[0])
+    w, h = current_image.size
+    pixels = [sum(current_image.getpixel((x, y))) / 3
+              for y in range(round(band[1] * h), round(band[3] * h)) for x in range(round(band[0] * w), w)]
+    if not pixels or max(pixels) - min(pixels) > 24:
+        return None
+    return current, (expand, (region[2], band[1], 1., band[3]))
+
+
+def _return_key_box(original, current, suggestion_bar):
+    """The keyboard's return/send key, whose tint changes once the field is non-empty."""
+    def find(items):
+        found = [item for item in items if item.conf >= _MIN_CONFIDENCE
+                 and ocr.normalize_text(item.text) in _RETURN_KEYS
+                 and .72 <= item.box[0] < item.box[2] <= 1
+                 and max(suggestion_bar[1] + .14, .82) <= item.box[1] < item.box[3] <= .94]
+        return found[0] if len(found) == 1 else None
+
+    first, second = find(original), find(current)
+    if (first is None or second is None
+            or ocr.normalize_text(first.text) != ocr.normalize_text(second.text)
+            or abs(first.center[0] - second.center[0]) > .008 or abs(first.center[1] - second.center[1]) > .005):
+        return None
+    x, y = (first.center[0] + second.center[0]) / 2, (first.center[1] + second.center[1]) / 2
+    return (max(.74, x - .13), max(suggestion_bar[1] + .12, y - .034), min(1., x + .12), min(.94, y + .032))
+
+
 async def verify_after_paste_permission(before, sheet, after, region, observed_text) -> bool:
     """Check three already authenticated frames and OCR of the original field."""
     if not before or not sheet or not after or before == after or sheet in (before, after) or region is None:
@@ -217,8 +295,13 @@ async def verify_after_paste_permission(before, sheet, after, region, observed_t
             return False
         original = await ocr.read_text_async(before)
         current = await ocr.read_text_async(after)
+        if _is_permission_prompt(original) or _is_permission_prompt(current):
+            return False
+        suggestion_bar = _located_suggestion_bar(before, after, region)
+        grown = _grown_field(original_image, current_image, region, suggestion_bar)
+        current_region = grown[0] if grown else region
         original_lines = _field_lines(original, region)
-        current_lines = _field_lines(current, region)
+        current_lines = _field_lines(current, current_region)
         # The pasted text must be new and appear after the existing field
         # text: the current lines end with the expected lines, and the lines
         # before them are exactly the lines that were there before the paste.
@@ -228,14 +311,25 @@ async def verify_after_paste_permission(before, sheet, after, region, observed_t
                     and len(current_lines) >= len(expected)
                     and current_lines[-len(expected):] == expected
                     and current_lines[:len(current_lines) - len(expected)] == original_lines)
-        if (_is_permission_prompt(original) or _is_permission_prompt(current)
-                or not appended or not _same_field_outline(original_image, current_image, region)):
+        if not appended:
             return False
-        if _same_context(original, current, region):
-            return True
-        suggestion_bar = _located_suggestion_bar(before, after, region)
-        return (suggestion_bar is not None
-                and _same_context(original, current, region, suggestion_bar=suggestion_bar)
-                and not _outside_visual_changed(before, after, region, suggestion_bar))
+        if grown is None:
+            if not _same_field_outline(original_image, current_image, region):
+                return False
+            if _same_context(original, current, region):
+                return True
+        elif len(current_lines) < 2:
+            return False  # only multi-line text grows the field
+        if suggestion_bar is None:
+            return False
+        extra = []
+        if grown is not None:
+            extra.extend(grown[1])
+        if original_lines == ():
+            key = _return_key_box(original, current, suggestion_bar)
+            if key is not None:
+                extra.append(key)
+        return (_same_context(original, current, current_region, suggestion_bar=suggestion_bar)
+                and not _outside_visual_changed(before, after, current_region, suggestion_bar, extra))
     except (ocr.OCRError, OSError, ValueError):
         return False

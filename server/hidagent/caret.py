@@ -199,14 +199,40 @@ def _same_field(image, reference, caret, patch):
     return _field_difference(image, reference, caret, patch) < 6
 
 
-def _current_template_matches(image, reference, caret, patch, low, high):
-    errors = _phase_errors(image.crop(patch).tobytes(), low, high)
-    if errors is None:
+def _green_scanout_matches(sample, off, on, width):
+    """Allow smooth sRGB/4:2:0 scanout fade along a proven green caret, never a mark or tick."""
+    stride = width * 3
+    alphas, errors = [], []
+    for r0 in range(0, len(sample), stride):
+        s_row, lo_row, hi_row = sample[r0:r0 + stride], off[r0:r0 + stride], on[r0:r0 + stride]
+        delta = [h - lo for lo, h in zip(lo_row, hi_row, strict=True)]
+        norm = sum(d * d for d in delta)
+        if norm < 300:
+            row_errors = [max(abs(s_row[k + c] - lo_row[k + c]) for c in range(3)) for k in range(0, stride, 3)]
+        else:
+            alpha = sum((s - lo) * d for s, lo, d in zip(s_row, lo_row, delta, strict=True)) / norm
+            if not -.10 <= alpha <= 1.10:
+                return False
+            alpha = max(0., min(1., alpha))
+            alphas.append(alpha)
+            row_errors = [max(abs(s_row[k + c] - (lo_row[k + c] + alpha * delta[k + c])) for c in range(3))
+                          for k in range(0, stride, 3)]
+        if any(err > 54 for err in row_errors):
+            return False
+        errors.extend(row_errors)
+    if not errors or statistics.median(errors) > 12:
         return False
-    # Do not split a small new glyph across the mask border and grant each half
-    # a separate noise allowance. Foot/underline edits must remain observable.
-    return (_field_difference(image, reference, caret, patch) + sum(v > 20 for v in errors) < 6
-            and sum(v > 55 for v in errors) < 3)
+    return not alphas or (max(alphas) - min(alphas) <= .65
+                          and all(abs(b - a) <= .22 for a, b in zip(alphas, alphas[1:], strict=False)))
+
+
+def _current_template_matches(image, reference, caret, patch, low, high, *, green=False):
+    field_diff = _field_difference(image, reference, caret, patch)
+    sample = image.crop(patch).tobytes()
+    errors = _phase_errors(sample, low, high)
+    if errors is not None and (field_diff + sum(v > 20 for v in errors) < 6 and sum(v > 55 for v in errors) < 3):
+        return True
+    return green and field_diff < 6 and _green_scanout_matches(sample, low, high, patch[2] - patch[0])
 
 
 def _amber_tone(r, g, b):
@@ -216,9 +242,41 @@ def _amber_tone(r, g, b):
     return r >= 165 and r - g >= 0 and g - b >= 48
 
 
-def _template_cycle(caret, images, frames, current, *, allow_white=True, amber=False):
+def _green_tone(r, g, b):
+    # WeChat's insertion caret: full phase ~(9,199,101), fading ~(155,226,184).
+    return g >= 145 and g - r >= 45 and g - b >= 30
+
+
+def _scoped_caret(image, box, scope):
+    """A thin line inside a caller-verified input field, on that field's light background.
+
+    Used only for a green caret, and only when the caller names the field (`scope`,
+    pixels). The comparison area is the padded caret neighbourhood clipped to that
+    field, so nearby glyphs, the field's own text and anything outside stay compared.
+    """
+    x0, y0, x1, y1 = box
+    left, top, right, bottom = scope
+    if not (left <= x0 < x1 <= right and top <= y0 < y1 <= bottom):
+        return None
+    w, h = image.size
+    pad_x, pad_y = round(.06 * w), round(.02 * h)
+    margin = max(3, round(.012 * w))
+    for background_x in (x1 + margin, x0 - margin):
+        if not left <= background_x < right:
+            continue
+        light = [min(image.getpixel((background_x, y))) >= 232 for y in range(y0, y1)]
+        if sum(light) < .95 * len(light):
+            continue
+        field = (max(left, x0 - pad_x), max(top, y0 - pad_y), min(right, x1 + pad_x), min(bottom, y1 + pad_y))
+        if field[0] < x0 - 1 and x1 + 2 < field[2] and field[1] < y0 - 1 and y1 + 1 < field[3]:
+            return FieldCaret(box, field, background_x)
+    return None
+
+
+def _template_cycle(caret, images, frames, current, *, allow_white=True, amber=False, green=False):
     """Use complete periodic templates, including unchanged preedit underline."""
     x0, y0, x1, y1 = caret.box
+    tone = _amber_tone if amber else _green_tone if green else None
     patch = x0 - 1, y0 - 1, x1 + 2, y1 + 1
     # A complete on-phase must remain a colored vertical line. The top three
     # quarters of an off-phase must reveal the field; its foot may intersect a
@@ -230,8 +288,8 @@ def _template_cycle(caret, images, frames, current, *, allow_white=True, amber=F
         on, off = [], []
         for i, image in enumerate(images):
             colors = [image.getpixel((x, y)) for y in rows]
-            if amber:
-                on_pixels = sum(_amber_tone(*color) for color in colors)
+            if tone is not None:
+                on_pixels = sum(tone(*color) for color in colors)
             else:
                 blue = sum(b >= 150 and b - r >= 60 and b - g >= 25 and g >= 50 for r, g, b in colors)
                 white = sum(min(c) >= 215 and max(c) - min(c) <= 65 for c in colors) if allow_white else 0
@@ -241,13 +299,13 @@ def _template_cycle(caret, images, frames, current, *, allow_white=True, amber=F
             if on_pixels >= .85 * len(colors) and sum(v >= 60 for v in contrasts) >= .85 * len(contrasts):
                 on.append(i)
             if statistics.median(contrasts) <= 12 and sum(v <= 20 for v in contrasts) >= .85 * len(contrasts):
-                # An amber line on a white canvas must disappear completely.
+                # An amber or green line on a light field must disappear completely.
                 # Its endpoints cannot become part of a new learned off phase.
-                if amber:
+                if tone is not None:
                     clearance = max(3, round(.006 * image.height))
                     pixels = image.crop((x0 - 1, y0 - clearance, x1 + 1, y1 + clearance)).tobytes()
                     colors = zip(pixels[::3], pixels[1::3], pixels[2::3], strict=True)
-                    if any(_amber_tone(*color) for color in colors):
+                    if any(tone(*color) for color in colors):
                         continue
                 off.append(i)
         if not on or not off:
@@ -260,7 +318,8 @@ def _template_cycle(caret, images, frames, current, *, allow_white=True, amber=F
                 if pair in tried:
                     continue
                 tried.add(pair)
-                if _matching_cycle(caret, patch, images, frames, current, off_index, on_index, x, pair):
+                if _matching_cycle(caret, patch, images, frames, current, off_index, on_index, x, pair,
+                                   green=green):
                     return True
     return False
 
@@ -303,14 +362,14 @@ def _opposite_caret_pixels(low, high, caret, patch, core_x):
     return wrong
 
 
-def _matching_cycle(caret, patch, images, frames, current, off_index, on_index, core_x, pair):
+def _matching_cycle(caret, patch, images, frames, current, off_index, on_index, core_x, pair, *, green=False):
     low, high = pair
     low_image = images[off_index]
     if (not _stable_underline(low_image, images[on_index], caret)
             or _field_difference(images[on_index], low_image, caret, patch)
             + _opposite_caret_pixels(low_image, images[on_index], caret, patch, core_x) >= 6):
         return False
-    if not all(_current_template_matches(image, low_image, caret, patch, low, high) for image in current):
+    if not all(_current_template_matches(image, low_image, caret, patch, low, high, green=green) for image in current):
         return False
     delta = [b - a for a, b in zip(low, high, strict=True)]
     norm = sum(v * v for v in delta)
@@ -336,13 +395,22 @@ def _matching_cycle(caret, patch, images, frames, current, off_index, on_index, 
     return False
 
 
-def _temporal_carets(first, second, frames, regions, *, images=None, allow_white=True, allow_editor=False):
+def _temporal_carets(first, second, frames, regions, *, images=None, allow_white=True, allow_editor=False,
+                     green_scope=None):
     images = images if images is not None else [_image(frame.frame) for frame in frames]
     if any(image.size != first.size for image in images):
         return []
     found = []
     for bounds in regions:
-        patches = [image.crop(bounds) for image in images]
+        ref = first.crop(bounds)
+        border = [(x, y) for x in range(ref.width) for y in (0, ref.height - 1)] + [
+            (x, y) for y in range(1, ref.height - 1) for x in (0, ref.width - 1)]
+        patches = [patch for image in images
+                   for patch in (image.crop(bounds),)
+                   if max((max(abs(a - b) for a, b in zip(patch.getpixel(p), ref.getpixel(p), strict=True))
+                           for p in border), default=0) <= 24]
+        if len(patches) < 3:
+            continue
         low, high = patches[0], patches[0]
         for patch in patches[1:]:
             low, high = ImageChops.darker(low, patch), ImageChops.lighter(high, patch)
@@ -361,7 +429,13 @@ def _temporal_carets(first, second, frames, regions, *, images=None, allow_white
             caret = _bounded_field(first, box) if dense else None
             if caret and _template_cycle(caret, images, frames, (first, second), allow_white=allow_white):
                 found.append(caret)
-            elif allow_editor and (dense or max(xs.count(x) for x in set(xs)) >= .95 * bh):
+                continue
+            if green_scope is not None and (dense or max(xs.count(x) for x in set(xs)) >= .95 * bh):
+                scoped = _scoped_caret(first, box, green_scope)
+                if scoped and _template_cycle(scoped, images, frames, (first, second), green=True):
+                    found.append(scoped)
+                    continue
+            if allow_editor and (dense or max(xs.count(x) for x in set(xs)) >= .95 * bh):
                 # JPEG fringes can widen the component with little extra area.
                 # The complete box still has to match the learned phases.
                 editor = _editor_caret(first, box)
@@ -464,8 +538,13 @@ def _periodic(caret, bright, frames, current):
                for a, b, c in zip(states, states[1:], states[2:], strict=False))
 
 
-def mask_caret_blink(before, after, diff, frames=()):
-    """Exempt a reversible thin caret only; surrounding text is always compared."""
+def mask_caret_blink(before, after, diff, frames=(), scope=None):
+    """Exempt a reversible thin caret only; surrounding text is always compared.
+
+    `scope` (normalized [left, top, right, bottom]) is a caller-verified input field.
+    Only inside it may a green caret (WeChat) be recognised; without it, green
+    lines are always compared as content.
+    """
     if len(frames) < 3:
         return
     hot = diff.point(lambda value: 255 if value > 24 else 0)
@@ -509,7 +588,11 @@ def mask_caret_blink(before, after, diff, frames=()):
     if not candidates:
         # Editor evidence can exempt the thin blink from a comparison. It does
         # not provide a bounded field to callers that are trying to locate focus.
-        for caret in _temporal_carets(first, second, frames, regions, allow_editor=True):
+        green_scope = None
+        if scope is not None:
+            w, h = first.size
+            green_scope = (round(scope[0] * w), round(scope[1] * h), round(scope[2] * w), round(scope[3] * h))
+        for caret in _temporal_carets(first, second, frames, regions, allow_editor=True, green_scope=green_scope):
             x0, y0, x1, y1 = caret.box
             candidates.append(tuple(round(v * diff.size[i % 2] / first.size[i % 2])
                                     for i, v in enumerate((x0 - 1, y0 - 1, x1 + 1, y1))))

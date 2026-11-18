@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
-from . import feedback, ocr
+from . import feedback, ocr, screen_compare
 from .clipboard import NO_STORE
 from .freshness import fresh_frame, snapshot
 from .input_context import InputContextGuard
@@ -41,6 +41,10 @@ class ConfirmPaste(TransactionId):
     screen_id: str = Field(min_length=1)
     observed_text: str = Field(min_length=1, max_length=4000)
     confirmed: StrictBool
+
+
+class StatusRequest(TransactionId):
+    include_observation: StrictBool = True
 
 
 @dataclass(repr=False)
@@ -127,10 +131,14 @@ class StagedClipboardControls:
             self.transaction = None
         return {**state, "phase": "cancelled", "effect_verified": False}
 
-    def status(self, nonce):
+    def status(self, nonce, *, include_observation=True):
         item = self._lookup(nonce)
-        return {**item.provider.stage_status(nonce), **self._evidence(),
-                "focus_verified_by": item.focus_verified_by}
+        state = {**item.provider.stage_status(nonce), "focus_verified_by": item.focus_verified_by}
+        if not include_observation:
+            # Read-only poll while waiting for the copy ACK: no image and no new
+            # screen_id. The next action still needs its own fresh observation.
+            return state
+        return {**state, **self._evidence()}
 
     async def prepare(self, request):
         controls = self.get_controls()
@@ -141,7 +149,8 @@ class StagedClipboardControls:
         select_type_mode(request.text, "paste", clipboard_available=True)
         if request.focused is not True:
             raise ValueError("visually confirm the intended input field is focused before prepare")
-        controls.consume(request.screen_id)
+        scope = tuple(ocr.validate_region(request.target_box)) if request.target_box is not None else None
+        controls.consume(request.screen_id, caret_scope=scope)
         anchor = InputContextGuard(screen, controls._observation)
         focus_source = "visible_caret"
         if request.target_box is not None:
@@ -181,10 +190,10 @@ class StagedClipboardControls:
         if not copied["copied"]:
             raise ValueError("Shortcut has not acknowledged an actual copy; check paste status")
         self._session(item)
-        controls._validate_ticket(controls.ticket, request.screen_id)
+        controls._validate_ticket(controls.ticket, request.screen_id, caret_scope=item.guard.region)
         if not self._post_event_evidence(controls, copied["copied_at"]):
             raise ValueError("observe a fresh frame after the copy ACK and mirror pipeline before pasting")
-        controls.consume(request.screen_id)
+        controls.consume(request.screen_id, caret_scope=item.guard.region)
         item.guard()
         item.provider.stage_start_paste(item.nonce)
 
@@ -230,7 +239,7 @@ class StagedClipboardControls:
             raise ValueError("paste has not been sent")
         self._session(item)
         controls = self.get_controls()
-        controls._validate_ticket(controls.ticket, request.screen_id)
+        controls._validate_ticket(controls.ticket, request.screen_id, caret_scope=item.guard.region)
         if not self._post_event_evidence(controls, item.completed_at):
             raise ValueError("confirmation requires a fresh post-paste observation")
         evidence = {}
@@ -265,11 +274,12 @@ class StagedClipboardControls:
                             item.guard.region, request.observed_text)):
                     verified = item.sheet_evidence
             if verified is None:
-                # Candidates are the frames retained right after Cmd+V first,
-                # then the live recent window; a sheet is not pushed out of
-                # the candidate list by later ordinary frames, and a sheet
-                # that left the window before confirm still verifies.
-                candidates = tuple(item.post_paste_frames) + tuple(
+                # Candidates are the frames retained right after Cmd+V (latest
+                # settled frame first, before early transition frames), then the
+                # live recent window; a sheet is not pushed out of the candidate
+                # list by later ordinary frames, and a sheet that left the
+                # window before confirm still verifies.
+                candidates = tuple(reversed(item.post_paste_frames)) + tuple(
                     getattr(controls.screen, "recent_frames", ()))
                 for snapshot in candidates:
                     frame = getattr(snapshot, "frame", None)
@@ -281,6 +291,12 @@ class StagedClipboardControls:
                             or updated > result.updated):
                         continue
                     seen.add(frame)
+                    # A permission sheet dims and covers the page, so it differs
+                    # from both the original page and the result page. Skip
+                    # plain pre-sheet or post-sheet frames before OCR (~1 s/frame).
+                    if (not screen_compare.observation_changed(after, frame)
+                            or not screen_compare.observation_changed(original.frame, frame)):
+                        continue
                     if await verify_after_paste_permission(
                             original.frame, frame, after,
                             item.guard.region, request.observed_text):
@@ -299,7 +315,7 @@ class StagedClipboardControls:
             self._session(item)
             if not self._post_event_evidence(controls, item.completed_at):
                 raise ValueError("confirmation requires a fresh post-paste observation")
-        controls.consume(request.screen_id)
+        controls.consume(request.screen_id, caret_scope=item.guard.region)
         state = item.provider.stage_finish(item.nonce, confirmed=True)
         self.transaction = None
         return {**state, **self._evidence(), "phase": "completed", "effect_verified": True,
@@ -351,8 +367,9 @@ def create_control_router(get_controls, get_lock, check_manual, refuse_if_trippe
         return await run(request, lambda: manager.confirm(body))
 
     @router.post("/status")
-    async def status(body: TransactionId, request: Request):
-        return await run(request, lambda: manager.status(body.transaction_id), read_only=True)
+    async def status(body: StatusRequest, request: Request):
+        return await run(request, lambda: manager.status(
+            body.transaction_id, include_observation=body.include_observation), read_only=True)
 
     @router.post("/cancel")
     async def cancel(body: TransactionId, request: Request):
