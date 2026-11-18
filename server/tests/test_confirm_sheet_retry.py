@@ -10,6 +10,7 @@ import asyncio
 import io
 
 import pytest
+from fastapi import HTTPException
 from PIL import Image, ImageDraw
 from test_staged_clipboard import copied, field_image, prepare_body, setup
 
@@ -178,6 +179,7 @@ def test_confirm_without_any_sheet_frame_still_refuses(monkeypatch):
         assert provider.current()["active"]
 
     asyncio.run(scenario())
+
 
 def test_confirm_uses_sheet_retained_at_paste_time_after_window_passes(monkeypatch):
     """A sheet that left the 4 s recent window before confirm still verifies.
@@ -377,5 +379,189 @@ def test_confirm_accepts_newline_leading_append_with_retained_sheet(monkeypatch)
         assert receipt["sheet_frame_updated"] is not None
         assert receipt["sheet_frame_generation"] is not None
         assert provider.current() == {"active": False, "needs_resolution": False}
+
+    asyncio.run(scenario())
+
+
+def _suggestion_bar_scenario_frames(*, outside_ocr_change=False, outside_visual_change=False):
+    from test_paste_confirmation import _kb_context_boxes, _kb_suggestion_boxes, keyboard_frame, label
+
+    new_text = "\n修验通过：云海00417\n末行 GhJ kLm"
+    existing = [label("已有第一行", .25, .20), label("第二行 AbD eFg", .25, .25)]
+    pasted = [label("修验通过：云海00417", .25, .30), label("末行 GhJ kLm", .25, .35)]
+    dialog = [label("“备忘录”想从“快捷指令”粘贴", .5, .44), label("你允许这样做吗？", .5, .48),
+              label("不允许粘贴", .27, .55), label("允许粘贴", .7, .55)]
+    original = keyboard_frame([200, 250], suggestion_variant=0)
+    sheet = keyboard_frame([200, 250], suggestion_variant=0, sheet=True)
+    after = keyboard_frame([200, 250, 300, 350], suggestion_variant=1,
+                           header_tamper=outside_visual_change)
+    after_ctx = _kb_context_boxes(
+        nav_top_label="群聊" if outside_ocr_change else "返回",
+    )
+    frames = {
+        original: _kb_context_boxes() + _kb_suggestion_boxes(0) + existing,
+        sheet: dialog,
+        after: after_ctx + _kb_suggestion_boxes(1) + existing + pasted,
+    }
+    return new_text, original, sheet, after, frames
+
+
+def _claim_and_copy(provider, screen, expected_text):
+    pending = provider.pending()
+    assert pending["protocol"] == "staged-v1"
+    token = pending["text_url"].rsplit("/", 1)[-1]
+    assert provider.fetch_payload(token) == {"copy_allowed": True, "text": expected_text}
+    provider.acknowledge(token, copied=True, focused=False)
+    screen._on_jpeg(screen.frame)
+
+
+def test_confirm_completes_when_only_suggestion_bar_changes_after_sheet(monkeypatch):
+    from test_paste_confirmation import KB_REGION
+
+    from hidagent import feedback, ocr
+    from hidagent.clipboard_control import PreparePaste
+
+    new_text, original, sheet, after, frames = _suggestion_bar_scenario_frames()
+
+    async def read(image):
+        return frames.get(image, [])
+
+    async def scenario():
+        screen, provider, _phone, control, manager = setup(monkeypatch)
+        screen._on_jpeg(original)
+        monkeypatch.setattr(ocr, "read_text_async", read)
+
+        async def capture(_screen, _completed_at):
+            screen._on_jpeg(sheet)
+            return sheet
+
+        monkeypatch.setattr(feedback, "wait_after_action", capture)
+        prepared = await manager.prepare(PreparePaste(
+            text=new_text, screen_id=control.observation()["screen_id"],
+            focused=True, target_box=KB_REGION))
+        _claim_and_copy(provider, screen, new_text)
+        await manager.paste(PasteTransaction(transaction_id=prepared["transaction_id"],
+                                             screen_id=control.observation()["screen_id"], focused=True))
+        screen._on_jpeg(after)
+        receipt = await manager.confirm(ConfirmPaste(
+            transaction_id=prepared["transaction_id"],
+            screen_id=control.observation()["screen_id"],
+            observed_text=new_text, confirmed=True))
+        assert receipt["phase"] == "completed" and receipt["effect_verified"] is True
+        assert receipt["confirmation_evidence"] == "paste_permission_dismissed"
+        assert provider.current() == {"active": False, "needs_resolution": False}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("case", [
+    "missing_sheet",
+    "pre_paste_sheet",
+    "other_transaction_sheet",
+    "new_mirror_generation",
+])
+def test_confirm_refuses_suggestion_bar_change_when_sheet_missing_expired_or_other_tx(monkeypatch, case):
+    from test_paste_confirmation import KB_REGION
+
+    from hidagent import feedback, ocr
+    from hidagent.clipboard_control import PreparePaste
+
+    new_text, original, sheet, after, frames = _suggestion_bar_scenario_frames()
+
+    async def read(image):
+        return frames.get(image, [])
+
+    async def scenario():
+        screen, provider, _phone, control, manager = setup(monkeypatch)
+        monkeypatch.setattr(ocr, "read_text_async", read)
+
+        if case == "other_transaction_sheet":
+            screen._on_jpeg(original)
+
+            async def capture_sheet(_screen, _completed_at):
+                screen._on_jpeg(sheet)
+                return sheet
+
+            monkeypatch.setattr(feedback, "wait_after_action", capture_sheet)
+            first = await manager.prepare(PreparePaste(
+                text=new_text, screen_id=control.observation()["screen_id"],
+                focused=True, target_box=KB_REGION))
+            _claim_and_copy(provider, screen, new_text)
+            await manager.paste(PasteTransaction(transaction_id=first["transaction_id"],
+                                                 screen_id=control.observation()["screen_id"], focused=True))
+            manager.cancel(first["transaction_id"])
+            provider.resolve(paste_finished=True)
+
+        screen._on_jpeg(original)
+        if case == "pre_paste_sheet":
+            screen._on_jpeg(sheet)
+            screen._on_jpeg(original)
+
+        async def capture_plain(_screen, _completed_at):
+            if case == "new_mirror_generation":
+                screen._on_jpeg(sheet)
+                return sheet
+            screen._on_jpeg(original)
+            return original
+
+        monkeypatch.setattr(feedback, "wait_after_action", capture_plain)
+        prepared = await manager.prepare(PreparePaste(
+            text=new_text, screen_id=control.observation()["screen_id"],
+            focused=True, target_box=KB_REGION))
+        _claim_and_copy(provider, screen, new_text)
+        await manager.paste(PasteTransaction(transaction_id=prepared["transaction_id"],
+                                             screen_id=control.observation()["screen_id"], focused=True))
+        if case == "new_mirror_generation":
+            screen._on_ready()
+        screen._on_jpeg(after)
+        expected_exc = HTTPException if case == "new_mirror_generation" else RuntimeError
+        with pytest.raises(expected_exc):
+            await manager.confirm(ConfirmPaste(
+                transaction_id=prepared["transaction_id"],
+                screen_id=control.observation()["screen_id"],
+                observed_text=new_text, confirmed=True))
+        assert provider.current()["active"] is (case != "new_mirror_generation")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("case", ["outside_ocr_label", "outside_visual_banner"])
+def test_confirm_refuses_when_outside_ui_changes_alongside_suggestion_bar(monkeypatch, case):
+    from test_paste_confirmation import KB_REGION
+
+    from hidagent import feedback, ocr
+    from hidagent.clipboard_control import PreparePaste
+
+    new_text, original, sheet, after, frames = _suggestion_bar_scenario_frames(
+        outside_ocr_change=(case == "outside_ocr_label"),
+        outside_visual_change=(case == "outside_visual_banner"),
+    )
+
+    async def read(image):
+        return frames.get(image, [])
+
+    async def scenario():
+        screen, provider, _phone, control, manager = setup(monkeypatch)
+        screen._on_jpeg(original)
+        monkeypatch.setattr(ocr, "read_text_async", read)
+
+        async def capture(_screen, _completed_at):
+            screen._on_jpeg(sheet)
+            return sheet
+
+        monkeypatch.setattr(feedback, "wait_after_action", capture)
+        prepared = await manager.prepare(PreparePaste(
+            text=new_text, screen_id=control.observation()["screen_id"],
+            focused=True, target_box=KB_REGION))
+        _claim_and_copy(provider, screen, new_text)
+        await manager.paste(PasteTransaction(transaction_id=prepared["transaction_id"],
+                                             screen_id=control.observation()["screen_id"], focused=True))
+        screen._on_jpeg(after)
+        with pytest.raises(RuntimeError):
+            await manager.confirm(ConfirmPaste(
+                transaction_id=prepared["transaction_id"],
+                screen_id=control.observation()["screen_id"],
+                observed_text=new_text, confirmed=True))
+        assert provider.current()["active"]
 
     asyncio.run(scenario())
