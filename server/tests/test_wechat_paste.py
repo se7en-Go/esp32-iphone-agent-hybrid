@@ -206,3 +206,28 @@ def test_confirmation_rejects_everything_but_the_expected_change(monkeypatch, ca
     elif case == "region_over_strip":
         kwargs["region"] = (.132, .525, .768, .62)
     assert verify(monkeypatch, **kwargs) is False
+
+
+def test_codec_quantization_drift_confirms_while_broad_dim_still_fails(monkeypatch):
+    def adjust_outside(delta_fn):
+        image = Image.open(io.BytesIO(load("live_pasted"))).convert("RGB")
+        w, h = image.size
+        pixels = image.load()
+        for y in range(h):
+            if int(.45 * h) <= y <= int(.66 * h):
+                continue
+            for x in range(w):
+                d = delta_fn(x, y, h)
+                if d:
+                    r, g, b = pixels[x, y]
+                    pixels[x, y] = (min(255, max(0, r + d)), min(255, max(0, g + d)), min(255, max(0, b + d)))
+        output = io.BytesIO()
+        image.save(output, "PNG")
+        return output.getvalue()
+
+    jittered = adjust_outside(lambda x, y, _h: 3 if ((x // 3) + (y // 3)) % 2 == 0 else -3)
+    dimmed = adjust_outside(lambda _x, y, h: -8 if int(.10 * h) <= y <= int(.46 * h) else 0)
+    assert verify(monkeypatch, before="live_original", sheet="live_sheet",
+                  after_frame=jittered, after_boxes=boxes("live_pasted"), text=LIVE_TEXT) is True
+    assert verify(monkeypatch, before="live_original", sheet="live_sheet",
+                  after_frame=dimmed, after_boxes=boxes("live_pasted"), text=LIVE_TEXT) is False

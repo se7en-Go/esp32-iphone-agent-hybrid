@@ -1,5 +1,6 @@
 """Corroborate host-observed paste effects after an iOS paste permission prompt."""
 
+import hashlib
 import io
 import math
 import re
@@ -122,7 +123,10 @@ def _outside_visual_changed(before: bytes, after: bytes, region: tuple[float, fl
     screen_compare._mask_pointer_discs(before, after, diff, max_discs=2)
     screen_compare._mask_translucent_pointer_fade(before, after, diff)
     values = diff.tobytes()
-    return sum(values) / len(values) > .8 or any(len(points) >= 6 for points in screen_compare._regions(diff, 24))
+    # Ignore <=4/255 AirPlay/JPEG quantization noise after full-screen sheet dim/undim;
+    # sharp small edits still trip _regions(diff, 24) >= 6 and broad low-contrast shifts exceed .8.
+    return (sum(value for value in values if value > 4) / len(values) > .8
+            or any(len(points) >= 6 for points in screen_compare._regions(diff, 24)))
 
 
 def _same_context(before, after, region, *, suggestion_bar=None):
@@ -275,6 +279,64 @@ def _return_key_box(original, current, suggestion_bar):
     return (max(.74, x - .13), max(suggestion_bar[1] + .12, y - .034), min(1., x + .12), min(.94, y + .032))
 
 
+_PAIR_CACHE: tuple[object, tuple, bool] | None = None
+
+
+async def _verify_before_after_uncached(read_fn, before, after, original_image, current_image,
+                                        region, expected) -> bool:
+    original = await read_fn(before)
+    current = await read_fn(after)
+    if _is_permission_prompt(original) or _is_permission_prompt(current):
+        return False
+    suggestion_bar = _located_suggestion_bar(before, after, region)
+    grown = _grown_field(original_image, current_image, region, suggestion_bar)
+    current_region = grown[0] if grown else region
+    original_lines = _field_lines(original, region)
+    current_lines = _field_lines(current, current_region)
+    # The pasted text must be new and appear after the existing field
+    # text: the current lines end with the expected lines, and the lines
+    # before them are exactly the lines that were there before the paste.
+    # This covers an empty field and appending after existing borderless
+    # body text, and still rejects text that was already present.
+    appended = (original_lines is not None and current_lines is not None
+                and len(current_lines) >= len(expected)
+                and current_lines[-len(expected):] == expected
+                and current_lines[:len(current_lines) - len(expected)] == original_lines)
+    if not appended:
+        return False
+    if grown is None:
+        if not _same_field_outline(original_image, current_image, region):
+            return False
+        if _same_context(original, current, region):
+            return True
+    elif len(current_lines) < 2:
+        return False  # only multi-line text grows the field
+    if suggestion_bar is None:
+        return False
+    extra = []
+    if grown is not None:
+        extra.extend(grown[1])
+    if original_lines == ():
+        key_box = _return_key_box(original, current, suggestion_bar)
+        if key_box is not None:
+            extra.append(key_box)
+    return (_same_context(original, current, current_region, suggestion_bar=suggestion_bar)
+            and not _outside_visual_changed(before, after, current_region, suggestion_bar, extra))
+
+
+async def _verify_before_after(before, after, original_image, current_image, region, expected) -> bool:
+    global _PAIR_CACHE
+    read_fn = ocr.read_text_async
+    key = (hashlib.sha256(before).digest(), hashlib.sha256(after).digest(), region, expected)
+    cached = _PAIR_CACHE
+    if cached is not None and cached[0] is read_fn and cached[1] == key:
+        return cached[2]
+    verified = await _verify_before_after_uncached(
+        read_fn, before, after, original_image, current_image, region, expected)
+    _PAIR_CACHE = (read_fn, key, verified)
+    return verified
+
+
 async def verify_after_paste_permission(before, sheet, after, region, observed_text) -> bool:
     """Check three already authenticated frames and OCR of the original field."""
     if not before or not sheet or not after or before == after or sheet in (before, after) or region is None:
@@ -291,45 +353,8 @@ async def verify_after_paste_permission(before, sheet, after, region, observed_t
         original_image, sheet_image, current_image = (_image(frame) for frame in (before, sheet, after))
         if original_image.size != sheet_image.size or original_image.size != current_image.size:
             return False
-        if not _is_permission_prompt(await ocr.read_text_async(sheet)):
+        if not await _verify_before_after(before, after, original_image, current_image, region, expected):
             return False
-        original = await ocr.read_text_async(before)
-        current = await ocr.read_text_async(after)
-        if _is_permission_prompt(original) or _is_permission_prompt(current):
-            return False
-        suggestion_bar = _located_suggestion_bar(before, after, region)
-        grown = _grown_field(original_image, current_image, region, suggestion_bar)
-        current_region = grown[0] if grown else region
-        original_lines = _field_lines(original, region)
-        current_lines = _field_lines(current, current_region)
-        # The pasted text must be new and appear after the existing field
-        # text: the current lines end with the expected lines, and the lines
-        # before them are exactly the lines that were there before the paste.
-        # This covers an empty field and appending after existing borderless
-        # body text, and still rejects text that was already present.
-        appended = (original_lines is not None and current_lines is not None
-                    and len(current_lines) >= len(expected)
-                    and current_lines[-len(expected):] == expected
-                    and current_lines[:len(current_lines) - len(expected)] == original_lines)
-        if not appended:
-            return False
-        if grown is None:
-            if not _same_field_outline(original_image, current_image, region):
-                return False
-            if _same_context(original, current, region):
-                return True
-        elif len(current_lines) < 2:
-            return False  # only multi-line text grows the field
-        if suggestion_bar is None:
-            return False
-        extra = []
-        if grown is not None:
-            extra.extend(grown[1])
-        if original_lines == ():
-            key = _return_key_box(original, current, suggestion_bar)
-            if key is not None:
-                extra.append(key)
-        return (_same_context(original, current, current_region, suggestion_bar=suggestion_bar)
-                and not _outside_visual_changed(before, after, current_region, suggestion_bar, extra))
+        return _is_permission_prompt(await ocr.read_text_async(sheet))
     except (ocr.OCRError, OSError, ValueError):
         return False
