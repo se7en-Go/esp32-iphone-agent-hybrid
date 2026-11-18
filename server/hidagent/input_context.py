@@ -1,6 +1,7 @@
 """Keep typing in its observed field, including while firmware ACKs are pending."""
 
 import io
+from functools import lru_cache
 
 from PIL import Image
 
@@ -10,6 +11,7 @@ from .caret import temporal_focused_region
 from .freshness import require_fresh
 
 
+@lru_cache(maxsize=8)
 def keyboard_suggestion_bar(frame: bytes) -> tuple[float, float] | None:
     """Return the (top, bottom) of the iOS keyboard suggestion bar, or None.
 
@@ -26,24 +28,21 @@ def keyboard_suggestion_bar(frame: bytes) -> tuple[float, float] | None:
     with Image.open(io.BytesIO(frame)) as image:
         rgb = image.convert("RGB")
     width, height = rgb.size
-    small = rgb.resize((120, max(1, round(120 * height / width))), Image.Resampling.BILINEAR)
-    found = _white_page_suggestion_bar(small)
-    return found if found is not None else _light_page_suggestion_bar(small)
+    sw, sh = 120, max(1, round(120 * height / width))
+    raw = rgb.resize((sw, sh), Image.Resampling.BILINEAR).tobytes()
+    # Read channel sums once from the contiguous byte buffer (3 * luma) so bare
+    # tap guards stay ~2 ms even when both detectors run on slow CI runners.
+    sums = [r + g + b for r, g, b in zip(raw[0::3], raw[1::3], raw[2::3], strict=True)]
+    found = _white_page_suggestion_bar(sums, sw, sh)
+    return found if found is not None else _light_page_suggestion_bar(sums, sw, sh)
 
 
-def _white_page_suggestion_bar(small):
-    sw, sh = small.size
+def _white_page_suggestion_bar(sums, sw, sh):
     band_h = max(1, round(0.02 * sh))
     bands = []
     for y0 in range(0, sh, band_h):
-        grey = total = 0
-        for y in range(y0, min(y0 + band_h, sh)):
-            for x in range(sw):
-                r, g, b = small.getpixel((x, y))
-                total += 1
-                if 150 <= (r + g + b) / 3 <= 245:
-                    grey += 1
-        bands.append(grey / total if total else 0)
+        chunk = sums[y0 * sw:min(y0 + band_h, sh) * sw]
+        bands.append(sum(450 <= value <= 735 for value in chunk) / len(chunk) if chunk else 0)
     for index in range(len(bands) // 2, len(bands)):
         if bands[index] <= 0.40:
             continue
@@ -64,7 +63,7 @@ def _white_page_suggestion_bar(small):
     return None
 
 
-def _light_page_suggestion_bar(small):
+def _light_page_suggestion_bar(sums, sw, sh):
     """Keyboard under a light-grey page (WeChat chat, ~238 brightness).
 
     The white-page detector counts that page as keyboard grey (150-245), so the
@@ -73,12 +72,11 @@ def _light_page_suggestion_bar(small):
     and screens without a keyboard still find nothing. The top is located to a
     single row so the same keyboard reads the same strip in every frame.
     """
-    sw, sh = small.size
     rows, lumas = [], []
     for y in range(sh):
-        values = [sum(small.getpixel((x, y))) / 3 for x in range(sw)]
-        rows.append(sum(150 <= value <= 232 for value in values) / sw)
-        lumas.append(sum(values) / sw)
+        row = sums[y * sw:(y + 1) * sw]
+        rows.append(sum(450 <= value <= 696 for value in row) / sw)
+        lumas.append(sum(row) / (3 * sw))
     run = max(3, round(.018 * sh))  # the strip starts with a solid, full-width keyboard band
     page = max(3, round(.10 * sh))
     for y in range(max(page, sh // 2 - round(.05 * sh)), min(sh - run, round(.72 * sh))):

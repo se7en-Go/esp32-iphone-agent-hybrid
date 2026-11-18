@@ -84,3 +84,12 @@ def test_uniform_grey_background_is_not_a_keyboard():
     frame = uniform_grey_frame()
     assert keyboard_suggestion_bar(frame) is None
     assert not point_in_suggestion_bar(frame, 0.5, 0.5)
+
+
+def test_suggestion_bar_reuses_same_frame_within_tight_tap_budget():
+    frame = no_keyboard_frame()
+    keyboard_suggestion_bar.cache_clear()
+    assert not point_in_suggestion_bar(frame, 0.5, 0.5)
+    assert not point_in_suggestion_bar(frame, 0.5, 0.6)
+    info = keyboard_suggestion_bar.cache_info()
+    assert info.misses == 1 and info.hits == 1

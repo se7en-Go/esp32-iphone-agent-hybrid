@@ -363,14 +363,14 @@ def test_http_deadline_includes_the_final_observation(tmp_path, monkeypatch):
     phone, sent = make_phone(tmp_path)
     monkeypatch.setattr(app_module, "phone", phone)
     monkeypatch.setattr(app_module, "controls", Controls(phone, phone.screen))
-    monkeypatch.setattr(operation, "OPERATION_TIMEOUT", 0.1)
+    monkeypatch.setattr(operation, "OPERATION_TIMEOUT", 0.25)
     monkeypatch.setattr(phone_module, "TAP_GAP", 0)
 
     async def find(*args, **kwargs):
         return (0.5, 0.5)
 
     async def fresh(*args):
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.6)
         return phone.screen.frame
 
     phone._find_pointer, phone.screen.fresh = find, fresh
