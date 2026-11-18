@@ -32,7 +32,7 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     root.add_argument("--url", help="server URL; defaults to IPHONE_AGENT_URL or http://127.0.0.1:8890")
     sub = root.add_subparsers(dest="command", required=True)
-    for name in ("status", "capabilities", "task-status", "stop", "mcp"):
+    for name in ("status", "capabilities", "task-status", "stop", "mcp", "layouts", "skill-list"):
         sub.add_parser(name)
     for name in ("home", "back"):
         _context(sub.add_parser(name))
@@ -145,6 +145,21 @@ def parser() -> argparse.ArgumentParser:
     _context(middle_enable, required=True)
     middle_revoke = middle_sub.add_parser("revoke", help="disable and forget middle-click Home routing")
     middle_revoke.add_argument("--all", action="store_true", help="revoke verification for all stored devices")
+    layout_tap = sub.add_parser("layout-tap", help="tap a named point from skills/*/layout.json")
+    layout_tap.add_argument("layout")
+    layout_tap.add_argument("point")
+    _context(layout_tap, required=True)
+    sub.add_parser("skill-show", help="read a skill SKILL.md by name").add_argument("name")
+    skill_check = sub.add_parser("skill-check", help="circuit-breaker check for on-screen risk phrases")
+    skill_check.add_argument("--observed-text", default="")
+    skill_check.add_argument("--skill", default="")
+    skill_prepare = sub.add_parser("skill-prepare-send", help="check quiet hours and reserve a send slot")
+    skill_prepare.add_argument("--skill", default="")
+    skill_confirm = sub.add_parser("skill-confirm-send", help="confirm send only after seeing the new bubble")
+    skill_confirm.add_argument("--bubble-visible", action=argparse.BooleanOptionalAction, required=True,
+                               help="confirm visible new message bubble on the latest screen")
+    skill_confirm.add_argument("--observed-text", default="")
+    skill_confirm.add_argument("--skill", default="")
     sub.add_parser("task").add_argument("goal")
     return root
 
@@ -275,6 +290,14 @@ def main(argv=None) -> int:
                         result = client.enable_middle_click_home(args.screen_id)
                     else:
                         result = client.revoke_middle_click_home(all_devices=args.all)
+                case "layouts": result = client.layouts()
+                case "layout-tap": result = client.layout_tap(args.layout, args.point, args.screen_id)
+                case "skill-list": result = client.skills()
+                case "skill-show": result = client.skill(args.name)
+                case "skill-check": result = client.skill_check(args.observed_text, args.skill)
+                case "skill-prepare-send": result = client.skill_prepare(args.skill)
+                case "skill-confirm-send":
+                    result = client.skill_confirm(args.bubble_visible, args.observed_text, args.skill)
                 case "task": result = client.delegate(args.goal)
                 case "task-status": result = client.task_status()
                 case "stop": result = client.stop()

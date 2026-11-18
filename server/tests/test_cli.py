@@ -214,3 +214,193 @@ def test_middle_click_home_cli_status_enable_and_revoke(remote, tmp_path, capsys
         }),
         ("POST", "/api/control/middle-click-home/revoke", {"all_devices": True}),
     ]
+
+
+@pytest.mark.parametrize("argv,expected", [
+    (["layouts"], ("GET", "/api/layouts", None)),
+    (["skill-list"], ("GET", "/api/skills", None)),
+    (["skill-show", "wechat-group-reply"], ("GET", "/api/skills/wechat-group-reply", None)),
+    (["skill-check", "--observed-text", "操作频繁", "--skill", "wechat-group-reply"],
+     ("POST", "/api/skill/check", {"observed_text": "操作频繁", "skill": "wechat-group-reply"})),
+    (["skill-prepare-send", "--skill", "wechat-group-reply"],
+     ("POST", "/api/skill/prepare-send", {"skill": "wechat-group-reply"})),
+    (["skill-confirm-send", "--bubble-visible", "--observed-text", "已发", "--skill", "wechat-group-reply"],
+     ("POST", "/api/skill/confirm-send",
+      {"bubble_visible": True, "observed_text": "已发", "skill": "wechat-group-reply"})),
+    (["skill-confirm-send", "--no-bubble-visible", "--skill", "wechat-group-reply"],
+     ("POST", "/api/skill/confirm-send",
+      {"bubble_visible": False, "observed_text": "", "skill": "wechat-group-reply"})),
+    (["layout-tap", "wechat-group-reply", "input", "--screen-id", "seen-1"],
+     ("POST", "/api/control/layout-tap",
+      {"layout": "wechat-group-reply", "point": "input", "screen_id": "seen-1"})),
+])
+def test_skill_and_layout_cli_subcommands(remote, capsys, argv, expected):
+    assert cli.main(argv) == 0
+    assert json.loads(capsys.readouterr().out)["effect_verified"] is False
+    assert remote == [expected]
+
+
+def test_skill_confirm_send_requires_explicit_bubble_visibility_and_layout_tap_saves_image(remote, tmp_path, capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["skill-confirm-send", "--skill", "wechat-group-reply"])
+    assert exc.value.code == 2 and remote == []
+    out = tmp_path / "layout.jpg"
+    assert cli.main(["layout-tap", "wechat-group-reply", "send", "--screen-id", "seen-1",
+                     "--image-output", str(out)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert out.read_bytes() == b"test jpeg" and payload["image_path"] == str(out)
+
+
+def test_cli_labeled_send_clicks_enforce_guard_and_emit_zero_clicks_when_refused(tmp_path, monkeypatch, capsys):
+    import asyncio
+    import time
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    from test_control_input_context import Link
+    from test_controls import jpeg
+
+    from hidagent import app as app_module
+    from hidagent import feedback, freshness, ocr
+    from hidagent.control import Controls
+    from hidagent.device import Device
+    from hidagent.guard import Guard
+    from hidagent.phone import Phone
+    from hidagent.screen import Screen
+
+    async def scenario():
+        now = [datetime(2026, 11, 15, 12, 0).timestamp()]
+        monkeypatch.setattr(time, "time", lambda: now[0])
+        device, link, screen = Device(), Link(), Screen()
+        device.attach(link)
+        now[0] += freshness.MIRROR_LAG_SECONDS + .1
+        screen._on_jpeg(jpeg())
+        phone = Phone(device, tmp_path / "missing-calibration.json", screen)
+        phone._clock, phone._clock_link = 0, device.links
+        controls = Controls(phone, screen)
+        guard = Guard(clock=lambda: now[0], path=tmp_path / "guard.json")
+        device.gate = app_module._hid_gate
+
+        async def effect(*_args):
+            now[0] += freshness.MIRROR_LAG_SECONDS + .1
+            screen._on_jpeg(jpeg("black"))
+            phone._effect_snapshot = freshness.require_fresh(screen)
+            phone._effect_frame = screen.frame
+            return True, True
+
+        async def positioned(x, y, **_kwargs):
+            phone._pointer_confirmed = True
+            return x, y
+
+        async def no_feedback(*_args, **_kwargs):
+            return False
+
+        async def find_send(_frame, query, **_kwargs):
+            return [ocr.TextBox("发送", (.82, .86, .94, .90), (.88, .88), .99)] if query == "发送" else []
+
+        monkeypatch.setattr(phone, "_tap_effect", effect)
+        monkeypatch.setattr(phone, "point_verified", positioned)
+        monkeypatch.setattr("hidagent.phone.TAP_GAP", 0)
+        monkeypatch.setattr(screen, "settled", no_feedback)
+        monkeypatch.setattr(feedback, "wait_after_action", no_feedback)
+        monkeypatch.setattr(ocr, "find_matches_async", find_send)
+        for name, value in {"device": device, "phone": phone, "screen": screen, "controls": controls,
+                            "guard": guard, "agent": SimpleNamespace(running=False),
+                            "manual_lock": asyncio.Lock()}.items():
+            monkeypatch.setattr(app_module, name, value)
+
+        loop = asyncio.get_running_loop()
+
+        async def forward(request):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_module.app),
+                                         base_url="http://127.0.0.1") as client:
+                response = await client.request(request.method, request.url.raw_path.decode(),
+                                                content=request.content, headers=dict(request.headers))
+                return httpx.Response(response.status_code, headers=response.headers, content=response.content)
+
+        monkeypatch.setattr(cli, "IPhoneClient", lambda url: IPhoneClient(
+            url or "http://test", transport=httpx.MockTransport(
+                lambda request: asyncio.run_coroutine_threadsafe(forward(request), loop).result(timeout=10))))
+
+        def run_cli(*argv):
+            code = cli.main(list(argv))
+            captured = capsys.readouterr()
+            return code, json.loads(captured.out) if captured.out.strip() else json.loads(captured.err)
+
+        try:
+            # 1. Ordinary unlabeled coordinate click is not classified as Send.
+            obs_id = controls.observation()["screen_id"]
+            code, plain = await asyncio.to_thread(
+                run_cli, "click-observed", ".5", ".4", "--screen-id", obs_id,
+                "--target-box", ".4", ".3", ".6", ".5")
+            assert code == 0 and plain["command_acknowledged"] is True
+            assert len(guard.sends) == 0 and sum(b" click" in line for line in link.written) == 1
+
+            # 2. Allowed Send flow via skill-prepare-send -> click-observed --target-label 发送 -> skill-confirm-send.
+            now[0] += 10
+            screen._on_jpeg(jpeg())
+            code, prep = await asyncio.to_thread(run_cli, "skill-prepare-send", "--skill", "wechat-group-reply")
+            assert code == 0 and prep["allowed"] is True
+            obs_id = controls.observation()["screen_id"]
+            code, sent_res = await asyncio.to_thread(
+                run_cli, "click-observed", ".5", ".4", "--screen-id", obs_id,
+                "--target-box", ".4", ".3", ".6", ".5", "--target-label", "发送")
+            assert code == 0 and sent_res["command_acknowledged"] is True
+            assert len(guard.sends) == 1 and sum(b" click" in line for line in link.written) == 2
+            code, conf = await asyncio.to_thread(
+                run_cli, "skill-confirm-send", "--bubble-visible", "--skill", "wechat-group-reply")
+            assert code == 0 and conf["counted"] is True and len(guard.sends) == 1
+
+            # 3. Min-interval rate limit blocks labeled Send with zero HID clicks.
+            now[0] += 1
+            screen._on_jpeg(jpeg("white"))
+            obs_id = controls.observation()["screen_id"]
+            code, err = await asyncio.to_thread(
+                run_cli, "click-observed", ".5", ".4", "--screen-id", obs_id,
+                "--target-box", ".4", ".3", ".6", ".5", "--target-label", "Send")
+            assert code == 2 and "8 秒" in err["error"]
+            assert sum(b" click" in line for line in link.written) == 2
+
+            # 4. Hold on Send is blocked with zero press/click writes.
+            now[0] += 10
+            screen._on_jpeg(jpeg())
+            obs_id = controls.observation()["screen_id"]
+            code, err = await asyncio.to_thread(
+                run_cli, "click-observed", ".5", ".4", "--screen-id", obs_id,
+                "--target-box", ".4", ".3", ".6", ".5", "--target-label", "发送", "--duration", "0.8")
+            assert code == 2 and "hold" in err["error"].lower()
+            assert not any(b"press" in line for line in link.written)
+            assert sum(b" click" in line for line in link.written) == 2
+
+            # 5. Quiet hours (23:30 for wechat-group-reply 23:00-07:00) blocks prepare + Send with zero clicks.
+            now[0] = datetime(2026, 11, 15, 23, 30).timestamp()
+            screen._on_jpeg(jpeg("black"))
+            code, quiet = await asyncio.to_thread(run_cli, "skill-prepare-send", "--skill", "wechat-group-reply")
+            assert code == 0 and quiet["allowed"] is False
+            obs_id = controls.observation()["screen_id"]
+            code, err = await asyncio.to_thread(
+                run_cli, "click-observed", ".5", ".4", "--screen-id", obs_id,
+                "--target-box", ".4", ".3", ".6", ".5", "--target-label", "发送")
+            assert code == 2 and "静默" in err["error"]
+            assert sum(b" click" in line for line in link.written) == 2
+
+            # 6. Circuit breaker (skill-check -> stop=True) blocks click-observed and tap-text Send with zero clicks.
+            now[0] = datetime(2026, 11, 16, 12, 0).timestamp()
+            screen._on_jpeg(jpeg())
+            code, chk = await asyncio.to_thread(
+                run_cli, "skill-check", "--observed-text", "操作频繁", "--skill", "wechat-group-reply")
+            assert code == 0 and chk["stop"] is True and guard.tripped is True
+            obs_id = controls.observation()["screen_id"]
+            code, err = await asyncio.to_thread(
+                run_cli, "click-observed", ".5", ".4", "--screen-id", obs_id,
+                "--target-box", ".4", ".3", ".6", ".5", "--target-label", "发送")
+            assert code == 2 and "熔断" in err["error"]
+            obs_id = controls.observation()["screen_id"]
+            code, err2 = await asyncio.to_thread(
+                run_cli, "tap-text", "发送", "--screen-id", obs_id, "--exact", "--region", "0", ".8", "1", "1")
+            assert code == 2 and "熔断" in err2["error"]
+            assert sum(b" click" in line for line in link.written) == 2
+        finally:
+            device.close()
+
+    asyncio.run(scenario())
