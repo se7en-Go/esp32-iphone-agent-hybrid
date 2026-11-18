@@ -16,9 +16,9 @@ COM 口没连上，或固件没刷进去。拔插 COM 线，看启动窗口里�
 
 ## screen 灯是红的
 
-解锁手机，控制中心重新选 **ESP32 Agent**。板子、手机、电脑要在同一个 2.4GHz，路由器不能开 AP 隔离或访客隔离，要放行 mDNS。企业 802.1X 和需要网页登录的 Wi-Fi 不行。
+解锁手机，在控制中心重选网页提示的接收器。Mac 接收器是 **ESP32 Agent Mac**，板载接收器是 **ESP32 Agent**。手机和接收器需要在能互通的同一局域网，使用板载接收器时电脑也要能连到它。检查路由器是否启用了访客隔离、AP 隔离，或拦截了 mDNS。
 
-列表里一直没有 ESP32 Agent：iOS 16/17 镜像到板载接收器还没有在这块板上验证过。退路是升级到 iOS 18，或只在 Mac 上使用 `SCREEN_BACKEND=uxplay`。Windows 不要设 uxplay。
+Mac 接收器一直找不到时，先运行 `./scripts/run-local.sh status` 确认接收器已经启动，再检查 Mac 与 iPhone 的网络。板载接收器的兼容性需要按机型和系统验证。Mac 可以按 [本机运行说明](RUNTIME.md) 切到独立接收器，Windows 使用板载接收器。
 
 ## 手机提示配件耗电量太大，或板子自己重启
 
@@ -26,7 +26,7 @@ COM 口没连上，或固件没刷进去。拔插 COM 线，看启动窗口里�
 
 ## calibrated 灯是红的
 
-前两个灯先绿。然后在网页里点校准，再点画面上的圆点。圆点没出现就是辅助触控没开，或当前这条控制通道没通。网页连接行会写着 HID 走 USB 还是蓝牙。走 USB 时检查标着 USB 的口。走蓝牙时，在 iPhone 设置 → 蓝牙里选择 **ESP32 Agent**，电脑上可运行 `scripts/hid-mode.sh pair`（Windows 用 `hid-mode.ps1`）。换了 USB 和蓝牙之后，旧的校准会被清掉，需要再点一次校准。蓝牙 HID 还没有在真机上验证。
+等 device 和 screen 变绿，再在网页点「校准」。如果网页提示手动确认，点镜像里的指针圆点。没有指针时，先检查辅助触控与当前输入连接。USB 模式检查板上的 USB 口，蓝牙模式检查 **ESP32 Agent** 是否已连接。切换 USB 和蓝牙后需要重新校准。
 
 ## 中文只有拼音、或候选不对
 
@@ -46,7 +46,7 @@ COM 口没连上，或固件没刷进去。拔插 COM 线，看启动窗口里�
 
 ## 手机蓝牙列表里没有 ESP32 Agent
 
-COM 口仍接电脑。运行 `scripts/hid-mode.sh pair`（Windows 用 `hid-mode.ps1`），60 秒内在 iPhone 设置 → 蓝牙里选择名字以 **ESP32 Agent** 开头的设备，并打开辅助触控。列表里已经有旧的同名设备时，先在系统蓝牙里忽略它，再运行 `hid-mode.sh unpair` 或 `hid-mode.ps1 unpair`，然后重新 pair。unpair 会删掉这块板上的蓝牙绑定，配套 App 的绑定也在同一处，会一起被删掉。网页 `/api/status` 的 `hid.ble` 会写着是否在广播、是否连上、是否已绑定。这一步还没有在真机上验证。
+COM 口仍接电脑。运行 `scripts/hid-mode.sh pair`（Windows 用 `hid-mode.ps1`），60 秒内在 iPhone 设置 → 蓝牙里选择名字以 **ESP32 Agent** 开头的设备，并打开辅助触控。若旧的同名配对导致连接失败，可以先在 iPhone 忽略该设备，再对板子运行 `scripts/hid-mode.sh unpair` 后重新配对。`unpair` 会清除板子保存的蓝牙绑定，包括共用配对存储的绑定。网页 `/api/status` 的 `hid.ble` 会显示是否正在广播、是否连接和是否已绑定。
 
 ## 命令说 phone not connected over usb/ble
 

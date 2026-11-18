@@ -12,6 +12,7 @@ MIT, under the copyrights in `LICENSE`:
 
 - Copyright (c) 2026 Kz-Aven
 - Copyright (c) 2026 Henry Yuan
+- Copyright (c) 2026 se7en-Go (original computer-side and documentation contributions)
 
 The Python server started from Kz-Aven/esp32-to-iphone
 (https://github.com/Kz-Aven/esp32-to-iphone, commit 5e7b4c2), which itself

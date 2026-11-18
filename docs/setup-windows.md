@@ -16,7 +16,7 @@
 1. `powershell -ExecutionPolicy Bypass -File scripts\setup.ps1`
 2. 从 GitHub Actions 的 Firmware 作业下载 `esp32s3-n16r8-merged.bin`，放到 `hardware\dist\`。COM 口接好后运行 `powershell -ExecutionPolicy Bypass -File hardware\flash.ps1`。第一次会写完整的 16MB 镜像，请等到脚本自己说刷好了。
 3. `powershell -ExecutionPolicy Bypass -File scripts\wifi.ps1 --ssid "你家的2.4GHz"`，按提示输入密码。
-4. USB 口接 iPhone。控制中心 → 屏幕镜像 → **ESP32 Agent**。`powershell -ExecutionPolicy Bypass -File scripts\run-server.ps1`，浏览器打开 `http://127.0.0.1:8890`。先等 device 和 screen 两盏灯变绿，再点校准。不方便插 USB 时，COM 口仍接电脑，运行 `powershell -ExecutionPolicy Bypass -File scripts\hid-mode.ps1 pair`，在 iPhone 的设置 → 蓝牙里选择 **ESP32 Agent**。蓝牙 HID 还没有在真机上验证。
+4. USB 口接 iPhone。控制中心 → 屏幕镜像 → **ESP32 Agent**。`powershell -ExecutionPolicy Bypass -File scripts\run-server.ps1`，浏览器打开 `http://127.0.0.1:8890`。先等 device 和 screen 两盏灯变绿，再点校准。走蓝牙时，COM 口仍接电脑，运行 `powershell -ExecutionPolicy Bypass -File scripts\hid-mode.ps1 pair`，在 iPhone 的设置 → 蓝牙里选择 **ESP32 Agent**。Windows 自动化检查通过，Windows 主机连接 ESP32 和 iPhone 的完整流程仍待真机验收。
 5. `powershell -ExecutionPolicy Bypass -File scripts\mcp-config.ps1`，把片段放进 Agent。
 
 服务只监听本机 8890，一般不用为它开入站防火墙。若 Windows 询问 Python 能否访问网络，允许专用网络的出站即可，那是电脑去连板子的 7201。
