@@ -120,6 +120,7 @@ def parser() -> argparse.ArgumentParser:
     flow.add_argument("--prewarm", action="store_true", help="hold AssistiveTouch once before prepare")
     flow.add_argument("--full-status", action="store_true", help="poll status with the image (old servers)")
     flow.add_argument("--image-output", type=Path, help="save the confirmation evidence image")
+    flow.add_argument("--evidence-dir", type=Path, help="save each stage's observed frame here (local only)")
     action = sub.add_parser("action", help="guarded action JSON containing action and screen_id")
     action.add_argument("payload", help="JSON object, @file.json or - for stdin")
     action.add_argument("--image-output", type=Path)
@@ -235,7 +236,7 @@ def main(argv=None) -> int:
                         report = run(client, text, tuple(args.target_box), expect_title=args.expect_title,
                                      caret_box=tuple(args.caret_box) if args.caret_box else None,
                                      prewarm=args.prewarm, light_status=not args.full_status,
-                                     evidence=args.image_output)
+                                     evidence=args.image_output, evidence_dir=args.evidence_dir)
                     except FlowStopped as stopped:
                         print(json.dumps({"error": str(stopped), **stopped.report.as_dict()},
                                          ensure_ascii=False), file=sys.stderr)

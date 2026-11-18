@@ -136,6 +136,24 @@ def test_three_line_paste_after_allow_paste_confirms(monkeypatch):
     assert verify(monkeypatch, before="empty_pinyin_caret_on") is True
 
 
+LIVE_TEXT = "微信粘贴验收 00731\n第二行 AbC xYz\n第三行 中文与换行保持原样"
+
+
+def test_live_acceptance_frames_confirm(monkeypatch):
+    # Recorded during the real run: a wide third line, the pointer parked over
+    # the text where Allow Paste was, and the input bar grown upward.
+    live = {"before": "live_original", "sheet": "live_sheet", "after": "live_pasted"}
+    assert verify(monkeypatch, **live, text=LIVE_TEXT) is True
+    assert verify(monkeypatch, **live, text=LIVE_TEXT.replace("xYz", "xyz")) is False
+    content_in_band = edited("live_pasted", lambda d: d.rectangle((400, 525, 480, 560), fill=(149, 236, 105)))
+    assert verify(monkeypatch, **live, text=LIVE_TEXT, after_frame=content_in_band,
+                  after_boxes=boxes("live_pasted")) is False
+
+
+def test_strip_is_the_keyboard_not_a_wide_text_line():
+    assert keyboard_suggestion_bar(load("live_pasted")) == keyboard_suggestion_bar(load("live_original"))
+
+
 def _moved(items, dy):
     return [ocr.TextBox(i.text, (i.box[0], i.box[1] + dy, i.box[2], i.box[3] + dy),
                         (i.center[0], i.center[1] + dy), i.conf) for i in items]

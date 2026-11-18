@@ -246,7 +246,15 @@ def _grown_field(original_image, current_image, region, suggestion_bar):
     current = (region[0], min(region[1], max(.06, after[0] - .006)), region[2], region[3])
     # The field's expand control appears left of the grown field, above the old top.
     expand = (.02, max(.06, after[0] - .008), region[0], before[0])
-    return current, expand
+    # Right of the field the input bar's own background now covers the page. It
+    # must be a flat bar colour; any content there is still a change.
+    band = (min(1., region[2] + .01), expand[1], 1., before[0])
+    w, h = current_image.size
+    pixels = [sum(current_image.getpixel((x, y))) / 3
+              for y in range(round(band[1] * h), round(band[3] * h)) for x in range(round(band[0] * w), w)]
+    if not pixels or max(pixels) - min(pixels) > 24:
+        return None
+    return current, (expand, (region[2], band[1], 1., band[3]))
 
 
 def _return_key_box(original, current, suggestion_bar):
@@ -316,7 +324,7 @@ async def verify_after_paste_permission(before, sheet, after, region, observed_t
             return False
         extra = []
         if grown is not None:
-            extra.append(grown[1])
+            extra.extend(grown[1])
         if original_lines == ():
             key = _return_key_box(original, current, suggestion_bar)
             if key is not None:

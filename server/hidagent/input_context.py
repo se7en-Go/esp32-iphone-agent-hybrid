@@ -74,36 +74,25 @@ def _light_page_suggestion_bar(small):
     single row so the same keyboard reads the same strip in every frame.
     """
     sw, sh = small.size
-    band_h = max(1, round(0.02 * sh))
     rows, lumas = [], []
     for y in range(sh):
         values = [sum(small.getpixel((x, y))) / 3 for x in range(sw)]
         rows.append(sum(150 <= value <= 232 for value in values) / sw)
         lumas.append(sum(values) / sw)
-
-    def band(series, index):
-        chunk = series[index * band_h:min((index + 1) * band_h, sh)]
-        return sum(chunk) / len(chunk)
-
-    count = (sh + band_h - 1) // band_h
-    bands = [band(rows, i) for i in range(count)]
-    light = [band(lumas, i) for i in range(count)]
-    for index in range(count // 2, count):
-        if index * band_h / sh > 0.72:
-            break
-        below = bands[index:]
-        if bands[index] <= 0.40 or sum(below) / len(below) <= 0.15:
+    run = max(3, round(.018 * sh))  # the strip starts with a solid, full-width keyboard band
+    page = max(3, round(.10 * sh))
+    for y in range(max(page, sh // 2 - round(.05 * sh)), min(sh - run, round(.72 * sh))):
+        if min(rows[y:y + run]) < .90:
             continue
-        if bands[index] - bands[index - 1] <= 0.30 and light[index - 1] - light[index] < 18:
+        # Text lines in a grown input field are only partly grey; a keyboard
+        # is grey across the full width, darker than the page above it, and
+        # continues to the bottom of the screen.
+        above = lumas[y - run:y]
+        if sum(above) / run - sum(lumas[y:y + run]) / run < 12:
             continue
-        if sum(bands[:index]) / index >= 0.50:
+        if sum(rows[y:]) / (sh - y) <= .15 or sum(rows[:y]) / y >= .50:
             continue
-        page = light[max(1, round(0.10 / 0.02)):max(2, index - 1)]
-        if not page or sum(page) / len(page) - light[index] < 12:
-            continue
-        start, stop = max(1, (index - 1) * band_h), min(sh, (index + 1) * band_h)
-        exact = next((y for y in range(start, stop) if rows[y] >= 0.50), index * band_h)
-        top = exact / sh
+        top = y / sh
         return (top, min(1.0, top + 0.06))
     return None
 

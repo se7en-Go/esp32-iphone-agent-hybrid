@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
-from . import feedback, ocr
+from . import feedback, ocr, screen_compare
 from .clipboard import NO_STORE
 from .freshness import fresh_frame, snapshot
 from .input_context import InputContextGuard
@@ -290,6 +290,11 @@ class StagedClipboardControls:
                             or updated > result.updated):
                         continue
                     seen.add(frame)
+                    # A permission sheet dims and covers the page. A frame that
+                    # still looks like the result page cannot be that sheet, so
+                    # skip it before the OCR-based check (each costs ~1 s).
+                    if not screen_compare.observation_changed(after, frame):
+                        continue
                     if await verify_after_paste_permission(
                             original.frame, frame, after,
                             item.guard.region, request.observed_text):
