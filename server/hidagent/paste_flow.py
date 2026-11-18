@@ -126,6 +126,11 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
             (evidence_dir / f"{name}.jpg").write_bytes(base64.b64decode(result["image_base64"]))
     transaction = None
     try:
+        trigger_configured = False
+        if hasattr(client, "capabilities"):
+            caps = client.capabilities() or {}
+            trigger_configured = bool(((caps.get("features") or {}).get("clipboard") or {}).get("trigger_configured"))
+        report.facts["trigger_configured"] = trigger_configured
         first = _observe(client, report, stage="initial_observe")
         frame = base64.b64decode(first["image_base64"])
         if expect_title:
@@ -174,36 +179,59 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
             with _Stage(report, "caret_sync"):
                 wait_caret_plateau(client, caret_box)
         observed = _observe(client, report, stage="prepare_observe")
+        prepare_frame = base64.b64decode(observed["image_base64"]) if observed.get("image_base64") else None
         keep("1-prepare-original", observed)
         with _Stage(report, "prepare"):
             prepared = client.clipboard_stage("prepare", screen_id=observed["screen_id"], text=text,
                                               focused=True, target_box=list(target_box))
         transaction = prepared["transaction_id"]
         time.sleep(.6)
-        _hold(client, report, point, box, caret_box, "shortcut_hold")
+        fields = {"transaction_id": transaction}
+        if light_status:
+            fields["include_observation"] = False
 
-        polls = 0
-        with _Stage(report, "wait_copied"):
-            deadline = time.monotonic() + copy_timeout
-            fields = {"transaction_id": transaction}
-            if light_status:
-                fields["include_observation"] = False
+        def poll_status():
             while True:
                 try:
-                    state = client.clipboard_stage("status", **fields)
+                    return client.clipboard_stage("status", **fields)
                 except RuntimeError as exc:
                     if "422" not in str(exc) or "include_observation" not in fields:
                         raise
                     fields.pop("include_observation")  # older server: full status only
                     report.facts["light_status"] = False
-                    continue
+
+        polls = 0
+        copied = False
+        if trigger_configured:
+            with _Stage(report, "wait_copied"):
+                state = poll_status()
                 polls += 1
                 if state.get("copied") and state.get("phase") == "awaiting_paste":
-                    break
-                if time.monotonic() > deadline:
-                    raise RuntimeError("Shortcut did not acknowledge a copy")
-                time.sleep(.25)
+                    copied = True
+                    report.facts["copy_trigger"] = "trigger_key"
+        if not copied:
+            _hold(client, report, point, box, caret_box, "shortcut_hold")
+            with _Stage(report, "wait_copied"):
+                deadline = time.monotonic() + copy_timeout
+                while True:
+                    state = poll_status()
+                    polls += 1
+                    if state.get("copied") and state.get("phase") == "awaiting_paste":
+                        break
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("Shortcut did not acknowledge a copy")
+                    time.sleep(.25)
+            report.facts["copy_trigger"] = "assistive_touch_hold"
         report.facts["status_polls"] = polls
+
+        if prepare_frame:
+            from . import screen_compare
+            overlay_deadline = time.monotonic() + 2.5
+            while time.monotonic() < overlay_deadline:
+                if not screen_compare.observation_changed(prepare_frame, client.screenshot(), caret_scope=target_box):
+                    break
+                with _Stage(report, "wait_overlay_clear"):
+                    time.sleep(.15)
 
         # Fresh frame after the copy ACK, then exactly one Cmd+V.
         if caret_box:

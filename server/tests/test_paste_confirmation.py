@@ -264,3 +264,50 @@ def test_permission_confirmation_rejects_defects_with_suggestion_bar(monkeypatch
     proof = verify_after_paste_permission(original, sheet, after, region,
                                           "\n修验通过：云海00417\n末行 GhJ kLm")
     assert asyncio.run(proof) is False
+
+
+def test_permission_confirmation_reuses_before_after_ocr_across_sheet_candidates(monkeypatch):
+    def plain_variant(shade):
+        image = Image.new("RGB", (500, 1000), (235, 235, 230))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((75, 300, 425, 550), fill="white", outline="black", width=3)
+        draw.rectangle((10, 10, 20, 20), fill=(shade, shade, shade))
+        output = io.BytesIO()
+        image.save(output, "PNG")
+        return output.getvalue()
+
+    original = frame()
+    cand_1, cand_2 = plain_variant(230), plain_variant(232)
+    sheet = frame(sheet=True)
+    after = frame(inserted=True)
+    context = [label("Safari test page", .25, .13), label("Tester", .25, .25), label("Footer anchor", .23, .65)]
+    dialog = [label('“Safari浏览器”想从“快捷指令”粘贴', .5, .39), label("你允许这样做吗？", .5, .44),
+              label("不允许粘贴", .27, .52), label("允许粘贴", .7, .52)]
+    actual = [label("第二次：你好00042", .25, .36), label("校验：XYZabc", .25, .40)]
+    frames = {
+        original: context,
+        after: context + actual,
+        cand_1: context,
+        cand_2: context,
+        sheet: dialog,
+    }
+    calls = []
+
+    async def read(image):
+        calls.append(image)
+        return frames[image]
+
+    monkeypatch.setattr(ocr, "read_text_async", read)
+    for cand, ok in ((cand_1, False), (cand_2, False), (sheet, True)):
+        assert asyncio.run(verify_after_paste_permission(original, cand, after, REGION, EXPECTED)) is ok
+    assert calls.count(original) == 1
+    assert calls.count(after) == 1
+    assert calls.count(cand_1) == 1 and calls.count(cand_2) == 1 and calls.count(sheet) == 1
+
+    calls.clear()
+    wrong = EXPECTED.replace("abc", "aBc")
+    for cand in (cand_1, cand_2):
+        assert asyncio.run(verify_after_paste_permission(original, cand, after, REGION, wrong)) is False
+    assert calls.count(original) == 1
+    assert calls.count(after) == 1
+    assert cand_1 not in calls and cand_2 not in calls

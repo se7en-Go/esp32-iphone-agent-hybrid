@@ -82,18 +82,25 @@ iphone-agent tap 0.5 0.4 --screen-id "实际返回的ID" \
 | `iphone_search_app` | `search-app Freeform` | 打开 Spotlight 并输入 ASCII 应用搜索名 |
 | `iphone_type` | `type 文本 --mode auto` | 兼容输入；粘贴模式可包含换行和制表符 |
 | `iphone_paste_prepare` | `paste-prepare 文本 --screen-id ID --focused` | 发布复制任务，保留原输入框证据 |
-| `iphone_paste_status` | `paste-status 事务ID` | 查看实际复制 ACK 与当前图 |
+| `iphone_paste_status` | `paste-status 事务ID [--no-include-observation]` | 查看实际复制 ACK 与可选当前图（轮询时可禁用图片输出） |
 | `iphone_paste` | `paste 事务ID --screen-id ID --focused` | 校验原输入上下文后仅粘贴一次 |
 | `iphone_paste_confirm` | `paste-confirm 事务ID --screen-id ID --observed-text 完整实见文本 --confirmed` | 宿主看图确认全文；不是服务端自动证明 |
 | `iphone_paste_cancel` | `paste-cancel 事务ID` | 取消待完成事务并清除服务端文本 |
+| — | `paste-flow 文本 --target-box l t r b [--expect-title 标题]` | 本机串联分阶段粘贴并输出阶段耗时；默认停在发送前 |
 | `iphone_compose_chinese` | `compose-chinese 你好 --input-mode pinyin` | 输入拼音，返回候选图 |
 | `iphone_key` | `key backspace --repeat 3` | 按键；仅退格/左右方向允许重复 |
 | `iphone_home` / `iphone_back` | `home` / `back` | 返回主屏幕或上一页，须核对结果 |
 | `iphone_calibrate` | `calibrate [--pointer x y]` | 启动或完成校准 |
 | `iphone_batch` | `batch '[动作对象,…]'` | 有条件执行 1..8 个动作 |
+| `iphone_layouts` | `layouts` | 读取已配置的命名坐标布局（包括 `HIDAGENT_SKILLS`） |
+| `iphone_layout_tap` | `layout-tap 布局名 点位名` | 点击布局里的命名点位，须带 `--screen-id` |
+| `skill_list` / `skill_show` | `skill-list` / `skill-show 名称` | 列出或查看可插拔 `SKILL.md` |
+| `skill_check` | `skill-check --observed-text 原文 [--skill 名称]` | 发送前检查屏幕系统风险词并按需触发熔断 |
+| `skill_prepare_send` | `skill-prepare-send [--skill 名称]` | 检查静默时段/限额并预留发送名额 |
+| `skill_confirm_send` | `skill-confirm-send --bubble-visible [--skill 名称]` | 见新气泡后确认发送结果（发送动作本身须走带发送标签点击） |
 | `task_status` / `stop_task` | `task-status` / `stop` | 网页任务状态和停止 |
 
-`iphone_layouts`、`iphone_layout_tap` 和 `skill_*` 是已有的布局/工作流辅助 MCP 工具，不代表系统级 UI 树或无障碍访问权限。
+`Pi` 等本地 CLI Agent 可直接按 [Pi 与本地 CLI 快速用法](PI_CLI.md) 执行标准观察、一次 `paste-flow`、带标签发送守卫和私有目录留存。`iphone_layouts`、`iphone_layout_tap` 和 `skill_*` 不代表系统级 UI 树或无障碍访问权限；普通无标签坐标点击也不会自动消费或替代发送守卫预留。
 
 `path`、`circle` 都会按住指针按钮拖动。`hold` 控制松开前是否短暂停留以减少惯性，关闭它仍会画线。只移动指针使用 `point`。服务端校验起点，后续根据该起点发送相对移动。iOS 对不同速度的 HID 移动响应可能不同，实际尺寸与落点以返回画面为准。归一化坐标中，圆的纵向半径为横向半径乘以 `图宽/图高`，像素坐标中两半径相等。绘图前确认画布和画笔，每笔结束后检查实际线条。
 

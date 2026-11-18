@@ -5,7 +5,7 @@ import base64
 import io
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 from test_staged_clipboard import prepare_body, setup
 
 from hidagent import assistive_vision, ocr, paste_flow
@@ -26,22 +26,41 @@ def test_light_status_has_no_image_and_keeps_the_current_ticket(monkeypatch):
     asyncio.run(scenario())
 
 
-def jpeg():
+def jpeg(banner=False):
+    image = Image.new("RGB", (50, 108), "white")
+    if banner:
+        ImageDraw.Draw(image).rectangle((5, 8, 45, 22), fill=(60, 60, 60))
     output = io.BytesIO()
-    Image.new("RGB", (50, 108), "white").save(output, "JPEG")
+    image.save(output, "JPEG")
     return output.getvalue()
 
 
+PLAIN_JPEG = jpeg()
+BANNER_JPEG = jpeg(banner=True)
+
+
 class FakeClient:
-    def __init__(self, *, confirm_conflicts=1, sheet=True):
+    def __init__(self, *, confirm_conflicts=1, sheet=True, trigger_configured=False,
+                 copied_on_prepare=False, overlay_frames=0):
         self.calls, self.confirm_conflicts, self.sheet, self.seen = [], confirm_conflicts, sheet, 0
+        self.trigger_configured = trigger_configured
+        self.copied_on_prepare = copied_on_prepare
+        self.overlay_frames = overlay_frames
+        self.screenshots = 0
+
+    def capabilities(self):
+        return {"features": {"clipboard": {"trigger_configured": self.trigger_configured}}}
 
     def observe(self, for_click=False):
         self.seen += 1
-        return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(jpeg()).decode()}
+        return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(PLAIN_JPEG).decode()}
 
     def screenshot(self):
-        return jpeg()
+        self.screenshots += 1
+        if "status" in self.calls and self.overlay_frames > 0:
+            self.overlay_frames -= 1
+            return BANNER_JPEG
+        return PLAIN_JPEG
 
     def control(self, name, screen_id, **fields):
         self.calls.append(name)
@@ -63,7 +82,8 @@ class FakeClient:
             return {"transaction_id": "tx"}
         if stage == "status":
             assert fields.get("include_observation") is False
-            return {"copied": True, "phase": "awaiting_paste"}
+            copied = self.copied_on_prepare or ("click", "辅助触控", .9) in self.calls
+            return {"copied": copied, "phase": "awaiting_paste" if copied else "awaiting_copy"}
         if stage == "paste":
             return {"command_acknowledged": True}
         if stage == "confirm":
@@ -111,3 +131,29 @@ def test_flow_never_repastes_when_confirmation_keeps_failing(vision):
         paste_flow.run(client, "文本", (.13, .52, .77, .58))
     assert client.calls.count("paste") == 1 and "cancel" not in client.calls
     assert stopped.value.report.facts["transaction_left_open"] is True
+
+
+def test_flow_records_pure_assistive_touch_trigger_when_trigger_key_disabled(vision):
+    client = FakeClient(trigger_configured=False, copied_on_prepare=False)
+    report = paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58)).as_dict()
+    assert report["trigger_configured"] is False
+    assert report["copy_trigger"] == "assistive_touch_hold"
+    assert ("click", "辅助触控", .9) in client.calls
+    assert report["cmd_v_sent"] == 1 and report["phase"] == "completed"
+
+
+def test_flow_attributes_trigger_key_when_prepare_already_copied(vision):
+    client = FakeClient(trigger_configured=True, copied_on_prepare=True)
+    report = paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58)).as_dict()
+    assert report["trigger_configured"] is True
+    assert report["copy_trigger"] == "trigger_key"
+    assert ("click", "辅助触控", .9) not in client.calls
+    assert report["cmd_v_sent"] == 1 and report["phase"] == "completed"
+
+
+def test_flow_waits_for_transient_shortcut_banner_before_paste(vision):
+    client = FakeClient(overlay_frames=2)
+    report = paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58)).as_dict()
+    assert client.overlay_frames == 0
+    assert "wait_overlay_clear" in report["stages_ms"]
+    assert client.calls.count("paste") == 1 and report["phase"] == "completed"
