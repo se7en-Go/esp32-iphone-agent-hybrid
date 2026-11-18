@@ -565,3 +565,39 @@ def test_confirm_refuses_when_outside_ui_changes_alongside_suggestion_bar(monkey
         assert provider.current()["active"]
 
     asyncio.run(scenario())
+
+
+def test_confirm_skips_pre_sheet_plain_frames_and_checks_latest_retained_first(monkeypatch):
+    from hidagent import feedback, paste_confirmation
+
+    async def scenario():
+        screen, provider, _phone, control, manager = setup(monkeypatch)
+        before, sheet, after = field_image(), changed_scene("blue"), changed_scene("orange")
+        calls = []
+
+        async def capture(_screen, _completed_at):
+            for _ in range(4):
+                screen._on_jpeg(before)  # pre-sheet plain frames before sheet pops up
+            screen._on_jpeg(sheet)
+            return sheet
+
+        async def verify(original, presented, selected, region, text):
+            calls.append(presented)
+            return presented == sheet
+
+        monkeypatch.setattr(feedback, "wait_after_action", capture)
+        monkeypatch.setattr(paste_confirmation, "verify_after_paste_permission", verify)
+        prepared = await manager.prepare(prepare_body(control))
+        copied(provider, screen)
+        await manager.paste(PasteTransaction(transaction_id=prepared["transaction_id"],
+                                             screen_id=control.observation()["screen_id"], focused=True))
+        screen._recent_frames.clear()
+        screen._on_jpeg(after)
+        receipt = await manager.confirm(ConfirmPaste(
+            transaction_id=prepared["transaction_id"],
+            screen_id=control.observation()["screen_id"],
+            observed_text="你好00123", confirmed=True))
+        assert receipt["phase"] == "completed" and receipt["effect_verified"]
+        assert calls == [sheet]
+
+    asyncio.run(scenario())

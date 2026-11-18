@@ -184,6 +184,8 @@ def test_explicit_empty_screen_id_cannot_fall_back_to_legacy(remote, capsys):
     (["paste-confirm", "tx-1", "--screen-id", "seen-1", "--observed-text", "你好", "--confirmed"],
      "confirm", {"transaction_id": "tx-1", "screen_id": "seen-1", "observed_text": "你好", "confirmed": True}),
     (["paste-status", "tx-1"], "status", {"transaction_id": "tx-1"}),
+    (["paste-status", "tx-1", "--no-include-observation"], "status",
+     {"transaction_id": "tx-1", "include_observation": False}),
     (["paste-cancel", "tx-1"], "cancel", {"transaction_id": "tx-1"}),
 ])
 def test_staged_paste_commands_keep_separate_evidence_boundaries(remote, capsys, argv, stage, body):

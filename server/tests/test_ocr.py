@@ -237,3 +237,18 @@ def test_real_phone_keypad_reads_number_and_chinese_label(real_ocr):
     assert .15 < number.center[0] < .85 and .08 < number.center[1] < .16
     target = ocr.find_text(frame, "拨号键盘", exact=True)
     assert target is not None and target.center[1] > .9
+
+
+@pytest.mark.ocr
+def test_real_wechat_pinyin_paste_permission_confirms_and_rejects_mismatch(real_ocr):
+    from hidagent.paste_confirmation import verify_after_paste_permission
+
+    wechat = Path(__file__).parent / "fixtures" / "wechat_paste"
+    before = (wechat / "live_original.jpg").read_bytes()
+    sheet = (wechat / "live_sheet.jpg").read_bytes()
+    after = (wechat / "live_pasted.jpg").read_bytes()
+    region = (.132, .525, .768, .576)
+    text = "微信粘贴验收 00731\n第二行 AbC xYz\n第三行 中文与换行保持原样"
+    assert asyncio.run(verify_after_paste_permission(before, sheet, after, region, text)) is True
+    wrong = text.replace("00731", "00732")
+    assert asyncio.run(verify_after_paste_permission(before, sheet, after, region, wrong)) is False

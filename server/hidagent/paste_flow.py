@@ -114,7 +114,7 @@ def _hold(client, report, point, box, caret_box, stage):
 
 
 def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=False,
-        light_status=True, copy_timeout=20.0, confirm_attempts=3, evidence=None, evidence_dir=None):
+        light_status=True, copy_timeout=20.0, confirm_attempts=4, evidence=None, evidence_dir=None):
     """Prepare -> copy -> one Cmd+V -> optional permission sheet -> confirm. Never sends."""
     from . import assistive_vision, ocr
 
@@ -261,6 +261,11 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
         report.facts["permission_sheet_seen"] = sheet
 
         with _Stage(report, "confirm"):
+            if sheet and caret_box:
+                # Let the post-sheet field accumulate one caret blink cycle and
+                # start confirm on a steady on-plateau.
+                with _Stage(report, "caret_sync"):
+                    wait_caret_plateau(client, target_box, timeout=1.5)
             for attempt in range(confirm_attempts):
                 observed = client.observe()
                 keep(f"4-confirm-{attempt}", observed)

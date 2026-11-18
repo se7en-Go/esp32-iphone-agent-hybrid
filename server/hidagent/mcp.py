@@ -276,13 +276,16 @@ def create_server(url: str | None = None):
                                                    **({"target_box": target_box} if target_box is not None else {})))
 
     @mcp.tool()
-    def iphone_paste_status(transaction_id: str) -> list[TextContent | ImageContent]:
-        """Read copy/paste phase and current image. Does not paste or confirm insertion.
+    def iphone_paste_status(transaction_id: str, include_observation: bool = True
+                            ) -> list[TextContent | ImageContent]:
+        """Read copy/paste phase and optional current image. Does not paste or confirm insertion.
 
-        Use the returned screen_id after inspecting the original target field, not a Shortcut overlay.
+        Set include_observation=False while polling for copied=true to skip encoding the image and
+        avoid replacing screen_id; observe a fresh post-copy image before iphone_paste.
         """
         with IPhoneClient(url) as client:
-            return content(client.clipboard_stage("status", transaction_id=transaction_id))
+            extra = {} if include_observation else {"include_observation": False}
+            return content(client.clipboard_stage("status", transaction_id=transaction_id, **extra))
 
     @mcp.tool()
     def iphone_paste(transaction_id: str, screen_id: str, focused: Literal[True]

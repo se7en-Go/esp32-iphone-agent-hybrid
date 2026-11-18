@@ -87,6 +87,22 @@ def test_green_caret_needs_a_complete_recent_blink():
     assert screen_compare.observation_changed(before, after, caret_frames=one_way, caret_scope=FIELD)
 
 
+def test_green_caret_masks_immediately_after_permission_sheet_dismissal():
+    # For 4 s after Allow Paste closes, recent_frames still begins with the
+    # dimmed permission sheet; those frames must not poison caret discovery.
+    before, after = load("blink_mid"), load("blink_on_3")
+    names = ("permission_sheet", "permission_sheet", "blink_on_1", "blink_off_1", "blink_on_2")
+    history = tuple(SimpleNamespace(frame=load(n), arrived=i * .45, generation=1) for i, n in enumerate(names))
+    assert not screen_compare.observation_changed(before, after, caret_frames=history, caret_scope=FIELD)
+    for tamper in (
+        lambda d: d.rectangle((77, 592, 79, 596), fill=(30, 30, 30)),    # black dot inside caret column
+        lambda d: d.rectangle((77, 590, 79, 596), fill=(9, 199, 101)),   # short green tick inside caret column
+        lambda d: d.rectangle((77, 581, 79, 608), fill=(0, 120, 255)),   # blue line in caret column
+    ):
+        assert screen_compare.observation_changed(
+            load("blink_off_1"), edited("blink_off_1", tamper), caret_frames=history, caret_scope=FIELD)
+
+
 def test_pre_paste_context_guard_accepts_only_the_blink_in_its_field():
     now = time.time()
     history = tuple(SimpleNamespace(**vars(item), updated=now - 3 + item.arrived) for item in blink_history())

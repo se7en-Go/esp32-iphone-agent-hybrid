@@ -105,6 +105,9 @@ def parser() -> argparse.ArgumentParser:
             _context(stage, required=True)
         else:
             stage.add_argument("--image-output", type=Path)
+        if name == "paste-status":
+            stage.add_argument("--include-observation", action=argparse.BooleanOptionalAction, default=True,
+                               help="include image_base64 and a new screen_id (disable while polling copied)")
         if name == "paste":
             stage.add_argument("--focused", action="store_true", required=True)
         if name == "paste-confirm":
@@ -254,6 +257,8 @@ def main(argv=None) -> int:
                     stage = "paste" if args.command == "paste" else args.command.removeprefix("paste-")
                     fields = {key: getattr(args, key) for key in (
                         "transaction_id", "screen_id", "focused", "observed_text", "confirmed") if hasattr(args, key)}
+                    if getattr(args, "include_observation", True) is False:
+                        fields["include_observation"] = False
                     result = client.clipboard_stage(stage, **fields)
                 case "point" | "tap" | "swipe" | "scroll" | "type" | "key" | "home" | "back" | \
                         "tap-text" | "compose-chinese" | "long-press" | "double-tap" | "circle" | "path" | \

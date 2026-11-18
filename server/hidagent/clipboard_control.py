@@ -274,11 +274,12 @@ class StagedClipboardControls:
                             item.guard.region, request.observed_text)):
                     verified = item.sheet_evidence
             if verified is None:
-                # Candidates are the frames retained right after Cmd+V first,
-                # then the live recent window; a sheet is not pushed out of
-                # the candidate list by later ordinary frames, and a sheet
-                # that left the window before confirm still verifies.
-                candidates = tuple(item.post_paste_frames) + tuple(
+                # Candidates are the frames retained right after Cmd+V (latest
+                # settled frame first, before early transition frames), then the
+                # live recent window; a sheet is not pushed out of the candidate
+                # list by later ordinary frames, and a sheet that left the
+                # window before confirm still verifies.
+                candidates = tuple(reversed(item.post_paste_frames)) + tuple(
                     getattr(controls.screen, "recent_frames", ()))
                 for snapshot in candidates:
                     frame = getattr(snapshot, "frame", None)
@@ -290,10 +291,11 @@ class StagedClipboardControls:
                             or updated > result.updated):
                         continue
                     seen.add(frame)
-                    # A permission sheet dims and covers the page. A frame that
-                    # still looks like the result page cannot be that sheet, so
-                    # skip it before the OCR-based check (each costs ~1 s).
-                    if not screen_compare.observation_changed(after, frame):
+                    # A permission sheet dims and covers the page, so it differs
+                    # from both the original page and the result page. Skip
+                    # plain pre-sheet or post-sheet frames before OCR (~1 s/frame).
+                    if (not screen_compare.observation_changed(after, frame)
+                            or not screen_compare.observation_changed(original.frame, frame)):
                         continue
                     if await verify_after_paste_permission(
                             original.frame, frame, after,
@@ -313,7 +315,7 @@ class StagedClipboardControls:
             self._session(item)
             if not self._post_event_evidence(controls, item.completed_at):
                 raise ValueError("confirmation requires a fresh post-paste observation")
-        controls.consume(request.screen_id)
+        controls.consume(request.screen_id, caret_scope=item.guard.region)
         state = item.provider.stage_finish(item.nonce, confirmed=True)
         self.transaction = None
         return {**state, **self._evidence(), "phase": "completed", "effect_verified": True,

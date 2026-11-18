@@ -199,14 +199,40 @@ def _same_field(image, reference, caret, patch):
     return _field_difference(image, reference, caret, patch) < 6
 
 
-def _current_template_matches(image, reference, caret, patch, low, high):
-    errors = _phase_errors(image.crop(patch).tobytes(), low, high)
-    if errors is None:
+def _green_scanout_matches(sample, off, on, width):
+    """Allow smooth sRGB/4:2:0 scanout fade along a proven green caret, never a mark or tick."""
+    stride = width * 3
+    alphas, errors = [], []
+    for r0 in range(0, len(sample), stride):
+        s_row, lo_row, hi_row = sample[r0:r0 + stride], off[r0:r0 + stride], on[r0:r0 + stride]
+        delta = [h - lo for lo, h in zip(lo_row, hi_row, strict=True)]
+        norm = sum(d * d for d in delta)
+        if norm < 300:
+            row_errors = [max(abs(s_row[k + c] - lo_row[k + c]) for c in range(3)) for k in range(0, stride, 3)]
+        else:
+            alpha = sum((s - lo) * d for s, lo, d in zip(s_row, lo_row, delta, strict=True)) / norm
+            if not -.10 <= alpha <= 1.10:
+                return False
+            alpha = max(0., min(1., alpha))
+            alphas.append(alpha)
+            row_errors = [max(abs(s_row[k + c] - (lo_row[k + c] + alpha * delta[k + c])) for c in range(3))
+                          for k in range(0, stride, 3)]
+        if any(err > 54 for err in row_errors):
+            return False
+        errors.extend(row_errors)
+    if not errors or statistics.median(errors) > 12:
         return False
-    # Do not split a small new glyph across the mask border and grant each half
-    # a separate noise allowance. Foot/underline edits must remain observable.
-    return (_field_difference(image, reference, caret, patch) + sum(v > 20 for v in errors) < 6
-            and sum(v > 55 for v in errors) < 3)
+    return not alphas or (max(alphas) - min(alphas) <= .65
+                          and all(abs(b - a) <= .22 for a, b in zip(alphas, alphas[1:], strict=False)))
+
+
+def _current_template_matches(image, reference, caret, patch, low, high, *, green=False):
+    field_diff = _field_difference(image, reference, caret, patch)
+    sample = image.crop(patch).tobytes()
+    errors = _phase_errors(sample, low, high)
+    if errors is not None and (field_diff + sum(v > 20 for v in errors) < 6 and sum(v > 55 for v in errors) < 3):
+        return True
+    return green and field_diff < 6 and _green_scanout_matches(sample, low, high, patch[2] - patch[0])
 
 
 def _amber_tone(r, g, b):
@@ -292,7 +318,8 @@ def _template_cycle(caret, images, frames, current, *, allow_white=True, amber=F
                 if pair in tried:
                     continue
                 tried.add(pair)
-                if _matching_cycle(caret, patch, images, frames, current, off_index, on_index, x, pair):
+                if _matching_cycle(caret, patch, images, frames, current, off_index, on_index, x, pair,
+                                   green=green):
                     return True
     return False
 
@@ -335,14 +362,14 @@ def _opposite_caret_pixels(low, high, caret, patch, core_x):
     return wrong
 
 
-def _matching_cycle(caret, patch, images, frames, current, off_index, on_index, core_x, pair):
+def _matching_cycle(caret, patch, images, frames, current, off_index, on_index, core_x, pair, *, green=False):
     low, high = pair
     low_image = images[off_index]
     if (not _stable_underline(low_image, images[on_index], caret)
             or _field_difference(images[on_index], low_image, caret, patch)
             + _opposite_caret_pixels(low_image, images[on_index], caret, patch, core_x) >= 6):
         return False
-    if not all(_current_template_matches(image, low_image, caret, patch, low, high) for image in current):
+    if not all(_current_template_matches(image, low_image, caret, patch, low, high, green=green) for image in current):
         return False
     delta = [b - a for a, b in zip(low, high, strict=True)]
     norm = sum(v * v for v in delta)
@@ -375,7 +402,15 @@ def _temporal_carets(first, second, frames, regions, *, images=None, allow_white
         return []
     found = []
     for bounds in regions:
-        patches = [image.crop(bounds) for image in images]
+        ref = first.crop(bounds)
+        border = [(x, y) for x in range(ref.width) for y in (0, ref.height - 1)] + [
+            (x, y) for y in range(1, ref.height - 1) for x in (0, ref.width - 1)]
+        patches = [patch for image in images
+                   for patch in (image.crop(bounds),)
+                   if max((max(abs(a - b) for a, b in zip(patch.getpixel(p), ref.getpixel(p), strict=True))
+                           for p in border), default=0) <= 24]
+        if len(patches) < 3:
+            continue
         low, high = patches[0], patches[0]
         for patch in patches[1:]:
             low, high = ImageChops.darker(low, patch), ImageChops.lighter(high, patch)
