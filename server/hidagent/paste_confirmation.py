@@ -282,6 +282,28 @@ def _return_key_box(original, current, suggestion_bar):
 _PAIR_CACHE: tuple[object, tuple, bool] | None = None
 
 
+def _matches_wrapped_lines(added: tuple[str, ...], expected: tuple[str, ...]) -> bool:
+    """Match visual OCR rows to logical lines, allowing display-level soft wrapping.
+
+    One logical line may wrap across consecutive visual rows whose concatenation
+    equals that exact logical line. Distinct logical lines (separated by a real
+    newline) must still start on separate visual rows, and any missing, extra,
+    altered, or duplicated text is rejected.
+    """
+    idx = 0
+    for line in expected:
+        if idx >= len(added):
+            return False
+        joined = added[idx]
+        idx += 1
+        while len(joined) < len(line) and idx < len(added) and line.startswith(joined):
+            joined += added[idx]
+            idx += 1
+        if joined != line:
+            return False
+    return idx == len(added)
+
+
 async def _verify_before_after_uncached(read_fn, before, after, original_image, current_image,
                                         region, expected) -> bool:
     original = await read_fn(before)
@@ -299,9 +321,9 @@ async def _verify_before_after_uncached(read_fn, before, after, original_image, 
     # This covers an empty field and appending after existing borderless
     # body text, and still rejects text that was already present.
     appended = (original_lines is not None and current_lines is not None
-                and len(current_lines) >= len(expected)
-                and current_lines[-len(expected):] == expected
-                and current_lines[:len(current_lines) - len(expected)] == original_lines)
+                and len(current_lines) >= len(original_lines)
+                and current_lines[:len(original_lines)] == original_lines
+                and _matches_wrapped_lines(current_lines[len(original_lines):], expected))
     if not appended:
         return False
     if grown is None:
