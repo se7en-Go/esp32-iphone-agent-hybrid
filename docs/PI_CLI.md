@@ -21,14 +21,18 @@
 
 ```sh
 ./server/.venv/bin/iphone-agent observe server/.local-data/runs/check.jpg
+# 本机 OCR：read_text 只接受图片字节，不接受路径字符串
+./server/.venv/bin/python -c 'from pathlib import Path; from hidagent.ocr import read_text
+for b in read_text(Path("server/.local-data/runs/check.jpg").read_bytes()): print(b.text, b.box)'
 ```
 
 1. 先核对目标窗口/会话标题唯一准确（日常排查优先用本机 OCR 读取，减少大图拷贝）。
-2. 打开 App 避坑：优先用 `search-app` 走 Spotlight（查询词仅限英文 ASCII，例如 `WeChat`）；若在桌面直接点击图标，必须点击文字标题上方的图标本体（点文字中心不会启动 App）。
+2. 打开 App 避坑：**当前桌面已能看到图标时，直接点击文字标题上方的图标本体**（点文字中心不会启动 App），不要多调 `search-app`，否则可能翻到别的主屏页。当前页确实没有该 App 时，再用 `search-app`（查询词仅限英文 ASCII，例如 `WeChat`），并从结果中点图标本体。
 3. 底部输入框避坑：点击底部收起态输入框时，避开最底端 `y > 0.95`（`x ≈ 0.32..0.68`）的 iOS 主屏幕指示条吸附区（优先点击白色输入框偏左文字起点区域），并以「原生键盘弹出 + 光标出现」确认聚焦成功。
-4. `point` 与 `click-observed` 落点核对：`point` 仅在 `pointer_seen == true` 时返回非空 `measured_pointer`；若 `pointer_seen == false`（`measured_pointer: null`），`pointer` 字段只是请求坐标回显，**严禁直接把请求坐标传给 `click-observed`**。发生偏位（如曾触碰底部系统指示条）时加 `--rehome` 重新定位，并用 `observe --for-click` 实拍图确认灰点已落在目标框内。
-5. 从当前最新观察确定空输入框的归一化边界 `--target-box LEFT TOP RIGHT BOTTOM`（若光标在闪烁，记下左侧光标区 `--caret-box`）。
-6. **已有草稿保护**：若输入框内已经存在文字，核对是否完全等于本轮预期清理的测试草稿；发现其他未发送草稿时**原样保留并报告**，不得清空或覆盖。
+4. `point` 与 `click-observed` 落点核对：`point` 返回的 `measured_pointer` 是 JSON 对象 `{"x": …, "y": …}`，未确认落点时为 `null`（**不是数组**，脚本里请用 JSON 解析判断）。`measured_pointer` 非空且在目标框内即可推进，不必再移动。`click-observed` 的坐标必须取 `measured_pointer` 或 `observe --for-click` 实拍图里确认的真实灰点，**严禁传请求坐标或 OCR 文字中心**。发生偏位（如曾触碰底部系统指示条）时加 `--rehome` 重新定位。
+5. 内容会自动刷新的列表（如微信会话列表）里，`tap` / `tap-text` 可能因整屏变化被拒；改用 `point --target-box` → `observe --for-click` → `click-observed`。
+6. 从当前最新观察确定空输入框的归一化边界 `--target-box LEFT TOP RIGHT BOTTOM`（若光标在闪烁，记下左侧光标区 `--caret-box`）。
+7. **已有草稿保护**：若输入框内已经存在文字，核对是否完全等于本轮预期清理的测试草稿；发现其他未发送草稿时**原样保留并报告**，不得清空或覆盖。
 
 ## 3. 一次 `paste-flow` 与回执判读
 
@@ -38,14 +42,25 @@
 ./server/.venv/bin/iphone-agent paste-flow @server/.local-data/runs/payload.txt \
   --target-box L T R B --expect-title "会话标题" \
   [--caret-box CL CT CR CB] \
+  --evidence-dir server/.local-data/runs/<task> \
   --image-output server/.local-data/runs/receipt.jpg
 ```
 
+`--evidence-dir`（`0700` 目录）会保存 `1-prepare-original.jpg`、`2-paste-original*.jpg`、`3-after-cmd-v.jpg`、`4-confirm-*.jpg`，失败时可直接对照定位哪块画面变了。完整 JSON 回执在标准输出（成功）或标准错误（失败）中，请整段保存，不要只挑几个字段。
+
 核对标准 JSON 回执：
-- `cmd_v_sent == 1`、`phase == "completed"`、`effect_verified == true`。
-- `copy_trigger` 明确标示本次复制来源（`assistive_touch_hold` 或 `trigger_key`），`trigger_configured` 记录服务端是否配置组合键；`permission_sheet_seen` 记录是否实际处理了 iOS「允许粘贴」弹窗；`retries` 与 `stages_ms` 记录各阶段重试与耗时。
+- `cmd_v_sent == 1`、`phase == "completed"`、`effect_verified == true`、`recovery_state == "completed"`。
+- `copy_trigger` 明确标示本次复制来源（`assistive_touch_hold` 或 `trigger_key`），`trigger_configured` 记录服务端是否配置组合键；`permission_sheet_seen` 记录是否实际处理了 iOS「允许粘贴」弹窗；`retries` 与 `stages_ms` 记录各阶段重试与耗时（`retries.paste` 表示发键前的画面校验被拒后重新观察，此时 `Cmd+V` 尚未发出）。
 - 完成后再 `observe` 一次确认输入框正文完整且只写入一次、会话标题未变、无新消息气泡。
-- **中断恢复铁律**：若 `confirm` 超时或返回 409 但回执显示 `cmd_v_sent == 1`，先用新画面检查输入框现有内容；确认正文已入框且事务未超期时，只对同一 `transaction_id` 调 `paste-confirm`，**严禁清空重贴或重发第二次 `Cmd+V`**。
+
+**失败时按 `recovery_state` 停下，执行 `next_action`，不要现场编写重试循环、猜事务 ID 或等 TTL：**
+
+| `recovery_state` | 含义 | 下一步 |
+| --- | --- | --- |
+| `not_copied` | 快捷指令没领取正文，什么都没粘贴 | 检查画面后可重新运行一次 `paste-flow` |
+| `claimed_not_confirmed` | 快捷指令领取了正文但没回复制确认，`Cmd+V` 未发出，剪贴板阻塞（`needs_resolution`） | 停止。确认旧快捷指令已结束、输入框未变后，按 [PASTE_INPUT.md](PASTE_INPUT.md#协议取消与恢复) 调用 resolve 或重启 worker |
+| `copied_not_pasted` | 已复制但 `Cmd+V` 未发出，剪贴板阻塞（`needs_resolution`） | 同上：停止并核对后 resolve 或重启 worker，**重跑 `paste-flow` 只会一直报「剪贴板仍有未完成或结果不明的事务」** |
+| `paste_sent_unconfirmed` | `Cmd+V` 可能已发出，`paste-flow` 未能确认 | 用新画面检查输入框并停止汇报，**严禁清空重贴或重发第二次 `Cmd+V`**；由人核对正文后再 resolve 或重启 worker |
 
 ## 4. 受守卫发送流程（仅在获明确授权后执行）
 

@@ -14,6 +14,30 @@ from PIL import Image, ImageChops
 
 PRE_DISPATCH = ("未发送原地点击", "未发送点击", "等待点击期间原画面已变化")
 ALLOW_LABELS = ("允许粘贴", "Allow Paste")
+PASTE_ATTEMPTS = 3  # pre-dispatch 409 retries for the paste stage; Cmd+V is still sent at most once
+
+# What a caller must do next for each terminal state. Never contains text or ids.
+RECOVERY = {
+    "completed": "Paste confirmed. Inspect the field before any Send.",
+    "not_copied": "Nothing was copied or pasted. Inspect the screen, then run paste-flow again.",
+    "copied_not_pasted": (
+        "The Shortcut copied the text but Cmd+V was NOT sent; the clipboard stays blocked "
+        "(needs_resolution). Do not rerun paste-flow, wait for TTL or guess ids. Confirm the Shortcut "
+        "finished and the field is unchanged, then resolve per docs/PASTE_INPUT.md or restart the worker."),
+    "claimed_not_confirmed": (
+        "The Shortcut claimed the text but never confirmed the copy; Cmd+V was NOT sent and the clipboard "
+        "stays blocked (needs_resolution). Do not rerun paste-flow, wait for TTL or guess ids. Stop the old "
+        "Shortcut, check the field, then resolve per docs/PASTE_INPUT.md or restart the worker."),
+    "paste_sent_unconfirmed": (
+        "Cmd+V may have been sent. Never paste again or clear the field. Inspect the field and stop; "
+        "the clipboard stays blocked until the operator checks the result and resolves per "
+        "docs/PASTE_INPUT.md or restarts the worker."),
+}
+
+
+def _recovery(report, state):
+    report.facts["recovery_state"] = state
+    report.facts["next_action"] = RECOVERY[state]
 
 
 class FlowStopped(RuntimeError):
@@ -161,6 +185,7 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
         if evidence_dir is not None and result and result.get("image_base64"):
             (evidence_dir / f"{name}.jpg").write_bytes(base64.b64decode(result["image_base64"]))
     transaction = None
+    report.facts.update(copied=False, cmd_v_sent=0)
     try:
         trigger_configured = False
         if hasattr(client, "capabilities"):
@@ -189,7 +214,10 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
         point, box = bubble
 
         def point_to_bubble(aim_x, aim_y, *, rehome_flag):
-            fields = {"target_box": list(box)}
+            # The server requires target_box to contain the aim point. A
+            # correction aim may sit outside the button by design; send the box
+            # only when it contains the aim, and verify the landing afterwards.
+            fields = {"target_box": list(box)} if box[0] < aim_x < box[2] and box[1] < aim_y < box[3] else {}
             if rehome_flag:
                 fields["rehome"] = True
             for attempt in range(4):
@@ -212,6 +240,7 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
                     if "409" not in str(exc) or attempt == 3:
                         raise
                     report.retry("point_bubble")
+            return None
 
         with _Stage(report, "point_bubble"):
             before_point = point_to_bubble(point[0], point[1], rehome_flag=True)
@@ -287,6 +316,7 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
                     time.sleep(.25)
             report.facts["copy_trigger"] = "assistive_touch_hold"
         report.facts["status_polls"] = polls
+        report.facts["copied"] = True
 
         if prepare_frame:
             from . import screen_compare
@@ -297,15 +327,29 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
                 with _Stage(report, "wait_overlay_clear"):
                     time.sleep(.15)
 
-        # Fresh frame after the copy ACK, then exactly one Cmd+V.
-        if caret_box:
-            with _Stage(report, "caret_sync"):
-                wait_caret_plateau(client, caret_box)
-        observed = _observe(client, report, stage="paste_observe")
-        keep("2-paste-original", observed)
-        with _Stage(report, "paste"):
-            pasted = client.clipboard_stage("paste", transaction_id=transaction,
-                                            screen_id=observed["screen_id"], focused=True)
+        # Fresh frame after the copy ACK, then exactly one Cmd+V. A 409 from the
+        # paste stage is raised by the server's pre-dispatch checks (ticket,
+        # freshness, original-context guard) before Cmd+V is written; once the
+        # key is attempted the server answers 200 with command_acknowledged.
+        # So a 409 is safe to retry on a new observation, never a sent key.
+        pasted = None
+        for attempt in range(PASTE_ATTEMPTS):
+            if caret_box:
+                with _Stage(report, "caret_sync"):
+                    wait_caret_plateau(client, caret_box)
+            observed = _observe(client, report, stage="paste_observe")
+            keep("2-paste-original" if attempt == 0 else f"2-paste-original-{attempt}", observed)
+            try:
+                with _Stage(report, "paste"):
+                    pasted = client.clipboard_stage("paste", transaction_id=transaction,
+                                                    screen_id=observed["screen_id"], focused=True)
+                break
+            except RuntimeError as exc:
+                if "409" not in str(exc) or attempt == PASTE_ATTEMPTS - 1:
+                    raise
+                report.retry("paste")
+                report.facts.setdefault("paste_rejections", []).append(str(exc))
+                time.sleep(.35)
         keep("3-after-cmd-v", pasted)
         report.facts["cmd_v_sent"] = 1 if pasted.get("command_acknowledged") else 0
         if not pasted.get("command_acknowledged"):
@@ -379,6 +423,7 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
         transaction = None
         if evidence is not None and receipt.get("image_base64"):
             evidence.write_bytes(base64.b64decode(receipt["image_base64"]))
+        _recovery(report, "completed")
         return report
     except Exception as exc:
         report.facts["stopped"] = str(exc)
@@ -391,6 +436,14 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
             except RuntimeError as cancel_error:
                 report.facts["cancel_error"] = str(cancel_error)
         report.facts["transaction_left_open"] = transaction is not None
+        if report.facts.get("cmd_v_sent"):
+            _recovery(report, "paste_sent_unconfirmed")
+        elif report.facts.get("copied"):
+            _recovery(report, "copied_not_pasted")
+        elif (report.facts.get("cancelled") or {}).get("needs_resolution") or "cancel_error" in report.facts:
+            _recovery(report, "claimed_not_confirmed")
+        else:
+            _recovery(report, "not_copied")
         raise FlowStopped(str(exc), report) from exc
     finally:
         report.stages["total"] = (time.perf_counter() - began) * 1000
