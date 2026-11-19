@@ -286,3 +286,44 @@ def test_stationary_assistive_opacity_never_hides_content_or_moved_bubble(monkey
                             lambda frame: (.15, .25, .85, .75) if frame == bright else None)
     assert screen_compare.observation_changed(
         before, after, caret_scope=FIELD, allow_assistive_opacity=True)
+
+
+WRAPPED_TEXT = "Pi 第一期底座验收\n第二行 AbC 123\n第三行 粘贴回执与对照帧正常"
+WRAPPED_FIELD = (.13627, .53105, .75752, .57275)
+
+
+def test_soft_wrapped_three_line_paste_after_allow_paste_confirms(monkeypatch):
+    from hidagent import paste_confirmation
+
+    wrapped = {
+        "before": "wrapped_original",
+        "sheet": "wrapped_sheet",
+        "after": "wrapped_pasted",
+        "region": WRAPPED_FIELD,
+    }
+    assert verify(monkeypatch, **wrapped, text=WRAPPED_TEXT) is True
+    assert verify(monkeypatch, **wrapped, text=WRAPPED_TEXT[:-1]) is False
+    assert verify(monkeypatch, **wrapped, text=WRAPPED_TEXT.replace("常", "崇")) is False
+    assert verify(monkeypatch, **wrapped, text=WRAPPED_TEXT.replace("AbC", "abc")) is False
+
+    after = boxes("wrapped_pasted")
+    first_two = [item for item in after if item.text in ("Pi第一期底座验收", "第二行AbC123")]
+    assert len(first_two) == 2
+    merged_box = ocr.TextBox(
+        "Pi第一期底座验收第二行AbC123",
+        (.158, .466, .72, .489),
+        (.439, .477),
+        .99,
+    )
+    merged_boxes = [item for item in after if item not in first_two] + [merged_box]
+    paste_confirmation._PAIR_CACHE = None
+    assert verify(monkeypatch, **wrapped, text=WRAPPED_TEXT, after_boxes=merged_boxes) is False
+
+    dup_row = ocr.TextBox("常", (.158, .566, .206, .571), (.182, .5685), .99)
+    dup_boxes = after + [dup_row]
+    paste_confirmation._PAIR_CACHE = None
+    assert verify(monkeypatch, **wrapped, text=WRAPPED_TEXT, after_boxes=dup_boxes) is False
+
+    tampered_title = edited("wrapped_pasted", lambda d: d.rectangle((180, 70, 320, 95), fill=(200, 200, 200)))
+    assert verify(monkeypatch, **wrapped, text=WRAPPED_TEXT,
+                  after_frame=tampered_title, after_boxes=after) is False

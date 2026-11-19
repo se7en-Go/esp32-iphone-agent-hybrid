@@ -311,3 +311,22 @@ def test_permission_confirmation_reuses_before_after_ocr_across_sheet_candidates
     assert calls.count(original) == 1
     assert calls.count(after) == 1
     assert cand_1 not in calls and cand_2 not in calls
+
+
+def test_matches_wrapped_lines_preserves_newlines_and_rejects_edits():
+    from hidagent.paste_confirmation import _matches_wrapped_lines
+
+    assert _matches_wrapped_lines(("第一行", "第二行"), ("第一行", "第二行")) is True
+    assert _matches_wrapped_lines(("长行前半", "长行后半"), ("长行前半长行后半",)) is True
+    assert _matches_wrapped_lines(("第一", "部分", "末尾"), ("第一部分末尾",)) is True
+    assert _matches_wrapped_lines(
+        ("标题甲", "正文第一段", "前半截", "后半", "截", "落款"),
+        ("标题甲", "正文第一段", "前半截后半截", "落款"),
+    ) is True
+
+    assert _matches_wrapped_lines(("第一行第二行",), ("第一行", "第二行")) is False
+    assert _matches_wrapped_lines(("第一行", "第二行", "第二行"), ("第一行", "第二行")) is False
+    assert _matches_wrapped_lines(("长行前半", "长行后"), ("长行前半长行后半",)) is False
+    assert _matches_wrapped_lines(("长行前半", "长行改半"), ("长行前半长行后半",)) is False
+    assert _matches_wrapped_lines((), ("第一行",)) is False
+    assert _matches_wrapped_lines(("多余行",), ()) is False
