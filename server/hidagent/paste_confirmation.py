@@ -87,6 +87,11 @@ def _in_suggestion_bar(item, suggestion_bar: tuple[float, float] | None) -> bool
     return bar_top <= item.center[1] <= bar_bottom and top >= bar_top - .005 and bottom <= bar_bottom + .008
 
 
+def _overlaps_box(item, box: tuple[float, float, float, float]) -> bool:
+    left, top, right, bottom = item.box
+    return right > box[0] and left < box[2] and bottom > box[1] and top < box[3]
+
+
 def _mask_normalized_box(draw: ImageDraw.ImageDraw, box: tuple[float, float, float, float],
                          size: tuple[int, int]) -> None:
     width, height = size
@@ -95,14 +100,15 @@ def _mask_normalized_box(draw: ImageDraw.ImageDraw, box: tuple[float, float, flo
 
 
 def _outside_visual_changed(before: bytes, after: bytes, region: tuple[float, float, float, float],
-                            suggestion_bar: tuple[float, float], extra=()) -> bool:
+                            suggestion_bar: tuple[float, float] | None, extra=()) -> bool:
     """Verify no unintended UI outside the field, suggestion strip, clock, pointer, or bubble changed."""
     diff = screen_compare._difference(before, after, 360)
     if diff is None:
         return True
     draw = ImageDraw.Draw(diff)
     _mask_normalized_box(draw, region, diff.size)
-    _mask_normalized_box(draw, (0., suggestion_bar[0], 1., suggestion_bar[1]), diff.size)
+    if suggestion_bar is not None:
+        _mask_normalized_box(draw, (0., suggestion_bar[0], 1., suggestion_bar[1]), diff.size)
     for box in extra:
         _mask_normalized_box(draw, box, diff.size)
     for frame in (before, after):
@@ -129,13 +135,14 @@ def _outside_visual_changed(before: bytes, after: bytes, region: tuple[float, fl
             or any(len(points) >= 6 for points in screen_compare._regions(diff, 24)))
 
 
-def _same_context(before, after, region, *, suggestion_bar=None):
+def _same_context(before, after, region, *, suggestion_bar=None, ignored_boxes=()):
     def anchors(items):
         result = {}
         for item in items:
             left, top, right, bottom = item.box
             outside = right < region[0] or left > region[2] or bottom < region[1] or top > region[3]
-            if outside and _in_suggestion_bar(item, suggestion_bar):
+            if outside and (_in_suggestion_bar(item, suggestion_bar)
+                            or any(_overlaps_box(item, box) for box in ignored_boxes)):
                 continue
             label = _visible_text(item.text)
             if outside and item.center[1] > .06 and item.conf >= _MIN_CONFIDENCE and len(label) >= 2:
@@ -333,16 +340,19 @@ async def _verify_before_after_uncached(read_fn, before, after, original_image, 
             return True
     elif len(current_lines) < 2:
         return False  # only multi-line text grows the field
-    if suggestion_bar is None:
+    assistive_box = screen_compare.stationary_assistive_button_box(before, after, exclude=(current_region,))
+    if suggestion_bar is None and (grown is not None or assistive_box is None):
         return False
     extra = []
     if grown is not None:
         extra.extend(grown[1])
-    if original_lines == ():
+    if original_lines == () and suggestion_bar is not None:
         key_box = _return_key_box(original, current, suggestion_bar)
         if key_box is not None:
             extra.append(key_box)
-    return (_same_context(original, current, current_region, suggestion_bar=suggestion_bar)
+    ignored = (assistive_box,) if assistive_box is not None else ()
+    return (_same_context(original, current, current_region,
+                          suggestion_bar=suggestion_bar, ignored_boxes=ignored)
             and not _outside_visual_changed(before, after, current_region, suggestion_bar, extra))
 
 
