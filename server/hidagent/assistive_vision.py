@@ -168,6 +168,55 @@ def find_button(frame: bytes, near: Point | None = None) -> Point | None:
     return target[0] if target is not None else None
 
 
+def stationary_button_at(frame: bytes, target: tuple[Point, Box]) -> bool:
+    """Confirm a dimmed AssistiveTouch button at an already-proved location, tolerating a parked pointer.
+
+    Only called after the paired frame has already proved the full concentric
+    AssistiveTouch button via `find_button_target`. Requires intact neutral outer
+    and inner rings plus at least 4 coherent pale core rays; any occluded core
+    rays must be darker neutral-gray pointer pixels rather than bright/colored edits.
+    """
+    (cx, cy), box = target
+    image = _small(frame)
+    gray = image.convert("L")
+    w, h = image.size
+    short = min(w, h)
+    x, y = cx * w, cy * h
+    outer_r = ((box[2] - box[0]) * w + (box[3] - box[1]) * h) / (4 * .85)
+    if not (.05 * short <= outer_r <= .11 * short):
+        return False
+    if not (outer_r < x < w - outer_r and outer_r < y < h - outer_r):
+        return False
+    core = _circle(gray, x, y, outer_r * .25)
+    inner = _circle(gray, x, y, outer_r * .58)
+    outer = _circle(gray, x, y, outer_r * .87)
+    outside = _circle(gray, x, y, outer_r * 1.22)
+    i_med, o_med, beyond = median(inner), median(outer), median(outside)
+    if not (i_med - o_med >= 5 and beyond - o_med >= 18):
+        return False
+    if sum(abs(v - o_med) <= 18 for v in outer) < 9:
+        return False
+    if sum(b - d > 2 and e - d > 12 for b, d, e in zip(inner, outer, outside, strict=True)) < 8:
+        return False
+    outer_rgb = [_circle(channel, x, y, outer_r * .87) for channel in image.split()]
+    if sum(max(rgb) - min(rgb) <= 40 for rgb in zip(*outer_rgb, strict=True)) < 9:
+        return False
+    core_rgb = [_circle(channel, x, y, outer_r * .25) for channel in image.split()]
+    coherent = [
+        idx for idx, (a, b, d, e) in enumerate(zip(core, inner, outer, outside, strict=True))
+        if a - b > 5 and b - d > 2 and e - d > 12
+    ]
+    if len(coherent) < 4:
+        return False
+    for idx in range(12):
+        if idx in coherent:
+            continue
+        rgb = tuple(channel[idx] for channel in core_rgb)
+        if core[idx] > i_med + 5 or max(rgb) - min(rgb) > 30:
+            return False
+    return True
+
+
 def _icon_boxes(image: Image.Image, box: tuple[int, int, int, int]):
     panel = image.crop(box)
     w, h = panel.size

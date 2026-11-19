@@ -762,8 +762,16 @@ def _mask_stationary_assistive_button(before: bytes | None, after: bytes | None,
         return
     first = assistive_vision.find_button_target(before)
     second = assistive_vision.find_button_target(after)
-    if first is None or second is None:
+    if first is None and second is None:
         return
+    if first is None:
+        if not assistive_vision.stationary_button_at(before, second):
+            return
+        first = second
+    elif second is None:
+        if not assistive_vision.stationary_button_at(after, first):
+            return
+        second = first
     (x0, y0), box0 = first
     (x1, y1), box1 = second
     if (abs(x0 - x1) > .015 or abs(y0 - y1) > .015

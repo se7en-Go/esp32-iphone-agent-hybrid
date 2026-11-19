@@ -288,6 +288,64 @@ def test_stationary_assistive_opacity_never_hides_content_or_moved_bubble(monkey
         before, after, caret_scope=FIELD, allow_assistive_opacity=True)
 
 
+def test_pointer_occluded_dim_assistive_bubble_passes_opt_in_pre_paste_check():
+    from hidagent import assistive_vision
+
+    dim, bright = load("assistive_dim_occluded"), load("assistive_bright_occluded")
+    assert assistive_vision.find_button_target(dim) is None
+    assert assistive_vision.find_button_target(bright) is not None
+    assert screen_compare.observation_changed(dim, bright, caret_scope=FIELD)
+    assert not screen_compare.observation_changed(
+        dim, bright, caret_scope=FIELD, allow_assistive_opacity=True)
+    assert not screen_compare.observation_changed(
+        bright, dim, caret_scope=FIELD, allow_assistive_opacity=True)
+
+    now = time.time()
+    screen = SimpleNamespace(frame=bright, live=True, updated=now, generation=1, recent_frames=())
+    original = SimpleNamespace(frame=dim, generation=1, updated=now)
+    guard = InputContextGuard(screen, original, allow_assistive_opacity=True)
+    guard.region = FIELD
+    guard()
+
+    overlapping = InputContextGuard(screen, original, allow_assistive_opacity=True)
+    overlapping.region = (.80, .30, .98, .40)
+    with pytest.raises(RuntimeError, match="screen changed"):
+        overlapping()
+
+
+@pytest.mark.parametrize("tamper", ["title", "field_text", "new_bubble", "bubble_erased",
+                                    "bubble_shifted", "colored_core_smudge", "menu_opened"])
+def test_pointer_occluded_assistive_fallback_still_rejects_tamper(monkeypatch, tamper):
+    from hidagent import assistive_vision
+
+    dim, bright = load("assistive_dim_occluded"), load("assistive_bright_occluded")
+    before, after = dim, bright
+    if tamper == "title":
+        after = edited("assistive_bright_occluded", lambda d: d.rectangle((180, 70, 320, 95), fill=(200, 200, 200)))
+    elif tamper == "field_text":
+        after = edited("assistive_bright_occluded", lambda d: d.rectangle((100, 585, 180, 605), fill=(30, 30, 30)))
+    elif tamper == "new_bubble":
+        after = edited("assistive_bright_occluded",
+                       lambda d: d.rounded_rectangle((140, 200, 380, 270), radius=12, fill=(149, 236, 105)))
+    elif tamper == "bubble_erased":
+        before = edited("assistive_dim_occluded", lambda d: d.rectangle((400, 320, 495, 425), fill=(238, 237, 239)))
+    elif tamper == "bubble_shifted":
+        image = Image.open(io.BytesIO(dim)).convert("RGB")
+        patch = image.crop((405, 330, 490, 420))
+        ImageDraw.Draw(image).rectangle((405, 330, 490, 420), fill=(238, 237, 239))
+        image.paste(patch, (405, 352))
+        out = io.BytesIO()
+        image.save(out, "JPEG", quality=92)
+        before = out.getvalue()
+    elif tamper == "colored_core_smudge":
+        before = edited("assistive_dim_occluded", lambda d: d.ellipse((440, 365, 470, 395), fill=(220, 40, 40)))
+    elif tamper == "menu_opened":
+        monkeypatch.setattr(assistive_vision, "find_panel",
+                            lambda frame: (.15, .25, .85, .75) if frame == bright else None)
+    assert screen_compare.observation_changed(
+        before, after, caret_scope=FIELD, allow_assistive_opacity=True)
+
+
 WRAPPED_TEXT = "Pi 第一期底座验收\n第二行 AbC 123\n第三行 粘贴回执与对照帧正常"
 WRAPPED_FIELD = (.13627, .53105, .75752, .57275)
 
