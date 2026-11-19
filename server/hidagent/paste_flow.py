@@ -322,7 +322,8 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
             from . import screen_compare
             overlay_deadline = time.monotonic() + 2.5
             while time.monotonic() < overlay_deadline:
-                if not screen_compare.observation_changed(prepare_frame, client.screenshot(), caret_scope=target_box):
+                if not screen_compare.observation_changed(
+                        prepare_frame, client.screenshot(), caret_scope=target_box, allow_assistive_opacity=True):
                     break
                 with _Stage(report, "wait_overlay_clear"):
                     time.sleep(.15)

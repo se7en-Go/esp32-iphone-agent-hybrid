@@ -738,14 +738,63 @@ def mask_pointer_highlights(before: bytes | Image.Image, after: bytes | Image.Im
     return tuple(recognized[0]), tuple(recognized[1])
 
 
+def _boxes_overlap(first, second) -> bool:
+    return (first[0] < second[2] and first[2] > second[0]
+            and first[1] < second[3] and first[3] > second[1])
+
+
+def _mask_stationary_assistive_button(before: bytes | None, after: bytes | None,
+                                      diff: Image.Image, *, exclude=()) -> None:
+    """Mask only a stationary AssistiveTouch floating button changing idle opacity.
+
+    Both frames must independently prove the concentric AssistiveTouch button at
+    the same position and size, with no AssistiveTouch menu panel open and no
+    overlap with excluded regions (such as the verified input field). Changes
+    anywhere outside the stationary button footprint remain unmasked.
+    """
+    if not before or not after:
+        return
+    from . import assistive_vision
+
+    if assistive_vision.find_panel(before) is not None or assistive_vision.find_panel(after) is not None:
+        return
+    first = assistive_vision.find_button_target(before)
+    second = assistive_vision.find_button_target(after)
+    if first is None or second is None:
+        return
+    (x0, y0), box0 = first
+    (x1, y1), box1 = second
+    if (abs(x0 - x1) > .015 or abs(y0 - y1) > .015
+            or abs((box0[2] - box0[0]) - (box1[2] - box1[0])) > .02
+            or abs((box0[3] - box0[1]) - (box1[3] - box1[1])) > .02):
+        return
+    pad = .015
+    union = (
+        max(0., min(box0[0], box1[0]) - pad),
+        max(0., min(box0[1], box1[1]) - pad),
+        min(1., max(box0[2], box1[2]) + pad),
+        min(1., max(box0[3], box1[3]) + pad),
+    )
+    if any(_boxes_overlap(union, box) for box in exclude if box is not None):
+        return
+    w, h = diff.size
+    ImageDraw.Draw(diff).rectangle(
+        (round(union[0] * w), round(union[1] * h), round(union[2] * w), round(union[3] * h)),
+        fill=0,
+    )
+
+
 def observation_changed(before: bytes | None, after: bytes | None, *, input_region=None,
                         moved_pointer: tuple = (), caret_frames=(), context_regions=None,
-                        caret_scope=None) -> bool:
+                        caret_scope=None, allow_assistive_opacity: bool = False) -> bool:
     """Reject content edits while tolerating clock and recognized pointer shapes.
 
     Recognized hover outlines and small compact discs may fade or move. Other larger
     regions, several edits, scrolling and broad low-contrast changes invalidate it.
     `caret_scope` names a verified input field in which a green caret may blink.
+    `allow_assistive_opacity` opts into ignoring an idle-to-opaque (or reverse)
+    appearance shift on a stationary AssistiveTouch floating button outside the
+    verified input field during a staged clipboard paste transaction.
     """
     if before and before == after:
         return False
@@ -765,9 +814,12 @@ def observation_changed(before: bytes | None, after: bytes | None, *, input_regi
     _mask_pointer_discs(before, after, diff, max_discs=2)
     _mask_translucent_pointer_fade(before, after, diff)
     values = diff.tobytes()
-    if sum(values) / len(values) > 0.8:
-        return True
-    return any(len(points) >= 6 for points in _regions(diff, 24))
+    changed = sum(values) / len(values) > 0.8 or any(len(points) >= 6 for points in _regions(diff, 24))
+    if changed and allow_assistive_opacity:
+        _mask_stationary_assistive_button(before, after, diff, exclude=(input_region, caret_scope))
+        values = diff.tobytes()
+        changed = sum(values) / len(values) > 0.8 or any(len(points) >= 6 for points in _regions(diff, 24))
+    return changed
 
 
 def effect_changed(before: bytes | None, after: bytes | None, ignore: tuple = (), *, hover: tuple = ()) -> bool:

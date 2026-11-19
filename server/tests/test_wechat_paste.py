@@ -231,3 +231,58 @@ def test_codec_quantization_drift_confirms_while_broad_dim_still_fails(monkeypat
                   after_frame=jittered, after_boxes=boxes("live_pasted"), text=LIVE_TEXT) is True
     assert verify(monkeypatch, before="live_original", sheet="live_sheet",
                   after_frame=dimmed, after_boxes=boxes("live_pasted"), text=LIVE_TEXT) is False
+
+
+# --- pre-paste: stationary AssistiveTouch idle-to-opaque shift --------------------
+
+def test_stationary_assistive_bubble_opacity_requires_opt_in_and_matches_real_frames():
+    dim, bright = load("assistive_dim"), load("assistive_bright")
+    assert screen_compare.observation_changed(dim, bright, caret_scope=FIELD)
+    assert not screen_compare.observation_changed(
+        dim, bright, caret_scope=FIELD, allow_assistive_opacity=True)
+    assert not screen_compare.observation_changed(
+        bright, dim, caret_scope=FIELD, allow_assistive_opacity=True)
+
+    now = time.time()
+    screen = SimpleNamespace(frame=bright, live=True, updated=now, generation=1, recent_frames=())
+    original = SimpleNamespace(frame=dim, generation=1, updated=now)
+    guard = InputContextGuard(screen, original, allow_assistive_opacity=True)
+    guard.region = FIELD
+    guard()
+
+    # Never mask when the AssistiveTouch bubble overlaps the verified input field.
+    overlapping = InputContextGuard(screen, original, allow_assistive_opacity=True)
+    overlapping.region = (.80, .30, .98, .40)
+    with pytest.raises(RuntimeError, match="screen changed"):
+        overlapping()
+
+
+@pytest.mark.parametrize("tamper", ["title", "field_text", "new_bubble", "bubble_moved",
+                                    "bubble_appeared", "menu_opened"])
+def test_stationary_assistive_opacity_never_hides_content_or_moved_bubble(monkeypatch, tamper):
+    from hidagent import assistive_vision
+
+    dim, bright = load("assistive_dim"), load("assistive_bright")
+    before, after = dim, bright
+    if tamper == "title":
+        after = edited("assistive_bright", lambda d: d.rectangle((180, 70, 320, 95), fill=(200, 200, 200)))
+    elif tamper == "field_text":
+        after = edited("assistive_bright", lambda d: d.rectangle((100, 585, 180, 605), fill=(30, 30, 30)))
+    elif tamper == "new_bubble":
+        after = edited("assistive_bright",
+                       lambda d: d.rounded_rectangle((140, 200, 380, 270), radius=12, fill=(149, 236, 105)))
+    elif tamper == "bubble_moved":
+        image = Image.open(io.BytesIO(bright)).convert("RGB")
+        bubble = image.crop((405, 330, 490, 420))
+        ImageDraw.Draw(image).rectangle((405, 330, 490, 420), fill=(237, 237, 237))
+        image.paste(bubble, (405, 450))
+        out = io.BytesIO()
+        image.save(out, "JPEG", quality=92)
+        after = out.getvalue()
+    elif tamper == "bubble_appeared":
+        before = edited("assistive_dim", lambda d: d.rectangle((405, 330, 490, 420), fill=(237, 237, 237)))
+    elif tamper == "menu_opened":
+        monkeypatch.setattr(assistive_vision, "find_panel",
+                            lambda frame: (.15, .25, .85, .75) if frame == bright else None)
+    assert screen_compare.observation_changed(
+        before, after, caret_scope=FIELD, allow_assistive_opacity=True)
