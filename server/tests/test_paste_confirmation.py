@@ -330,3 +330,41 @@ def test_matches_wrapped_lines_preserves_newlines_and_rejects_edits():
     assert _matches_wrapped_lines(("长行前半", "长行改半"), ("长行前半长行后半",)) is False
     assert _matches_wrapped_lines((), ("第一行",)) is False
     assert _matches_wrapped_lines(("多余行",), ()) is False
+
+
+def test_permission_confirmation_accepts_stationary_assistive_without_suggestion_bar(monkeypatch):
+    from hidagent import paste_confirmation, screen_compare
+
+    original = keyboard_frame([200, 250], keyboard=False)
+    sheet = keyboard_frame([200, 250], keyboard=False, sheet=True)
+    after = keyboard_frame([200, 250, 300, 350], keyboard=False)
+    tampered = keyboard_frame([200, 250, 300, 350], keyboard=False, header_tamper=True)
+
+    context = [
+        label("返回", .12, .08),
+        label("完成", .91, .08),
+        label("123", .06, .88),
+        label("底部锚点", .50, .88),
+    ]
+    occluded = [ocr.TextBox("被遮字", (.83, .58, .95, .62), (.89, .60), .96)]
+    pasted = [label("修验通过：云海00417", .25, .30), label("末行 GhJ kLm", .25, .35)]
+    dialog = [label("“备忘录”想从“快捷指令”粘贴", .5, .44), label("你允许这样做吗？", .5, .48),
+              label("不允许粘贴", .27, .55), label("允许粘贴", .7, .55)]
+
+    monkeypatch.setattr(screen_compare, "stationary_assistive_button_box",
+                        lambda before, after, *, exclude=(): (.80, .56, .98, .64))
+
+    async def verify_case(after_img):
+        paste_confirmation._PAIR_CACHE = None
+        frames = {original: context + occluded, sheet: dialog, after_img: context + pasted}
+
+        async def read(image):
+            return frames[image]
+
+        monkeypatch.setattr(ocr, "read_text_async", read)
+        return await verify_after_paste_permission(
+            original, sheet, after_img, KB_REGION, "\n修验通过：云海00417\n末行 GhJ kLm",
+        )
+
+    assert asyncio.run(verify_case(after)) is True
+    assert asyncio.run(verify_case(tampered)) is False

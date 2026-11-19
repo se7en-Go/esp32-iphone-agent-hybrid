@@ -385,3 +385,74 @@ def test_soft_wrapped_three_line_paste_after_allow_paste_confirms(monkeypatch):
     tampered_title = edited("wrapped_pasted", lambda d: d.rectangle((180, 70, 320, 95), fill=(200, 200, 200)))
     assert verify(monkeypatch, **wrapped, text=WRAPPED_TEXT,
                   after_frame=tampered_title, after_boxes=after) is False
+
+
+def test_stationary_assistive_button_occluding_ocr_anchor_confirms(monkeypatch):
+    from hidagent import assistive_vision, paste_confirmation
+
+    before_img = load("wrapped_original")
+    after_img = load("wrapped_pasted")
+    assistive_box = screen_compare.stationary_assistive_button_box(before_img, after_img, exclude=(WRAPPED_FIELD,))
+    assert assistive_box is not None
+
+    inside_button = ocr.TextBox("徽标", (.850, .348, .960, .368), (.905, .358), .95)
+    base_before = boxes("wrapped_original")
+    base_after = boxes("wrapped_pasted")
+
+    async def run(before_ocr, after_ocr, after_bytes=after_img):
+        paste_confirmation._PAIR_CACHE = None
+        frames = {before_img: before_ocr, load("wrapped_sheet"): boxes("wrapped_sheet"), after_bytes: after_ocr}
+
+        async def read(image):
+            return frames[image]
+
+        with monkeypatch.context() as mp:
+            mp.setattr(ocr, "read_text_async", read)
+            return await verify_after_paste_permission(before_img, load("wrapped_sheet"), after_bytes,
+                                                       WRAPPED_FIELD, WRAPPED_TEXT)
+
+    # 1) Dim -> bright occlusion: anchor inside the stationary AssistiveTouch button only in before.
+    assert asyncio.run(run(base_before + [inside_button], base_after)) is True
+    # 2) Bright -> dim reveal: anchor inside stationary button only in after.
+    assert asyncio.run(run(base_before, base_after + [inside_button])) is True
+
+    # 3) Wide anchor touching stationary button: allowed if outside-button pixels are intact,
+    #    rejected immediately if pixels on the non-button left portion change.
+    wide_before = ocr.TextBox("通知预览徽标", (.620, .348, .940, .368), (.780, .358), .95)
+    wide_after = ocr.TextBox("通知预览", (.620, .348, .820, .368), (.720, .358), .95)
+    assert asyncio.run(run(base_before + [wide_before], base_after + [wide_after])) is True
+    tampered_left = edited("wrapped_pasted", lambda d: d.rectangle((310, 376, 370, 396), fill=(180, 40, 40)))
+    assert asyncio.run(run(base_before + [wide_before], base_after + [wide_after], after_bytes=tampered_left)) is False
+
+    # 4) Negative: missing/extra anchor outside AssistiveTouch button must still fail.
+    outside_anchor = ocr.TextBox("其他联系人", (.200, .348, .350, .368), (.275, .358), .95)
+    assert asyncio.run(run(base_before + [outside_anchor], base_after)) is False
+    assert asyncio.run(run(base_before, base_after + [outside_anchor])) is False
+
+    # 5) Negative: moved AssistiveTouch button rejects the occluded anchor.
+    orig_find = assistive_vision.find_button_target
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            assistive_vision, "find_button_target",
+            lambda f: ((.89, .45), (.82, .42, .96, .48)) if f == after_img else orig_find(f),
+        )
+        assert asyncio.run(run(base_before + [inside_button], base_after)) is False
+
+    # 6) Negative: open AssistiveTouch panel rejects.
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            assistive_vision, "find_panel",
+            lambda f: (.15, .25, .85, .75) if f == after_img else None,
+        )
+        assert asyncio.run(run(base_before + [inside_button], base_after)) is False
+
+    # 7) Negative: stationary AssistiveTouch box excluded if it overlaps the input field region.
+    assert screen_compare.stationary_assistive_button_box(
+        before_img, after_img, exclude=((.80, .30, .98, .57),)) is None
+    near_field_anchor = ocr.TextBox("徽标", (.780, .480, .920, .500), (.850, .490), .95)
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            assistive_vision, "find_button_target",
+            lambda f: ((.85, .51), (.75, .47, .95, .55)),
+        )
+        assert asyncio.run(run(base_before + [near_field_anchor], base_after)) is False

@@ -745,6 +745,46 @@ def _boxes_overlap(first, second) -> bool:
             and first[1] < second[3] and first[3] > second[1])
 
 
+def stationary_assistive_button_box(
+    before: bytes | None, after: bytes | None, *, exclude=()
+) -> tuple[float, float, float, float] | None:
+    """Return the padded box of a stationary AssistiveTouch floating button, if both frames prove it."""
+    if not before or not after:
+        return None
+    from . import assistive_vision
+
+    if assistive_vision.find_panel(before) is not None or assistive_vision.find_panel(after) is not None:
+        return None
+    first = assistive_vision.find_button_target(before)
+    second = assistive_vision.find_button_target(after)
+    if first is None and second is None:
+        return None
+    if first is None:
+        if not assistive_vision.stationary_button_at(before, second):
+            return None
+        first = second
+    elif second is None:
+        if not assistive_vision.stationary_button_at(after, first):
+            return None
+        second = first
+    (x0, y0), box0 = first
+    (x1, y1), box1 = second
+    if (abs(x0 - x1) > .015 or abs(y0 - y1) > .015
+            or abs((box0[2] - box0[0]) - (box1[2] - box1[0])) > .02
+            or abs((box0[3] - box0[1]) - (box1[3] - box1[1])) > .02):
+        return None
+    pad = .015
+    union = (
+        max(0., min(box0[0], box1[0]) - pad),
+        max(0., min(box0[1], box1[1]) - pad),
+        min(1., max(box0[2], box1[2]) + pad),
+        min(1., max(box0[3], box1[3]) + pad),
+    )
+    if any(_boxes_overlap(union, box) for box in exclude if box is not None):
+        return None
+    return union
+
+
 def _mask_stationary_assistive_button(before: bytes | None, after: bytes | None,
                                       diff: Image.Image, *, exclude=()) -> None:
     """Mask only a stationary AssistiveTouch floating button changing idle opacity.
@@ -754,38 +794,8 @@ def _mask_stationary_assistive_button(before: bytes | None, after: bytes | None,
     overlap with excluded regions (such as the verified input field). Changes
     anywhere outside the stationary button footprint remain unmasked.
     """
-    if not before or not after:
-        return
-    from . import assistive_vision
-
-    if assistive_vision.find_panel(before) is not None or assistive_vision.find_panel(after) is not None:
-        return
-    first = assistive_vision.find_button_target(before)
-    second = assistive_vision.find_button_target(after)
-    if first is None and second is None:
-        return
-    if first is None:
-        if not assistive_vision.stationary_button_at(before, second):
-            return
-        first = second
-    elif second is None:
-        if not assistive_vision.stationary_button_at(after, first):
-            return
-        second = first
-    (x0, y0), box0 = first
-    (x1, y1), box1 = second
-    if (abs(x0 - x1) > .015 or abs(y0 - y1) > .015
-            or abs((box0[2] - box0[0]) - (box1[2] - box1[0])) > .02
-            or abs((box0[3] - box0[1]) - (box1[3] - box1[1])) > .02):
-        return
-    pad = .015
-    union = (
-        max(0., min(box0[0], box1[0]) - pad),
-        max(0., min(box0[1], box1[1]) - pad),
-        min(1., max(box0[2], box1[2]) + pad),
-        min(1., max(box0[3], box1[3]) + pad),
-    )
-    if any(_boxes_overlap(union, box) for box in exclude if box is not None):
+    union = stationary_assistive_button_box(before, after, exclude=exclude)
+    if union is None:
         return
     w, h = diff.size
     ImageDraw.Draw(diff).rectangle(
