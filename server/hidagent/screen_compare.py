@@ -383,7 +383,8 @@ def translucent_pointer_pair(before, after, near, shift, reach, *, reference_poi
 
 
 def cursor_overlay_pair(reference: bytes, before: bytes, after: bytes, near, shift, reach, *,
-                        reference_pointer, report_reference=False, axis=0, caret_frames=(), context_regions=None):
+                        reference_pointer, report_reference=False, axis=0, caret_frames=(), context_regions=None,
+                        caret_scope=None):
     """Find motion of local cursor-sized overlays over a previously observed background."""
     with Image.open(io.BytesIO(reference)) as image:
         width, height = image.size
@@ -443,14 +444,14 @@ def cursor_overlay_pair(reference: bytes, before: bytes, after: bytes, near, shi
     pair = pairs[0]
     match, reference_pointer = verify_cursor_reference(
         reference, before, after, pair, reference_pointer, caret_frames=caret_frames,
-        context_regions=context_regions)
+        context_regions=context_regions, caret_scope=caret_scope)
     if not match:
         return None
     return (pair, reference_pointer) if report_reference else pair
 
 
 def verify_cursor_reference(reference, before, after, pair, reference_pointer, *,
-                            caret_frames=(), context_regions=None):
+                            caret_frames=(), context_regions=None, caret_scope=None):
     """Check the original view against both halves of an observed pointer move."""
     if reference_pointer is None:
         # A translucent pointer can start over colored or textured content.
@@ -476,8 +477,8 @@ def verify_cursor_reference(reference, before, after, pair, reference_pointer, *
         _mask_locations(second, (pair[1],), ())
         mask_clock_ticks(reference, before, first)
         mask_clock_ticks(reference, after, second)
-        mask_caret_blink(reference, before, first, caret_frames)
-        mask_caret_blink(reference, after, second, caret_frames)
+        mask_caret_blink(reference, before, first, caret_frames, scope=caret_scope)
+        mask_caret_blink(reference, after, second, caret_frames, scope=caret_scope)
         footprints = []
         for points in _regions(ImageChops.darker(first, second), 24):
             xs, ys = zip(*points, strict=True)
@@ -490,7 +491,8 @@ def verify_cursor_reference(reference, before, after, pair, reference_pointer, *
         reference_pointer = footprints[0] if footprints else None
     original = () if reference_pointer is None else (reference_pointer,)
     unchanged = all(not observation_changed(reference, frame, moved_pointer=(*original, point),
-                                           caret_frames=caret_frames, context_regions=context_regions)
+                                           caret_frames=caret_frames, context_regions=context_regions,
+                                           caret_scope=caret_scope)
                     for frame, point in zip((before, after), pair, strict=True))
     return unchanged, reference_pointer
 

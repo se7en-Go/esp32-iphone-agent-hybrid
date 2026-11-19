@@ -405,10 +405,15 @@ def _temporal_carets(first, second, frames, regions, *, images=None, allow_white
         ref = first.crop(bounds)
         border = [(x, y) for x in range(ref.width) for y in (0, ref.height - 1)] + [
             (x, y) for y in range(1, ref.height - 1) for x in (0, ref.width - 1)]
-        patches = [patch for image in images
-                   for patch in (image.crop(bounds),)
-                   if max((max(abs(a - b) for a, b in zip(patch.getpixel(p), ref.getpixel(p), strict=True))
-                           for p in border), default=0) <= 24]
+        patches = []
+        for image in images:
+            patch = image.crop(bounds)
+            border_diffs = [
+                max(abs(a - b) for a, b in zip(patch.getpixel(p), ref.getpixel(p), strict=True))
+                for p in border
+            ]
+            if sum(value > 24 for value in border_diffs) <= 3 and max(border_diffs, default=0) <= 40:
+                patches.append(patch)
         if len(patches) < 3:
             continue
         low, high = patches[0], patches[0]

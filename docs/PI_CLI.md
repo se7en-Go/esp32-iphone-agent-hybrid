@@ -82,6 +82,7 @@ for b in read_text(Path("server/.local-data/runs/check.jpg").read_bytes()): prin
    # 方式 B：紧区域 OCR 精确匹配发送标签后点击
    ./server/.venv/bin/iphone-agent tap-text 发送 --screen-id <id> --exact --region 0.7 0.6 1 1
    ```
+   > 同一会话内刚完成 `paste-flow` 时，服务端会自动延续已验证的输入框范围以容忍绿色光标闪烁（遇到发送键之外的真实画面变化仍会拦截）；若重启过 worker 或直接操作已有草稿，可显式传入 `--caret-scope <fl> <ft> <fr> <fb>`。
 4. **见新气泡再确认**：只有在新画面里明确看到完整的新消息气泡时，才结算发送记录；输入框变空或仅硬件 `ok` 不算发出：
    ```sh
    ./server/.venv/bin/iphone-agent skill-confirm-send --bubble-visible --skill <skill>

@@ -142,6 +142,8 @@ class StagedClipboardControls:
 
     async def prepare(self, request):
         controls = self.get_controls()
+        if hasattr(controls, "clear_verified_caret_scope"):
+            controls.clear_verified_caret_scope()
         phone, screen = controls.phone, controls.screen
         provider = getattr(phone, "clipboard", None)
         if provider is None:
@@ -318,6 +320,10 @@ class StagedClipboardControls:
         controls.consume(request.screen_id, caret_scope=item.guard.region)
         state = item.provider.stage_finish(item.nonce, confirmed=True)
         self.transaction = None
+        if item.guard.region is not None and hasattr(controls, "remember_verified_caret_scope"):
+            controls.remember_verified_caret_scope(
+                item.guard.region, device=item.device, links=item.links, epoch=item.epoch,
+                generation=item.guard.original.generation)
         return {**state, **self._evidence(), "phase": "completed", "effect_verified": True,
                 "verified_by": "host_observation", "server_content_verified": False, **evidence}
 
@@ -325,6 +331,9 @@ class StagedClipboardControls:
         item = self._lookup(nonce)
         state = item.provider.stage_finish(nonce)
         self.transaction = None
+        controls = self.get_controls()
+        if hasattr(controls, "clear_verified_caret_scope"):
+            controls.clear_verified_caret_scope()
         return {**state, "phase": "cancelled", "effect_verified": False}
 
 

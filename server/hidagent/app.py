@@ -262,6 +262,7 @@ class ActionStep(BaseModel):
     region: tuple[float, float, float, float] | None = None
     enter_intent: Literal["navigation", "editing"] | None = None
     target_box: tuple[float, float, float, float] | None = None
+    caret_scope: tuple[float, float, float, float] | None = None
     points: list[tuple[float, float]] | None = Field(default=None, min_length=2, max_length=256)
     radius_x: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     radius_y: float | None = Field(default=None, gt=0, allow_inf_nan=False)
@@ -316,6 +317,7 @@ class HostClickBody(BaseModel):
     target_box: tuple[UnitCoordinate, UnitCoordinate, UnitCoordinate, UnitCoordinate]
     target_label: str = Field(default="", max_length=120)
     duration: float | None = Field(default=None, ge=.3, le=3, strict=True, allow_inf_nan=False)
+    caret_scope: tuple[UnitCoordinate, UnitCoordinate, UnitCoordinate, UnitCoordinate] | None = None
 
 
 def check_keyboard(text):
