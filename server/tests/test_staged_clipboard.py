@@ -764,3 +764,45 @@ def test_pre_dispatch_paste_rejection_sends_no_cmd_v_and_keeps_transaction_retry
         assert pasted["command_acknowledged"] is True and phone.sent.count("cmd+v") == 1
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("tamper_title", [False, True])
+def test_staged_paste_allows_stationary_assistive_opacity_change_but_blocks_context_edits(monkeypatch, tamper_title):
+    from pathlib import Path
+
+    from hidagent.clipboard_control import PasteTransaction, PreparePaste
+
+    fixtures = Path(__file__).parent / "fixtures" / "wechat_paste"
+    dim = (fixtures / "assistive_dim.jpg").read_bytes()
+    bright = (fixtures / "assistive_bright.jpg").read_bytes()
+    if tamper_title:
+        with Image.open(io.BytesIO(bright)) as image:
+            rgb = image.convert("RGB")
+            ImageDraw.Draw(rgb).rectangle((180, 70, 320, 95), fill=(200, 200, 200))
+            out = io.BytesIO()
+            rgb.save(out, "JPEG", quality=92)
+            bright = out.getvalue()
+
+    async def scenario():
+        screen, provider, phone, control, manager = setup(monkeypatch)
+        screen._on_jpeg(dim)
+        prepared = await manager.prepare(PreparePaste(
+            screen_id=control.observation()["screen_id"],
+            text="你好00123",
+            focused=True,
+            target_box=[.132, .523, .768, .578],
+        ))
+        transaction = prepared["transaction_id"]
+        copied(provider, screen)
+        screen._on_jpeg(bright)
+        if tamper_title:
+            with pytest.raises(RuntimeError, match="screen changed"):
+                await manager.paste(PasteTransaction(
+                    transaction_id=transaction, screen_id=control.observation()["screen_id"], focused=True))
+            assert "cmd+v" not in phone.sent
+        else:
+            pasted = await manager.paste(PasteTransaction(
+                transaction_id=transaction, screen_id=control.observation()["screen_id"], focused=True))
+            assert pasted["command_acknowledged"] is True and phone.sent.count("cmd+v") == 1
+
+    asyncio.run(scenario())

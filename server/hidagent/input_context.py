@@ -102,8 +102,10 @@ def point_in_suggestion_bar(frame: bytes, x: float, y: float) -> bool:
 
 
 class InputContextGuard:
-    def __init__(self, screen, observation, *, allow_white=False, accept_field=None):
+    def __init__(self, screen, observation, *, allow_white=False, accept_field=None,
+                 allow_assistive_opacity: bool = False):
         self.screen, self.original = screen, observation
+        self.allow_assistive_opacity = bool(allow_assistive_opacity)
         self.region = _focused_region(observation.frame, allow_white=allow_white, accept_field=accept_field)
         # This guard may be created after the first chunk was acknowledged.
         # Only history from the original observation can establish its field;
@@ -130,6 +132,7 @@ class InputContextGuard:
         if (current.generation != self.original.generation
                 or screen_compare.observation_changed(
                     self.original.frame, current.frame, input_region=region,
-                    caret_frames=getattr(self.screen, "recent_frames", ()), caret_scope=self.region)):
+                    caret_frames=getattr(self.screen, "recent_frames", ()), caret_scope=self.region,
+                    allow_assistive_opacity=self.allow_assistive_opacity)):
             raise RuntimeError("screen changed since the original observation; observe again before acting")
         return current

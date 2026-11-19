@@ -151,7 +151,7 @@ class StagedClipboardControls:
             raise ValueError("visually confirm the intended input field is focused before prepare")
         scope = tuple(ocr.validate_region(request.target_box)) if request.target_box is not None else None
         controls.consume(request.screen_id, caret_scope=scope)
-        anchor = InputContextGuard(screen, controls._observation)
+        anchor = InputContextGuard(screen, controls._observation, allow_assistive_opacity=True)
         focus_source = "visible_caret"
         if request.target_box is not None:
             anchor.region = tuple(ocr.validate_region(request.target_box))
