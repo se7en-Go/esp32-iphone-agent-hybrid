@@ -15,6 +15,7 @@ from PIL import Image, ImageChops
 PRE_DISPATCH = ("未发送原地点击", "未发送点击", "等待点击期间原画面已变化")
 ALLOW_LABELS = ("允许粘贴", "Allow Paste")
 PASTE_ATTEMPTS = 3  # pre-dispatch 409 retries for the paste stage; Cmd+V is still sent at most once
+ALLOW_DISMISS_ATTEMPTS = 2  # at most one follow-up click if the first click only wakes an auto-hidden pointer
 
 # What a caller must do next for each terminal state. Never contains text or ids.
 RECOVERY = {
@@ -153,6 +154,51 @@ def _stray_cursor_outside_bubble(before: bytes | None, after: bytes | None, poin
     sx = sum(px for px, _ in pts) / len(pts)
     sy = sum(py for _, py in pts) / len(pts)
     return (sx, sy) if abs(sx - point[0]) <= .10 and abs(sy - point[1]) <= .10 else None
+
+
+def _pointer_in_box(moved: dict | None, box) -> tuple[float, float] | None:
+    mp = (moved or {}).get("measured_pointer")
+    if isinstance(mp, dict):
+        mx, my = mp.get("x"), mp.get("y")
+        if (isinstance(mx, (int, float)) and not isinstance(mx, bool)
+                and isinstance(my, (int, float)) and not isinstance(my, bool)
+                and box[0] < mx < box[2] and box[1] < my < box[3]):
+            return float(mx), float(my)
+    return None
+
+
+def _locate_pointer_in_box(before: bytes | None, after: bytes | None, box) -> tuple[float, float] | None:
+    """Locate a dark visible AssistiveTouch pointer disc strictly inside `box`."""
+    if not before or not after or before == after:
+        return None
+    try:
+        with Image.open(io.BytesIO(before)) as first, Image.open(io.BytesIO(after)) as second:
+            if first.size != second.size:
+                return None
+            w = min(360, first.width)
+            h = max(1, round(first.height * w / first.width))
+            a = first.convert("L").resize((w, h), Image.Resampling.BILINEAR)
+            b = second.convert("L").resize((w, h), Image.Resampling.BILINEAR)
+    except (OSError, ValueError):
+        return None
+    dark = ImageChops.subtract(a, b)
+    x0, x1 = max(0, round(box[0] * w)), min(w, round(box[2] * w))
+    y0, y1 = max(0, round(box[1] * h)), min(h, round(box[3] * h))
+    dpix, bpix = dark.load(), b.load()
+    pts = []
+    for py in range(y0, y1):
+        for px in range(x0, x1):
+            if dpix[px, py] > 35 and bpix[px, py] < 175:
+                pts.append((px / w, py / h))
+    if not 35 <= len(pts) <= 600:
+        return None
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    if max(xs) - min(xs) > .12 or max(ys) - min(ys) > .06:
+        return None
+    cx = sum(xs) / len(xs)
+    cy = sum(ys) / len(ys)
+    return (cx, cy) if box[0] < cx < box[2] and box[1] < cy < box[3] else None
 
 
 def _hold(client, report, point, box, caret_box, stage):
@@ -356,44 +402,110 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
         if not pasted.get("command_acknowledged"):
             raise RuntimeError(f"Cmd+V was not acknowledged: {pasted.get('error')}")
 
+        def _find_allow(sid):
+            for label in ALLOW_LABELS:
+                try:
+                    hit = client.find_text(label, sid, exact=True)
+                except RuntimeError:
+                    continue
+                if hit.get("match"):
+                    return hit["match"]
+            return None
+
         sheet = False
         with _Stage(report, "permission_sheet"):
             screen_id = pasted.get("screen_id")  # the post-Cmd+V evidence frame, when fresh
+            sheet_frame = base64.b64decode(pasted["image_base64"]) if pasted.get("image_base64") else None
             for _ in range(4):
                 with _Stage(report, "sheet_find"):
                     if screen_id is None:
-                        screen_id = client.observe()["screen_id"]
-                    found = None
-                    for label in ALLOW_LABELS:
-                        try:
-                            hit = client.find_text(label, screen_id, exact=True)
-                        except RuntimeError:
-                            continue
-                        if hit.get("match"):
-                            found = hit["match"]
-                            break
+                        obs = client.observe()
+                        screen_id = obs["screen_id"]
+                        sheet_frame = base64.b64decode(obs["image_base64"]) if obs.get("image_base64") else None
+                    found = _find_allow(screen_id)
                 if found is None:
                     screen_id = None
+                    sheet_frame = None
                     time.sleep(.3)
                     continue
                 sheet = True
-                (x, y), (left, top, right, bottom) = found["center"], found["box"]
-                allow_box = [max(0, left - .005), max(0, top - .005), min(1, right + .005), min(1, bottom + .005)]
-                with _Stage(report, "allow_point"):
-                    moved = client.control("point", screen_id, x=x, y=y)
-                report.server_timing_ms.setdefault("allow_point", []).append(moved.get("timing_ms"))
-                time.sleep(.8)
-                with _Stage(report, "allow_click"):
-                    for _ in range(3):
-                        clicking = client.observe(for_click=True)
-                        result = client.click_observed(clicking["screen_id"], x, y, allow_box,
-                                                       target_label=found["text"])
-                        report.server_timing_ms.setdefault("allow_click", []).append(result.get("timing_ms"))
-                        if result.get("command_acknowledged"):
-                            break
-                        report.retry("allow_paste_click")
-                    else:
-                        raise RuntimeError("could not press Allow Paste")
+                report.facts["permission_sheet_seen"] = True
+                report.facts["permission_sheet_dismissed"] = False
+
+                def allow_bounds(match):
+                    (cx, cy), (left, top, right, bottom) = match["center"], match["box"]
+                    box_ = [max(0., left - .02), max(0., top - .012), min(1., right + .02), min(1., bottom + .012)]
+                    return cx, cy, box_
+
+                def point_to_allow(sid, cx, cy, box_, *, rehome_flag=False):
+                    fields = {"target_box": box_}
+                    if rehome_flag:
+                        fields["rehome"] = True
+                    with _Stage(report, "allow_point"):
+                        try:
+                            moved_ = client.control("point", sid, x=cx, y=cy, **fields)
+                        except RuntimeError as exc:
+                            if "422" not in str(exc):
+                                raise
+                            moved_ = client.control("point", sid, x=cx, y=cy)
+                    report.server_timing_ms.setdefault("allow_point", []).append(moved_.get("timing_ms"))
+                    return moved_
+
+                x, y, allow_box = allow_bounds(found)
+                moved = point_to_allow(screen_id, x, y, allow_box)
+                rehomed = False
+                for dismiss_attempt in range(ALLOW_DISMISS_ATTEMPTS):
+                    result = None
+                    with _Stage(report, "allow_click"):
+                        for _ in range(3):
+                            try:
+                                clicking = client.observe(for_click=True)
+                            except RuntimeError as exc:
+                                if "409" not in str(exc):
+                                    raise
+                                report.retry("allow_paste_click")
+                                time.sleep(.25)
+                                continue
+                            clicking_frame = (base64.b64decode(clicking["image_base64"])
+                                              if clicking.get("image_base64") else None)
+                            click_xy = (_locate_pointer_in_box(sheet_frame, clicking_frame, allow_box)
+                                        or _pointer_in_box(moved, allow_box))
+                            if click_xy is None:
+                                if not rehomed:
+                                    rehomed = True
+                                    reobs = client.observe()
+                                    moved = point_to_allow(reobs["screen_id"], x, y, allow_box, rehome_flag=True)
+                                    report.retry("allow_paste_point")
+                                    continue
+                                raise RuntimeError("Allow Paste pointer was not confirmed inside button")
+                            result = client.click_observed(clicking["screen_id"], click_xy[0], click_xy[1], allow_box,
+                                                           target_label=found["text"])
+                            report.server_timing_ms.setdefault("allow_click", []).append(result.get("timing_ms"))
+                            if result.get("command_acknowledged"):
+                                keep("3b-allow-click" if dismiss_attempt == 0 else f"3b-allow-click-{dismiss_attempt}",
+                                     result)
+                                break
+                            report.retry("allow_paste_click")
+                        else:
+                            raise RuntimeError("could not press Allow Paste")
+                    check_sid = result.get("screen_id") if result else None
+                    if check_sid is None:
+                        post = client.observe()
+                        keep("3b-allow-check" if dismiss_attempt == 0 else f"3b-allow-check-{dismiss_attempt}", post)
+                        check_sid = post["screen_id"]
+                    still_open = _find_allow(check_sid)
+                    if still_open is None:
+                        report.facts["permission_sheet_dismissed"] = True
+                        break
+                    if dismiss_attempt < ALLOW_DISMISS_ATTEMPTS - 1:
+                        report.retry("allow_paste_dismiss")
+                        found = still_open
+                        x, y, allow_box = allow_bounds(found)
+                        moved = None
+                        rehomed = False
+                        time.sleep(.15)
+                        continue
+                    raise RuntimeError("Allow Paste permission sheet did not dismiss")
                 break
         report.facts["permission_sheet_seen"] = sheet
 
