@@ -395,7 +395,7 @@ def test_stationary_assistive_button_occluding_ocr_anchor_confirms(monkeypatch):
     assistive_box = screen_compare.stationary_assistive_button_box(before_img, after_img, exclude=(WRAPPED_FIELD,))
     assert assistive_box is not None
 
-    inside_button = ocr.TextBox("良策", (.850, .348, .960, .368), (.905, .358), .95)
+    inside_button = ocr.TextBox("徽标", (.850, .348, .960, .368), (.905, .358), .95)
     base_before = boxes("wrapped_original")
     base_after = boxes("wrapped_pasted")
 
@@ -418,7 +418,7 @@ def test_stationary_assistive_button_occluding_ocr_anchor_confirms(monkeypatch):
 
     # 3) Wide anchor touching stationary button: allowed if outside-button pixels are intact,
     #    rejected immediately if pixels on the non-button left portion change.
-    wide_before = ocr.TextBox("通知预览良策", (.620, .348, .940, .368), (.780, .358), .95)
+    wide_before = ocr.TextBox("通知预览徽标", (.620, .348, .940, .368), (.780, .358), .95)
     wide_after = ocr.TextBox("通知预览", (.620, .348, .820, .368), (.720, .358), .95)
     assert asyncio.run(run(base_before + [wide_before], base_after + [wide_after])) is True
     tampered_left = edited("wrapped_pasted", lambda d: d.rectangle((310, 376, 370, 396), fill=(180, 40, 40)))
@@ -449,7 +449,7 @@ def test_stationary_assistive_button_occluding_ocr_anchor_confirms(monkeypatch):
     # 7) Negative: stationary AssistiveTouch box excluded if it overlaps the input field region.
     assert screen_compare.stationary_assistive_button_box(
         before_img, after_img, exclude=((.80, .30, .98, .57),)) is None
-    near_field_anchor = ocr.TextBox("良策", (.780, .480, .920, .500), (.850, .490), .95)
+    near_field_anchor = ocr.TextBox("徽标", (.780, .480, .920, .500), (.850, .490), .95)
     with monkeypatch.context() as mp:
         mp.setattr(
             assistive_vision, "find_button_target",
