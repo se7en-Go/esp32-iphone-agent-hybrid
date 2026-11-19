@@ -396,9 +396,13 @@ class Phone:
         self._seen = {axis: deque(map(tuple, seen.get(axis, [])), maxlen=12) for axis in ("x", "y")}
         self._pointer_seen = False
         self._pointer_confirmed = False
+        self._pointer_escape_attempted = False
         self._pointer_pair_verified = False
         self._pointer_overlay = None
         self._pointer_reference = None
+        self._pointer_diagnostics = None
+        self._tap_target_frame = None
+        self._navigation_context = None
         self._menu_highlight_landing_active = False
         self._last_motion = 0.0
         self._position_before = None
@@ -1531,9 +1535,9 @@ class Phone:
                                 and 0 <= target_box[1] < y < target_box[3] <= 1)):
                     break
                 correction_guard = TextTargetGuard(
-                    self.screen, self._tap_target_frame or observed.frame,
+                    self.screen, getattr(self, "_tap_target_frame", None) or observed.frame,
                     SimpleNamespace(center=(x, y), box=target_box), observation=observed,
-                    navigation_context=self._navigation_context)
+                    navigation_context=getattr(self, "_navigation_context", None))
                 relative_corrected = True
 
             def before_correction(guard=correction_guard, cursor=cursor, reference=reference):

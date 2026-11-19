@@ -337,3 +337,50 @@ def test_extension_keeps_total_travel_and_screen_edges_bounded(tmp_path, near, a
         position = near[axis] * size + extended * size / phone.span['wh'[axis]]
         assert .055 * width <= position <= size - .055 * width
         assert abs(extended) * size / phone.span['wh'[axis]] <= .18 * width
+
+
+@pytest.mark.parametrize("screen_changed", [False, True])
+def test_fresh_phone_point_verified_relative_correction_without_prior_tap(tmp_path, monkeypatch, screen_changed):
+    from hidagent.text_target import TargetChangedError
+
+    phone, device, mirror = setup_phone(tmp_path)
+    target = (.89, .35)
+    box = (.82, .31, .96, .39)
+    off_center = (.955, .35)
+
+    async def missing(*args, **kwargs):
+        return None
+
+    async def localize(near, epoch, *, reference=None, probe=None, before_probe=None):
+        if before_probe is not None:
+            before_probe()
+        phone._pos = None
+        phone._pointer_pair_verified = True
+        phone._pointer_overlay = (off_center, mirror.frame)
+        phone._pointer_reference = None
+        if screen_changed:
+            changed = io.BytesIO()
+            Image.new("RGB", (360, 780), "black").save(changed, "PNG")
+            mirror.frame = changed.getvalue()
+            mirror.updated = time.time()
+        return off_center
+
+    async def observed_correction(*args):
+        return target
+
+    monkeypatch.setattr(phone, "_find_pointer", missing)
+    monkeypatch.setattr(phone, "_localize_pointer", localize)
+    monkeypatch.setattr(phone, "_observe_landing", observed_correction)
+
+    if screen_changed:
+        with pytest.raises(TargetChangedError):
+            asyncio.run(phone.point_verified(*target, target_box=box))
+        assert not phone._pointer_confirmed
+        assert len(device.commands) == 1  # blocked before sending the relative correction move
+    else:
+        landed = asyncio.run(phone.point_verified(*target, target_box=box))
+        assert landed == target
+        assert phone._pointer_confirmed
+        assert len(device.commands) == 2
+        assert device.commands[1].startswith("move ")
+    assert not any(command in {"press", "click"} for command in device.commands)
