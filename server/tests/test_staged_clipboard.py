@@ -733,3 +733,34 @@ def test_confirmation_cannot_use_frame_still_in_post_paste_pipeline(monkeypatch)
         manager.cancel(prepared["transaction_id"])
 
     asyncio.run(scenario())
+
+
+def test_pre_dispatch_paste_rejection_sends_no_cmd_v_and_keeps_transaction_retryable(monkeypatch):
+    """paste_flow retries a paste-stage 409; that is only safe if the 409 precedes Cmd+V."""
+    from hidagent.clipboard_control import PasteTransaction
+
+    def bannered():
+        with Image.open(io.BytesIO(field_image())) as image:
+            ImageDraw.Draw(image).rectangle((20, 10, 380, 70), fill=(40, 40, 40))  # a transient top banner
+            output = io.BytesIO()
+            image.save(output, "PNG")
+            return output.getvalue()
+
+    async def scenario():
+        screen, provider, phone, control, manager = setup(monkeypatch)
+        prepared = await manager.prepare(prepare_body(control))
+        transaction = prepared["transaction_id"]
+        copied(provider, screen)
+        screen._on_jpeg(bannered())
+        with pytest.raises((ValueError, RuntimeError)):
+            await manager.paste(PasteTransaction(
+                transaction_id=transaction, screen_id=control.observation()["screen_id"], focused=True))
+        assert "cmd+v" not in phone.sent
+        state = manager.status(transaction, include_observation=False)
+        assert state["copied"] and not state["paste_sent"] and state["phase"] == "awaiting_paste"
+        screen._on_jpeg(field_image())  # the banner left; the original context is back
+        pasted = await manager.paste(PasteTransaction(
+            transaction_id=transaction, screen_id=control.observation()["screen_id"], focused=True))
+        assert pasted["command_acknowledged"] is True and phone.sent.count("cmd+v") == 1
+
+    asyncio.run(scenario())

@@ -41,12 +41,14 @@ BANNER_JPEG = jpeg(banner=True)
 
 class FakeClient:
     def __init__(self, *, confirm_conflicts=1, sheet=True, trigger_configured=False,
-                 copied_on_prepare=False, overlay_frames=0):
+                 copied_on_prepare=False, overlay_frames=0, paste_conflicts=0, never_copy=False,
+                 never_claim=False):
         self.calls, self.control_calls = [], []
         self.confirm_conflicts, self.sheet, self.seen = confirm_conflicts, sheet, 0
         self.trigger_configured = trigger_configured
         self.copied_on_prepare = copied_on_prepare
         self.overlay_frames = overlay_frames
+        self.paste_conflicts, self.never_copy, self.never_claim = paste_conflicts, never_copy, never_claim
         self.screenshots = 0
 
     def capabilities(self):
@@ -84,9 +86,12 @@ class FakeClient:
             return {"transaction_id": "tx"}
         if stage == "status":
             assert fields.get("include_observation") is False
-            copied = self.copied_on_prepare or ("click", "辅助触控", .9) in self.calls
+            copied = not self.never_copy and (self.copied_on_prepare or ("click", "辅助触控", .9) in self.calls)
             return {"copied": copied, "phase": "awaiting_paste" if copied else "awaiting_copy"}
         if stage == "paste":
+            if self.paste_conflicts:
+                self.paste_conflicts -= 1
+                raise RuntimeError("HTTP 409: screen changed since the original observation; observe again")
             return {"command_acknowledged": True}
         if stage == "confirm":
             if self.confirm_conflicts:
@@ -95,8 +100,13 @@ class FakeClient:
             return {"phase": "completed", "effect_verified": True,
                     "confirmation_evidence": "paste_permission_dismissed"}
         if stage == "cancel":
-            return {"active": False, "needs_resolution": True}
+            # The real server blocks only once the Shortcut has claimed the text.
+            return {"active": False, "needs_resolution": self.claimed}
         raise AssertionError(stage)
+
+    @property
+    def claimed(self):
+        return ("click", "辅助触控", .9) in self.calls and not self.never_claim
 
 
 @pytest.fixture
@@ -132,7 +142,44 @@ def test_flow_never_repastes_when_confirmation_keeps_failing(vision):
     with pytest.raises(paste_flow.FlowStopped) as stopped:
         paste_flow.run(client, "文本", (.13, .52, .77, .58))
     assert client.calls.count("paste") == 1 and "cancel" not in client.calls
-    assert stopped.value.report.facts["transaction_left_open"] is True
+    facts = stopped.value.report.facts
+    assert facts["transaction_left_open"] is True
+    assert facts["cmd_v_sent"] == 1 and facts["recovery_state"] == "paste_sent_unconfirmed"
+    assert "Never paste again" in facts["next_action"]
+
+
+def test_flow_retries_a_pre_dispatch_paste_409_and_keeps_each_frame(vision, tmp_path):
+    client = FakeClient(paste_conflicts=1)
+    report = paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58), evidence_dir=tmp_path).as_dict()
+    assert client.calls.count("paste") == 2  # one rejected before dispatch, one sent
+    assert report["cmd_v_sent"] == 1 and report["phase"] == "completed"
+    assert report["retries"]["paste"] == 1 and "cancel" not in client.calls
+    assert report["recovery_state"] == "completed" and report["copied"] is True
+    assert (tmp_path / "1-prepare-original.jpg").exists()
+    assert (tmp_path / "2-paste-original.jpg").exists() and (tmp_path / "2-paste-original-1.jpg").exists()
+
+
+def test_flow_reports_copied_not_pasted_when_paste_stays_rejected(vision):
+    client = FakeClient(paste_conflicts=paste_flow.PASTE_ATTEMPTS)
+    with pytest.raises(paste_flow.FlowStopped) as stopped:
+        paste_flow.run(client, "文本", (.13, .52, .77, .58))
+    facts = stopped.value.report.facts
+    assert client.calls.count("paste") == paste_flow.PASTE_ATTEMPTS and client.calls.count("cancel") == 1
+    assert facts["copied"] is True and facts["cmd_v_sent"] == 0
+    assert facts["cancelled"]["needs_resolution"] is True
+    assert facts["recovery_state"] == "copied_not_pasted" and "Do not rerun paste-flow" in facts["next_action"]
+
+
+@pytest.mark.parametrize(("never_claim", "state"), [(True, "not_copied"), (False, "claimed_not_confirmed")])
+def test_flow_reports_copy_failure_by_whether_the_shortcut_claimed_the_text(vision, never_claim, state):
+    client = FakeClient(never_copy=True, never_claim=never_claim)
+    with pytest.raises(paste_flow.FlowStopped) as stopped:
+        paste_flow.run(client, "文本", (.13, .52, .77, .58), copy_timeout=0)
+    facts = stopped.value.report.facts
+    assert "paste" not in client.calls
+    assert facts["copied"] is False and facts["cmd_v_sent"] == 0
+    assert facts["cancelled"]["needs_resolution"] is (not never_claim)
+    assert facts["recovery_state"] == state
 
 
 def test_flow_records_pure_assistive_touch_trigger_when_trigger_key_disabled(vision):
@@ -189,6 +236,13 @@ def test_flow_corrects_or_aborts_before_hold_when_stray_cursor_lands_below_bubbl
             self.seen += 1
             return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(clean).decode()}
 
+        def control(self, name, screen_id, **fields):
+            box = fields.get("target_box")
+            # Same rule as Controls._plan: a supplied box must contain the point.
+            if box is not None and not (box[0] < fields["x"] < box[2] and box[1] < fields["y"] < box[3]):
+                raise RuntimeError("HTTP 409: target_box must contain the tap in normalized observed coordinates")
+            return super().control(name, screen_id, **fields)
+
         def screenshot(self):
             self.screenshots += 1
             if self.calls.count("point") == 1:
@@ -203,13 +257,15 @@ def test_flow_corrects_or_aborts_before_hold_when_stray_cursor_lands_below_bubbl
         assert stopped.value.report.retries["point_bubble_miss"] == 1
         assert ("click", "辅助触控", .9) not in client.calls
         assert "prepare" not in client.calls and "paste" not in client.calls
+        assert stopped.value.report.facts["recovery_state"] == "not_copied"
     else:
         report = paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58)).as_dict()
         assert report["retries"]["point_bubble_miss"] == 1
-        bubble_points = [fields for name, fields in client.control_calls if name == "point" and "target_box" in fields]
+        assert "point_bubble" not in report["retries"]  # the correction was not rejected
+        bubble_points = [fields for name, fields in client.control_calls if name == "point" and fields["x"] > .8]
         assert len(bubble_points) == 2
-        assert bubble_points[0]["rehome"] is True
+        assert bubble_points[0]["rehome"] is True and bubble_points[0]["target_box"] == [.82, .33, .96, .39]
         assert "rehome" not in bubble_points[1]
-        assert bubble_points[1]["y"] < .36
+        assert bubble_points[1]["y"] < .33 and "target_box" not in bubble_points[1]  # aim outside the box
         assert ("click", "辅助触控", .9) in client.calls
         assert report["phase"] == "completed"
