@@ -122,7 +122,23 @@ HOST_OBSERVATION_TTL = 30.0
 _HOST_OBSERVATION_ISSUER = object()
 
 
-def _host_observed_pixels_match(before: bytes, current: bytes, pointer_xy) -> bool:
+def _validate_caret_scope(caret_scope) -> tuple[float, float, float, float] | None:
+    if caret_scope is None:
+        return None
+    if len(caret_scope) != 4:
+        raise ValueError("caret_scope must have 4 normalized bounds [left, top, right, bottom]")
+    values = tuple(float(value) for value in caret_scope)
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+           for value in caret_scope):
+        raise ValueError("caret_scope bounds must be finite numbers in 0..1")
+    left, top, right, bottom = values
+    if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
+        raise ValueError("caret_scope bounds must satisfy 0 <= left < right <= 1 and 0 <= top < bottom <= 1")
+    return left, top, right, bottom
+
+
+def _host_observed_pixels_match(before: bytes, current: bytes, pointer_xy, *,
+                                caret_frames=(), caret_scope=None) -> bool:
     """Host-only stationary evidence: unchanged page plus tiny native RGB noise.
 
     No caller-supplied mask, target-box exemption, resizing, pointer estimation
@@ -138,7 +154,8 @@ def _host_observed_pixels_match(before: bytes, current: bytes, pointer_xy) -> bo
         return False
     if original.size != latest.size:
         return False
-    if screen_compare.observation_changed(before, current):
+    if screen_compare.observation_changed(
+            before, current, caret_frames=caret_frames, caret_scope=caret_scope):
         return False
     width, height = original.size
     x, y = round(pointer_xy[0] * width), round(pointer_xy[1] * height)
@@ -403,6 +420,7 @@ class Phone:
         self._pointer_diagnostics = None
         self._tap_target_frame = None
         self._navigation_context = None
+        self._pointer_caret_scope = None
         self._menu_highlight_landing_active = False
         self._last_motion = 0.0
         self._position_before = None
@@ -804,7 +822,8 @@ class Phone:
                 prior_frame, frame, baseline, near, -shift, reach,
                 reference_pointer=prior_pointer, axis=int(vertical),
                 caret_frames=getattr(self.screen, "recent_frames", ()),
-                context_regions=self._pointer_context_regions()) is not None
+                context_regions=self._pointer_context_regions(),
+                caret_scope=getattr(self, "_pointer_caret_scope", None)) is not None
                 for frame in dict.fromkeys([*reversed(outward), *reversed(early)]))
 
         sent = await self._send(epoch, f"move {dx} {dy}", before_write=same_session)
@@ -848,9 +867,11 @@ class Phone:
 
         def locate(returned):
             context_regions = self._pointer_context_regions()
+            caret_scope = getattr(self, "_pointer_caret_scope", None)
             if not ble and screen_compare.observation_changed(
                 baseline, returned,
-                caret_frames=getattr(self.screen, "recent_frames", ()), context_regions=context_regions):
+                caret_frames=getattr(self.screen, "recent_frames", ()), context_regions=context_regions,
+                caret_scope=caret_scope):
                 return None
             for frame in dict.fromkeys([*reversed(outward), *reversed(early)]):
                 pair = None if vertical else vision.pointer_move(frame, returned, near, -shift, reach, strict=True)
@@ -860,7 +881,8 @@ class Phone:
                         evidence = screen_compare.cursor_overlay_pair(
                             prior_frame, frame, returned, near, -shift, reach,
                             reference_pointer=prior_pointer, report_reference=True, axis=int(vertical),
-                            caret_frames=getattr(self.screen, "recent_frames", ()), context_regions=context_regions)
+                            caret_frames=getattr(self.screen, "recent_frames", ()), context_regions=context_regions,
+                            caret_scope=caret_scope)
                         if evidence is not None:
                             pair, prior_pointer = evidence
                         if pair is None:
@@ -876,7 +898,8 @@ class Phone:
                     else:
                         stable, detected = screen_compare.verify_cursor_reference(
                             prior_frame, frame, returned, pair, prior_pointer,
-                            caret_frames=getattr(self.screen, "recent_frames", ()), context_regions=context_regions)
+                            caret_frames=getattr(self.screen, "recent_frames", ()), context_regions=context_regions,
+                            caret_scope=caret_scope)
                         prior_pointer = detected if stable else None
                 if pair is None:
                     if diagnostics:
@@ -889,7 +912,8 @@ class Phone:
                             or screen_compare.observation_changed(
                                 frame, returned, moved_pointer=pair,
                                 caret_frames=getattr(self.screen, "recent_frames", ()),
-                                context_regions=context_regions)):
+                                context_regions=context_regions,
+                                caret_scope=caret_scope)):
                         continue
                     self._pointer_pair_verified = True
                     self._pos = position
@@ -981,7 +1005,8 @@ class Phone:
             if current.size != before.size or screen_compare.observation_changed(
                 self._position_before, snap.frame,
                 caret_frames=getattr(self.screen, "recent_frames", ()),
-                context_regions=self._pointer_context_regions()):
+                context_regions=self._pointer_context_regions(),
+                caret_scope=getattr(self, "_pointer_caret_scope", None)):
                 return None
             remaining = [(px + source_bounds[0], py + source_bounds[1], diameter, color)
                          for px, py, diameter, color in vision._discs(current.crop(source_bounds), width)]
@@ -1418,8 +1443,10 @@ class Phone:
 
     @bounded_operation
     @_serialized
-    async def point_verified(self, x: float, y: float, *, target_box=None, rehome: bool = False) -> tuple[float, float]:
+    async def point_verified(self, x: float, y: float, *, target_box=None, rehome: bool = False,
+                             caret_scope=None) -> tuple[float, float]:
         """Use measured landings and verify every correction before it can authorize a click."""
+        caret_scope = _validate_caret_scope(caret_scope)
         observed = freshness.require_fresh(self.screen)
         epoch = getattr(self.device, "abort_epoch", 0)
         link = getattr(self.device, "links", 0)
@@ -1437,12 +1464,15 @@ class Phone:
         self._pointer_overlay = None
         self._pointer_reference = None
         self._menu_highlight_landing_active = False
+        prev_scope = getattr(self, "_pointer_caret_scope", None)
+        self._pointer_caret_scope = caret_scope
         if rehome:
             self._pos = None
-        await self.point(x, y)
         try:
+            await self.point(x, y)
             return await self._confirm_point_landing(x, y, epoch, observed, same_session, target_box=target_box)
         finally:
+            self._pointer_caret_scope = prev_scope
             if not self._pointer_confirmed:
                 # An unconfirmed landing leaves the relative accumulator untrusted;
                 # re-home before the next move rather than carrying drift forward.
@@ -1537,7 +1567,8 @@ class Phone:
                 correction_guard = TextTargetGuard(
                     self.screen, getattr(self, "_tap_target_frame", None) or observed.frame,
                     SimpleNamespace(center=(x, y), box=target_box), observation=observed,
-                    navigation_context=getattr(self, "_navigation_context", None))
+                    navigation_context=getattr(self, "_navigation_context", None),
+                    caret_scope=getattr(self, "_pointer_caret_scope", None))
                 relative_corrected = True
 
             def before_correction(guard=correction_guard, cursor=cursor, reference=reference):
@@ -1763,13 +1794,15 @@ class Phone:
                              expected_abort_epoch: int, expected_input_seq: int,
                              before_click: Callable[[], None] | None = None,
                              host_observation: HostObservation | None = None,
-                             duration: float | None = None) -> dict:
+                             duration: float | None = None,
+                             caret_scope=None) -> dict:
         try:
             return await self._click_observed(
                 observation=observation, pointer_xy=pointer_xy, target_box=target_box,
                 expected_device=expected_device, expected_links=expected_links,
                 expected_abort_epoch=expected_abort_epoch, expected_input_seq=expected_input_seq,
                 before_click=before_click, host_observation=host_observation,
+                **({"caret_scope": caret_scope} if caret_scope is not None else {}),
                 **({"duration": duration} if duration is not None else {}))
         finally:
             if isinstance(host_observation, HostObservation):
@@ -1784,8 +1817,10 @@ class Phone:
                               expected_abort_epoch: int, expected_input_seq: int,
                               before_click: Callable[[], None] | None = None,
                               host_observation: HostObservation | None = None,
-                              duration: float | None = None) -> dict:
+                              duration: float | None = None,
+                              caret_scope=None) -> dict:
         """One explicit host-observed contact at the unmoved pointer; never a CV fallback."""
+        caret_scope = _validate_caret_scope(caret_scope)
         if duration is not None and (not isinstance(duration, (int, float)) or isinstance(duration, bool)
                                      or not math.isfinite(duration) or not .3 <= duration <= 3):
             raise ValueError("host-observed hold duration must be 0.3..3 seconds")
@@ -1828,7 +1863,10 @@ class Phone:
             if host_observation is not None:
                 host_observation.validate(self)
             current = freshness.require_fresh(self.screen)
-            if not _host_observed_pixels_match(observation.frame, current.frame, pointer_xy):
+            if not _host_observed_pixels_match(
+                    observation.frame, current.frame, pointer_xy,
+                    caret_frames=getattr(self.screen, "recent_frames", ()),
+                    caret_scope=caret_scope):
                 raise RuntimeError("宿主观察的原画面已变化或过期，未发送原地点击。")
             if host_observation is not None:
                 # Admission proved the immutable original image was fresh and
@@ -1873,7 +1911,10 @@ class Phone:
                 # Once a different page is observed, never wait for it to turn
                 # back into A. We retain no history of unseen inference frames.
                 if (not current.live
-                        or not _host_observed_pixels_match(observation.frame, current.frame, pointer_xy)):
+                        or not _host_observed_pixels_match(
+                            observation.frame, current.frame, pointer_xy,
+                            caret_frames=getattr(self.screen, "recent_frames", ()),
+                            caret_scope=caret_scope)):
                     raise RuntimeError("等待点击期间原画面已变化或断开，请重新观察。")
                 current_source = SimpleNamespace(snapshot=current, _freshness_phone=self)
                 if freshness.fresh_frame(current_source) is not None:
@@ -1942,7 +1983,8 @@ class Phone:
                            target_box: tuple[float, float, float, float] | None = None,
                            target_frame: bytes | None = None,
                            allow_estimated_landing: bool = True,
-                           duration: float = 0, click_count: int = 1, navigation_context=None) -> dict:
+                           duration: float = 0, click_count: int = 1, navigation_context=None,
+                           caret_scope=None) -> dict:
         """Perform a single observed contact gesture, then return its visual evidence."""
         if (click_count not in (1, 2) or isinstance(click_count, bool)
                 or not math.isfinite(duration) or duration < 0 or duration > 3
@@ -2007,8 +2049,12 @@ class Phone:
                 target = SimpleNamespace(center=(x, y))
                 if target_box is not None:
                     target.box = target_box
+                caret_scope = _validate_caret_scope(caret_scope)
+                scope_kwargs = {"caret_scope": caret_scope} if caret_scope is not None else {}
+                prev_scope = getattr(self, "_pointer_caret_scope", None)
+                self._pointer_caret_scope = caret_scope
                 target_guard = TextTargetGuard(self.screen, target_frame or observed.frame, target,
-                                              navigation_context=navigation_context)
+                                              navigation_context=navigation_context, **scope_kwargs)
                 self._tap_blind_allowed = False
                 if allow_estimated_landing:
                     try:
@@ -2017,10 +2063,13 @@ class Phone:
                         pass
                     else:
                         self._tap_blind_allowed = True
-                if self._pace == BLE_PACE and target_box is not None:
-                    landed = await self.point_verified(x, y, target_box=target_box)
-                else:
-                    landed = await self.point_verified(x, y)
+                try:
+                    if self._pace == BLE_PACE and target_box is not None:
+                        landed = await self.point_verified(x, y, target_box=target_box, **scope_kwargs)
+                    else:
+                        landed = await self.point_verified(x, y, **scope_kwargs)
+                finally:
+                    self._pointer_caret_scope = prev_scope
                 same_session()
                 freshness.require_fresh(self.screen)
                 if self._pointer_confirmed and target_box is not None:

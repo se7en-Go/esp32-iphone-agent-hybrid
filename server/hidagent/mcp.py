@@ -93,6 +93,7 @@ def create_server(url: str | None = None):
                      coordinate_space: Literal["normalized", "pixels"] = "normalized",
                      target_box: tuple[float, float, float, float] | None = None,
                      rehome: bool = False,
+                     caret_scope: tuple[float, float, float, float] | None = None,
                      ) -> list[TextContent | ImageContent]:
         """Move without clicking. pointer_seen is true only after confirming the final landing.
 
@@ -104,12 +105,15 @@ def create_server(url: str | None = None):
             fields["target_box"] = target_box
         if rehome:
             fields["rehome"] = True
+        if caret_scope is not None:
+            fields["caret_scope"] = caret_scope
         return action("point", screen_id, **fields)
 
     @mcp.tool()
     def iphone_tap(x: float, y: float, screen_id: str,
                    coordinate_space: Literal["normalized", "pixels"] = "normalized",
-                   target_box: tuple[float, float, float, float] | None = None
+                   target_box: tuple[float, float, float, float] | None = None,
+                   caret_scope: tuple[float, float, float, float] | None = None,
                    ) -> list[TextContent | ImageContent]:
         """Click once with a visible pointer or measured error within an observed normalized target_box.
 
@@ -118,12 +122,15 @@ def create_server(url: str | None = None):
         fields = {"x": x, "y": y, "coordinate_space": coordinate_space}
         if target_box is not None:
             fields["target_box"] = target_box
+        if caret_scope is not None:
+            fields["caret_scope"] = caret_scope
         return action("tap", screen_id, **fields)
 
     @mcp.tool()
     def iphone_click_observed(pointer_x: float, pointer_y: float, screen_id: str,
                               target_box: tuple[float, float, float, float], target_label: str = "",
-                              duration: Annotated[float | None, Field(ge=.3, le=3, strict=True)] = None
+                              duration: Annotated[float | None, Field(ge=.3, le=3, strict=True)] = None,
+                              caret_scope: tuple[float, float, float, float] | None = None,
                               ) -> list[TextContent | ImageContent]:
         """Click ONCE at the existing pointer position, after YOU inspect it inside the visible target.
 
@@ -138,9 +145,12 @@ def create_server(url: str | None = None):
         it does not verify an iOS long-press effect. Stop or lost ACK triggers bounded release recovery.
         """
         with IPhoneClient(url) as client:
-            return content(client.click_observed(screen_id, pointer_x, pointer_y, target_box,
-                                                 target_label=target_label,
-                                                 **({"duration": duration} if duration is not None else {})))
+            return content(client.click_observed(
+                screen_id, pointer_x, pointer_y, target_box,
+                target_label=target_label,
+                **({"duration": duration} if duration is not None else {}),
+                **({"caret_scope": caret_scope} if caret_scope is not None else {}),
+            ))
 
     @mcp.tool()
     def iphone_find_text(text: str, screen_id: str, nth: int = 1,
@@ -155,8 +165,11 @@ def create_server(url: str | None = None):
             return content(client.find_text(text, screen_id, nth=nth, exact=exact, region=region))
 
     @mcp.tool()
-    def iphone_tap_text(text: str, screen_id: str, nth: int | None = None,
-                        exact: bool = False, region: list[float] | None = None) -> list[TextContent | ImageContent]:
+    def iphone_tap_text(
+        text: str, screen_id: str, nth: int | None = None,
+        exact: bool = False, region: list[float] | None = None,
+        caret_scope: tuple[float, float, float, float] | None = None,
+    ) -> list[TextContent | ImageContent]:
         """Locate visible text with optional OCR, verify pointer and tap once. nth is 1-based.
 
         Inspect the returned image and screen_diff; OCR text and changed pixels do not prove success.
@@ -164,7 +177,8 @@ def create_server(url: str | None = None):
         Send labels and substring-only targets require region. Missing or ambiguous text sends no HID.
         """
         return action("tap_text", screen_id, text=text, nth=nth, exact=exact,
-                      **({"region": region} if region is not None else {}))
+                      **({"region": region} if region is not None else {}),
+                      **({"caret_scope": caret_scope} if caret_scope is not None else {}))
 
     @mcp.tool()
     def iphone_swipe(x1: float, y1: float, x2: float, y2: float, screen_id: str,

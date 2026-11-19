@@ -66,10 +66,12 @@ class TargetChangedError(RuntimeError):
 class TextTargetGuard:
     """Ignore recognized cursor discs/outlines, never the entire target rectangle."""
 
-    def __init__(self, screen, before: bytes, target, *, observation=None, navigation_context=None):
+    def __init__(self, screen, before: bytes, target, *, observation=None, navigation_context=None,
+                 caret_scope=None):
         self.screen, self.target = screen, target
         self.generation = (observation if observation is not None else snapshot(screen)).generation
         self.navigation_context = navigation_context
+        self.caret_scope = caret_scope
         if navigation_context is not None:
             from .navigation_context import NavigationContext
 
@@ -99,7 +101,8 @@ class TextTargetGuard:
         red, green, blue = delta.split()
         mask = ImageChops.lighter(ImageChops.lighter(red, green), blue)
         retain_context_regions(mask, self.navigation_context.regions if self.navigation_context is not None else None)
-        mask_caret_blink(self.before, after, mask, getattr(self.screen, "recent_frames", ()))
+        mask_caret_blink(self.before, after, mask, getattr(self.screen, "recent_frames", ()),
+                         scope=self.caret_scope)
         mask_clock_ticks(self.before, after, mask)
         _, highlights = mask_pointer_highlights(self.before, after, mask)
         mask = mask.point(lambda value: 255 if value > 28 else 0)

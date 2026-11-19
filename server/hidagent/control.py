@@ -30,6 +30,18 @@ from .send_context import is_send_target, send_target_scope
 from .text_input import clipboard_mode_options, select_type_mode
 from .text_target import TextTargetGuard
 
+VERIFIED_CARET_SCOPE_TTL = 120.0
+
+
+@dataclass(frozen=True)
+class _VerifiedCaretScope:
+    region: tuple[float, float, float, float]
+    device: object
+    links: int
+    epoch: int
+    generation: int
+    recorded_monotonic: float
+
 
 @dataclass(frozen=True)
 class _ObservedInput:
@@ -66,7 +78,34 @@ class Controls:
         self.ticket = None
         self._input_observation = None
         self._host_observation = None
+        self._verified_caret_scope = None
         self.job = None
+
+    def remember_verified_caret_scope(self, region, *, device, links: int, epoch: int, generation: int) -> None:
+        normalized = tuple(ocr.validate_region(region))
+        self._verified_caret_scope = _VerifiedCaretScope(
+            normalized, device, links, epoch, generation, time.monotonic())
+
+    def clear_verified_caret_scope(self) -> None:
+        self._verified_caret_scope = None
+
+    def _resolve_caret_scope(self, explicit, *, inherit: bool = False) -> tuple[float, float, float, float] | None:
+        if explicit is not None:
+            return tuple(ocr.validate_region(explicit))
+        if not inherit:
+            return None
+        saved = getattr(self, "_verified_caret_scope", None)
+        if saved is None:
+            return None
+        device = getattr(self.phone, "device", None)
+        current = freshness.snapshot(self.screen)
+        if (device is not saved.device or getattr(device, "links", None) != saved.links
+                or getattr(device, "abort_epoch", None) != saved.epoch
+                or not current.live or current.generation != saved.generation
+                or not 0 <= time.monotonic() - saved.recorded_monotonic <= VERIFIED_CARET_SCOPE_TTL):
+            self.clear_verified_caret_scope()
+            return None
+        return saved.region
 
     def invalidate(self):
         qualified = self._host_observation
@@ -273,7 +312,8 @@ class Controls:
                 regions = navigation.regions
             if screen_compare.observation_changed(
                     original.frame, current.frame, context_regions=regions,
-                    caret_frames=getattr(self.screen, "recent_frames", ())):
+                    caret_frames=getattr(self.screen, "recent_frames", ()),
+                    caret_scope=plan.get("caret_scope")):
                 record("before_refresh", "layout_changed", current)
                 raise ValueError("screen changed since observation; observe again")
 
@@ -284,9 +324,11 @@ class Controls:
             before_refresh()
             await ensure(before_refresh=before_refresh)
             same_session()
+        caret_scope = plan.get("caret_scope")
         before, _, _ = self._validate_ticket(
             ticket, request.screen_id, navigation_context=navigation, observation=original,
-            on_reject=lambda reason, current: record("final_validation", reason, current), admission=admission)
+            on_reject=lambda reason, current: record("final_validation", reason, current), admission=admission,
+            caret_scope=caret_scope)
         plan.update(navigation_context=navigation, target_frame=before, observation=original,
                     before_session=same_session)
         return plan, before, ticket[1]
@@ -310,13 +352,16 @@ class Controls:
             raise ValueError("nth 从 1 开始。")
 
     async def _resolve_text(self, plan, before, observed_at):
+        caret_scope = plan.get("caret_scope")
+        guard_kwargs = {"caret_scope": caret_scope} if caret_scope is not None else {}
         if plan["name"] in {"tap", "long_press", "double_tap"}:
             target = SimpleNamespace(center=plan["xy"])
             if "target_box" in plan:
                 target.box = plan["target_box"]
             options = {"before_session": plan["before_session"]} if "before_session" in plan else {}
             guard_type = _ActionTargetGuard if options else TextTargetGuard
-            plan["before_click"] = guard_type(self.screen, before, target, observation=plan["observation"], **options)
+            plan["before_click"] = guard_type(
+                self.screen, before, target, observation=plan["observation"], **guard_kwargs, **options)
         if plan["name"] != "tap_text":
             return
         matches = await ocr.find_matches_async(before, plan["text"], plan["exact"], plan["region"])
@@ -335,7 +380,8 @@ class Controls:
         if (expired or current.generation != plan["observation"].generation
                 or screen_compare.observation_changed(
                     before, current.frame,
-                    caret_frames=getattr(self.screen, "recent_frames", ()))):
+                    caret_frames=getattr(self.screen, "recent_frames", ()),
+                    caret_scope=caret_scope)):
             raise ValueError("OCR 期间屏幕已变化或观察已过期，请重新观察再点击。")
         match = ocr.select_match(matches, plan["text"], plan["nth"], plan["region"])
         if match is None:
@@ -344,7 +390,8 @@ class Controls:
         plan["is_send"] = is_send_target(plan["text"], match.text)
         options = {"before_session": plan["before_session"]} if "before_session" in plan else {}
         guard_type = _ActionTargetGuard if options else TextTargetGuard
-        plan["before_click"] = guard_type(self.screen, before, match, observation=plan["observation"], **options)
+        plan["before_click"] = guard_type(
+            self.screen, before, match, observation=plan["observation"], **guard_kwargs, **options)
         plan["target_box"], plan["target_frame"] = match.box, before
         plan["extra"]["text_match"] = asdict(match)
 
@@ -368,6 +415,10 @@ class Controls:
             return x, y
 
         planned = {"name": name, "extra": extra, "repeat": request.repeat, "text": request.text}
+        caret_scope = self._resolve_caret_scope(
+            getattr(request, "caret_scope", None), inherit=name in {"point", "tap", "tap_text"})
+        if caret_scope is not None:
+            planned["caret_scope"] = caret_scope
         if name == "tap_text":
             self._check_text_query(request.text, request.nth)
             planned.update(nth=request.nth, exact=request.exact, region=ocr.validate_region(request.region))
@@ -462,17 +513,20 @@ class Controls:
                 planned["_input_guard"] = InputContextGuard(self.screen, original)
             planned["_input_guard"](stage=stage)
             return
+        caret_scope = planned.get("caret_scope")
         if cursor is not None:
             # Gesture callers forward internally measured evidence, never a caller-supplied mask.
             # Reuse the same crop checks as the final pointer guard at the device write boundary.
             if "_gesture_context" not in planned:
                 planned["_gesture_context"] = TextTargetGuard(
-                    self.screen, original.frame, SimpleNamespace(center=cursor[0]), observation=original)
+                    self.screen, original.frame, SimpleNamespace(center=cursor[0]), observation=original,
+                    **({"caret_scope": caret_scope} if caret_scope is not None else {}))
             planned["_gesture_context"](cursor=cursor, reference=reference)
             return
         if screen_compare.observation_changed(
             original.frame, current.frame,
-            caret_frames=getattr(self.screen, "recent_frames", ())):
+            caret_frames=getattr(self.screen, "recent_frames", ()),
+            caret_scope=caret_scope):
             raise RuntimeError("screen changed since the original observation; observe again before acting")
 
     async def _execute(self, planned: dict) -> float | None:
@@ -486,6 +540,8 @@ class Controls:
                 kwargs.update(target_box=planned["target_box"], target_frame=planned["target_frame"])
             if "before_click" in planned:
                 kwargs["before_click"] = planned["before_click"]
+            if planned.get("caret_scope") is not None:
+                kwargs["caret_scope"] = planned["caret_scope"]
             if name == "long_press":
                 kwargs["duration"] = planned["duration"]
             if name == "double_tap":
@@ -504,6 +560,8 @@ class Controls:
                 kwargs["target_box"] = planned["target_box"]
             if planned.get("rehome"):
                 kwargs["rehome"] = True
+            if planned.get("caret_scope") is not None:
+                kwargs["caret_scope"] = planned["caret_scope"]
             located = await self.phone.point_verified(*planned["xy"], **kwargs)
             confirmed = getattr(self.phone, "_pointer_confirmed", False)
             extra["pointer"] = {"x": located[0], "y": located[1]}
@@ -734,6 +792,8 @@ class Controls:
                 completed_at = time.time()
             except (RuntimeError, OSError) as exc:
                 error = str(exc)
+        if acknowledged and plan["name"] != "point":
+            self.clear_verified_caret_scope()
         options = {"home_unconfirmed": home_unconfirmed} if home_unconfirmed is not None else {}
         return await self._respond(before, completed_at or time.time(), began, ready, acknowledged, error,
                                    plan["extra"], request.include_diff, request.ocr_diff, response_session, **options)
@@ -832,6 +892,7 @@ class Controls:
                 or not math.isfinite(inputs.last_input_at) or inputs.session_started_at is None
                 or not math.isfinite(inputs.session_started_at)):
             raise ValueError("host-observed click requires device input history; observe again")
+        caret_scope = self._resolve_caret_scope(getattr(request, "caret_scope", None), inherit=True)
 
         def validate_original():
             device = self.phone.device
@@ -844,7 +905,7 @@ class Controls:
                 raise ValueError(
                     "observe a new frame after connection/last input and mirror pipeline before host-click")
             if qualified is None:
-                self._validate_ticket(ticket, request.screen_id)
+                self._validate_ticket(ticket, request.screen_id, caret_scope=caret_scope)
             else:
                 self._check_ticket(ticket, request.screen_id)
 
@@ -864,12 +925,14 @@ class Controls:
                     expected_abort_epoch=inputs.epoch, expected_input_seq=inputs.sequence,
                     before_click=validate_original,
                     **({"duration": duration} if duration is not None else {}),
-                    **({"host_observation": qualified} if qualified is not None else {}))
+                    **({"host_observation": qualified} if qualified is not None else {}),
+                    **({"caret_scope": caret_scope} if caret_scope is not None else {}))
             if isinstance(result, dict):
                 result = dict(result)
                 completed_at = result.pop("completed_at", None)
                 extra.update(result)
             acknowledged = True
+            self.clear_verified_caret_scope()
         except (RuntimeError, OSError) as exc:
             error = str(exc)
         return await self._respond(before, completed_at or time.time(), began, ready, acknowledged, error, extra,

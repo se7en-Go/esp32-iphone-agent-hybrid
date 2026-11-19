@@ -49,6 +49,8 @@ def parser() -> argparse.ArgumentParser:
                             metavar=("LEFT", "TOP", "RIGHT", "BOTTOM"))
     host_click.add_argument("--target-label", default="", help="visible target label; required for sending controls")
     host_click.add_argument("--duration", type=float, help="hold the stationary pointer for 0.3..3 seconds")
+    host_click.add_argument("--caret-scope", nargs=4, type=float, metavar=("LEFT", "TOP", "RIGHT", "BOTTOM"),
+                            help="verified input field bounds [L T R B] in 0..1 where a green caret may blink")
     _context(host_click, required=True)
     for name, keys in {"point": ("x", "y"), "tap": ("x", "y"), "swipe": ("x1", "y1", "x2", "y2"),
                        "scroll": ("x", "y", "lines"), "long-press": ("x", "y"),
@@ -60,6 +62,9 @@ def parser() -> argparse.ArgumentParser:
                  coordinates=True, target=name in {"point", "tap", "long-press", "double-tap"})
         if name == "point":
             action.add_argument("--rehome", action="store_true", help="re-home pointer to origin before moving")
+        if name in {"point", "tap"}:
+            action.add_argument("--caret-scope", nargs=4, type=float, metavar=("LEFT", "TOP", "RIGHT", "BOTTOM"),
+                                help="verified input field bounds [L T R B] in 0..1 where a green caret may blink")
         if name == "long-press":
             action.add_argument("--duration", type=float, default=.8, help="hold duration, 0.3..3 seconds")
         if name == "circle":
@@ -89,6 +94,9 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--nth", type=int, default=1 if name == "find-text" else None)
         command.add_argument("--exact", action="store_true")
         command.add_argument("--region", nargs=4, type=float, metavar=("LEFT", "TOP", "RIGHT", "BOTTOM"))
+        if name == "tap-text":
+            command.add_argument("--caret-scope", nargs=4, type=float, metavar=("LEFT", "TOP", "RIGHT", "BOTTOM"),
+                                 help="verified input field bounds [L T R B] in 0..1 where a green caret may blink")
         _context(command, required=True)
     compose = sub.add_parser("compose-chinese")
     compose.add_argument("text")
@@ -198,13 +206,14 @@ def _action_fields(args):
     if args.screen_id is not None and not args.screen_id.strip():
         raise ValueError("--screen-id must be nonempty; run observe first")
     if args.screen_id:
-        for key in ("coordinate_space", "target_box", "repeat", "enter_intent", "region"):
+        for key in ("coordinate_space", "target_box", "caret_scope", "repeat", "enter_intent", "region"):
             value = getattr(args, key, None)
             if value is not None:
                 fields[key] = value
         if args.command == "point" and getattr(args, "rehome", False):
             fields["rehome"] = True
     elif (getattr(args, "target_box", None) is not None
+          or getattr(args, "caret_scope", None) is not None
           or getattr(args, "rehome", False)
           or getattr(args, "coordinate_space", "normalized") != "normalized"
           or getattr(args, "repeat", 1) != 1 or getattr(args, "enter_intent", None) is not None
@@ -228,9 +237,11 @@ def main(argv=None) -> int:
                 case "capabilities": result = client.capabilities()
                 case "observe": result = _save_evidence(client.observe(for_click=args.for_click), args.output)
                 case "click-observed":
-                    result = client.click_observed(args.screen_id, args.pointer_x, args.pointer_y, args.target_box,
-                                                   target_label=args.target_label,
-                                                   **({"duration": args.duration} if args.duration is not None else {}))
+                    result = client.click_observed(
+                        args.screen_id, args.pointer_x, args.pointer_y, args.target_box,
+                        target_label=args.target_label,
+                        **({"duration": args.duration} if args.duration is not None else {}),
+                        **({"caret_scope": args.caret_scope} if args.caret_scope is not None else {}))
                 case "screenshot":
                     args.output.write_bytes(client.screenshot())
                     result = {"path": str(args.output.resolve())}
