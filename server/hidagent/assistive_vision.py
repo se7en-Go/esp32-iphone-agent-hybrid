@@ -212,7 +212,7 @@ def stationary_button_at(frame: bytes, target: tuple[Point, Box]) -> bool:
         if idx in coherent:
             continue
         rgb = tuple(channel[idx] for channel in core_rgb)
-        if core[idx] > i_med + 5 or max(rgb) - min(rgb) > 30:
+        if core[idx] > inner[idx] + 5 or max(rgb) - min(rgb) > 30:
             return False
     return True
 

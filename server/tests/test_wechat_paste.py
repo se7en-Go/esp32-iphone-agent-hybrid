@@ -456,3 +456,57 @@ def test_stationary_assistive_button_occluding_ocr_anchor_confirms(monkeypatch):
             lambda f: ((.85, .51), (.75, .47, .95, .55)),
         )
         assert asyncio.run(run(base_before + [near_field_anchor], base_after)) is False
+
+
+def test_stationary_button_at_eliminates_inner_median_boundary_dead_zone(monkeypatch):
+    from hidagent import assistive_vision
+
+    frame = load("assistive_bright_occluded")
+    target = ((.8958, .3205), (.8268, .2885, .9649, .3525))
+    image = assistive_vision._small(frame)
+    w, h = image.size
+    _, box = target
+    outer_r = ((box[2] - box[0]) * w + (box[3] - box[1]) * h) / (4 * .85)
+
+    def run_rays(core_vals, inner_vals, outer_vals, outside_vals, *, core_rgb_vals=None):
+        counts = {"core": 0, "outer": 0}
+        rgb_sets = core_rgb_vals or (core_vals, core_vals, core_vals)
+
+        def fake_circle(_img, _x, _y, radius):
+            ratio = round(radius / outer_r, 2)
+            if ratio == .25:
+                idx = counts["core"]
+                counts["core"] += 1
+                return list(core_vals) if idx == 0 else list(rgb_sets[idx - 1])
+            if ratio == .58:
+                return list(inner_vals)
+            if ratio == .87:
+                counts["outer"] += 1
+                return list(outer_vals)
+            if ratio == 1.22:
+                return list(outside_vals)
+            raise AssertionError(f"unexpected radius ratio {ratio}")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(assistive_vision, "_circle", fake_circle)
+            return assistive_vision.stationary_button_at(frame, target)
+
+    outer = [178] * 12
+    outside = [238] * 12
+    inner = [192, 191, 190, 193, 192, 193, 193, 192, 191, 192, 190, 190]
+    core = [200, 209, 209, 209, 209, 198, 150, 134, 134, 133, 134, 133]
+
+    # Ray 5 sits at core[5] == inner[5] + 5 (198 > i_med + 5 == 197) with neutral RGB.
+    assert run_rays(core, inner, outer, outside) is True
+
+    # Negative: ray 5 brighter than inner[5] + 5 on a broken-ring ray still rejects.
+    broken_outer = list(outer)
+    broken_outer[5] = 193
+    bright_core = list(core)
+    bright_core[5] = 205
+    assert run_rays(bright_core, inner, broken_outer, outside) is False
+
+    # Negative: colored RGB smudge on ray 5 (span 50 > 30) still rejects.
+    r_ch, g_ch, b_ch = list(core), list(core), list(core)
+    r_ch[5], g_ch[5], b_ch[5] = 225, 175, 175
+    assert run_rays(core, inner, outer, outside, core_rgb_vals=(r_ch, g_ch, b_ch)) is False
