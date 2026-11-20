@@ -1,5 +1,6 @@
 """Corroborate host-observed paste effects after an iOS paste permission prompt."""
 
+import asyncio
 import hashlib
 import io
 import math
@@ -8,7 +9,7 @@ import unicodedata
 from collections import Counter
 from statistics import median
 
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 from . import assistive_vision, input_context, ocr, screen_compare
 
@@ -17,6 +18,7 @@ _DENY = {"don'tallowpaste", "don’tallowpaste", "don'tallow", "don’tallow",
          "不允许粘贴", "不允许", "不允許貼上", "不允許"}
 _PASTE_FROM = re.compile(r"(?:wouldliketo|wantsto)pastefrom.+|想(?:要)?[从從].+(?:粘贴|貼上)")
 _MIN_CONFIDENCE = .83
+_VERTICAL_AA = ImageFilter.Kernel((3, 3), (0, 1, 0, 0, 2, 0, 0, 1, 0), scale=4)
 
 
 def _visible_text(text):
@@ -281,13 +283,15 @@ def _scrolled_viewport_match(
 
     before_360 = original_image.resize((w, h), Image.Resampling.BILINEAR)
     after_360 = current_image.resize((w, h), Image.Resampling.BILINEAR)
+    after_360_aa = after_360.filter(_VERTICAL_AA)
 
     def shifted_pair(d_orig: float):
-        # Resample at native resolution before 360p downsampling to match `after_360`'s box filter.
+        # Resample at native resolution before 360p downsampling and apply symmetric 1D vertical
+        # anti-aliasing inside the viewport band to absorb fractional-pixel row phase residuals.
         a_full = original_image.transform((ow, oh), Image.Transform.AFFINE, (1, 0, 0, 0, 1, d_orig),
-                                          resample=Image.Resampling.BILINEAR)
+                                          resample=Image.Resampling.BICUBIC)
         a_360 = a_full.resize((w, h), Image.Resampling.BILINEAR)
-        red, green, blue = ImageChops.difference(a_360, after_360).split()
+        red, green, blue = ImageChops.difference(a_360.filter(_VERTICAL_AA), after_360_aa).split()
         sd = ImageChops.lighter(ImageChops.lighter(red, green), blue)
         if assistive_box is not None:
             sdraw = ImageDraw.Draw(sd)
@@ -309,8 +313,10 @@ def _scrolled_viewport_match(
 
     delta_px = growth_delta * oh
     max_err = max(4., .006 * oh)
-    low, high = delta_px - max_err, delta_px + max_err
-    coarse_steps = sorted({low, high, *(delta_px + k for k in range(-math.floor(max_err), math.floor(max_err) + 1))})
+    low = max(1., delta_px - max_err)
+    high = max(low, delta_px + max_err)
+    coarse_steps = sorted({low, high, *(d for k in range(-math.floor(max_err), math.floor(max_err) + 1)
+                                         if low <= (d := delta_px + k) <= high)})
     best = min((eval_shift(d) for d in coarse_steps), key=lambda item: item[0])
     best_coarse = best[1]
     fine_steps = [min(high, max(low, best_coarse + k * .1)) for k in range(-9, 10) if k != 0]
@@ -374,8 +380,10 @@ def _same_context_scrolled(before, after, region, current_region, *, split_y: fl
                  and not _ignored_across_scroll(i, ignored_boxes, -scroll_delta)]
     after_vp = [i for i in curr_anchors if split_y <= i.center[1] <= current_region[1]
                 and not _ignored_across_scroll(i, ignored_boxes, scroll_delta)]
-    _, unmatched_before, unmatched_after = _match_shifted_anchors(
+    matched_vp, unmatched_before, unmatched_after = _match_shifted_anchors(
         before_vp, after_vp, dy=scroll_delta, tol_x=.008, tol_y=.008)
+    if len(matched_vp) >= 2 and abs(median(b.center[1] - a.center[1] for b, a in matched_vp) - scroll_delta) > .006:
+        return False
     top_margin, bot_margin = .010, .012
     strict_before = {
         id(i) for i in before_vp
@@ -468,7 +476,7 @@ def _field_span(image, left, right, bottom):
     return min(rows) / h, (max(rows) + 1) / h
 
 
-def _grown_field(original_image, current_image, region, suggestion_bar):
+def _grown_field(original_image, current_image, region, suggestion_bar, *, assistive_box=None):
     """The same chat input field after it grew upward for multi-line text.
 
     Its bottom edge must stay put just above the located suggestion strip, its
@@ -487,12 +495,25 @@ def _grown_field(original_image, current_image, region, suggestion_bar):
     # The field's expand control appears left of the grown field, above the old top.
     expand = (.02, max(.06, after[0] - .008), region[0], before[0])
     # Right of the field the input bar's own background now covers the page. It
-    # must be a flat bar colour; any content there is still a change.
+    # must be a flat bar colour; any content there is still a change. Skip only
+    # a stationary AssistiveTouch floating button independently proven by both frames.
     band = (min(1., region[2] + .01), expand[1], 1., before[0])
     w, h = current_image.size
-    pixels = [sum(current_image.getpixel((x, y))) / 3
-              for y in range(round(band[1] * h), round(band[3] * h)) for x in range(round(band[0] * w), w)]
+    bx0, by0, bx1, by1 = round(band[0] * w), round(band[1] * h), w, round(band[3] * h)
+    total_band = max(0, bx1 - bx0) * max(0, by1 - by0)
+    hole = None
+    if assistive_box is not None and _boxes_overlap(band, assistive_box):
+        hole = (round(assistive_box[0] * w), round(assistive_box[1] * h),
+                round(assistive_box[2] * w), round(assistive_box[3] * h))
+    pixels = [
+        sum(current_image.getpixel((x, y))) / 3
+        for y in range(by0, by1)
+        for x in range(bx0, bx1)
+        if not (hole and hole[0] <= x < hole[2] and hole[1] <= y < hole[3])
+    ]
     if not pixels or max(pixels) - min(pixels) > 24:
+        return None
+    if hole is not None and len(pixels) < max(200, round(.20 * total_band)):
         return None
     return current, (expand, (region[2], band[1], 1., band[3])), before[0] - after[0]
 
@@ -540,15 +561,21 @@ def _matches_wrapped_lines(added: tuple[str, ...], expected: tuple[str, ...]) ->
     return idx == len(added)
 
 
-async def _verify_before_after_uncached(read_fn, before, after, original_image, current_image,
-                                        region, expected) -> bool:
-    original = await read_fn(before)
-    current = await read_fn(after)
+def _verify_before_after_sync(before, after, original, current, region, expected) -> bool:
+    original_image, current_image = _image(before), _image(after)
+    if original_image.size != current_image.size:
+        return False
     if _is_permission_prompt(original) or _is_permission_prompt(current):
         return False
     suggestion_bar = _located_suggestion_bar(before, after, region)
-    grown = _grown_field(original_image, current_image, region, suggestion_bar)
+    assistive_box = screen_compare.stationary_assistive_button_box(before, after, exclude=(region,))
+    grown = _grown_field(original_image, current_image, region, suggestion_bar, assistive_box=assistive_box)
     current_region = grown[0] if grown else region
+    if assistive_box is not None and _boxes_overlap(assistive_box, current_region):
+        assistive_box = None
+        if grown is not None:
+            grown = _grown_field(original_image, current_image, region, suggestion_bar, assistive_box=None)
+            current_region = grown[0] if grown else region
     original_lines = _field_lines(original, region)
     current_lines = _field_lines(current, current_region)
     # The pasted text must be new and appear after the existing field
@@ -569,7 +596,6 @@ async def _verify_before_after_uncached(read_fn, before, after, original_image, 
             return True
     elif len(current_lines) < 2:
         return False  # only multi-line text grows the field
-    assistive_box = screen_compare.stationary_assistive_button_box(before, after, exclude=(region, current_region))
     if suggestion_bar is None and (grown is not None or assistive_box is None):
         return False
     extra = []
@@ -602,17 +628,52 @@ async def _verify_before_after_uncached(read_fn, before, after, original_image, 
     )
 
 
-async def _verify_before_after(before, after, original_image, current_image, region, expected) -> bool:
+async def _verify_before_after_uncached(read_fn, before, after, region, expected) -> bool:
+    original = await read_fn(before)
+    current = await read_fn(after)
+    return await asyncio.to_thread(_verify_before_after_sync, before, after, original, current, region, expected)
+
+
+async def _verify_before_after(before, after, region, expected) -> bool:
     global _PAIR_CACHE
     read_fn = ocr.read_text_async
     key = (hashlib.sha256(before).digest(), hashlib.sha256(after).digest(), region, expected)
     cached = _PAIR_CACHE
     if cached is not None and cached[0] is read_fn and cached[1] == key:
         return cached[2]
-    verified = await _verify_before_after_uncached(
-        read_fn, before, after, original_image, current_image, region, expected)
+    verified = await _verify_before_after_uncached(read_fn, before, after, region, expected)
     _PAIR_CACHE = (read_fn, key, verified)
     return verified
+
+
+def _expected_lines(observed_text: str) -> tuple[str, ...]:
+    # Blank lines (e.g. a leading newline when appending after existing
+    # text) have no OCR row, so they cannot be verified visually; the
+    # transaction digest already pins the exact intended text. Compare
+    # only the visible lines.
+    return tuple(line for line in (_visible_text(line) for line in observed_text.splitlines()) if line)
+
+
+def _same_frame_sizes(*frames: bytes) -> bool:
+    sizes = set()
+    for frame in frames:
+        with Image.open(io.BytesIO(frame)) as image:
+            sizes.add(image.size)
+    return len(sizes) == 1
+
+
+async def verify_before_after_for_permission(before, after, region, observed_text) -> bool:
+    """Verify before/after paste state alone before scanning permission-sheet candidates."""
+    if not before or not after or before == after or region is None:
+        return False
+    try:
+        region = ocr.validate_region(region)
+        expected = _expected_lines(observed_text)
+        if not expected:
+            return False
+        return await _verify_before_after(before, after, region, expected)
+    except (ocr.OCRError, OSError, ValueError):
+        return False
 
 
 async def verify_after_paste_permission(before, sheet, after, region, observed_text) -> bool:
@@ -621,18 +682,16 @@ async def verify_after_paste_permission(before, sheet, after, region, observed_t
         return False
     try:
         region = ocr.validate_region(region)
-        # Blank lines (e.g. a leading newline when appending after existing
-        # text) have no OCR row, so they cannot be verified visually; the
-        # transaction digest already pins the exact intended text. Compare
-        # only the visible lines.
-        expected = tuple(line for line in (_visible_text(line) for line in observed_text.splitlines()) if line)
+        expected = _expected_lines(observed_text)
         if not expected:
             return False
-        original_image, sheet_image, current_image = (_image(frame) for frame in (before, sheet, after))
-        if original_image.size != sheet_image.size or original_image.size != current_image.size:
+        if not await asyncio.to_thread(_same_frame_sizes, before, sheet, after):
             return False
-        if not await _verify_before_after(before, after, original_image, current_image, region, expected):
+        if not await _verify_before_after(before, after, region, expected):
             return False
         return _is_permission_prompt(await ocr.read_text_async(sheet))
     except (ocr.OCRError, OSError, ValueError):
         return False
+
+
+_default_verify_after_paste_permission = verify_after_paste_permission

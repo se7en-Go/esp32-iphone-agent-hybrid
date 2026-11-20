@@ -524,16 +524,21 @@ def _encode(image: Image.Image) -> bytes:
 
 def _scrolled_chat_pair(
     *,
-    shift_px: int = 77,
+    shift_px: float = 77,
     with_viewport_ocr: bool = True,
     single_line: bool = False,
+    button_y: int = 320,
 ):
     """Build synthetic full-chat frames on `wrapped_original` / `wrapped_pasted`."""
     orig_base = Image.open(io.BytesIO(load("wrapped_original"))).convert("RGB")
     after_base = Image.open(io.BytesIO(load("wrapped_original" if single_line else "wrapped_pasted"))).convert("RGB")
-    ab_box = (400, 320, 494, 428)
-    ab_before = orig_base.crop(ab_box)
-    ab_after = after_base.crop(ab_box)
+    ab_src = (400, 320, 494, 428)
+    ab_before = orig_base.crop(ab_src)
+    ab_after = after_base.crop(ab_src)
+    if button_y != 320:
+        for img in (orig_base, after_base):
+            ImageDraw.Draw(img).rectangle(ab_src, fill=(239, 237, 240))
+    ab_dest = (400, button_y, 494, button_y + (ab_src[3] - ab_src[1]))
 
     canvas = Image.new("RGB", orig_base.size, (239, 237, 240))
     cdraw = ImageDraw.Draw(canvas)
@@ -550,19 +555,19 @@ def _scrolled_chat_pair(
 
     orig_img = orig_base.copy()
     orig_img.paste(canvas.crop((0, 118, 500, 558)), (0, 118))
-    orig_img.paste(ab_before, ab_box[:2])
+    orig_img.paste(ab_before, ab_dest[:2])
 
     after_vp_bot = 558 if single_line else 483
     after_img = after_base.copy()
-    src_top = 118 + shift_px
-    src_bot = min(558, after_vp_bot + shift_px)
-    after_img.paste(canvas.crop((0, src_top, 500, src_bot)), (0, 118))
-    if src_bot - src_top < after_vp_bot - 118:
-        ImageDraw.Draw(after_img).rectangle(
-            (0, 118 + (src_bot - src_top), 500, after_vp_bot),
-            fill=(239, 237, 240),
-        )
-    after_img.paste(ab_after, ab_box[:2])
+    shifted_canvas = canvas.transform(
+        orig_base.size, Image.Transform.AFFINE, (1, 0, 0, 0, 1, shift_px), resample=Image.Resampling.BICUBIC,
+    )
+    copy_bot = min(after_vp_bot, 558 - int(shift_px))
+    if copy_bot > 118:
+        after_img.paste(shifted_canvas.crop((0, 118, 500, copy_bot)), (0, 118))
+    if copy_bot < after_vp_bot:
+        ImageDraw.Draw(after_img).rectangle((0, max(118, copy_bot), 500, after_vp_bot), fill=(239, 237, 240))
+    after_img.paste(ab_after, ab_dest[:2])
     if single_line:
         ImageDraw.Draw(after_img).rectangle((86, 588, 220, 604), fill=(40, 40, 40))
 
@@ -622,16 +627,26 @@ def test_grown_field_confirms_full_chat_rigid_viewport_scroll(monkeypatch):
     b3, a3, bo3, ao3 = _scrolled_chat_pair(shift_px=77, with_viewport_ocr=False)
     assert run(b3, a3, bo3, ao3) is True
 
+    # 4) Fractional subpixel scroll + stationary AssistiveTouch parked inside grown right-of-field band.
+    b4, a4, bo4, ao4 = _scrolled_chat_pair(shift_px=77.4, with_viewport_ocr=True, button_y=450)
+    assert run(b4, a4, bo4, ao4) is True
+
 
 @pytest.mark.parametrize("tamper", [
     "header_text_changed",
     "header_pixel_tampered",
     "keyboard_tampered",
     "viewport_bubble_edited",
+    "viewport_thin_2px_bar",
+    "viewport_12px_dot",
     "split_zone_tampered",
     "extra_scroll_new_message",
     "viewport_ocr_changed",
     "viewport_ocr_missing",
+    "viewport_ocr_median_drift",
+    "band_non_assistive_sticker",
+    "band_assistive_plus_tamper",
+    "assistive_overlaps_grown_field",
     "single_line_no_growth",
     "assistive_panel_open",
     "wrong_pasted_text",
@@ -640,9 +655,11 @@ def test_grown_field_confirms_full_chat_rigid_viewport_scroll(monkeypatch):
 def test_grown_field_scrolled_viewport_rejects_tamper(monkeypatch, tamper):
     from hidagent import assistive_vision, paste_confirmation
 
+    button_y = 450 if tamper in {"band_non_assistive_sticker", "band_assistive_plus_tamper"} else 320
     before_img, after_img, before_ocr, after_ocr = _scrolled_chat_pair(
         shift_px=77 + (30 if tamper == "extra_scroll_new_message" else 0),
         single_line=(tamper == "single_line_no_growth"),
+        button_y=button_y,
     )
     text = "单行消息内容" if tamper == "single_line_no_growth" else WRAPPED_TEXT
     if tamper == "header_text_changed":
@@ -660,6 +677,14 @@ def test_grown_field_scrolled_viewport_rejects_tamper(monkeypatch, tamper):
         im = Image.open(io.BytesIO(after_img)).convert("RGB")
         ImageDraw.Draw(im).rectangle((200, 230, 235, 260), fill=(149, 236, 105))
         after_img = _encode(im)
+    elif tamper == "viewport_thin_2px_bar":
+        im = Image.open(io.BytesIO(after_img)).convert("RGB")
+        ImageDraw.Draw(im).rectangle((160, 240, 260, 242), fill=(40, 40, 40))
+        after_img = _encode(im)
+    elif tamper == "viewport_12px_dot":
+        im = Image.open(io.BytesIO(after_img)).convert("RGB")
+        ImageDraw.Draw(im).rectangle((200, 240, 212, 252), fill=(40, 40, 40))
+        after_img = _encode(im)
     elif tamper == "split_zone_tampered":
         im = Image.open(io.BytesIO(after_img)).convert("RGB")
         ImageDraw.Draw(im).rectangle((210, 110, 270, 128), fill=(180, 40, 40))
@@ -669,6 +694,27 @@ def test_grown_field_scrolled_viewport_rejects_tamper(monkeypatch, tamper):
                      if i.text == "中间一条完整聊天消息" else i for i in after_ocr]
     elif tamper == "viewport_ocr_missing":
         after_ocr = [i for i in after_ocr if i.text != "中间一条完整聊天消息"]
+    elif tamper == "viewport_ocr_median_drift":
+        drift = .007
+        vp_targets = {"10:03", "联系人甲", "中间一条完整聊天消息", "10:05", "联系人乙", "底部贴近输入栏的历史消息"}
+        after_ocr = [
+            ocr.TextBox(i.text, (i.box[0], i.box[1] - drift, i.box[2], i.box[3] - drift),
+                        (i.center[0], i.center[1] - drift), i.conf)
+            if i.text in vp_targets else i
+            for i in after_ocr
+        ]
+    elif tamper == "band_non_assistive_sticker":
+        im = Image.open(io.BytesIO(after_img)).convert("RGB")
+        ImageDraw.Draw(im).rectangle((400, 450, 494, 558), fill=(239, 237, 240))
+        ImageDraw.Draw(im).rounded_rectangle((415, 490, 480, 540), radius=8, fill=(149, 236, 105))
+        after_img = _encode(im)
+    elif tamper == "band_assistive_plus_tamper":
+        im = Image.open(io.BytesIO(after_img)).convert("RGB")
+        ImageDraw.Draw(im).rectangle((386, 495, 402, 540), fill=(149, 236, 105))
+        after_img = _encode(im)
+    elif tamper == "assistive_overlaps_grown_field":
+        monkeypatch.setattr(screen_compare, "stationary_assistive_button_box",
+                            lambda *_a, **_kw: (.74, .44, .92, .51))
     elif tamper == "wrong_pasted_text":
         text = WRAPPED_TEXT.replace("正常", "异常")
     elif tamper == "no_header_anchor":

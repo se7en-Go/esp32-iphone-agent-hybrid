@@ -246,7 +246,8 @@ class StagedClipboardControls:
             raise ValueError("confirmation requires a fresh post-paste observation")
         evidence = {}
         try:
-            item.guard(stage="accept")  # allow text changes only inside the original observed input area
+            # Allow text changes only inside the original observed input area.
+            await asyncio.to_thread(item.guard, stage="accept")
         except RuntimeError:
             # A native paste permission sheet can re-render the original page.
             # This evidence only records the effect of a paste that already ran.
@@ -257,11 +258,16 @@ class StagedClipboardControls:
             # candidate list by later ordinary frames or by the 4 s recent
             # window expiring: frames retained at paste time, and a sheet
             # verified once in this transaction, stay candidates.
-            from .paste_confirmation import verify_after_paste_permission
+            from . import paste_confirmation
 
+            verify = paste_confirmation.verify_after_paste_permission
             result = controls._observation
             after = result.frame
             original = item.guard.original
+            if (verify is paste_confirmation._default_verify_after_paste_permission
+                    and not await paste_confirmation.verify_before_after_for_permission(
+                        original.frame, after, item.guard.region, request.observed_text)):
+                raise
             seen = {original.frame, after}
             verified = None
             # A sheet this transaction already verified stays usable even
@@ -271,7 +277,7 @@ class StagedClipboardControls:
                 frame, updated, generation = item.sheet_evidence
                 if (frame and frame not in seen and generation == original.generation
                         and updated > item.completed_at and updated <= result.updated
-                        and await verify_after_paste_permission(
+                        and await verify(
                             original.frame, frame, after,
                             item.guard.region, request.observed_text)):
                     verified = item.sheet_evidence
@@ -296,10 +302,10 @@ class StagedClipboardControls:
                     # A permission sheet dims and covers the page, so it differs
                     # from both the original page and the result page. Skip
                     # plain pre-sheet or post-sheet frames before OCR (~1 s/frame).
-                    if (not screen_compare.observation_changed(after, frame)
-                            or not screen_compare.observation_changed(original.frame, frame)):
+                    if (not await asyncio.to_thread(screen_compare.observation_changed, after, frame)
+                            or not await asyncio.to_thread(screen_compare.observation_changed, original.frame, frame)):
                         continue
-                    if await verify_after_paste_permission(
+                    if await verify(
                             original.frame, frame, after,
                             item.guard.region, request.observed_text):
                         verified = (frame, updated, generation)

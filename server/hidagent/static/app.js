@@ -163,7 +163,7 @@ $("zoom").addEventListener("click", () => $("zoom").close());
 const live = $("live");
 let down = null, calibrating = false;
 let previewState = "waiting", previewGeneration = null, boardFrozen = false, expectsFrame = false;
-let previewEpoch = 0;
+let previewEpoch = 0, liveFetchFailures = 0;
 let refreshingForInput = false;
 const canUsePreview = () => live.complete && live.naturalWidth > 0
   && (previewState === "live" || previewState === "idle");
@@ -254,6 +254,7 @@ function showFrame(url, state, age, generation = null) {
 
 function invalidatePreview(state, generation = previewGeneration) {
   previewEpoch += 1;
+  liveFetchFailures = 0;
   showFrame("", state, null, generation);
 }
 
@@ -265,6 +266,7 @@ async function refreshLive() {
       const r = await fetch("/api/frame.jpg", { cache: "no-store", signal: AbortSignal.timeout(2500) });
       const state = r.headers.get("X-Preview-State") || (r.ok ? "live" : "waiting");
       const generation = r.headers.get("X-Preview-Generation");
+      if (epoch === previewEpoch) liveFetchFailures = 0;
       if (r.ok) {
         const frame = await r.blob();
         // Status may have observed a disconnect/new session while either headers
@@ -278,12 +280,15 @@ async function refreshLive() {
       }
     } catch {
       if (epoch === previewEpoch) {
-        expectsFrame = false;
-        invalidatePreview("disconnected");
+        liveFetchFailures += 1;
+        if (liveFetchFailures >= 3) {
+          expectsFrame = false;
+          invalidatePreview("disconnected");
+        }
       }
     }
   }
-  setTimeout(refreshLive, expectsFrame ? 150 : 400);
+  setTimeout(refreshLive, expectsFrame ? (liveFetchFailures ? 400 : 150) : 400);
 }
 
 // ---- controls ------------------------------------------------------------------------
@@ -346,9 +351,11 @@ function formatHid(hid, hint) {
 // ---- polling -------------------------------------------------------------------------
 
 let shown = "";
+let statusFetchFailures = 0;
 async function poll() {
   try {
     const s = await (await fetch("/api/status", { cache: "no-store", signal: AbortSignal.timeout(2500) })).json();
+    statusFetchFailures = 0;
     let ready = true;
     boardFrozen = s.video?.board?.fz === 1;
     expectsFrame = !!s.screen;
@@ -422,11 +429,14 @@ async function poll() {
       $("wall").replaceChildren(...cards.reverse());  // newest first
     }
   } catch {
-    expectsFrame = false;
-    boardFrozen = false;
-    invalidatePreview("disconnected");
-    $("run").disabled = true;
-    $("examples").querySelectorAll("button").forEach((b) => { b.disabled = true; });
+    statusFetchFailures += 1;
+    if (statusFetchFailures >= 3) {
+      expectsFrame = false;
+      boardFrozen = false;
+      invalidatePreview("disconnected");
+      $("run").disabled = true;
+      $("examples").querySelectorAll("button").forEach((b) => { b.disabled = true; });
+    }
   }
   setTimeout(poll, 500);
 }
