@@ -141,6 +141,58 @@ async function main() {
     await publish(h, 2);
     assert(h.state().src, "a current frame was blocked by an obsolete request failure");
   }
+  // Transient fetch timeouts must not drop the live preview until 3 consecutive failures.
+  {
+    record("transient-frame-timeouts");
+    const h = harness();
+    await h.status(1, true);
+    await publish(h, 1);
+    for (let i = 0; i < 2; i += 1) {
+      const done = h.refreshLive();
+      h.take("/api/frame.jpg").reject(new Error("timeout"));
+      await done;
+      assert.equal(h.state().expectsFrame, true);
+      assert(h.state().src, "transient frame timeout cleared preview prematurely");
+    }
+    await publish(h, 1);  // valid frame resets failure streak
+    const done1 = h.refreshLive();
+    h.take("/api/frame.jpg").reject(new Error("timeout"));
+    await done1;
+    assert.equal(h.state().expectsFrame, true);
+    for (let i = 0; i < 2; i += 1) {
+      const done = h.refreshLive();
+      h.take("/api/frame.jpg").reject(new Error("timeout"));
+      await done;
+    }
+    assert.equal(h.state().expectsFrame, false);
+    assert.equal(h.state().previewState, "disconnected");
+    assert.equal(h.state().src, "");
+  }
+  // Transient status timeouts tolerate 2 stalls, while an explicit screen=false disconnects at once.
+  {
+    record("transient-status-timeouts");
+    const h = harness();
+    await h.status(1, true);
+    await publish(h, 1);
+    for (let i = 0; i < 2; i += 1) {
+      const done = h.poll();
+      h.take("/api/status").reject(new Error("timeout"));
+      await done;
+      assert.equal(h.state().expectsFrame, true);
+      assert(h.state().src, "transient status timeout cleared preview prematurely");
+    }
+    const third = h.poll();
+    h.take("/api/status").reject(new Error("timeout"));
+    await third;
+    assert.equal(h.state().expectsFrame, false);
+    assert.equal(h.state().previewState, "disconnected");
+
+    await h.status(2, true);
+    await publish(h, 2);
+    await h.status(2, false);
+    assert.equal(h.state().expectsFrame, false);
+    assert.equal(h.state().previewState, "disconnected");
+  }
 }
 
 // A pending Promise alone does not keep Node alive. Mark completion explicitly

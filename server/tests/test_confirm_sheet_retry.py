@@ -601,3 +601,67 @@ def test_confirm_skips_pre_sheet_plain_frames_and_checks_latest_retained_first(m
         assert calls == [sheet]
 
     asyncio.run(scenario())
+
+
+def test_confirm_short_circuits_before_after_and_keeps_event_loop_responsive(monkeypatch):
+    import time
+
+    from hidagent import feedback, paste_confirmation, screen_compare
+
+    async def scenario():
+        screen, provider, _phone, control, manager = setup(monkeypatch)
+        cand1, cand2, after = changed_scene("blue"), changed_scene("green"), changed_scene("orange")
+        obs_calls = []
+
+        async def capture(_screen, _completed_at):
+            screen._on_jpeg(cand1)
+            screen._on_jpeg(cand2)
+            return cand2
+
+        async def precheck_fail(orig, aft, reg, text):
+            precheck_calls.append(aft)
+            return False
+
+        precheck_calls = []
+        real_obs_changed = screen_compare.observation_changed
+
+        def slow_obs_changed(first, second, **kwargs):
+            obs_calls.append((first, second))
+            time.sleep(0.05)
+            return real_obs_changed(first, second, **kwargs)
+
+        monkeypatch.setattr(feedback, "wait_after_action", capture)
+        monkeypatch.setattr(paste_confirmation, "verify_before_after_for_permission", precheck_fail)
+        monkeypatch.setattr(screen_compare, "observation_changed", slow_obs_changed)
+
+        prepared = await manager.prepare(prepare_body(control))
+        copied(provider, screen)
+        await manager.paste(PasteTransaction(transaction_id=prepared["transaction_id"],
+                                             screen_id=control.observation()["screen_id"], focused=True))
+        screen._on_jpeg(after)
+        obs_calls.clear()
+
+        ticks = 0
+        stop = False
+
+        async def heartbeat():
+            nonlocal ticks
+            while not stop:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        task = asyncio.create_task(heartbeat())
+        with pytest.raises(RuntimeError):
+            await manager.confirm(ConfirmPaste(
+                transaction_id=prepared["transaction_id"],
+                screen_id=control.observation()["screen_id"],
+                observed_text="你好00123", confirmed=True))
+        stop = True
+        await task
+        # `_validate_ticket` + `item.guard` each call `observation_changed` once;
+        # short-circuiting `verify_before_after_for_permission` skips every candidate scan.
+        assert precheck_calls == [after]
+        assert len(obs_calls) == 2
+        assert ticks >= 2
+
+    asyncio.run(scenario())
