@@ -5,9 +5,10 @@ import io
 import math
 import re
 import unicodedata
+from collections import Counter
 from statistics import median
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 from . import assistive_vision, input_context, ocr, screen_compare
 
@@ -87,9 +88,14 @@ def _in_suggestion_bar(item, suggestion_bar: tuple[float, float] | None) -> bool
     return bar_top <= item.center[1] <= bar_bottom and top >= bar_top - .005 and bottom <= bar_bottom + .008
 
 
+def _boxes_overlap(first: tuple[float, float, float, float],
+                   second: tuple[float, float, float, float]) -> bool:
+    return (first[0] < second[2] and first[2] > second[0]
+            and first[1] < second[3] and first[3] > second[1])
+
+
 def _overlaps_box(item, box: tuple[float, float, float, float]) -> bool:
-    left, top, right, bottom = item.box
-    return right > box[0] and left < box[2] and bottom > box[1] and top < box[3]
+    return _boxes_overlap(item.box, box)
 
 
 def _mask_normalized_box(draw: ImageDraw.ImageDraw, box: tuple[float, float, float, float],
@@ -99,18 +105,27 @@ def _mask_normalized_box(draw: ImageDraw.ImageDraw, box: tuple[float, float, flo
                     round(box[2] * width), round(box[3] * height)), fill=0)
 
 
-def _outside_visual_changed(before: bytes, after: bytes, region: tuple[float, float, float, float],
-                            suggestion_bar: tuple[float, float] | None, extra=()) -> bool:
-    """Verify no unintended UI outside the field, suggestion strip, clock, pointer, or bubble changed."""
-    diff = screen_compare._difference(before, after, 360)
-    if diff is None:
-        return True
+def _diff_has_unexpected_changes(
+    before: bytes,
+    after: bytes,
+    diff: Image.Image,
+    region: tuple[float, float, float, float],
+    suggestion_bar: tuple[float, float] | None,
+    extra=(),
+    *,
+    mask_before: Image.Image | None = None,
+    mask_after: Image.Image | None = None,
+    assistive_box: tuple[float, float, float, float] | None = None,
+) -> bool:
+    """Apply expected masks to `diff` and reject any remaining visual change."""
     draw = ImageDraw.Draw(diff)
     _mask_normalized_box(draw, region, diff.size)
     if suggestion_bar is not None:
         _mask_normalized_box(draw, (0., suggestion_bar[0], 1., suggestion_bar[1]), diff.size)
     for box in extra:
         _mask_normalized_box(draw, box, diff.size)
+    if assistive_box is not None:
+        _mask_normalized_box(draw, assistive_box, diff.size)
     for frame in (before, after):
         if assistive_vision.find_panel(frame) is not None:
             return True
@@ -125,9 +140,11 @@ def _outside_visual_changed(before: bytes, after: bytes, region: tuple[float, fl
             )
     screen_compare.mask_caret_blink(before, after, diff, ())
     screen_compare.mask_clock_ticks(before, after, diff)
-    screen_compare.mask_pointer_highlights(before, after, diff)
+    highlight_before = before if mask_before is None else mask_before
+    highlight_after = after if mask_after is None else mask_after
+    screen_compare.mask_pointer_highlights(highlight_before, highlight_after, diff)
     screen_compare._mask_pointer_discs(before, after, diff, max_discs=2)
-    screen_compare._mask_translucent_pointer_fade(before, after, diff)
+    screen_compare._mask_translucent_pointer_fade(highlight_before, highlight_after, diff)
     values = diff.tobytes()
     # Ignore <=4/255 AirPlay/JPEG quantization noise after full-screen sheet dim/undim;
     # sharp small edits still trip _regions(diff, 24) >= 6 and broad low-contrast shifts exceed .8.
@@ -135,33 +152,245 @@ def _outside_visual_changed(before: bytes, after: bytes, region: tuple[float, fl
             or any(len(points) >= 6 for points in screen_compare._regions(diff, 24)))
 
 
-def _same_context(before, after, region, *, suggestion_bar=None, ignored_boxes=()):
-    def anchors(items):
-        result = {}
-        for item in items:
-            left, top, right, bottom = item.box
-            outside = right < region[0] or left > region[2] or bottom < region[1] or top > region[3]
-            if outside and (_in_suggestion_bar(item, suggestion_bar)
-                            or any(_overlaps_box(item, box) for box in ignored_boxes)):
-                continue
-            label = _visible_text(item.text)
-            if outside and item.center[1] > .06 and item.conf >= _MIN_CONFIDENCE and len(label) >= 2:
-                result.setdefault(label, []).append(item.center)
-        return result
+def _outside_visual_changed(before: bytes, after: bytes, region: tuple[float, float, float, float],
+                            suggestion_bar: tuple[float, float] | None, extra=()) -> bool:
+    """Verify no unintended UI outside the field, suggestion strip, clock, pointer, or bubble changed."""
+    diff = screen_compare._difference(before, after, 360)
+    if diff is None:
+        return True
+    return _diff_has_unexpected_changes(before, after, diff, region, suggestion_bar, extra)
 
-    original, current = anchors(before), anchors(after)
-    unique = [points[0] for points in original.values() if len(points) == 1]
-    if (original.keys() != current.keys() or len(unique) < 3
-            or not any(y < region[1] for x, y in unique) or not any(y > region[3] for x, y in unique)):
-        return False
+
+def _context_anchors(items, region, *, suggestion_bar=None, ignored_boxes=()):
+    selected = []
+    for item in items:
+        left, top, right, bottom = item.box
+        outside = right < region[0] or left > region[2] or bottom < region[1] or top > region[3]
+        if not outside or _in_suggestion_bar(item, suggestion_bar):
+            continue
+        if any(_overlaps_box(item, box) for box in ignored_boxes):
+            continue
+        label = _visible_text(item.text)
+        if item.center[1] > .06 and item.conf >= _MIN_CONFIDENCE and len(label) >= 2:
+            selected.append(item)
+    return selected
+
+
+def _stationary_anchors_match(before_items, after_items):
+    def group(items):
+        grouped = {}
+        for item in items:
+            grouped.setdefault(_visible_text(item.text), []).append(item.center)
+        return grouped
+
+    original, current = group(before_items), group(after_items)
+    if original.keys() != current.keys():
+        return None
     for label, locations in original.items():
         candidates = current[label]
         if len(locations) != len(candidates):
-            return False
+            return None
         for (x, y), (other_x, other_y) in zip(sorted(locations), sorted(candidates), strict=True):
             if abs(x - other_x) > .008 or abs(y - other_y) > .005:
-                return False
-    return True
+                return None
+    return [points[0] for points in original.values() if len(points) == 1]
+
+
+def _same_context(before, after, region, *, suggestion_bar=None, ignored_boxes=()):
+    original = _context_anchors(before, region, suggestion_bar=suggestion_bar, ignored_boxes=ignored_boxes)
+    current = _context_anchors(after, region, suggestion_bar=suggestion_bar, ignored_boxes=ignored_boxes)
+    unique = _stationary_anchors_match(original, current)
+    return (unique is not None and len(unique) >= 3
+            and any(y < region[1] for _, y in unique) and any(y > region[3] for _, y in unique))
+
+
+def _match_shifted_anchors(before_items, after_items, *, dy=0., tol_x=.008, tol_y=.005):
+    """Pair same-label anchors where `after` sits at `(before.x, before.y - dy)`."""
+    candidates = []
+    for b_idx, before_item in enumerate(before_items):
+        label = _visible_text(before_item.text)
+        bx, by = before_item.center
+        for a_idx, after_item in enumerate(after_items):
+            if _visible_text(after_item.text) != label:
+                continue
+            dx = abs(bx - after_item.center[0])
+            dy_err = abs((by - dy) - after_item.center[1])
+            if dx <= tol_x and dy_err <= tol_y:
+                candidates.append((dx * dx + dy_err * dy_err, before_item.center[1], before_item.center[0],
+                                   after_item.center[1], after_item.center[0], b_idx, a_idx))
+    candidates.sort()
+    used_before, used_after, pairs = set(), set(), []
+    for *_, b_idx, a_idx in candidates:
+        if b_idx in used_before or a_idx in used_after:
+            continue
+        used_before.add(b_idx)
+        used_after.add(a_idx)
+        pairs.append((before_items[b_idx], after_items[a_idx]))
+    unmatched_before = [item for idx, item in enumerate(before_items) if idx not in used_before]
+    unmatched_after = [item for idx, item in enumerate(after_items) if idx not in used_after]
+    return pairs, unmatched_before, unmatched_after
+
+
+def _header_viewport_bounds(before, after, region, current_region,
+                            *, ignored_boxes=()) -> tuple[float, float] | None:
+    """Locate the vertical split band between a fixed top header and the scrolled viewport."""
+    header_cap = min(.20, current_region[1] - .12)
+    if header_cap <= .07:
+        return None
+    top_before = [item for item in _context_anchors(before, region, ignored_boxes=ignored_boxes)
+                  if item.center[1] < header_cap]
+    top_after = [item for item in _context_anchors(after, current_region, ignored_boxes=ignored_boxes)
+                 if item.center[1] < header_cap]
+    matched, unmatched_before, unmatched_after = _match_shifted_anchors(top_before, top_after)
+    first_moved = min((item.center[1] for item in (*unmatched_before, *unmatched_after)), default=header_cap)
+    y_hi = min(header_cap, first_moved)
+    header_pairs = [(b, a) for b, a in matched if b.center[1] < y_hi]
+    counts = Counter(_visible_text(b.text) for b, _ in header_pairs)
+    if not any(count == 1 for count in counts.values()):
+        return None
+    y_lo = max(max(b.box[3], a.box[3]) for b, a in header_pairs) + .002
+    return (y_lo, y_hi) if y_lo < y_hi else None
+
+
+def _scrolled_viewport_match(
+    before: bytes,
+    after: bytes,
+    original_image: Image.Image,
+    current_image: Image.Image,
+    current_region: tuple[float, float, float, float],
+    suggestion_bar: tuple[float, float] | None,
+    extra,
+    *,
+    growth_delta: float,
+    split_bounds: tuple[float, float],
+    assistive_box: tuple[float, float, float, float] | None,
+) -> tuple[float, float] | None:
+    """Verify the chat viewport scrolled rigidly upward by `growth_delta` while header & keyboard stayed put."""
+    if assistive_vision.find_panel(before) is not None or assistive_vision.find_panel(after) is not None:
+        return None
+    diff0 = screen_compare._difference(before, after, 360)
+    if diff0 is None:
+        return None
+    w, h = diff0.size
+    ow, oh = original_image.size
+    y_lo_px = max(round(.06 * h), round(split_bounds[0] * h))
+    y_bot_px = round(current_region[1] * h)
+    y_hi_px = min(y_bot_px - round(.10 * h), round(split_bounds[1] * h))
+    if not (y_lo_px < y_hi_px < y_bot_px):
+        return None
+
+    before_360 = original_image.resize((w, h), Image.Resampling.BILINEAR)
+    after_360 = current_image.resize((w, h), Image.Resampling.BILINEAR)
+
+    def shifted_pair(d_orig: float):
+        # Resample at native resolution before 360p downsampling to match `after_360`'s box filter.
+        a_full = original_image.transform((ow, oh), Image.Transform.AFFINE, (1, 0, 0, 0, 1, d_orig),
+                                          resample=Image.Resampling.BILINEAR)
+        a_360 = a_full.resize((w, h), Image.Resampling.BILINEAR)
+        red, green, blue = ImageChops.difference(a_360, after_360).split()
+        sd = ImageChops.lighter(ImageChops.lighter(red, green), blue)
+        if assistive_box is not None:
+            sdraw = ImageDraw.Draw(sd)
+            _mask_normalized_box(sdraw, assistive_box, sd.size)
+            _mask_normalized_box(
+                sdraw,
+                (assistive_box[0], max(0., assistive_box[1] - d_orig / oh),
+                 assistive_box[2], max(0., assistive_box[3] - d_orig / oh)),
+                sd.size,
+            )
+        return a_360, sd
+
+    def eval_shift(d_orig: float):
+        a_360, sd = shifted_pair(d_orig)
+        hist = sd.crop((0, y_hi_px, w, y_bot_px)).histogram()
+        outliers = sum(hist[25:])
+        energy = sum(level * count for level, count in enumerate(hist[5:], 5))
+        return (outliers, energy, abs(d_orig - growth_delta * oh)), d_orig, a_360, sd
+
+    delta_px = growth_delta * oh
+    max_err = max(4., .006 * oh)
+    low, high = delta_px - max_err, delta_px + max_err
+    coarse_steps = sorted({low, high, *(delta_px + k for k in range(-math.floor(max_err), math.floor(max_err) + 1))})
+    best = min((eval_shift(d) for d in coarse_steps), key=lambda item: item[0])
+    best_coarse = best[1]
+    fine_steps = [min(high, max(low, best_coarse + k * .1)) for k in range(-9, 10) if k != 0]
+    best = min((best, *(eval_shift(d) for d in fine_steps)), key=lambda item: item[0])
+    _, best_d, a_360, sd = best
+
+    d0_bytes = diff0.tobytes()
+    sd_bytes = sd.tobytes()
+    row0 = [sum(v for v in d0_bytes[y * w:(y + 1) * w] if v > 4) for y in range(y_lo_px, y_hi_px)]
+    rows = [sum(v for v in sd_bytes[y * w:(y + 1) * w] if v > 4) for y in range(y_lo_px, y_hi_px)]
+    pref, suf = 0, sum(rows)
+    best_cost, best_y = None, y_lo_px
+    for i in range(len(row0) + 1):
+        cost = pref + suf
+        if best_cost is None or cost < best_cost:
+            best_cost, best_y = cost, y_lo_px + i
+        if i < len(row0):
+            pref += row0[i]
+            suf -= rows[i]
+
+    comp = diff0.copy()
+    comp.paste(sd.crop((0, best_y, w, y_bot_px)), (0, best_y))
+    comp_before_360 = before_360.copy()
+    comp_before_360.paste(a_360.crop((0, best_y, w, y_bot_px)), (0, best_y))
+    if _diff_has_unexpected_changes(before, after, comp, current_region, suggestion_bar, extra,
+                                    mask_before=comp_before_360, mask_after=after_360,
+                                    assistive_box=assistive_box):
+        return None
+    return best_y / h, best_d / oh
+
+
+def _ignored_across_scroll(item, ignored_boxes, dy: float) -> bool:
+    left, top, right, bottom = item.box
+    shifted = (left, top + dy, right, bottom + dy)
+    return any(_boxes_overlap(item.box, box) or _boxes_overlap(shifted, box) for box in ignored_boxes)
+
+
+def _same_context_scrolled(before, after, region, current_region, *, split_y: float, scroll_delta: float,
+                           suggestion_bar=None, ignored_boxes=()) -> bool:
+    """Verify stationary header/lower anchors and rigidly scrolled chat-viewport anchors."""
+    orig_anchors = _context_anchors(before, region, suggestion_bar=suggestion_bar)
+    curr_anchors = _context_anchors(after, current_region, suggestion_bar=suggestion_bar)
+
+    orig_header = [i for i in orig_anchors if i.center[1] < split_y
+                   and not any(_overlaps_box(i, box) for box in ignored_boxes)]
+    curr_header = [i for i in curr_anchors if i.center[1] < split_y
+                   and not any(_overlaps_box(i, box) for box in ignored_boxes)]
+    header_unique = _stationary_anchors_match(orig_header, curr_header)
+    if header_unique is None or not header_unique:
+        return False
+
+    orig_lower = [i for i in orig_anchors if i.center[1] > region[3]
+                  and not any(_overlaps_box(i, box) for box in ignored_boxes)]
+    curr_lower = [i for i in curr_anchors if i.center[1] > region[3]
+                  and not any(_overlaps_box(i, box) for box in ignored_boxes)]
+    lower_unique = _stationary_anchors_match(orig_lower, curr_lower)
+    if lower_unique is None or not lower_unique or len(header_unique) + len(lower_unique) < 3:
+        return False
+
+    before_vp = [i for i in orig_anchors if split_y <= i.center[1] <= region[1]
+                 and not _ignored_across_scroll(i, ignored_boxes, -scroll_delta)]
+    after_vp = [i for i in curr_anchors if split_y <= i.center[1] <= current_region[1]
+                and not _ignored_across_scroll(i, ignored_boxes, scroll_delta)]
+    _, unmatched_before, unmatched_after = _match_shifted_anchors(
+        before_vp, after_vp, dy=scroll_delta, tol_x=.008, tol_y=.008)
+    top_margin, bot_margin = .010, .012
+    strict_before = {
+        id(i) for i in before_vp
+        if (i.box[1] - scroll_delta >= split_y + top_margin
+            and i.box[3] <= region[1] - bot_margin
+            and i.box[3] - scroll_delta <= current_region[1] - bot_margin)
+    }
+    strict_after = {
+        id(i) for i in after_vp
+        if (i.box[1] >= split_y + top_margin
+            and i.box[3] <= current_region[1] - bot_margin
+            and i.box[3] + scroll_delta <= region[1] - bot_margin)
+    }
+    return (not any(id(i) in strict_before for i in unmatched_before)
+            and not any(id(i) in strict_after for i in unmatched_after))
 
 
 def _edge_profile(pixels, horizontal, edge, start, stop, radius):
@@ -244,7 +473,7 @@ def _grown_field(original_image, current_image, region, suggestion_bar):
 
     Its bottom edge must stay put just above the located suggestion strip, its
     original top must match the observed field, and it may only grow upward by
-    a bounded amount. Returns (current_region, expand_control_box) or None.
+    a bounded amount. Returns (current_region, extra_boxes, growth_delta) or None.
     """
     if suggestion_bar is None or not 0 <= suggestion_bar[0] - region[3] <= .04:
         return None
@@ -265,7 +494,7 @@ def _grown_field(original_image, current_image, region, suggestion_bar):
               for y in range(round(band[1] * h), round(band[3] * h)) for x in range(round(band[0] * w), w)]
     if not pixels or max(pixels) - min(pixels) > 24:
         return None
-    return current, (expand, (region[2], band[1], 1., band[3]))
+    return current, (expand, (region[2], band[1], 1., band[3])), before[0] - after[0]
 
 
 def _return_key_box(original, current, suggestion_bar):
@@ -340,7 +569,7 @@ async def _verify_before_after_uncached(read_fn, before, after, original_image, 
             return True
     elif len(current_lines) < 2:
         return False  # only multi-line text grows the field
-    assistive_box = screen_compare.stationary_assistive_button_box(before, after, exclude=(current_region,))
+    assistive_box = screen_compare.stationary_assistive_button_box(before, after, exclude=(region, current_region))
     if suggestion_bar is None and (grown is not None or assistive_box is None):
         return False
     extra = []
@@ -351,9 +580,26 @@ async def _verify_before_after_uncached(read_fn, before, after, original_image, 
         if key_box is not None:
             extra.append(key_box)
     ignored = (assistive_box,) if assistive_box is not None else ()
-    return (_same_context(original, current, current_region,
-                          suggestion_bar=suggestion_bar, ignored_boxes=ignored)
-            and not _outside_visual_changed(before, after, current_region, suggestion_bar, extra))
+    if (_same_context(original, current, current_region,
+                      suggestion_bar=suggestion_bar, ignored_boxes=ignored)
+            and not _outside_visual_changed(before, after, current_region, suggestion_bar, extra)):
+        return True
+    if grown is None:
+        return False
+    split_bounds = _header_viewport_bounds(original, current, region, current_region, ignored_boxes=ignored)
+    if split_bounds is None:
+        return False
+    scrolled = _scrolled_viewport_match(
+        before, after, original_image, current_image, current_region, suggestion_bar, extra,
+        growth_delta=grown[2], split_bounds=split_bounds, assistive_box=assistive_box,
+    )
+    if scrolled is None:
+        return False
+    split_y, scroll_delta = scrolled
+    return _same_context_scrolled(
+        original, current, region, current_region,
+        split_y=split_y, scroll_delta=scroll_delta, suggestion_bar=suggestion_bar, ignored_boxes=ignored,
+    )
 
 
 async def _verify_before_after(before, after, original_image, current_image, region, expected) -> bool:

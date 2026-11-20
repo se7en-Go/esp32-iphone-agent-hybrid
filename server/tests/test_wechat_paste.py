@@ -510,3 +510,181 @@ def test_stationary_button_at_eliminates_inner_median_boundary_dead_zone(monkeyp
     r_ch, g_ch, b_ch = list(core), list(core), list(core)
     r_ch[5], g_ch[5], b_ch[5] = 225, 175, 175
     assert run_rays(core, inner, outer, outside, core_rgb_vals=(r_ch, g_ch, b_ch)) is False
+
+
+def _box(text, cx, cy, half_w=.18, half_h=.010):
+    return ocr.TextBox(text, (cx - half_w, cy - half_h, cx + half_w, cy + half_h), (cx, cy), .98)
+
+
+def _encode(image: Image.Image) -> bytes:
+    output = io.BytesIO()
+    image.save(output, "JPEG", quality=94)
+    return output.getvalue()
+
+
+def _scrolled_chat_pair(
+    *,
+    shift_px: int = 77,
+    with_viewport_ocr: bool = True,
+    single_line: bool = False,
+):
+    """Build synthetic full-chat frames on `wrapped_original` / `wrapped_pasted`."""
+    orig_base = Image.open(io.BytesIO(load("wrapped_original"))).convert("RGB")
+    after_base = Image.open(io.BytesIO(load("wrapped_original" if single_line else "wrapped_pasted"))).convert("RGB")
+    ab_box = (400, 320, 494, 428)
+    ab_before = orig_base.crop(ab_box)
+    ab_after = after_base.crop(ab_box)
+
+    canvas = Image.new("RGB", orig_base.size, (239, 237, 240))
+    cdraw = ImageDraw.Draw(canvas)
+    cdraw.rectangle((16, 134, 52, 170), fill=(95, 145, 200))
+    cdraw.rounded_rectangle((64, 134, 340, 198), radius=10, fill=(255, 255, 255))
+    cdraw.rectangle((80, 156, 260, 168), fill=(40, 40, 40))
+    cdraw.rectangle((16, 280, 52, 316), fill=(110, 175, 135))
+    cdraw.rounded_rectangle((64, 280, 380, 360), radius=10, fill=(255, 255, 255))
+    cdraw.rectangle((80, 304, 310, 316), fill=(40, 40, 40))
+    cdraw.rectangle((80, 330, 240, 342), fill=(40, 40, 40))
+    cdraw.rectangle((16, 468, 52, 504), fill=(205, 140, 95))
+    cdraw.rounded_rectangle((64, 468, 360, 534), radius=10, fill=(255, 255, 255))
+    cdraw.rectangle((80, 492, 290, 504), fill=(40, 40, 40))
+
+    orig_img = orig_base.copy()
+    orig_img.paste(canvas.crop((0, 118, 500, 558)), (0, 118))
+    orig_img.paste(ab_before, ab_box[:2])
+
+    after_vp_bot = 558 if single_line else 483
+    after_img = after_base.copy()
+    src_top = 118 + shift_px
+    src_bot = min(558, after_vp_bot + shift_px)
+    after_img.paste(canvas.crop((0, src_top, 500, src_bot)), (0, 118))
+    if src_bot - src_top < after_vp_bot - 118:
+        ImageDraw.Draw(after_img).rectangle(
+            (0, 118 + (src_bot - src_top), 500, after_vp_bot),
+            fill=(239, 237, 240),
+        )
+    after_img.paste(ab_after, ab_box[:2])
+    if single_line:
+        ImageDraw.Draw(after_img).rectangle((86, 588, 220, 604), fill=(40, 40, 40))
+
+    dy = shift_px / 1080
+    vp_before = [
+        _box("10:01", .50, .120, half_w=.05),
+        _box("上一条历史消息", .38, .155),
+        _box("10:03", .50, .235, half_w=.05),
+        _box("联系人甲", .20, .270, half_w=.06),
+        _box("中间一条完整聊天消息", .42, .310),
+        _box("10:05", .50, .410, half_w=.05),
+        _box("联系人乙", .20, .445, half_w=.06),
+        _box("底部贴近输入栏的历史消息", .42, .476),
+    ] if with_viewport_ocr else []
+    vp_after = [
+        item for item in _moved(vp_before, -dy)
+        if item.box[1] >= .112 and item.box[3] <= (.520 if single_line else .445)
+    ]
+
+    orig_ocr = boxes("wrapped_original") + vp_before
+    if single_line:
+        after_ocr = boxes("wrapped_original") + [_box("单行消息内容", .31, .551, half_w=.12)] + vp_after
+    else:
+        after_ocr = boxes("wrapped_pasted") + vp_after
+    return _encode(orig_img), _encode(after_img), orig_ocr, after_ocr
+
+
+def test_grown_field_confirms_full_chat_rigid_viewport_scroll(monkeypatch):
+    from hidagent import paste_confirmation
+
+    sheet_img = load("wrapped_sheet")
+    sheet_ocr = boxes("wrapped_sheet")
+
+    def run(before_img, after_img, before_ocr, after_ocr, *, text=WRAPPED_TEXT):
+        paste_confirmation._PAIR_CACHE = None
+        frames = {before_img: before_ocr, sheet_img: sheet_ocr, after_img: after_ocr}
+
+        async def read(image):
+            return frames[image]
+
+        with monkeypatch.context() as mp:
+            mp.setattr(ocr, "read_text_async", read)
+            return asyncio.run(verify_after_paste_permission(before_img, sheet_img, after_img, WRAPPED_FIELD, text))
+
+    # 1) Full chat with text bubbles: top bubble clips under header, bottom bubble scrolls above grown field.
+    b1, a1, bo1, ao1 = _scrolled_chat_pair(shift_px=77, with_viewport_ocr=True)
+    assert run(b1, a1, bo1, ao1) is True
+
+    # 2) Scrolled bubble overlapping stationary AssistiveTouch before scrolling up reveals cleanly.
+    occluded_before = ocr.TextBox("被浮球遮挡的消息前段", (.60, .330, .86, .352), (.73, .341), .98)
+    revealed_after = ocr.TextBox("被浮球遮挡的消息完整", (.60, .330 - 77 / 1080, .90, .352 - 77 / 1080),
+                                 (.75, .341 - 77 / 1080), .98)
+    assert run(b1, a1, bo1 + [occluded_before], ao1 + [revealed_after]) is True
+    assert run(b1, a1, bo1, ao1 + [revealed_after]) is True
+
+    # 3) Image/sticker-only viewport (no viewport OCR anchors; verified by header + keyboard + rigid pixel shift).
+    b3, a3, bo3, ao3 = _scrolled_chat_pair(shift_px=77, with_viewport_ocr=False)
+    assert run(b3, a3, bo3, ao3) is True
+
+
+@pytest.mark.parametrize("tamper", [
+    "header_text_changed",
+    "header_pixel_tampered",
+    "keyboard_tampered",
+    "viewport_bubble_edited",
+    "split_zone_tampered",
+    "extra_scroll_new_message",
+    "viewport_ocr_changed",
+    "viewport_ocr_missing",
+    "single_line_no_growth",
+    "assistive_panel_open",
+    "wrong_pasted_text",
+    "no_header_anchor",
+])
+def test_grown_field_scrolled_viewport_rejects_tamper(monkeypatch, tamper):
+    from hidagent import assistive_vision, paste_confirmation
+
+    before_img, after_img, before_ocr, after_ocr = _scrolled_chat_pair(
+        shift_px=77 + (30 if tamper == "extra_scroll_new_message" else 0),
+        single_line=(tamper == "single_line_no_growth"),
+    )
+    text = "单行消息内容" if tamper == "single_line_no_growth" else WRAPPED_TEXT
+    if tamper == "header_text_changed":
+        after_ocr = [ocr.TextBox("群聊会话", i.box, i.center, i.conf) if i.text == "文件传输助手" else i
+                     for i in after_ocr]
+    elif tamper == "header_pixel_tampered":
+        im = Image.open(io.BytesIO(after_img)).convert("RGB")
+        ImageDraw.Draw(im).rectangle((180, 75, 260, 95), fill=(180, 40, 40))
+        after_img = _encode(im)
+    elif tamper == "keyboard_tampered":
+        im = Image.open(io.BytesIO(after_img)).convert("RGB")
+        ImageDraw.Draw(im).rectangle((220, 720, 260, 765), fill=(18, 132, 255))
+        after_img = _encode(im)
+    elif tamper == "viewport_bubble_edited":
+        im = Image.open(io.BytesIO(after_img)).convert("RGB")
+        ImageDraw.Draw(im).rectangle((200, 230, 235, 260), fill=(149, 236, 105))
+        after_img = _encode(im)
+    elif tamper == "split_zone_tampered":
+        im = Image.open(io.BytesIO(after_img)).convert("RGB")
+        ImageDraw.Draw(im).rectangle((210, 110, 270, 128), fill=(180, 40, 40))
+        after_img = _encode(im)
+    elif tamper == "viewport_ocr_changed":
+        after_ocr = [ocr.TextBox("被篡改的聊天记录", i.box, i.center, i.conf)
+                     if i.text == "中间一条完整聊天消息" else i for i in after_ocr]
+    elif tamper == "viewport_ocr_missing":
+        after_ocr = [i for i in after_ocr if i.text != "中间一条完整聊天消息"]
+    elif tamper == "wrong_pasted_text":
+        text = WRAPPED_TEXT.replace("正常", "异常")
+    elif tamper == "no_header_anchor":
+        before_ocr = [i for i in before_ocr if i.text != "文件传输助手"]
+        after_ocr = [i for i in after_ocr if i.text != "文件传输助手"]
+    elif tamper == "assistive_panel_open":
+        monkeypatch.setattr(assistive_vision, "find_panel",
+                            lambda f: (.15, .25, .85, .75) if f == after_img else None)
+
+    paste_confirmation._PAIR_CACHE = None
+    frames = {before_img: before_ocr, load("wrapped_sheet"): boxes("wrapped_sheet"), after_img: after_ocr}
+
+    async def read(image):
+        return frames[image]
+
+    monkeypatch.setattr(ocr, "read_text_async", read)
+    assert asyncio.run(verify_after_paste_permission(
+        before_img, load("wrapped_sheet"), after_img, WRAPPED_FIELD, text,
+    )) is False
