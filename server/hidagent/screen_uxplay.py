@@ -16,7 +16,7 @@ from pathlib import Path
 
 from . import freshness, messages, vision
 from .screen import PREVIEW_HOLD_S, FrameSnapshot, PreviewStatus, RecentFrameHistory
-from .uxplay_frames import BEGIN, END, FrameProtocolError, FrameStreamParser
+from .uxplay_frames import BEGIN, END, MAX_JPEG, FrameProtocolError, FrameStreamParser
 
 log = logging.getLogger(__name__)
 
@@ -143,6 +143,7 @@ class UxPlayScreen(RecentFrameHistory):
 
     def _supervise(self) -> None:
         """Keep UxPlay running: it exits on some disconnects, so restart it every time."""
+        failures = 0
         while True:
             with self._frame_lock:
                 if self._stopping:
@@ -161,9 +162,16 @@ class UxPlayScreen(RecentFrameHistory):
                 try:
                     proc = subprocess.Popen(
                         command, env=env, pass_fds=(write_fd,))  # logs remain separate from the frame pipe
-                except OSError:
+                except OSError as exc:
                     os.close(read_fd)
-                    raise
+                    self.last_error = f"AirPlay receiver failed to start: {exc}"
+                    log.warning("%s", self.last_error)
+                    if self._stopping:
+                        return
+                    failures += 1
+                    delay = min(16.0, float(1 << min(failures - 1, 4)))
+                    time.sleep(delay)
+                    continue
                 finally:
                     os.close(write_fd)
                 self._proc = proc
@@ -171,13 +179,18 @@ class UxPlayScreen(RecentFrameHistory):
                 self._native_epoch, self._native_active = 0, False
                 self._clients_at, self._clients_n = 0.0, None
             log.info("AirPlay receiver '%s' started (pid %d)", self.name, proc.pid)
+            read_failed = False
             try:
                 self._read(read_fd)  # returns when UxPlay closes the pipe
             except (OSError, FrameProtocolError) as exc:
-                if not self._framed:
-                    raise
-                log.warning("AirPlay frame stream rejected: %s", exc)
+                read_failed = True
+                if self._framed:
+                    log.warning("AirPlay frame stream rejected: %s", exc)
+                else:
+                    self.last_error = f"AirPlay frame stream error: {exc}"
+                    log.warning("%s", self.last_error)
             with self._frame_lock:
+                received_frame = self._snapshot is not None
                 self.frame, self.updated, self._snapshot = None, 0.0, None
             if self._framed:
                 try:
@@ -187,11 +200,22 @@ class UxPlayScreen(RecentFrameHistory):
                     log.error(self.last_error)
                     return  # Never start a second owner while the failed child may still exist.
             else:
-                code = proc.wait()
+                try:
+                    code = self._reap_legacy(proc)
+                except (OSError, subprocess.TimeoutExpired):
+                    self.last_error = "UxPlay did not stop after its frame stream closed."
+                    log.error(self.last_error)
+                    return  # Never start a second owner while the failed child may still exist.
             if self._stopping:
                 return
-            log.warning("AirPlay receiver exited (code %s), restarting", code)
-            time.sleep(1)
+            if received_frame and not read_failed:
+                failures = 0
+                self.last_error = ""
+            else:
+                failures += 1
+            delay = 1 if failures <= 1 else min(16, 1 << min(failures - 1, 4))
+            log.warning("AirPlay receiver exited (code %s), restarting in %ss", code, delay)
+            time.sleep(delay)
 
     @staticmethod
     def _reap_native(proc):
@@ -209,6 +233,26 @@ class UxPlayScreen(RecentFrameHistory):
                 proc.kill()
             except ProcessLookupError:
                 pass
+            return proc.wait(timeout=2)
+
+    @staticmethod
+    def _reap_legacy(proc):
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            return proc.wait(timeout=2)
+        except TypeError:
+            return proc.wait()
+        except subprocess.TimeoutExpired:
+            kill = getattr(proc, "kill", None)
+            if kill is not None:
+                try:
+                    kill()
+                except ProcessLookupError:
+                    pass
             return proc.wait(timeout=2)
 
     @property
@@ -412,3 +456,11 @@ class UxPlayScreen(RecentFrameHistory):
                 while (start := buf.find(b"\xff\xd8")) >= 0 and (end := buf.find(b"\xff\xd9", start)) >= 0:
                     self._on_jpeg(buf[start:end + 2])
                     buf = buf[end + 2:]
+                if len(buf) > MAX_JPEG:
+                    last_start = buf.rfind(b"\xff\xd8")
+                    if last_start >= 0 and len(buf) - last_start <= MAX_JPEG:
+                        buf = buf[last_start:]
+                    else:
+                        log.warning("AirPlay legacy stream exceeded %d bytes without a complete JPEG; dropping buffer",
+                                    MAX_JPEG)
+                        buf = b""

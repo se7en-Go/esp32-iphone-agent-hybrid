@@ -288,3 +288,99 @@ def test_recent_frames_retains_distinct_same_tick_frames_and_ignores_duplicates(
     }, b"frame-2")
 
     assert [snap.frame for snap in screen.recent_frames] == [b"frame-1", b"frame-2"]
+
+
+def test_legacy_supervise_recovers_from_read_error_reaps_child_and_backs_off(monkeypatch):
+    import subprocess
+
+    screen = UxPlayScreen()
+    children = []
+    sleeps = []
+
+    class Child:
+        pid = 456
+
+        def __init__(self):
+            self.returncode = None
+            self.terminated = False
+            self.killed = False
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            if not self.killed and len(children) == 1:
+                raise subprocess.TimeoutExpired("uxplay", timeout)
+            self.returncode = 0
+            return self.returncode
+
+    def spawn(*_args, **_kwargs):
+        child = Child()
+        children.append(child)
+        return child
+
+    calls = 0
+
+    def flaky_read(fd):
+        nonlocal calls
+        os.close(fd)
+        calls += 1
+        if calls <= 2:
+            raise OSError("pipe broken")
+        screen._on_jpeg(b"recovered")
+        screen.stop()
+
+    monkeypatch.setattr("hidagent.screen_uxplay.subprocess.Popen", spawn)
+    monkeypatch.setattr("hidagent.screen_uxplay.time.sleep", sleeps.append)
+    monkeypatch.setattr(screen, "_read", flaky_read)
+    screen._supervise()
+
+    assert len(children) == 3
+    assert children[0].terminated and children[0].killed
+    assert children[1].terminated
+    assert sleeps == [1, 2]
+    assert "pipe broken" in screen.last_error
+
+
+def test_legacy_supervise_handles_popen_oserror_with_backoff(monkeypatch):
+    screen = UxPlayScreen()
+    sleeps = []
+    attempts = 0
+
+    def spawn(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts >= 3:
+            screen.stop()
+        raise OSError("uxplay missing")
+
+    monkeypatch.setattr("hidagent.screen_uxplay.subprocess.Popen", spawn)
+    monkeypatch.setattr("hidagent.screen_uxplay.time.sleep", sleeps.append)
+    screen._supervise()
+
+    assert attempts == 3
+    assert sleeps == [1.0, 2.0]
+    assert "uxplay missing" in screen.last_error
+
+
+def test_legacy_read_drops_unbounded_garbage_above_max_jpeg(monkeypatch):
+    from hidagent import screen_uxplay
+
+    monkeypatch.setattr(screen_uxplay, "MAX_JPEG", 128)
+    screen = UxPlayScreen()
+    screen._proc = ReceiverProcess()
+    frames = []
+    monkeypatch.setattr(screen, "_on_jpeg", frames.append)
+
+    r_fd, w_fd = os.pipe()
+    os.write(w_fd, b"X" * 200 + b"\xff\xd8ok-jpeg\xff\xd9")
+    os.close(w_fd)
+    screen._read_legacy(r_fd)
+    assert frames == [b"\xff\xd8ok-jpeg\xff\xd9"]

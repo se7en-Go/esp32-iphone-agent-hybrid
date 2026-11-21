@@ -160,8 +160,14 @@ def serve(path, name, instance=None):
                     try:
                         process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=3)
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            pass
                 path.unlink(missing_ok=True)
 
 

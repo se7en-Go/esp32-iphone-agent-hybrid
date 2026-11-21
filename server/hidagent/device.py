@@ -15,8 +15,9 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field
 
 import serial
@@ -46,9 +47,22 @@ COM_BRIDGES = {
 PING_EVERY = 0.3
 PING_WINDOW = 8.0
 RELEASE_TIMEOUT = 1.0
+SERIAL_WRITE_TIMEOUT = 0.5
+MAX_WIRE_LINE = 512
 HID_COMMANDS = {"home", "move", "press", "release", "click", "middlepress", "middleclick",
                 "scroll", "type", "key", "homescreen"}
 FIXED_ID = {"netinfo", "status", "net"}
+
+
+def _validate_command(command: str) -> str:
+    if not isinstance(command, str) or not command.strip():
+        raise DeviceError("串口命令不能为空。")
+    if any(ch in command for ch in ("\r", "\n", "\x00")):
+        raise DeviceError("串口命令只能是单行文本，不能包含换行或空字符。")
+    name = command.split(" ", 1)[0]
+    if not name:
+        raise DeviceError("串口命令格式无效。")
+    return name
 
 
 class DeviceError(RuntimeError):
@@ -179,6 +193,7 @@ def open_serial(port: str, baud: int = 115200, impl=None, platform: str | None =
     ser.port = port
     ser.baudrate = baud
     ser.timeout = 0.2
+    ser.write_timeout = SERIAL_WRITE_TIMEOUT
     ser.rtscts = False
     ser.dsrdtr = False
     ser.rts = False
@@ -193,12 +208,16 @@ def open_serial(port: str, baud: int = 115200, impl=None, platform: str | None =
 class SerialLink:
     """阻塞的 pyserial 收成一行一行的异步队列。"""
 
+    blocking_write = True
+
     def __init__(self, port: str, baud: int = 115200, opened=None):
+        self._port = port
         self._ser = opened if opened is not None else open_serial(port, baud)
         self._loop = asyncio.get_running_loop()
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._buf = bytearray()
         self._closed = False
+        self._writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"serial-tx-{port}")
         self._thread = threading.Thread(target=self._pump, name=f"serial-{port}", daemon=True)
         self._thread.start()
 
@@ -209,7 +228,10 @@ class SerialLink:
                 # Block for one byte when idle, then drain only bytes already buffered.
                 waiting = getattr(self._ser, "in_waiting", 0)
                 data = self._ser.read(max(1, min(256, waiting)))
-            except Exception:
+            except Exception as exc:
+                if not self._closed:
+                    log.warning("serial reader stopped on %s: %s: %s",
+                                getattr(self, "_port", "<serial>"), type(exc).__name__, exc)
                 break
             if not data:
                 continue
@@ -221,6 +243,9 @@ class SerialLink:
                 line = bytes(self._buf[:nl + 1])
                 del self._buf[:nl + 1]
                 self._post(line)
+        if self._buf and not self._closed:
+            log.debug("serial reader discarding %d partial bytes on %s",
+                      len(self._buf), getattr(self, "_port", "<serial>"))
         self._post(b"")
 
     def _post(self, line: bytes) -> None:
@@ -229,11 +254,27 @@ class SerialLink:
         except RuntimeError:
             return
 
-    def write(self, data: bytes) -> None:
+    def write_nowait(self, data: bytes) -> None:
         if self._closed:
             raise OSError("serial closed")
         self._ser.write(data)
+
+    def flush(self) -> None:
+        if self._closed:
+            raise OSError("serial closed")
         self._ser.flush()
+
+    def write(self, data: bytes) -> None:
+        self.write_nowait(data)
+        self.flush()
+
+    async def run_write(self, fn: Callable):
+        if self._closed:
+            raise OSError("serial closed")
+        writer = getattr(self, "_writer", None)
+        ctx = copy_context()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(writer, ctx.run, fn)
 
     async def readline(self) -> bytes:
         return await self._queue.get()
@@ -246,6 +287,9 @@ class SerialLink:
             self._ser.close()
         except Exception:
             pass
+        writer = getattr(self, "_writer", None)
+        if writer is not None:
+            writer.shutdown(wait=False, cancel_futures=False)
         thread = getattr(self, "_thread", None)
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=1.0)
@@ -372,6 +416,8 @@ class Device:
                 return ""
             if text.startswith(prefix):
                 return text[len(prefix):]
+            if '"pass"' not in text:
+                log.debug("serial ignored line (waiting %s): %s", req_id, text[:80])
 
     def unguarded(self):
         return _Unguarded(self)
@@ -416,13 +462,18 @@ class Device:
             if self._link is link:
                 self._link = None
 
+    async def _write_release_async(self, link) -> str:
+        if getattr(link, "blocking_write", False) and hasattr(link, "run_write"):
+            return await link.run_write(lambda: self._write_release(link))
+        return self._write_release(link)
+
     async def _release_held(self, link) -> None:
         """Called with the serial lock held and the previous reply reader stopped."""
         if self._pressed_link is not link:
             return
 
         async def release():
-            req_id = self._write_release(link)
+            req_id = await self._write_release_async(link)
             await self._read_reply(link, req_id, RELEASE_TIMEOUT)
 
         try:
@@ -434,10 +485,10 @@ class Device:
                 self._link = None
 
     async def exchange(self, command: str, *, before_write=None, write_lock=None) -> str:
+        name = _validate_command(command)
         if not self.connected:
             raise DeviceError(messages.BOARD_NOT_CONNECTED)
         timeout = self._timeout(command)
-        name = command.split(" ", 1)[0]
         async with self._lock:
             # asyncio 锁只串行化交换；熔断还需要 gate 提供的跨线程写入锁。
             if self._abort and name not in {"release", "home"}:
@@ -448,9 +499,15 @@ class Device:
             if link is None or not link.is_open():
                 raise DeviceError(messages.BOARD_NOT_CONNECTED)
             req_id = self._request_id(command)
-            try:
+            wire_body = f"{req_id} {command}".encode()
+            if len(wire_body) > MAX_WIRE_LINE:
+                raise DeviceError(f"串口命令超过 {MAX_WIRE_LINE} 字节上限，未发送。")
+            wire = wire_body + b"\n"
+            blocking = bool(getattr(link, "blocking_write", False) and hasattr(link, "run_write"))
+
+            def _commit_and_write() -> None:
                 # 板子收到这一行之后才选 USB 或 BLE。两条路都先经过这把锁里的熔断复查，没有第二条写手机的路。
-                # 在 guard 的同一把锁内复查并写入；先释放它，再 await 应答。
+                # 在 guard 的同一把锁内复查并写入；先释放它，再 flush 和 await 应答。
                 with write_guard if write_guard is not None else nullcontext() as commit_write:
                     attempt = _input_attempt.get()
                     publication_lock = write_lock
@@ -483,9 +540,27 @@ class Device:
                             attempt.started = True  # all guards passed; an unknown ACK cannot undo this boundary
                         if name in HID_COMMANDS:
                             self._mark_input_attempt()
-                        link.write(f"{req_id} {command}\n".encode())
+                        if blocking and hasattr(link, "write_nowait"):
+                            link.write_nowait(wire)
+                        else:
+                            link.write(wire)
                         if name == "release" and self._pressed_link is link:
                             self._pressed_link = None
+                if blocking and hasattr(link, "flush"):
+                    link.flush()
+
+            try:
+                if blocking:
+                    write_fut = asyncio.ensure_future(link.run_write(_commit_and_write))
+                    try:
+                        await write_fut
+                    except asyncio.CancelledError:
+                        # Let an already-started serial write finish (bounded by write_timeout)
+                        # before cancellation cleanup writes release or closes the port.
+                        await shield_cleanup(asyncio.gather(write_fut, return_exceptions=True))
+                        raise
+                else:
+                    _commit_and_write()
                 reply = await self._read_reply(link, req_id, timeout)
             except asyncio.CancelledError:
                 await self._release_held(link)
@@ -643,7 +718,7 @@ class Device:
                 log.info("%s", exc)
             except Exception as exc:
                 self.last_error = messages.BOARD_NOT_CONNECTED
-                log.warning("board maintain: %s", type(exc).__name__)
+                log.warning("board maintain: %s: %s", type(exc).__name__, exc)
             await asyncio.sleep(0.05 if self._abort else 2)
 
     async def wait_connected(self, timeout: float) -> bool:
@@ -691,9 +766,9 @@ class Device:
 
     async def keep_awake(self, idle: float = 25, heartbeat: float = 2, screen=None) -> None:
         """netinfo 也会刷新 _beat，所以不能等“完全没流量”才去碰指针，否则手机会自己锁屏。"""
-        while True:
+        while not self._closing:
             await asyncio.sleep(heartbeat)
-            if not self.connected:
+            if self._closing or not self.connected:
                 continue
             try:
                 if (time.time() - self._last > idle and (screen is None or screen.live)
@@ -701,10 +776,14 @@ class Device:
                     await self._nudge_idle()
                 elif time.time() - self._beat >= heartbeat:
                     await self.send("ping")
+            except asyncio.CancelledError:
+                raise
             except _IdleNudgePaused:
                 continue
             except DeviceError as exc:
                 log.info("board gone: %s", exc)
+            except Exception as exc:
+                log.warning("keep_awake: %s: %s", type(exc).__name__, exc)
 
 
 async def supervise_maintain(device: Device) -> None:
@@ -752,7 +831,10 @@ async def wait_for_ping(link, timeout: float = PING_WINDOW) -> bool:
     while time.monotonic() < deadline:
         now = time.monotonic()
         if now >= next_ping:
-            link.write(b"0 ping\n")
+            if getattr(link, "blocking_write", False) and hasattr(link, "run_write"):
+                await link.run_write(lambda: link.write(b"0 ping\n"))
+            else:
+                link.write(b"0 ping\n")
             next_ping = now + PING_EVERY
         remaining = deadline - time.monotonic()
         if remaining <= 0:

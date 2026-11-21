@@ -67,19 +67,26 @@ guard = Guard(path=DATA_DIR / "guard.json")
 async def lifespan(_):
     # 测试可替换 device / screen；启动时必须具备设备保活接口。
     device._closing = False
-    maintain = asyncio.create_task(supervise_maintain(device)) if hasattr(device, "maintain") else None
-    if hasattr(screen, "bind"):
-        screen.bind(device)
-    if hasattr(screen, "start"):
-        screen.start()
-    awake = asyncio.create_task(device.keep_awake(screen=screen))
+    maintain = None
+    awake = None
     try:
+        maintain = asyncio.create_task(supervise_maintain(device)) if hasattr(device, "maintain") else None
+        if hasattr(screen, "bind"):
+            screen.bind(device)
+        if hasattr(screen, "start"):
+            screen.start()
+        awake = asyncio.create_task(device.keep_awake(screen=screen))
         yield
     finally:
         device._closing = True
-        awake.cancel()
-        if maintain:
-            maintain.cancel()
+        tasks = [task for task in (awake, maintain) if task is not None]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
         if hasattr(screen, "stop"):
             screen.stop()
         if hasattr(device, "close"):

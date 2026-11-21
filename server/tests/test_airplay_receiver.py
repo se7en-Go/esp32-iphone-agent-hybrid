@@ -193,3 +193,55 @@ def test_socket_rejects_oversized_frame_before_reading_body(tmp_path):
             with pytest.raises(ValueError, match="limit"):
                 read_snapshot(path)
             thread.join(timeout=2)
+
+
+def test_serve_unlinks_socket_even_if_killed_child_wait_times_out(monkeypatch):
+    import subprocess
+    import tempfile
+
+    from hidagent import airplay_receiver
+
+    with tempfile.TemporaryDirectory(prefix="airplay-unlink-", dir="/tmp") as short:
+        sock = Path(short) / "airplay.sock"
+
+        class StuckChild:
+            killed = False
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("uxplay", timeout)
+
+            def kill(self):
+                self.killed = True
+
+        child = StuckChild()
+
+        class FakeScreen:
+            def __init__(self, _name):
+                self._proc = child
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        class FakeServer:
+            def __init__(self, path, _screen, instance=None):
+                self.path = path
+
+            def __enter__(self):
+                self.path.write_text("sock")
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def serve_forever(self, poll_interval=0.1):
+                return None
+
+        monkeypatch.setattr(airplay_receiver, "UxPlayScreen", FakeScreen)
+        monkeypatch.setattr(airplay_receiver, "ReceiverServer", FakeServer)
+        monkeypatch.setattr(airplay_receiver.signal, "signal", lambda *_a: None)
+        airplay_receiver.serve(sock, "Test")
+        assert child.killed is True
+        assert not sock.exists()

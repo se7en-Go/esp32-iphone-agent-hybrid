@@ -504,3 +504,47 @@ def test_real_proxy_subprocess_uses_inherited_ephemeral_listener(tmp_path):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reclaimed:
         reclaimed.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         reclaimed.bind(address)
+
+
+def test_stop_worker_escalates_to_sigkill_and_removes_stale_record(tmp_path, monkeypatch):
+    import signal
+
+    record_path = tmp_path / "worker.json"
+    record_path.write_text(json.dumps({"pid": 4321, "instance": "a" * 32}))
+    alive = [True]
+    signals = []
+    now = [0.0]
+
+    def fake_kill(pid, sig):
+        assert pid == 4321
+        signals.append(sig)
+        if sig == signal.SIGKILL:
+            alive[0] = False
+
+    def fake_sleep(dt):
+        now[0] += dt
+
+    monkeypatch.setattr(local_runtime, "_owned_worker", lambda rec: rec is not None and alive[0])
+    monkeypatch.setattr(local_runtime.os, "kill", fake_kill)
+    monkeypatch.setattr(local_runtime.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(local_runtime.time, "sleep", fake_sleep)
+
+    local_runtime.stop_worker({"HIDAGENT_DATA": str(tmp_path)})
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert not record_path.exists()
+
+
+def test_owned_worker_returns_false_on_ps_timeout(monkeypatch):
+    def slow_ps(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("ps", 2)
+
+    monkeypatch.setattr(local_runtime.subprocess, "run", slow_ps)
+    assert local_runtime._owned_worker({"pid": 123, "instance": "a" * 32}) is False
+
+
+def test_terminate_process_kills_child_ignoring_term_without_leaking_timeout():
+    child = ManagedChild(202)
+    child.terminate = lambda: setattr(child, "terminated", child.terminated + 1)
+    child.kill = lambda: setattr(child, "killed", child.killed + 1)
+    local_runtime._terminate_process(child, term_timeout=0.01, kill_timeout=0.01)
+    assert child.terminated == 1 and child.killed == 1
