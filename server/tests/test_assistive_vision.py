@@ -256,3 +256,32 @@ def test_menu_slot_snaps_only_to_unique_visible_icon_nearby():
     assert actual is not None
     assert actual[0] == pytest.approx((left+.5*(right-left), top+.74*(bottom-top)), abs=.01)
     assert find_icon_target(frame, panel, (.5, (top+bottom)/2)) is None
+
+
+def test_stationary_button_at_accepts_outlined_button_without_085_radius_mismatch():
+    from hidagent.assistive_vision import find_button_target, stationary_button_at
+
+    frame = button_frame()
+    target = find_button_target(frame)
+    assert target is not None
+    assert stationary_button_at(frame, target) is True
+
+    # Colored edit over the button location must still be rejected.
+    edited = Image.new("RGB", (360, 780), "white")
+    cx, cy = round(target[0][0] * 360), round(target[0][1] * 780)
+    ImageDraw.Draw(edited).ellipse((cx - 25, cy - 25, cx + 25, cy + 25), fill=(255, 20, 20))
+    assert stationary_button_at(encoded(edited), target) is False
+
+
+def test_find_button_target_and_find_panel_cache_repeated_frame_bytes():
+    from hidagent import assistive_vision
+
+    assistive_vision._find_button_target_cached.cache_clear()
+    assistive_vision._find_panel_cached.cache_clear()
+    frame = button_frame()
+    first = assistive_vision.find_button_target(frame)
+    second = assistive_vision.find_button_target(frame)
+    assert first == second and assistive_vision._find_button_target_cached.cache_info().hits >= 1
+    p1 = assistive_vision.find_panel(frame)
+    p2 = assistive_vision.find_panel(frame)
+    assert p1 == p2 and assistive_vision._find_panel_cached.cache_info().hits >= 1

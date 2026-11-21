@@ -2,7 +2,7 @@
 
 import time
 
-from . import ocr
+from . import ocr, screen_compare
 from .freshness import require_fresh
 
 ENTER_EVIDENCE_TTL = 3.0
@@ -28,19 +28,31 @@ def _keyboard_return(boxes, intent):
     return space and mode and not send
 
 
+def _frame_changed(screen, before: bytes, current: bytes) -> bool:
+    if current == before:
+        return False
+    if before and current.startswith(before):
+        return True
+    return screen_compare.observation_changed(
+        before, current,
+        caret_frames=getattr(screen, "recent_frames", ()),
+        allow_assistive_opacity=True,
+    )
+
+
 async def verify_enter_context(screen, before: bytes, intent: str, combo: str = "enter", *, observation=None):
     """Return a synchronous final-write validator; an intent string alone proves nothing."""
     if intent not in {"navigation", "editing"} or combo.strip().lower() != "enter":
         raise ValueError("非发送 Enter 只支持单独的 enter 和已观察的导航/换行键。")
     observed = observation or require_fresh(screen)
     expires = time.monotonic() + ENTER_EVIDENCE_TTL
-    if observed.frame != before:
+    if _frame_changed(screen, before, observed.frame):
         raise ValueError("键盘画面已变化，请重新观察后再按 Enter。")
 
     def validate():
         current = require_fresh(screen)
         if (time.monotonic() > expires or current.generation != observed.generation
-                or current.frame != before):
+                or _frame_changed(screen, before, current.frame)):
             raise RuntimeError("Enter 的键盘或焦点证据已变化/过期，未发送按键。")
 
     validate()

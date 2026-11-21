@@ -734,3 +734,17 @@ def test_grown_field_scrolled_viewport_rejects_tamper(monkeypatch, tamper):
     assert asyncio.run(verify_after_paste_permission(
         before_img, load("wrapped_sheet"), after_img, WRAPPED_FIELD, text,
     )) is False
+
+
+def test_mask_normalized_box_uses_floor_ceil_so_left_edge_column_is_covered():
+    from PIL import Image, ImageDraw
+
+    from hidagent.paste_confirmation import _mask_normalized_box
+
+    diff = Image.new("L", (360, 780), 255)
+    # 100.9 / 360 rounds to 101, which previously leaked pixel column 100.
+    _mask_normalized_box(ImageDraw.Draw(diff), (100.9 / 360, 200.9 / 780, 150.1 / 360, 250.1 / 780), diff.size)
+    assert diff.getpixel((100, 200)) == 0
+    assert diff.getpixel((150, 250)) == 0
+    assert diff.getpixel((99, 200)) == 255
+    assert diff.getpixel((151, 250)) == 255

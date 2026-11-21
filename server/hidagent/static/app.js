@@ -43,10 +43,20 @@ $("motion").addEventListener("click", () => {
 
 const say = (key) => { $("msg").textContent = key ? t(key) : ""; };
 async function post(path, body) {
-  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
-  const data = await r.json().catch(() => ({}));
-  $("msg").textContent = r.ok ? "" : data.detail || r.statusText;
-  return r.ok ? data : null;
+  try {
+    const r = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+      signal: AbortSignal.timeout(10000),
+    });
+    const data = await r.json().catch(() => ({}));
+    $("msg").textContent = r.ok ? "" : data.detail || r.statusText;
+    return r.ok ? data : null;
+  } catch (err) {
+    $("msg").textContent = (lang === "zh" ? "请求失败或超时：" : "Request failed or timed out: ") + (err?.message || String(err));
+    return null;
+  }
 }
 
 // ---- step helpers --------------------------------------------------------------------

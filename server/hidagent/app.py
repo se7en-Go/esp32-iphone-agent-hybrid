@@ -528,7 +528,7 @@ async def control_observe(http_request: Request, for_click: bool = False):
                     controls.invalidate()
                     raise
             ensure = getattr(controls.phone, "ensure_observation", None)
-            accepted = await ensure() if ensure is not None else None
+            accepted = await while_connected(http_request, ensure()) if ensure is not None else None
             return controls.observation(accepted)
         except (ValueError, RuntimeError) as e:
             raise HTTPException(409, str(e)) from e
@@ -539,12 +539,15 @@ async def control_observe(http_request: Request, for_click: bool = False):
 
 
 @app.post("/api/control/find_text")
-async def control_find_text(request: FindTextBody):
+async def control_find_text(request: FindTextBody, http_request: Request):
     check_manual()
     async with manual_lock:
         controls.job = asyncio.current_task()
         try:
-            return await controls.find_text(request.screen_id, request.text, request.nth, request.exact, request.region)
+            return await while_connected(
+                http_request,
+                controls.find_text(request.screen_id, request.text, request.nth, request.exact, request.region),
+            )
         except ValueError as e:
             raise HTTPException(409, str(e)) from e
         except OCRUnavailable as e:
@@ -921,15 +924,22 @@ async def agent_stop():
     cancel_paste = getattr(getattr(phone, "clipboard", None), "cancel_staged", None)
     if callable(cancel_paste):
         cancel_paste()
-    await asyncio.sleep(0)  # 让被取消的那一条先放开串口锁
+    pending = [task for task in (job, *list(getattr(device, "_exchanges", ())))
+               if task is not None and task is not asyncio.current_task() and not task.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=0.5)
+    else:
+        await asyncio.sleep(0)  # 让被取消的那一条先放开串口锁
+    reset_ok = False
     try:
         if getattr(device, "connected", False):
             await phone.reset()
+        reset_ok = True
     except (DeviceError, RuntimeError) as e:
         raise HTTPException(409, for_user(str(e))) from e
     finally:
         await asyncio.sleep(0)
-        if hasattr(device, "clear_abort"):
+        if reset_ok and hasattr(device, "clear_abort"):
             device.clear_abort()
     return {"ok": True}
 

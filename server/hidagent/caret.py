@@ -1,7 +1,9 @@
 """Narrow insertion-caret evidence; never ignore an unknown field's contents."""
 
 import io
+import math
 import statistics
+from collections import Counter
 from dataclasses import dataclass
 
 from PIL import Image, ImageChops, ImageDraw
@@ -16,21 +18,79 @@ def _image(frame):
     return frame
 
 
-def _components(mask):
-    width = mask.width
-    hot = {(i % width, i // width) for i, value in enumerate(mask.tobytes()) if value}
-    while hot:
-        stack, points = [hot.pop()], []
+def _clear_component_8conn(data: bytearray, width: int, height: int, seeds: list[int]) -> None:
+    """Erase an oversized 8-connected component using C-speed bytearray scanlines."""
+    zero_row = bytes(width)
+    while seeds:
+        idx = seeds.pop()
+        if not data[idx]:
+            continue
+        y, x = divmod(idx, width)
+        row_off = y * width
+        zero_l = data.rfind(0, row_off, row_off + x)
+        lx = 0 if zero_l < 0 else zero_l - row_off + 1
+        zero_r = data.find(0, row_off + x, row_off + width)
+        rx = width if zero_r < 0 else zero_r - row_off
+        data[row_off + lx:row_off + rx] = zero_row[:rx - lx]
+        nx0 = lx - 1 if lx > 0 else 0
+        nx1 = rx + 1 if rx < width else width
+        for ny in (y - 1, y + 1):
+            if not 0 <= ny < height:
+                continue
+            ny_off = ny * width
+            scan = ny_off + nx0
+            limit = ny_off + nx1
+            while (hit := data.find(255, scan, limit)) >= 0:
+                seeds.append(hit)
+                next_zero = data.find(0, hit, limit)
+                if next_zero < 0:
+                    break
+                scan = next_zero + 1
+
+
+def _components(mask, *, max_points: int | None = None):
+    width, height = mask.size
+    data = bytearray(mask.tobytes())
+    pos = 0
+    while (start := data.find(255, pos)) >= 0:
+        pos = start + 1
+        data[start] = 0
+        stack = [start]
+        points = []
+        oversized = False
         while stack:
-            x, y = stack.pop()
+            idx = stack.pop()
+            x, y = idx % width, idx // width
             points.append((x, y))
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    neighbor = x + dx, y + dy
-                    if neighbor in hot:
-                        hot.remove(neighbor)
-                        stack.append(neighbor)
-        yield points
+            if max_points is not None and len(points) > max_points:
+                oversized = True
+                # Re-mark the frontier (and check their 8-neighbors) so scanline clearing
+                # erases the entire remaining 8-connected component without leaving stragglers.
+                seeds = []
+                for px, py in points:
+                    pidx = py * width + px
+                    data[pidx] = 255
+                    seeds.append(pidx)
+                for pidx in stack:
+                    data[pidx] = 255
+                    seeds.append(pidx)
+                points.clear()
+                stack.clear()
+                _clear_component_8conn(data, width, height, seeds)
+                break
+            x0 = x - 1 if x > 0 else 0
+            x1 = x + 1 if x + 1 < width else width - 1
+            y0 = y - 1 if y > 0 else 0
+            y1 = y + 1 if y + 1 < height else height - 1
+            for ny in range(y0, y1 + 1):
+                row = ny * width
+                for nx in range(x0, x1 + 1):
+                    nidx = row + nx
+                    if data[nidx]:
+                        data[nidx] = 0
+                        stack.append(nidx)
+        if not oversized:
+            yield points
 
 
 @dataclass(frozen=True)
@@ -40,15 +100,26 @@ class FieldCaret:
     background_x: int
 
 
-def _caret_components(image, white, regions):
+def _caret_mask(patch, white: bool):
+    r, g, b = patch.split()
+    if white:
+        lo = ImageChops.darker(ImageChops.darker(r, g), b)
+        hi = ImageChops.lighter(ImageChops.lighter(r, g), b)
+        bright = lo.point(lambda v: 255 if v >= 215 else 0)
+        neutral = ImageChops.subtract(hi, lo).point(lambda v: 255 if v <= 65 else 0)
+        return ImageChops.darker(bright, neutral)
+    b_ok = b.point(lambda v: 255 if v >= 150 else 0)
+    g_ok = g.point(lambda v: 255 if v >= 50 else 0)
+    br_ok = ImageChops.subtract(b, r).point(lambda v: 255 if v >= 60 else 0)
+    bg_ok = ImageChops.subtract(b, g).point(lambda v: 255 if v >= 25 else 0)
+    return ImageChops.darker(ImageChops.darker(b_ok, g_ok), ImageChops.darker(br_ok, bg_ok))
+
+
+def _caret_components(image, white, regions, *, max_points: int | None = None):
     for bounds in regions or ((0, 0, image.width, image.height),):
         patch = image.crop(bounds)
-        pixels = patch.tobytes()
-        mask = Image.new("L", patch.size)
-        mask.putdata([255 if (not white and b >= 150 and b - r >= 60 and b - g >= 25 and g >= 50)
-                      or (white and min(r, g, b) >= 215 and max(r, g, b) - min(r, g, b) <= 65)
-                      else 0 for r, g, b in zip(pixels[0::3], pixels[1::3], pixels[2::3], strict=True)])
-        for points in _components(mask):
+        mask = _caret_mask(patch, white)
+        for points in _components(mask, max_points=max_points):
             # Cropping a white page must never manufacture a thin caret shape.
             if regions and any(x in (0, patch.width - 1) or y in (0, patch.height - 1) for x, y in points):
                 continue
@@ -63,8 +134,9 @@ def field_carets(image, *, allow_white=False, _white=False, regions=None):
         return list(dict.fromkeys(field_carets(image, regions=regions)
                                   + field_carets(image, _white=True, regions=regions)))
     w, h = image.size
+    max_points = max(400, math.ceil(.06 * w) * math.ceil(.05 * h))
     found = []
-    for points in _caret_components(image, _white, regions):
+    for points in _caret_components(image, _white, regions, max_points=max_points):
         xs, ys = zip(*points, strict=True)
         x0, y0, x1, y1 = min(xs), min(ys), max(xs) + 1, max(ys) + 1
         bw, bh = x1 - x0, y1 - y0
@@ -72,7 +144,8 @@ def field_carets(image, *, allow_white=False, _white=False, regions=None):
             # JPEG chroma can join a few adjacent placeholder pixels to a white
             # caret. Require its nearly full-height core: a shorter adjacent
             # letter stroke is not another core. Never expand into that text.
-            columns = {x for x in xs if xs.count(x) >= .95 * bh}
+            col_counts = Counter(xs)
+            columns = {x for x, count in col_counts.items() if count >= .95 * bh}
             if columns and max(columns) - min(columns) + 1 == len(columns):
                 x0, x1 = min(columns), max(columns) + 1
                 points = [(x, y) for x, y in points if x0 <= x < x1]

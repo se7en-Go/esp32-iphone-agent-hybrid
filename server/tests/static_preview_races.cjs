@@ -193,6 +193,30 @@ async function main() {
     assert.equal(h.state().expectsFrame, false);
     assert.equal(h.state().previewState, "disconnected");
   }
+  // post() must apply an AbortSignal timeout and surface fetch failures to #msg instead of throwing.
+  {
+    record("post-timeout-feedback");
+    const postStart = source.indexOf("async function post(");
+    const postEnd = source.indexOf("// ---- step helpers", postStart);
+    assert(postStart > 0 && postEnd > postStart);
+    let capturedOpts = null;
+    const msgNode = { textContent: "" };
+    const ctx = {
+      $: (id) => (id === "msg" ? msgNode : { textContent: "" }),
+      lang: "en",
+      AbortSignal,
+      fetch: async (_url, opts) => {
+        capturedOpts = opts;
+        throw new Error("network down");
+      },
+    };
+    vm.createContext(ctx);
+    vm.runInContext(source.slice(postStart, postEnd) + ";globalThis.post = post;", ctx);
+    const res = await ctx.post("/api/agent/stop", {});
+    assert.equal(res, null);
+    assert(capturedOpts && capturedOpts.signal, "post() must attach an AbortSignal timeout");
+    assert(msgNode.textContent.includes("network down"), "post() must display failure feedback");
+  }
 }
 
 // A pending Promise alone does not keep Node alive. Mark completion explicitly
