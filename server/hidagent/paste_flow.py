@@ -14,6 +14,7 @@ from PIL import Image, ImageChops
 
 PRE_DISPATCH = ("未发送原地点击", "未发送点击", "等待点击期间原画面已变化")
 ALLOW_LABELS = ("允许粘贴", "Allow Paste")
+ALLOW_MODAL_REGION = (0.13, 0.27, 0.87, 0.75)
 PASTE_ATTEMPTS = 3  # pre-dispatch 409 retries for the paste stage; Cmd+V is still sent at most once
 ALLOW_DISMISS_ATTEMPTS = 2  # at most one follow-up click if the first click only wakes an auto-hidden pointer
 
@@ -113,11 +114,88 @@ def _observe(client, report, *, for_click=False, stage="observe"):
         return client.observe(for_click=for_click)
 
 
+def _field_lines_from_boxes(boxes, box):
+    left, top, right, bottom = box
+    return [item.text for item in boxes
+            if left <= item.box[0] and item.box[2] <= right and top <= item.box[1] and item.box[3] <= bottom]
+
+
 def _field_lines(raw, box):
     from . import ocr
-    left, top, right, bottom = box
-    return [item.text for item in ocr.read_text(raw)
-            if left <= item.box[0] and item.box[2] <= right and top <= item.box[1] and item.box[3] <= bottom]
+    return _field_lines_from_boxes(ocr.read_text(raw), box)
+
+
+def _verify_target_context(frame, target_box, *, expect_title=None, report=None):
+    from . import ocr
+
+    boxes = ocr.read_text(frame)
+    if expect_title:
+        title = [item for item in boxes if item.center[1] < .12
+                 and ocr.normalize_text(item.text) == ocr.normalize_text(expect_title)]
+        if len(title) != 1:
+            raise RuntimeError("conversation title does not match; nothing was pasted")
+    draft = _field_lines_from_boxes(boxes, target_box)
+    if draft:
+        if report is not None:
+            report.facts["existing_draft_lines"] = len(draft)
+        raise RuntimeError("input field already has a draft; it was kept and nothing was pasted")
+
+
+def _center_field_lines(boxes, region):
+    from . import paste_confirmation
+
+    left, top, right, bottom = region
+    inside = [item for item in boxes
+              if left <= item.center[0] <= right and top <= item.center[1] <= bottom
+              and paste_confirmation._visible_text(item.text)]
+    rows = []
+    for item in sorted(inside, key=lambda item: item.center[1]):
+        height = max(1e-4, item.box[3] - item.box[1])
+        if not rows or abs(rows[-1][0].center[1] - item.center[1]) > height / 2:
+            rows.append([])
+        rows[-1].append(item)
+    return tuple(
+        paste_confirmation._visible_text("".join(item.text for item in sorted(row, key=lambda item: item.center[0])))
+        for row in rows
+    )
+
+
+def _verify_confirm_frame(prepare_frame, confirm_frame, target_box, text, *, expect_title=None):
+    from . import ocr, paste_confirmation, screen_compare
+
+    boxes = ocr.read_text(confirm_frame)
+    if expect_title:
+        title = [item for item in boxes if item.center[1] < .12
+                 and ocr.normalize_text(item.text) == ocr.normalize_text(expect_title)]
+        if len(title) != 1:
+            return False, "conversation title changed before confirmation"
+    expected = paste_confirmation._expected_lines(text)
+    if not expected:
+        return True, ""
+    regions = []
+    if prepare_frame:
+        try:
+            region = tuple(target_box)
+            suggestion_bar = paste_confirmation._located_suggestion_bar(prepare_frame, confirm_frame, region)
+            if suggestion_bar is not None:
+                assistive_box = screen_compare.stationary_assistive_button_box(
+                    prepare_frame, confirm_frame, exclude=(region,))
+                grown = paste_confirmation._grown_field(
+                    _rgb(prepare_frame), _rgb(confirm_frame), region, suggestion_bar,
+                    assistive_box=assistive_box)
+                if grown is not None:
+                    regions.append(grown[0])
+        except (OSError, ValueError):
+            pass
+    regions.append(tuple(target_box))
+    for region in regions:
+        strict_lines = paste_confirmation._field_lines(boxes, region)
+        if strict_lines is not None and paste_confirmation._matches_wrapped_lines(strict_lines, expected):
+            return True, ""
+        relaxed_lines = _center_field_lines(boxes, region)
+        if relaxed_lines and paste_confirmation._matches_wrapped_lines(relaxed_lines, expected):
+            return True, ""
+    return False, "pasted text was not observed in target field"
 
 
 def _stray_cursor_outside_bubble(before: bytes | None, after: bytes | None, point: tuple[float, float],
@@ -222,7 +300,7 @@ def _hold(client, report, point, box, caret_box, stage):
 def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=False,
         light_status=True, copy_timeout=20.0, confirm_attempts=4, evidence=None, evidence_dir=None):
     """Prepare -> copy -> one Cmd+V -> optional permission sheet -> confirm. Never sends."""
-    from . import assistive_vision, ocr
+    from . import assistive_vision
 
     report = Report()
     began = time.perf_counter()
@@ -231,7 +309,7 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
         if evidence_dir is not None and result and result.get("image_base64"):
             (evidence_dir / f"{name}.jpg").write_bytes(base64.b64decode(result["image_base64"]))
     transaction = None
-    report.facts.update(copied=False, cmd_v_sent=0)
+    report.facts.update(copied=False, cmd_v_sent=0, action_may_have_executed=False)
     try:
         trigger_configured = False
         if hasattr(client, "capabilities"):
@@ -240,15 +318,7 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
         report.facts["trigger_configured"] = trigger_configured
         first = _observe(client, report, stage="initial_observe")
         frame = base64.b64decode(first["image_base64"])
-        if expect_title:
-            title = [item for item in ocr.read_text(frame) if item.center[1] < .12
-                     and ocr.normalize_text(item.text) == ocr.normalize_text(expect_title)]
-            if len(title) != 1:
-                raise RuntimeError("conversation title does not match; nothing was pasted")
-        draft = _field_lines(frame, target_box)
-        if draft:
-            report.facts["existing_draft_lines"] = len(draft)
-            raise RuntimeError("input field already has a draft; it was kept and nothing was pasted")
+        _verify_target_context(frame, target_box, expect_title=expect_title, report=report)
         bubble = assistive_vision.find_button_target(frame)
         for _ in range(6):
             if bubble is not None:
@@ -320,6 +390,8 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
         observed = _observe(client, report, stage="prepare_observe")
         prepare_frame = base64.b64decode(observed["image_base64"]) if observed.get("image_base64") else None
         keep("1-prepare-original", observed)
+        if prepare_frame and prepare_frame != frame:
+            _verify_target_context(prepare_frame, target_box, expect_title=expect_title, report=report)
         with _Stage(report, "prepare"):
             prepared = client.clipboard_stage("prepare", screen_id=observed["screen_id"], text=text,
                                               focused=True, target_box=list(target_box))
@@ -392,24 +464,33 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
                                                     screen_id=observed["screen_id"], focused=True)
                 break
             except RuntimeError as exc:
-                if "409" not in str(exc) or attempt == PASTE_ATTEMPTS - 1:
+                if "409" not in str(exc):
+                    report.facts["action_may_have_executed"] = True
+                    raise
+                if attempt == PASTE_ATTEMPTS - 1:
                     raise
                 report.retry("paste")
                 report.facts.setdefault("paste_rejections", []).append(str(exc))
                 time.sleep(.35)
         keep("3-after-cmd-v", pasted)
         report.facts["cmd_v_sent"] = 1 if pasted.get("command_acknowledged") else 0
+        if pasted.get("action_may_have_executed"):
+            report.facts["action_may_have_executed"] = True
         if not pasted.get("command_acknowledged"):
             raise RuntimeError(f"Cmd+V was not acknowledged: {pasted.get('error')}")
 
         def _find_allow(sid):
+            x0, y0, x1, y1 = ALLOW_MODAL_REGION
             for label in ALLOW_LABELS:
                 try:
-                    hit = client.find_text(label, sid, exact=True)
+                    hit = client.find_text(label, sid, exact=True, region=list(ALLOW_MODAL_REGION))
                 except RuntimeError:
                     continue
-                if hit.get("match"):
-                    return hit["match"]
+                match = hit.get("match")
+                if match:
+                    cx, cy = match["center"]
+                    if x0 < cx < x1 and y0 < cy < y1:
+                        return match
             return None
 
         sheet = False
@@ -518,6 +599,19 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
             for attempt in range(confirm_attempts):
                 observed = client.observe()
                 keep(f"4-confirm-{attempt}", observed)
+                confirm_frame = base64.b64decode(observed["image_base64"]) if observed.get("image_base64") else None
+                if confirm_frame:
+                    ok_text, reason = _verify_confirm_frame(
+                        prepare_frame, confirm_frame, target_box, text, expect_title=expect_title)
+                    if not ok_text:
+                        report.facts.setdefault("confirm_rejections", []).append(reason)
+                        if attempt == confirm_attempts - 1:
+                            report.facts["confirm_error"] = reason
+                            raise RuntimeError(reason)
+                        report.retry("confirm_text")
+                        time.sleep(.3)
+                        continue
+                    report.facts["client_text_verified"] = True
                 try:
                     receipt = client.clipboard_stage("confirm", transaction_id=transaction,
                                                      screen_id=observed["screen_id"],
@@ -540,7 +634,8 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
         return report
     except Exception as exc:
         report.facts["stopped"] = str(exc)
-        if transaction is not None and not report.facts.get("cmd_v_sent"):
+        paste_uncertain = bool(report.facts.get("cmd_v_sent") or report.facts.get("action_may_have_executed"))
+        if transaction is not None and not paste_uncertain:
             # Cmd+V never went out: cancelling is safe. A fetched copy still needs
             # the host to check the Shortcut and resolve, as the server requires.
             try:
@@ -549,7 +644,7 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
             except RuntimeError as cancel_error:
                 report.facts["cancel_error"] = str(cancel_error)
         report.facts["transaction_left_open"] = transaction is not None
-        if report.facts.get("cmd_v_sent"):
+        if paste_uncertain:
             _recovery(report, "paste_sent_unconfirmed")
         elif report.facts.get("copied"):
             _recovery(report, "copied_not_pasted")

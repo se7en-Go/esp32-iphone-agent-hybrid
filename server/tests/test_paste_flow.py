@@ -26,10 +26,12 @@ def test_light_status_has_no_image_and_keeps_the_current_ticket(monkeypatch):
     asyncio.run(scenario())
 
 
-def jpeg(banner=False):
+def jpeg(banner=False, pasted=False):
     image = Image.new("RGB", (50, 108), "white")
     if banner:
         ImageDraw.Draw(image).rectangle((5, 8, 45, 22), fill=(60, 60, 60))
+    if pasted:
+        ImageDraw.Draw(image).rectangle((10, 58, 35, 61), fill=(30, 30, 30))
     output = io.BytesIO()
     image.save(output, "JPEG")
     return output.getvalue()
@@ -37,12 +39,14 @@ def jpeg(banner=False):
 
 PLAIN_JPEG = jpeg()
 BANNER_JPEG = jpeg(banner=True)
+PASTED_JPEG = jpeg(pasted=True)
 
 
 class FakeClient:
     def __init__(self, *, confirm_conflicts=1, sheet=True, trigger_configured=False,
                  copied_on_prepare=False, overlay_frames=0, paste_conflicts=0, never_copy=False,
-                 never_claim=False, allow_measured_pointer="auto", allow_dismiss_after=1):
+                 never_claim=False, allow_measured_pointer="auto", allow_dismiss_after=1,
+                 pasted_visible=True):
         self.calls, self.control_calls, self.click_calls = [], [], []
         self.confirm_conflicts, self.sheet, self.seen = confirm_conflicts, sheet, 0
         self.trigger_configured = trigger_configured
@@ -51,6 +55,8 @@ class FakeClient:
         self.paste_conflicts, self.never_copy, self.never_claim = paste_conflicts, never_copy, never_claim
         self.allow_measured_pointer = allow_measured_pointer
         self.allow_dismiss_after = allow_dismiss_after
+        self.pasted_visible = pasted_visible
+        self.find_text_calls = []
         self.screenshots = 0
 
     def capabilities(self):
@@ -58,7 +64,8 @@ class FakeClient:
 
     def observe(self, for_click=False):
         self.seen += 1
-        return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(PLAIN_JPEG).decode()}
+        raw = PASTED_JPEG if (self.pasted_visible and "paste" in self.calls and not for_click) else PLAIN_JPEG
+        return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(raw).decode()}
 
     def screenshot(self):
         self.screenshots += 1
@@ -84,6 +91,7 @@ class FakeClient:
         return {"command_acknowledged": True, "timing_ms": {"total": 1}}
 
     def find_text(self, text, screen_id, **fields):
+        self.find_text_calls.append((text, screen_id, fields))
         clicks = self.calls.count(("click", "允许粘贴", None))
         if self.sheet and text == "允许粘贴" and "paste" in self.calls and clicks < self.allow_dismiss_after:
             return {"match": {"text": text, "center": [.32, .557], "box": [.22, .54, .42, .57]}}
@@ -122,7 +130,11 @@ class FakeClient:
 def vision(monkeypatch):
     monkeypatch.setattr(assistive_vision, "find_button_target", lambda frame: ((.75, .95), (.69, .92, .83, .98)))
     monkeypatch.setattr(paste_flow.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(ocr, "read_text", lambda frame: [])
+    monkeypatch.setattr(ocr, "read_text", lambda frame: (
+        [ocr.TextBox("第一行", (.16, .525, .40, .548), (.28, .536), .98),
+         ocr.TextBox("第二行", (.16, .552, .40, .575), (.28, .563), .98)]
+        if frame == PASTED_JPEG else []
+    ))
 
 
 def test_flow_pastes_once_handles_sheet_and_reconfirms_same_transaction(vision):
@@ -149,7 +161,7 @@ def test_flow_keeps_an_existing_draft_and_pastes_nothing(vision, monkeypatch):
 def test_flow_never_repastes_when_confirmation_keeps_failing(vision):
     client = FakeClient(confirm_conflicts=5)
     with pytest.raises(paste_flow.FlowStopped) as stopped:
-        paste_flow.run(client, "文本", (.13, .52, .77, .58))
+        paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58))
     assert client.calls.count("paste") == 1 and "cancel" not in client.calls
     facts = stopped.value.report.facts
     assert facts["transaction_left_open"] is True
@@ -232,18 +244,24 @@ def test_flow_corrects_or_aborts_before_hold_when_stray_cursor_lands_below_bubbl
         return output.getvalue()
 
     clean = bubble_scene()
+    pasted_scene = bubble_scene(dot_xy=(.25, .55))
     stray = bubble_scene(dot_xy=(.89, .41))
     inside = bubble_scene(dot_xy=(.89, .36))
 
     monkeypatch.setattr(assistive_vision, "find_button_target",
                         lambda _frame: ((.89, .36), (.82, .33, .96, .39)))
     monkeypatch.setattr(paste_flow.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(ocr, "read_text", lambda _frame: [])
+    monkeypatch.setattr(ocr, "read_text", lambda frame: (
+        [ocr.TextBox("第一行", (.16, .525, .40, .548), (.28, .536), .98),
+         ocr.TextBox("第二行", (.16, .552, .40, .575), (.28, .563), .98)]
+        if frame == pasted_scene else []
+    ))
 
     class StrayClient(FakeClient):
         def observe(self, for_click=False):
             self.seen += 1
-            return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(clean).decode()}
+            raw = pasted_scene if ("paste" in self.calls and not for_click) else clean
+            return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(raw).decode()}
 
         def control(self, name, screen_id, **fields):
             box = fields.get("target_box")
@@ -344,7 +362,12 @@ def test_flow_locates_visible_allow_pointer_from_for_click_frame_when_measured_p
     class VisualAllowClient(FakeClient):
         def observe(self, for_click=False):
             self.seen += 1
-            raw = pointed_sheet if (for_click and "paste" in self.calls) else clean_sheet
+            if for_click and "paste" in self.calls:
+                raw = pointed_sheet
+            elif "paste" in self.calls and self.calls.count(("click", "允许粘贴", None)) >= self.allow_dismiss_after:
+                raw = PASTED_JPEG
+            else:
+                raw = clean_sheet
             return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(raw).decode()}
 
         def clipboard_stage(self, stage, **fields):
@@ -360,3 +383,91 @@ def test_flow_locates_visible_allow_pointer_from_for_click_frame_when_measured_p
     allow_clicks = [(x, y) for x, y, _box, fields in client.click_calls if fields.get("target_label") == "允许粘贴"]
     assert len(allow_clicks) == 1
     assert allow_clicks[0] == pytest.approx((.330, .567), abs=.01)
+
+
+def test_flow_refuses_confirm_when_pasted_text_is_not_observed(vision):
+    client = FakeClient(pasted_visible=False, sheet=False)
+    with pytest.raises(paste_flow.FlowStopped) as stopped:
+        paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58), confirm_attempts=2)
+    assert "not observed" in str(stopped.value)
+    assert "confirm" not in client.calls and "cancel" not in client.calls
+    facts = stopped.value.report.facts
+    assert facts["cmd_v_sent"] == 1 and facts["transaction_left_open"] is True
+    assert facts["recovery_state"] == "paste_sent_unconfirmed"
+    assert stopped.value.report.retries["confirm_text"] == 1
+
+
+@pytest.mark.parametrize("drift", ["title", "draft"])
+def test_flow_rechecks_title_and_empty_draft_on_prepare_frame(monkeypatch, drift):
+    monkeypatch.setattr(assistive_vision, "find_button_target", lambda _f: ((.75, .95), (.69, .92, .83, .98)))
+    monkeypatch.setattr(paste_flow.time, "sleep", lambda _s: None)
+    initial_jpg = PLAIN_JPEG
+    drifted_jpg = BANNER_JPEG
+
+    def read_text(frame):
+        if frame == initial_jpg:
+            return [ocr.TextBox("测试群", (.35, .06, .65, .09), (.50, .075), .99)]
+        if drift == "title":
+            return [ocr.TextBox("其他群", (.35, .06, .65, .09), (.50, .075), .99)]
+        return [
+            ocr.TextBox("测试群", (.35, .06, .65, .09), (.50, .075), .99),
+            ocr.TextBox("人工刚打的草稿", (.18, .53, .45, .56), (.31, .545), .99),
+        ]
+
+    monkeypatch.setattr(ocr, "read_text", read_text)
+
+    class DriftClient(FakeClient):
+        def observe(self, for_click=False):
+            self.seen += 1
+            # First observe is initial check; after point_bubble, prepare_observe sees drifted frame.
+            raw = drifted_jpg if "point" in self.calls else initial_jpg
+            return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(raw).decode()}
+
+    client = DriftClient()
+    with pytest.raises(paste_flow.FlowStopped) as stopped:
+        paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58), expect_title="测试群")
+    assert "prepare" not in client.calls and "paste" not in client.calls
+    assert stopped.value.report.facts["recovery_state"] == "not_copied"
+    if drift == "title":
+        assert "title" in str(stopped.value)
+    else:
+        assert "draft" in str(stopped.value)
+
+
+@pytest.mark.parametrize("mode", ["unacked_200", "transport_504"])
+def test_flow_treats_ambiguous_paste_dispatch_as_paste_sent_unconfirmed(vision, mode):
+    class AmbiguousPasteClient(FakeClient):
+        def clipboard_stage(self, stage, **fields):
+            if stage == "paste":
+                self.calls.append(stage)
+                if mode == "unacked_200":
+                    return {"command_acknowledged": False, "action_may_have_executed": True,
+                            "error": "serial ack lost"}
+                raise RuntimeError("HTTP 504: operation deadline exceeded")
+            return super().clipboard_stage(stage, **fields)
+
+    client = AmbiguousPasteClient()
+    with pytest.raises(paste_flow.FlowStopped) as stopped:
+        paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58))
+    assert client.calls.count("paste") == 1
+    assert "cancel" not in client.calls
+    facts = stopped.value.report.facts
+    assert facts["action_may_have_executed"] is True
+    assert facts["recovery_state"] == "paste_sent_unconfirmed"
+
+
+def test_flow_find_allow_passes_modal_region_and_ignores_outside_match(vision):
+    class SpoofAllowClient(FakeClient):
+        def find_text(self, text, screen_id, **fields):
+            self.find_text_calls.append((text, screen_id, fields))
+            if text == "允许粘贴":
+                # Spoofed match inside header bar outside modal band must be ignored.
+                return {"match": {"text": text, "center": [.50, .08], "box": [.40, .06, .60, .10]}}
+            return {"match": None}
+
+    client = SpoofAllowClient(confirm_conflicts=0)
+    report = paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58)).as_dict()
+    assert report["permission_sheet_seen"] is False
+    assert ("click", "允许粘贴", None) not in client.calls
+    assert all(fields.get("region") == list(paste_flow.ALLOW_MODAL_REGION)
+               for _, _, fields in client.find_text_calls)

@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import logging
 import secrets
 import time
 from dataclasses import dataclass
@@ -17,6 +18,8 @@ from .freshness import fresh_frame, snapshot
 from .input_context import InputContextGuard
 from .operation import check_operation
 from .text_input import select_type_mode
+
+log = logging.getLogger(__name__)
 
 
 class TransactionId(BaseModel):
@@ -120,12 +123,19 @@ class StagedClipboardControls:
                                    _freshness_phone=getattr(controls.screen, "_freshness_phone", None))
         return fresh_frame(selected, since=since) is not None and fresh_frame(controls.screen, since=since) is not None
 
-    def _abandon(self, item):
+    def _abandon(self, item, *, suppress_errors=False):
         try:
             state = item.provider.stage_finish(item.nonce)
         except HTTPException as exc:
             if exc.status_code != 404:
+                if not suppress_errors:
+                    raise
+                log.warning("clipboard abandon failed (HTTP %s): %s", exc.status_code, exc.detail)
+            state = item.provider.current()
+        except Exception as exc:
+            if not suppress_errors:
                 raise
+            log.warning("clipboard abandon failed: %s: %s", type(exc).__name__, exc)
             state = item.provider.current()
         if self.transaction is item:
             self.transaction = None
@@ -179,7 +189,7 @@ class StagedClipboardControls:
                 with provider.stage_write(nonce, command):
                     await phone.key(provider.trigger_key, before_action=validate)
         except BaseException:
-            self._abandon(item)
+            self._abandon(item, suppress_errors=True)
             raise
         return self.status(nonce)
 
@@ -218,10 +228,10 @@ class StagedClipboardControls:
             # triple check below can still verify a retained frame.
             item.post_paste_frames = tuple(getattr(controls.screen, "recent_frames", ()))
         except asyncio.CancelledError:
-            self._abandon(item)
+            self._abandon(item, suppress_errors=True)
             raise
         except (RuntimeError, ValueError, HTTPException) as exc:
-            state = self._abandon(item)
+            state = self._abandon(item, suppress_errors=True)
             return {**self._evidence(), **state, "command_acknowledged": False, "effect_verified": False,
                     "action_may_have_executed": True, "error": str(exc), "phase": "cancelled"}
         result = self.status(item.nonce)

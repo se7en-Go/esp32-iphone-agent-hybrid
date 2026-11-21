@@ -806,3 +806,39 @@ def test_staged_paste_allows_stationary_assistive_opacity_change_but_blocks_cont
             assert pasted["command_acknowledged"] is True and phone.sent.count("cmd+v") == 1
 
     asyncio.run(scenario())
+
+
+def test_stage_begin_without_running_loop_leaves_clipboard_unblocked():
+    from hidagent.clipboard import CompanionClipboard
+
+    provider = CompanionClipboard("http://example.invalid:8891", "k" * 40, ttl=60)
+    with pytest.raises(RuntimeError):
+        provider.stage_begin("你好")
+    assert provider._pending is None
+    assert provider._operation_active is False
+
+
+def test_abandon_suppresses_unexpected_finish_error_without_masking_cancellation(monkeypatch):
+    from fastapi import HTTPException
+
+    async def scenario():
+        screen, provider, phone, control, manager = setup(monkeypatch)
+        prepared = await manager.prepare(prepare_body(control))
+        transaction = prepared["transaction_id"]
+        copied(provider, screen)
+
+        async def cancel_on_key(*_args, **_kwargs):
+            raise asyncio.CancelledError
+
+        def broken_finish(*_args, **_kwargs):
+            raise HTTPException(500, "unexpected finish boom")
+
+        monkeypatch.setattr(phone, "key", cancel_on_key)
+        monkeypatch.setattr(provider, "stage_finish", broken_finish)
+        from hidagent.clipboard_control import PasteTransaction
+        with pytest.raises(asyncio.CancelledError):
+            await manager.paste(PasteTransaction(
+                transaction_id=transaction, screen_id=control.observation()["screen_id"], focused=True))
+        assert manager.transaction is None
+
+    asyncio.run(scenario())
