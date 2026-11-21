@@ -18,13 +18,42 @@ def _image(frame):
     return frame
 
 
+def _clear_component_8conn(data: bytearray, width: int, height: int, seeds: list[int]) -> None:
+    """Erase an oversized 8-connected component using C-speed bytearray scanlines."""
+    zero_row = bytes(width)
+    while seeds:
+        idx = seeds.pop()
+        if not data[idx]:
+            continue
+        y, x = divmod(idx, width)
+        row_off = y * width
+        zero_l = data.rfind(0, row_off, row_off + x)
+        lx = 0 if zero_l < 0 else zero_l - row_off + 1
+        zero_r = data.find(0, row_off + x, row_off + width)
+        rx = width if zero_r < 0 else zero_r - row_off
+        data[row_off + lx:row_off + rx] = zero_row[:rx - lx]
+        nx0 = lx - 1 if lx > 0 else 0
+        nx1 = rx + 1 if rx < width else width
+        for ny in (y - 1, y + 1):
+            if not 0 <= ny < height:
+                continue
+            ny_off = ny * width
+            scan = ny_off + nx0
+            limit = ny_off + nx1
+            while (hit := data.find(255, scan, limit)) >= 0:
+                seeds.append(hit)
+                next_zero = data.find(0, hit, limit)
+                if next_zero < 0:
+                    break
+                scan = next_zero + 1
+
+
 def _components(mask, *, max_points: int | None = None):
     width, height = mask.size
     data = bytearray(mask.tobytes())
-    total = width * height
-    for start in range(total):
-        if not data[start]:
-            continue
+    pos = 0
+    while (start := data.find(255, pos)) >= 0:
+        pos = start + 1
         data[start] = 0
         stack = [start]
         points = []
@@ -32,11 +61,23 @@ def _components(mask, *, max_points: int | None = None):
         while stack:
             idx = stack.pop()
             x, y = idx % width, idx // width
-            if not oversized:
-                points.append((x, y))
-                if max_points is not None and len(points) > max_points:
-                    oversized = True
-                    points.clear()
+            points.append((x, y))
+            if max_points is not None and len(points) > max_points:
+                oversized = True
+                # Re-mark the frontier (and check their 8-neighbors) so scanline clearing
+                # erases the entire remaining 8-connected component without leaving stragglers.
+                seeds = []
+                for px, py in points:
+                    pidx = py * width + px
+                    data[pidx] = 255
+                    seeds.append(pidx)
+                for pidx in stack:
+                    data[pidx] = 255
+                    seeds.append(pidx)
+                points.clear()
+                stack.clear()
+                _clear_component_8conn(data, width, height, seeds)
+                break
             x0 = x - 1 if x > 0 else 0
             x1 = x + 1 if x + 1 < width else width - 1
             y0 = y - 1 if y > 0 else 0
@@ -59,14 +100,25 @@ class FieldCaret:
     background_x: int
 
 
+def _caret_mask(patch, white: bool):
+    r, g, b = patch.split()
+    if white:
+        lo = ImageChops.darker(ImageChops.darker(r, g), b)
+        hi = ImageChops.lighter(ImageChops.lighter(r, g), b)
+        bright = lo.point(lambda v: 255 if v >= 215 else 0)
+        neutral = ImageChops.subtract(hi, lo).point(lambda v: 255 if v <= 65 else 0)
+        return ImageChops.darker(bright, neutral)
+    b_ok = b.point(lambda v: 255 if v >= 150 else 0)
+    g_ok = g.point(lambda v: 255 if v >= 50 else 0)
+    br_ok = ImageChops.subtract(b, r).point(lambda v: 255 if v >= 60 else 0)
+    bg_ok = ImageChops.subtract(b, g).point(lambda v: 255 if v >= 25 else 0)
+    return ImageChops.darker(ImageChops.darker(b_ok, g_ok), ImageChops.darker(br_ok, bg_ok))
+
+
 def _caret_components(image, white, regions, *, max_points: int | None = None):
     for bounds in regions or ((0, 0, image.width, image.height),):
         patch = image.crop(bounds)
-        pixels = patch.tobytes()
-        mask = Image.new("L", patch.size)
-        mask.putdata([255 if (not white and b >= 150 and b - r >= 60 and b - g >= 25 and g >= 50)
-                      or (white and min(r, g, b) >= 215 and max(r, g, b) - min(r, g, b) <= 65)
-                      else 0 for r, g, b in zip(pixels[0::3], pixels[1::3], pixels[2::3], strict=True)])
+        mask = _caret_mask(patch, white)
         for points in _components(mask, max_points=max_points):
             # Cropping a white page must never manufacture a thin caret shape.
             if regions and any(x in (0, patch.width - 1) or y in (0, patch.height - 1) for x, y in points):
