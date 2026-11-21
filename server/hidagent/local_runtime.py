@@ -146,10 +146,34 @@ def _owned_worker(record):
     if record is None:
         return False
     # An instance token in the managed supervisor's argv protects against reused PIDs.
-    result = subprocess.run(["ps", "-p", str(record["pid"]), "-o", "command="],
-                            capture_output=True, text=True, timeout=2)
+    try:
+        result = subprocess.run(["ps", "-p", str(record["pid"]), "-o", "command="],
+                                capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
     marker = f"-m hidagent.local_runtime worker --instance {record['instance']}"
     return result.returncode == 0 and marker in result.stdout
+
+
+def _terminate_process(process, *, term_timeout: float, kill_timeout: float = 2.0):
+    if process is None:
+        return
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=term_timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=kill_timeout)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def receiver_status(env):
@@ -230,8 +254,7 @@ def ensure_receiver(env):
             break
         time.sleep(.1)
     if process.poll() is None:
-        process.terminate()
-        process.wait(timeout=3)
+        _terminate_process(process, term_timeout=3)
     raise RuntimeError("接收器启动失败；请查看本地 receiver.log。")
 
 
@@ -255,8 +278,7 @@ def start_worker(env):
             break
         time.sleep(.1)
     if process.poll() is None:
-        process.terminate()
-        process.wait(timeout=12)
+        _terminate_process(process, term_timeout=12)
     raise RuntimeError("网页服务启动失败；请查看本地 worker.log。")
 
 
@@ -265,12 +287,27 @@ def stop_worker(env):
     record = _worker_record(data)
     if not _owned_worker(record):
         return
-    os.kill(record["pid"], signal.SIGTERM)
+    try:
+        os.kill(record["pid"], signal.SIGTERM)
+    except ProcessLookupError:
+        pass
     deadline = time.monotonic() + 12
     while _owned_worker(record) and time.monotonic() < deadline:
         time.sleep(.1)
     if _owned_worker(record):
-        raise RuntimeError("网页服务仍在关闭；保留接收器，请稍后检查 status。")
+        # Escalate to SIGKILL only after re-confirming process identity.
+        try:
+            os.kill(record["pid"], signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        kill_deadline = time.monotonic() + 3
+        while _owned_worker(record) and time.monotonic() < kill_deadline:
+            time.sleep(.1)
+        if _owned_worker(record):
+            raise RuntimeError("网页服务仍在关闭；保留接收器，请稍后检查 status。")
+        current = _worker_record(data)
+        if current and current.get("pid") == record["pid"] and current.get("instance") == record["instance"]:
+            (data / "worker.json").unlink(missing_ok=True)
 
 
 def stop_receiver(env):
@@ -370,14 +407,23 @@ def worker(env, instance):
                 listener.close()
             for process in (proxy, child):
                 if process is not None and process.poll() is None:
-                    process.terminate()
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        pass
             for process in (proxy, child):
                 if process is not None:
                     try:
                         process.wait(timeout=4)
                     except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=2)
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            pass
             current = _worker_record(data)
             if current and current.get("pid") == os.getpid() and current.get("instance") == instance:
                 path.unlink(missing_ok=True)

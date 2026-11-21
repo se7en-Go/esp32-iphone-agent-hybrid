@@ -700,3 +700,172 @@ def test_flashing_still_lets_esptool_reset_the_board():
     text = (Path(__file__).resolve().parents[2] / "scripts" / "flash.py").read_text(encoding="utf-8")
     assert '"-m", "esptool"' in text and "open_serial" not in text
     assert "no_reset" not in text and "--before" not in text and "--after" not in text
+
+
+def test_open_serial_sets_bounded_write_timeout():
+    from hidagent.device import SERIAL_WRITE_TIMEOUT
+
+    fake = open_serial("COM9", impl=FakeSerial(), platform="win32")
+    assert fake.write_timeout == SERIAL_WRITE_TIMEOUT and fake.write_timeout > 0
+
+
+def test_serial_link_slow_flush_keeps_event_loop_responsive_and_releases_write_lock():
+    class SlowFlushSerial(FakeSerial):
+        def __init__(self):
+            super().__init__(replies_after=1, read_delay=0.005)
+            self.flush_entered = threading.Event()
+            self.flush_lock_free = None
+            self.write_lock = threading.Lock()
+
+        def write(self, data: bytes) -> None:
+            req = data.decode().strip().split(" ", 1)[0]
+            with self._lock:
+                self._buf.extend(f"{req} ok\n".encode())
+
+        def flush(self) -> None:
+            self.flush_entered.set()
+            # Publication lock must already be released before blocking flush drains UART.
+            acquired = self.write_lock.acquire(blocking=False)
+            self.flush_lock_free = acquired
+            if acquired:
+                self.write_lock.release()
+            time.sleep(0.18)
+
+    async def scenario():
+        raw = SlowFlushSerial()
+        opened = open_serial("COM9", impl=raw, platform="win32")
+        link = SerialLink("COM9", opened=opened)
+        device = Device()
+        device.attach(link, "COM9")
+        max_lag = 0.0
+        ticks = 0
+        stop_ticker = False
+
+        async def ticker():
+            nonlocal max_lag, ticks
+            prev = time.perf_counter()
+            while not stop_ticker:
+                await asyncio.sleep(0.01)
+                now = time.perf_counter()
+                max_lag = max(max_lag, now - prev - 0.01)
+                prev = now
+                ticks += 1
+
+        bg = asyncio.create_task(ticker())
+        try:
+            await device.send_guarded("click", lambda: None, write_lock=raw.write_lock)
+        finally:
+            stop_ticker = True
+            await bg
+            device.close()
+        assert raw.flush_entered.is_set()
+        assert raw.flush_lock_free is True
+        assert ticks >= 4 and max_lag < 0.09, (
+            f"event loop blocked during serial flush: ticks={ticks}, max_lag={max_lag:.3f}s"
+        )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "ping\nclick", "click\r", "type hi\x00", "type " + "a" * 520])
+def test_serial_command_rejects_multiline_nul_empty_and_oversize(bad):
+    async def scenario():
+        device = Device()
+        link = MemoryLink()
+        device.attach(link)
+        with pytest.raises(DeviceError):
+            await device.send(bad)
+        assert link.written == []
+        device.close()
+
+    asyncio.run(scenario())
+
+
+def test_serial_pump_logs_reader_exception_on_disconnect(caplog):
+    class FailingSerial:
+        in_waiting = 0
+
+        def read(self, _size):
+            raise OSError("usb cable pulled")
+
+    link = SerialLink.__new__(SerialLink)
+    link._port = "COM9"
+    link._closed = False
+    link._buf = bytearray(b"half-line")
+    link._ser = FailingSerial()
+    received = []
+    link._post = received.append
+    with caplog.at_level("WARNING", logger="hidagent.device"):
+        link._pump()
+    assert received == [b""]
+    assert any("usb cable pulled" in rec.message and "COM9" in rec.message for rec in caplog.records)
+
+
+def test_keep_awake_survives_unexpected_exception(monkeypatch, caplog):
+    from hidagent import device as module
+
+    async def scenario():
+        device = Device()
+        link = MemoryLink()
+        device.attach(link)
+        calls = 0
+
+        async def fake_send(_cmd):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("transient bug")
+            device._closing = True
+
+        async def fast_sleep(_delay):
+            return None
+
+        monkeypatch.setattr(device, "send", fake_send)
+        monkeypatch.setattr(module.asyncio, "sleep", fast_sleep)
+        monkeypatch.setattr(module.time, "time", lambda: device._beat + 5)
+        with caplog.at_level("WARNING", logger="hidagent.device"):
+            await device.keep_awake(idle=999, heartbeat=0.01)
+        assert calls == 2
+        assert any("transient bug" in rec.message for rec in caplog.records)
+        device.close()
+
+    asyncio.run(scenario())
+
+
+def test_app_lifespan_startup_error_preserves_original_exception_and_cleans_up(monkeypatch):
+    from hidagent import app as app_module
+
+    async def scenario():
+        events = []
+
+        class BrokenScreen:
+            def bind(self, _dev):
+                events.append("bind")
+
+            def start(self):
+                events.append("start")
+                raise RuntimeError("screen boom")
+
+            def stop(self):
+                events.append("stop")
+
+        class DummyDevice:
+            _closing = False
+
+            async def maintain(self):
+                await asyncio.sleep(10)
+
+            async def keep_awake(self, screen=None):
+                await asyncio.sleep(10)
+
+            def close(self):
+                events.append("close")
+
+        monkeypatch.setattr(app_module, "screen", BrokenScreen())
+        monkeypatch.setattr(app_module, "device", DummyDevice())
+        with pytest.raises(RuntimeError, match="screen boom"):
+            async with app_module.lifespan(app_module.app):
+                pass
+        assert events == ["bind", "start", "stop", "close"]
+
+    asyncio.run(scenario())

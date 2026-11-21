@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import socket
 import struct
 import threading
@@ -20,9 +21,12 @@ import time
 
 import av
 
+log = logging.getLogger(__name__)
+
 START, END, IDR, CONFIG, AUDIO = 1, 2, 4, 8, 0x80
 PAYLOAD = 1380
 STREAM_TIMEOUT_S = 12.0
+MAX_AU_BYTES = 8 * 1024 * 1024
 
 
 class SequenceGap(Exception):
@@ -157,6 +161,10 @@ class H264Decoder:
             self._ts = int.from_bytes(payload[:4], "little") if len(payload) >= 4 else 0
             self._cur = bytearray(payload[4:] if len(payload) >= 4 else b"")
         elif self._cur is not None:
+            if len(self._cur) + len(payload) > MAX_AU_BYTES:
+                log.warning("video access unit exceeded %d bytes without END; dropping partial frame", MAX_AU_BYTES)
+                self._cur = None
+                return []
             self._cur += payload
         else:
             return []

@@ -556,3 +556,18 @@ def test_large_replay_sends_keepalive_during_decode(monkeypatch):
     assert len(ka_times) >= 3, "keepalive must run while the receive batch is decoding"
     points = [0.0, *ka_times, elapsed]
     assert max(b - a for a, b in zip(points, points[1:], strict=False)) < 1.01
+
+
+def test_video_access_unit_drops_unbounded_frame_without_end(monkeypatch):
+    import struct
+
+    from hidagent import video7201
+
+    monkeypatch.setattr(video7201, "MAX_AU_BYTES", 64)
+    decoder = H264Decoder()
+    # START chunk with 4-byte timestamp + 30 bytes payload, no END.
+    assert decoder.push_chunk(struct.pack("<HB", 0, video7201.START) + b"\x00\x00\x00\x01" + b"a" * 30) == []
+    assert decoder._cur is not None and len(decoder._cur) == 30
+    # Continuation pushes past MAX_AU_BYTES -> drops partial AU cleanly instead of growing unboundedly.
+    assert decoder.push_chunk(struct.pack("<HB", 1, 0) + b"b" * 40) == []
+    assert decoder._cur is None
