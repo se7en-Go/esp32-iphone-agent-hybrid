@@ -245,8 +245,8 @@ class CompanionClipboard:
         item = _Pending(secrets.token_urlsafe(32), text, time.monotonic() + self.ttl,
                         host_nonce=secrets.token_urlsafe(32), validate_session=validate_session)
         item.auth_failures_at_begin = self.pending_auth_failures
-        self._pending, self._operation_active = item, True
-        self._staged_expiry = asyncio.get_running_loop().call_later(self.ttl, self._expire, item)
+        expiry = asyncio.get_running_loop().call_later(self.ttl, self._expire, item)
+        self._pending, self._operation_active, self._staged_expiry = item, True, expiry
         return item.host_nonce
 
     def cancel_staged(self) -> None:
