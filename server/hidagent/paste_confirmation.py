@@ -103,8 +103,11 @@ def _overlaps_box(item, box: tuple[float, float, float, float]) -> bool:
 def _mask_normalized_box(draw: ImageDraw.ImageDraw, box: tuple[float, float, float, float],
                          size: tuple[int, int]) -> None:
     width, height = size
-    draw.rectangle((round(box[0] * width), round(box[1] * height),
-                    round(box[2] * width), round(box[3] * height)), fill=0)
+    x0 = max(0, min(width - 1, math.floor(box[0] * width)))
+    y0 = max(0, min(height - 1, math.floor(box[1] * height)))
+    x1 = max(x0, min(width - 1, math.ceil(box[2] * width) - 1))
+    y1 = max(y0, min(height - 1, math.ceil(box[3] * height) - 1))
+    draw.rectangle((x0, y0, x1, y1), fill=0)
 
 
 def _diff_has_unexpected_changes(

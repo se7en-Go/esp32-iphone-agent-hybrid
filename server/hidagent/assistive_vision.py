@@ -2,6 +2,7 @@
 
 import io
 import math
+from functools import lru_cache
 from statistics import median
 from typing import NamedTuple
 
@@ -109,12 +110,8 @@ def _translucent_buttons(image, gray, near):
     return found
 
 
-def find_button_target(frame: bytes, near: Point | None = None) -> tuple[Point, Box] | None:
-    """Find an edge button by its concentric rings; `near` only ranks real candidates.
-
-    iOS 26 captures use a pale centre with two grey rings. Older appearances use a
-    white outline on a dark rounded square. A single filled pointer disc fails both.
-    """
+@lru_cache(maxsize=16)
+def _find_button_target_cached(frame: bytes, near: Point | None = None) -> tuple[Point, Box] | None:
     image = _small(frame)
     gray = image.convert("L")
     w, h = image.size
@@ -163,9 +160,55 @@ def find_button_target(frame: bytes, near: Point | None = None) -> tuple[Point, 
     return max(candidates)[1:] if candidates else None
 
 
+def find_button_target(frame: bytes, near: Point | None = None) -> tuple[Point, Box] | None:
+    """Find an edge button by its concentric rings; `near` only ranks real candidates.
+
+    iOS 26 captures use a pale centre with two grey rings. Older appearances use a
+    white outline on a dark rounded square. A single filled pointer disc fails both.
+    """
+    return _find_button_target_cached(frame, near)
+
+
 def find_button(frame: bytes, near: Point | None = None) -> Point | None:
     target = find_button_target(frame, near)
     return target[0] if target is not None else None
+
+
+def _stationary_outlined_or_layered_at(image: Image.Image, gray: Image.Image,
+                                       x: float, y: float, box: Box) -> bool:
+    """Fallback for outlined/layered buttons whose box spans full radius (not 0.85*radius)."""
+    w, h = image.size
+    short = min(w, h)
+    radius = ((box[2] - box[0]) * w + (box[3] - box[1]) * h) / 4
+    if not (.0175 * short <= radius <= .065 * short):
+        return False
+    if not (radius * 1.2 < x < w - radius * 1.2 and radius * 1.2 < y < h - radius * 1.2):
+        return False
+    rim = _circle(gray, x, y, radius * .8)
+    middle = _circle(gray, x, y, radius * 1.35)
+    outside = _circle(gray, x, y, radius * 1.8)
+    centre = _circle(gray, x, y, radius * .35)
+    rim_med, mid_med, out_med = median(rim), median(middle), median(outside)
+    rim_rgb = [_circle(channel, x, y, radius * .8) for channel in image.split()]
+    if sum(max(rgb) - min(rgb) <= 40 for rgb in zip(*rim_rgb, strict=True)) < 9:
+        return False
+    mid_rgb = [_circle(channel, x, y, radius * 1.35) for channel in image.split()]
+    if sum(max(rgb) - min(rgb) <= 40 for rgb in zip(*mid_rgb, strict=True)) < 9:
+        return False
+    # Outlined family: bright rim over darker middle ring, neutral core.
+    outlined_ok = (radius * 2 >= .07 * short
+                   and sum(v < rim_med - 14 for v in middle) >= 9
+                   and sum(abs(v - rim_med) <= 22 for v in rim) >= 9
+                   and rim_med - median(centre) >= 12)
+    # Layered family: concentric pale centre/rim stepping down to darker middle & outside.
+    layered_ok = (mid_med - out_med >= 6
+                  and sum(v < rim_med - 10 for v in middle) >= 9
+                  and sum(v < mid_med - 5 for v in outside) >= 9
+                  and sum(abs(v - rim_med) <= 20 for v in rim) >= 9)
+    if not (outlined_ok or layered_ok):
+        return False
+    core_rgb = [_circle(channel, x, y, radius * .35) for channel in image.split()]
+    return all(max(rgb) - min(rgb) <= 35 for rgb in zip(*core_rgb, strict=True))
 
 
 def stationary_button_at(frame: bytes, target: tuple[Point, Box]) -> bool:
@@ -183,38 +226,30 @@ def stationary_button_at(frame: bytes, target: tuple[Point, Box]) -> bool:
     short = min(w, h)
     x, y = cx * w, cy * h
     outer_r = ((box[2] - box[0]) * w + (box[3] - box[1]) * h) / (4 * .85)
-    if not (.05 * short <= outer_r <= .11 * short):
-        return False
-    if not (outer_r < x < w - outer_r and outer_r < y < h - outer_r):
-        return False
-    core = _circle(gray, x, y, outer_r * .25)
-    inner = _circle(gray, x, y, outer_r * .58)
-    outer = _circle(gray, x, y, outer_r * .87)
-    outside = _circle(gray, x, y, outer_r * 1.22)
-    i_med, o_med, beyond = median(inner), median(outer), median(outside)
-    if not (i_med - o_med >= 5 and beyond - o_med >= 18):
-        return False
-    if sum(abs(v - o_med) <= 18 for v in outer) < 9:
-        return False
-    if sum(b - d > 2 and e - d > 12 for b, d, e in zip(inner, outer, outside, strict=True)) < 8:
-        return False
-    outer_rgb = [_circle(channel, x, y, outer_r * .87) for channel in image.split()]
-    if sum(max(rgb) - min(rgb) <= 40 for rgb in zip(*outer_rgb, strict=True)) < 9:
-        return False
-    core_rgb = [_circle(channel, x, y, outer_r * .25) for channel in image.split()]
-    coherent = [
-        idx for idx, (a, b, d, e) in enumerate(zip(core, inner, outer, outside, strict=True))
-        if a - b > 5 and b - d > 2 and e - d > 12
-    ]
-    if len(coherent) < 4:
-        return False
-    for idx in range(12):
-        if idx in coherent:
-            continue
-        rgb = tuple(channel[idx] for channel in core_rgb)
-        if core[idx] > inner[idx] + 5 or max(rgb) - min(rgb) > 30:
-            return False
-    return True
+    if (.05 * short <= outer_r <= .11 * short
+            and outer_r < x < w - outer_r and outer_r < y < h - outer_r):
+        core = _circle(gray, x, y, outer_r * .25)
+        inner = _circle(gray, x, y, outer_r * .58)
+        outer = _circle(gray, x, y, outer_r * .87)
+        outside = _circle(gray, x, y, outer_r * 1.22)
+        i_med, o_med, beyond = median(inner), median(outer), median(outside)
+        if (i_med - o_med >= 5 and beyond - o_med >= 18
+                and sum(abs(v - o_med) <= 18 for v in outer) >= 9
+                and sum(b - d > 2 and e - d > 12 for b, d, e in zip(inner, outer, outside, strict=True)) >= 8):
+            outer_rgb = [_circle(channel, x, y, outer_r * .87) for channel in image.split()]
+            if sum(max(rgb) - min(rgb) <= 40 for rgb in zip(*outer_rgb, strict=True)) >= 9:
+                core_rgb = [_circle(channel, x, y, outer_r * .25) for channel in image.split()]
+                coherent = [
+                    idx for idx, (a, b, d, e) in enumerate(zip(core, inner, outer, outside, strict=True))
+                    if a - b > 5 and b - d > 2 and e - d > 12
+                ]
+                if len(coherent) >= 4 and all(
+                    core[idx] <= inner[idx] + 5 and max(rgb) - min(rgb) <= 30
+                    for idx in range(12) if idx not in coherent
+                    for rgb in (tuple(channel[idx] for channel in core_rgb),)
+                ):
+                    return True
+    return _stationary_outlined_or_layered_at(image, gray, x, y, box)
 
 
 def _icon_boxes(image: Image.Image, box: tuple[int, int, int, int]):
@@ -404,12 +439,8 @@ def find_icon_target(frame: bytes, panel: Box, slot: Point) -> tuple[Point, Box]
     return candidates[0] if len(candidates) == 1 else None
 
 
-def find_panel(frame: bytes, before: bytes | None = None) -> Box | None:
-    """Locate a rounded dark panel with the default six-icon arrangement.
-
-    Supplying `before` rejects unchanged app panels. Ambiguous/custom layouts are
-    rejected; a dark rectangle alone must never authorize a Home click.
-    """
+@lru_cache(maxsize=16)
+def _find_panel_cached(frame: bytes, before: bytes | None = None) -> Box | None:
     rgb = _small(frame)
     image = rgb.convert("L")
     w, h = image.size
@@ -451,6 +482,15 @@ def find_panel(frame: bytes, before: bytes | None = None) -> Box | None:
                     continue
             candidates.append((fill*bw*bh, (left/w, top/h, right/w, bottom/h)))
     return max(candidates)[1] if candidates else None
+
+
+def find_panel(frame: bytes, before: bytes | None = None) -> Box | None:
+    """Locate a rounded dark panel with the default six-icon arrangement.
+
+    Supplying `before` rejects unchanged app panels. Ambiguous/custom layouts are
+    rejected; a dark rectangle alone must never authorize a Home click.
+    """
+    return _find_panel_cached(frame, before)
 
 
 def is_home_visible(frame: bytes) -> bool:

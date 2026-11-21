@@ -2,6 +2,7 @@
 
 import io
 import math
+from functools import lru_cache
 from statistics import median
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
@@ -78,13 +79,29 @@ def _point_regions(hot):
         yield points
 
 
+@lru_cache(maxsize=16)
+def _cached_rgb_at_size(frame: bytes, size: tuple[int, int]) -> Image.Image:
+    with Image.open(io.BytesIO(frame)) as original:
+        rgb = original.convert("RGB")
+    return rgb if rgb.size == size else rgb.resize(size, Image.Resampling.BILINEAR)
+
+
 def _rgb_at_size(frame: bytes | Image.Image, size: tuple[int, int]) -> Image.Image:
     if isinstance(frame, bytes):
-        with Image.open(io.BytesIO(frame)) as original:
-            frame = original.convert("RGB")
-    elif frame.mode != "RGB":
+        return _cached_rgb_at_size(frame, size).copy()
+    if frame.mode != "RGB":
         frame = frame.convert("RGB")
     return frame if frame.size == size else frame.resize(size, Image.Resampling.BILINEAR)
+
+
+def _mask_rect(draw: ImageDraw.ImageDraw, region: tuple[float, float, float, float],
+               size: tuple[int, int]) -> None:
+    w, h = size
+    x0 = max(0, min(w - 1, math.floor(region[0] * w)))
+    y0 = max(0, min(h - 1, math.floor(region[1] * h)))
+    x1 = max(x0, min(w - 1, math.ceil(region[2] * w) - 1))
+    y1 = max(y0, min(h - 1, math.ceil(region[3] * h) - 1))
+    draw.rectangle((x0, y0, x1, y1), fill=0)
 
 
 def _dim_overlay_disc(background, current, points, width):
@@ -797,11 +814,7 @@ def _mask_stationary_assistive_button(before: bytes | None, after: bytes | None,
     union = stationary_assistive_button_box(before, after, exclude=exclude)
     if union is None:
         return
-    w, h = diff.size
-    ImageDraw.Draw(diff).rectangle(
-        (round(union[0] * w), round(union[1] * h), round(union[2] * w), round(union[3] * h)),
-        fill=0,
-    )
+    _mask_rect(ImageDraw.Draw(diff), union, diff.size)
 
 
 def observation_changed(before: bytes | None, after: bytes | None, *, input_region=None,
@@ -825,9 +838,7 @@ def observation_changed(before: bytes | None, after: bytes | None, *, input_regi
     if moved_pointer:
         _mask_locations(diff, moved_pointer, ())
     if input_region is not None:
-        w, h = diff.size
-        ImageDraw.Draw(diff).rectangle(tuple(round(v * (w if i % 2 == 0 else h))
-                                             for i, v in enumerate(input_region)), fill=0)
+        _mask_rect(ImageDraw.Draw(diff), input_region, diff.size)
     mask_caret_blink(before, after, diff, caret_frames, scope=caret_scope)
     mask_clock_ticks(before, after, diff)
     mask_pointer_highlights(before, after, diff)

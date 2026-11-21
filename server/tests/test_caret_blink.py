@@ -224,3 +224,17 @@ def test_spotlight_white_focus_requires_matching_ocr_before_typing(case, tmp_pat
             device.close()
 
     asyncio.run(scenario())
+
+
+def test_white_page_field_carets_skips_giant_background_fast():
+    import time
+
+    from PIL import Image
+
+    from hidagent.caret import field_carets
+
+    started = time.perf_counter()
+    result = field_carets(Image.new("RGB", (720, 1560), "white"), allow_white=True)
+    elapsed = time.perf_counter() - started
+    assert result == []
+    assert elapsed < 2.0, f"full white page caret scan took {elapsed:.2f}s"

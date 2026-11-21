@@ -963,20 +963,25 @@ class Phone:
         deadline = time.monotonic() + search_wait
         since = self._position_completed
         generation = freshness.require_fresh(self.screen).generation
-        with Image.open(io.BytesIO(self._position_before)) as image:
-            before = image.convert("RGB")
-        width, height = before.size
-        bounds = (max(0, round((near[0] - .1) * width)), max(0, round((near[1] - .08) * height)),
-                  min(width, round((near[0] + .1) * width)), min(height, round((near[1] + .08) * height)))
-        old = [(px + bounds[0], py + bounds[1], diameter, color)
-               for px, py, diameter, color in vision._discs(before.crop(bounds), width)]
+        def _decode_baseline():
+            with Image.open(io.BytesIO(self._position_before)) as image:
+                before_img = image.convert("RGB")
+            w, h = before_img.size
+            b = (max(0, round((near[0] - .1) * w)), max(0, round((near[1] - .08) * h)),
+                 min(w, round((near[0] + .1) * w)), min(h, round((near[1] + .08) * h)))
+            old_discs = [(px + b[0], py + b[1], diameter, color)
+                         for px, py, diameter, color in vision._discs(before_img.crop(b), w)]
+            ox0, oy0 = self._position_from
+            sb = (max(0, round((ox0 - .08) * w)), max(0, round((oy0 - .06) * h)),
+                  min(w, round((ox0 + .08) * w)), min(h, round((oy0 + .06) * h)))
+            src_discs = [(px + sb[0], py + sb[1], diameter, color)
+                         for px, py, diameter, color in vision._discs(before_img.crop(sb), w)
+                         if .025 * w <= diameter <= .065 * w
+                         and 40 <= min(color) <= max(color) <= 210 and max(color) - min(color) <= 25]
+            return (w, h), b, old_discs, sb, src_discs
+
+        (width, height), bounds, old, source_bounds, source = await asyncio.to_thread(_decode_baseline)
         ox, oy = self._position_from
-        source_bounds = (max(0, round((ox - .08) * width)), max(0, round((oy - .06) * height)),
-                         min(width, round((ox + .08) * width)), min(height, round((oy + .06) * height)))
-        source = [(px + source_bounds[0], py + source_bounds[1], diameter, color)
-                  for px, py, diameter, color in vision._discs(before.crop(source_bounds), width)
-                  if .025 * width <= diameter <= .065 * width
-                  and 40 <= min(color) <= max(color) <= 210 and max(color) - min(color) <= 25]
         if len(source) != 1:
             return None  # no observed starting disc: a new round UI element is not pointer evidence
         sx, sy, size, shade = source[0]
@@ -988,30 +993,19 @@ class Phone:
                     and abs(diameter - old_size) <= .3 * old_size
                     and max(abs(a - b) for a, b in zip(color, old_color, strict=True)) <= 40)
 
-        while time.monotonic() < deadline:
-            if self._stopped(epoch):
-                raise DeviceError("已紧急停止，后面的内容没有发出。")
-            after = await self.screen.fresh(since, min(.05, max(0, deadline - time.monotonic())))
-            if after is None:
-                continue
-            since = self.screen.updated
-            snap = freshness.fresh_frame(self.screen, since=self._position_completed)
-            if snap is None:
-                continue
-            if snap.generation != generation:
-                raise RuntimeError("指针定位期间画面连接已变化，请重新观察。")
-            with Image.open(io.BytesIO(snap.frame)) as image:
+        def _inspect_frame(frame_bytes, recent, ctx_regions, c_scope):
+            with Image.open(io.BytesIO(frame_bytes)) as image:
                 current = image.convert("RGB")
-            if current.size != before.size or screen_compare.observation_changed(
-                self._position_before, snap.frame,
-                caret_frames=getattr(self.screen, "recent_frames", ()),
-                context_regions=self._pointer_context_regions(),
-                caret_scope=getattr(self, "_pointer_caret_scope", None)):
-                return None
+            if current.size != (width, height) or screen_compare.observation_changed(
+                self._position_before, frame_bytes,
+                caret_frames=recent,
+                context_regions=ctx_regions,
+                caret_scope=c_scope):
+                return "changed", None
             remaining = [(px + source_bounds[0], py + source_bounds[1], diameter, color)
                          for px, py, diameter, color in vision._discs(current.crop(source_bounds), width)]
             if any(same_disc(candidate, source[0]) for candidate in remaining):
-                continue  # a static source plus a newly appeared circle does not prove pointer motion
+                return "continue", None  # a static source plus a newly appeared circle does not prove pointer motion
             candidates = [(px, py) for px, py, diameter, color in vision._discs(current.crop(bounds), width)
                           if .025 * width <= diameter <= .065 * width
                           and 40 <= min(color) <= max(color) <= 210 and max(color) - min(color) <= 25
@@ -1025,7 +1019,34 @@ class Phone:
                           and abs((py + bounds[1] - sy) / height - (near[1] - oy)) <= MAX_MISS]
             if len(candidates) == 1:
                 px, py = candidates[0]
-                landing = (px + bounds[0]) / width, (py + bounds[1]) / height
+                return "found", ((px + bounds[0]) / width, (py + bounds[1]) / height)
+            return "continue", None
+
+        last_checked = None
+        while time.monotonic() < deadline:
+            if self._stopped(epoch):
+                raise DeviceError("已紧急停止，后面的内容没有发出。")
+            after = await self.screen.fresh(since, min(.05, max(0, deadline - time.monotonic())))
+            if after is None:
+                continue
+            since = self.screen.updated
+            snap = freshness.fresh_frame(self.screen, since=self._position_completed)
+            if snap is None:
+                continue
+            if snap.generation != generation:
+                raise RuntimeError("指针定位期间画面连接已变化，请重新观察。")
+            if snap.frame == last_checked:
+                continue
+            last_checked = snap.frame
+            status, landing = await asyncio.to_thread(
+                _inspect_frame, snap.frame,
+                tuple(getattr(self.screen, "recent_frames", ())),
+                self._pointer_context_regions(),
+                getattr(self, "_pointer_caret_scope", None),
+            )
+            if status == "changed":
+                return None
+            if status == "found":
                 if self._pace == BLE_PACE:
                     self._pointer_overlay = landing, snap.frame
                 return landing
@@ -1073,10 +1094,10 @@ class Phone:
                     # each comparison is tens of ms of pure Python, and hogging the GIL starves the video thread
                     for before in dict.fromkeys(priors[:1] + priors[-1:]):
                         for look, reach in searches:
-                            moved = vision.pointer_move(before, after, look, shift, reach, strict=strict)
+                            moved = await asyncio.to_thread(
+                                vision.pointer_move, before, after, look, shift, reach, strict=strict)
                             if moved:
                                 return moved[0] if at_start else moved[1]
-                            await asyncio.sleep(0)
                 if not history or after != history[-1]:
                     history.append(after)
             await asyncio.sleep(.02)

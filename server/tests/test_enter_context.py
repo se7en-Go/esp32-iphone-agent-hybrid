@@ -302,3 +302,57 @@ def test_batch_non_send_intent_is_rejected_before_any_command(setup):
             assert response.status_code == 409
     asyncio.run(scenario())
     assert link.written == []
+
+
+def test_enter_context_tolerates_status_bar_clock_change_but_rejects_ui_change(setup):
+    from PIL import ImageDraw
+
+    from hidagent import enter_context
+
+    module, guard, link, screen, _boxes = setup
+
+    def make_png(*, top_bar=False, body_edit=False):
+        img = Image.new("RGB", (200, 400), "white")
+        draw = ImageDraw.Draw(img)
+        if top_bar:
+            draw.rectangle((20, 4, 55, 16), fill=(30, 30, 30))
+        if body_edit:
+            draw.rectangle((40, 200, 140, 240), fill=(20, 20, 20))
+        out = io.BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue()
+
+    before = make_png()
+    clock_ticked = make_png(top_bar=True)
+    ui_changed = make_png(body_edit=True)
+    screen.frame = before
+
+    async def scenario():
+        validate = await enter_context.verify_enter_context(screen, before, "navigation")
+        screen.frame = clock_ticked
+        validate()  # status bar clock change alone must not cause 409
+        screen.frame = ui_changed
+        with pytest.raises(RuntimeError, match="已变化"):
+            validate()
+
+    asyncio.run(scenario())
+
+
+def test_agent_stop_keeps_abort_active_when_reset_fails(setup, monkeypatch):
+    module, _guard, _link, _screen, _boxes = setup
+    reset_calls = []
+
+    async def failing_reset():
+        reset_calls.append(1)
+        raise DeviceError("serial busy")
+
+    monkeypatch.setattr(module.phone, "reset", failing_reset, raising=False)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=module.app), base_url="http://test") as client:
+            res = await client.post("/api/agent/stop", json={})
+            assert res.status_code == 409
+        assert reset_calls == [1]
+        assert module.device._abort is True
+
+    asyncio.run(scenario())
