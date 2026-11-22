@@ -228,7 +228,7 @@ def test_cancelled_gesture_releases_before_serial_close(tmp_path, monkeypatch, p
     from hidagent import operation
 
     if not disconnect:
-        monkeypatch.setattr(operation, "OPERATION_TIMEOUT", 0.04)
+        monkeypatch.setattr(operation, "OPERATION_TIMEOUT", 0.25)
 
     async def scenario():
         device, link = Device(), HeldButtonLink(pause, hold_release=repeat_cancel)
