@@ -193,29 +193,44 @@ async function main() {
     assert.equal(h.state().expectsFrame, false);
     assert.equal(h.state().previewState, "disconnected");
   }
-  // post() must apply an AbortSignal timeout and surface fetch failures to #msg instead of throwing.
+  // post() must apply path-aware AbortSignal timeouts and surface timeout/network feedback safely.
   {
     record("post-timeout-feedback");
     const postStart = source.indexOf("async function post(");
     const postEnd = source.indexOf("// ---- step helpers", postStart);
     assert(postStart > 0 && postEnd > postStart);
+    const seenTimeouts = [];
+    let nextErr = new Error("network down");
     let capturedOpts = null;
     const msgNode = { textContent: "" };
     const ctx = {
       $: (id) => (id === "msg" ? msgNode : { textContent: "" }),
       lang: "en",
-      AbortSignal,
+      AbortSignal: {
+        timeout: (ms) => {
+          seenTimeouts.push(ms);
+          return { fakeSignalMs: ms };
+        },
+      },
       fetch: async (_url, opts) => {
         capturedOpts = opts;
-        throw new Error("network down");
+        throw nextErr;
       },
     };
     vm.createContext(ctx);
     vm.runInContext(source.slice(postStart, postEnd) + ";globalThis.post = post;", ctx);
     const res = await ctx.post("/api/agent/stop", {});
     assert.equal(res, null);
-    assert(capturedOpts && capturedOpts.signal, "post() must attach an AbortSignal timeout");
+    assert(capturedOpts && capturedOpts.signal && capturedOpts.signal.fakeSignalMs === 60000);
     assert(msgNode.textContent.includes("network down"), "post() must display failure feedback");
+
+    nextErr = Object.assign(new Error("aborted"), { name: "TimeoutError" });
+    await ctx.post("/api/type", { text: "hello" });
+    assert.equal(seenTimeouts[seenTimeouts.length - 1], 60000);
+    assert(msgNode.textContent.includes("inspect the phone screen"), "timeout must warn before retrying");
+
+    await ctx.post("/api/key", { combo: "enter" });
+    assert.equal(seenTimeouts[seenTimeouts.length - 1], 15000);
   }
 }
 

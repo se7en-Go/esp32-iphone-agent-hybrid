@@ -142,17 +142,46 @@ def _worker_record(data):
     return None
 
 
-def _owned_worker(record):
+def _probe_owned_worker(record):
+    """Return True if owned, False if absent/different, or None if ps timed out."""
     if record is None:
         return False
     # An instance token in the managed supervisor's argv protects against reused PIDs.
     try:
         result = subprocess.run(["ps", "-p", str(record["pid"]), "-o", "command="],
                                 capture_output=True, text=True, timeout=2)
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        return None
+    except OSError:
         return False
     marker = f"-m hidagent.local_runtime worker --instance {record['instance']}"
     return result.returncode == 0 and marker in result.stdout
+
+
+def _owned_worker(record):
+    return _probe_owned_worker(record) is True
+
+
+def _kill_owned_subprocesses(record):
+    """Best-effort SIGKILL for recorded child/proxy PIDs whose command matches this runtime."""
+    checks = (
+        ("child_pid", "-m hidagent"),
+        ("clipboard_proxy_pid", "-m hidagent.local_runtime clipboard-proxy"),
+    )
+    for key, marker in checks:
+        pid = record.get(key)
+        if type(pid) is not int or pid <= 1 or pid == record.get("pid"):
+            continue
+        try:
+            result = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                    capture_output=True, text=True, timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0 and marker in result.stdout:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def _terminate_process(process, *, term_timeout: float, kill_timeout: float = 2.0):
@@ -285,25 +314,45 @@ def start_worker(env):
 def stop_worker(env):
     data = Path(env["HIDAGENT_DATA"])
     record = _worker_record(data)
-    if not _owned_worker(record):
+    owned = _probe_owned_worker(record)
+    if owned is None:
+        raise RuntimeError("无法确认网页服务进程身份（ps 超时），未发送停止信号。")
+    if not owned:
         return
     try:
         os.kill(record["pid"], signal.SIGTERM)
     except ProcessLookupError:
         pass
     deadline = time.monotonic() + 12
-    while _owned_worker(record) and time.monotonic() < deadline:
+    state = _probe_owned_worker(record)
+    while state is not False and time.monotonic() < deadline:
         time.sleep(.1)
-    if _owned_worker(record):
+        state = _probe_owned_worker(record)
+    if state is None:
+        raise RuntimeError("网页服务停止状态未确认（ps 超时）；保留接收器，请稍后检查 status。")
+    if state is True:
         # Escalate to SIGKILL only after re-confirming process identity.
+        # Worker runs in its own session (pgid == pid), so killing its group
+        # prevents orphaned child web/proxy processes from holding ports.
+        killed_group = False
         try:
-            os.kill(record["pid"], signal.SIGKILL)
-        except ProcessLookupError:
+            if hasattr(os, "getpgid") and hasattr(os, "killpg") and os.getpgid(record["pid"]) == record["pid"]:
+                os.killpg(record["pid"], signal.SIGKILL)
+                killed_group = True
+        except (OSError, ProcessLookupError):
             pass
+        if not killed_group:
+            try:
+                os.kill(record["pid"], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        _kill_owned_subprocesses(record)
         kill_deadline = time.monotonic() + 3
-        while _owned_worker(record) and time.monotonic() < kill_deadline:
+        state = _probe_owned_worker(record)
+        while state is not False and time.monotonic() < kill_deadline:
             time.sleep(.1)
-        if _owned_worker(record):
+            state = _probe_owned_worker(record)
+        if state is not False:
             raise RuntimeError("网页服务仍在关闭；保留接收器，请稍后检查 status。")
         current = _worker_record(data)
         if current and current.get("pid") == record["pid"] and current.get("instance") == record["instance"]:
@@ -368,12 +417,24 @@ def worker(env, instance):
             if stopping:
                 return 0
             child = subprocess.Popen([sys.executable, "-m", "hidagent"], cwd=ROOT / "server", env=env)
+            record(child_pid=child.pid)
             if stopping:
                 child.terminate()
             if not proxy_config or not proxy_config["managed"]:
-                return child.wait()
+                while not stopping:
+                    try:
+                        return child.wait(timeout=.1)
+                    except subprocess.TimeoutExpired:
+                        pass
+                try:
+                    return child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    return 0
             if stopping:
-                return child.wait()
+                try:
+                    return child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    return 0
             descriptor = listener.fileno()
             try:
                 proxy = subprocess.Popen([sys.executable, "-m", "hidagent.local_runtime", "clipboard-proxy",
@@ -388,7 +449,7 @@ def worker(env, instance):
                 if proxy.poll() is not None or child.poll() is not None:
                     break
                 if _proxy_accepting(proxy_config) and proxy.poll() is None:
-                    record(clipboard_proxy_ready=True, clipboard_proxy_pid=proxy.pid)
+                    record(child_pid=child.pid, clipboard_proxy_ready=True, clipboard_proxy_pid=proxy.pid)
                     break
                 time.sleep(.1)
             else:
@@ -401,7 +462,10 @@ def worker(env, instance):
                     return child.wait(timeout=.1)
                 except subprocess.TimeoutExpired:
                     pass
-            return child.wait(timeout=5)
+            try:
+                return child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                return 0
         finally:
             if listener is not None:
                 listener.close()

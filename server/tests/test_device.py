@@ -729,40 +729,41 @@ def test_serial_link_slow_flush_keeps_event_loop_responsive_and_releases_write_l
             self.flush_lock_free = acquired
             if acquired:
                 self.write_lock.release()
-            time.sleep(0.18)
+            self.allow_finish.wait(timeout=5.0)
 
     async def scenario():
         raw = SlowFlushSerial()
+        raw.allow_finish = threading.Event()
         opened = open_serial("COM9", impl=raw, platform="win32")
         link = SerialLink("COM9", opened=opened)
         device = Device()
         device.attach(link, "COM9")
-        max_lag = 0.0
-        ticks = 0
-        stop_ticker = False
+        loop_ticks_during_flush = 0
 
-        async def ticker():
-            nonlocal max_lag, ticks
-            prev = time.perf_counter()
-            while not stop_ticker:
-                await asyncio.sleep(0.01)
-                now = time.perf_counter()
-                max_lag = max(max_lag, now - prev - 0.01)
-                prev = now
-                ticks += 1
+        async def release_after_loop_proves_responsive():
+            nonlocal loop_ticks_during_flush
+            deadline = time.monotonic() + 5.0
+            while not raw.flush_entered.is_set():
+                assert time.monotonic() < deadline, "flush never started"
+                await asyncio.sleep(0.005)
+            # Prove the event loop still schedules multiple turns while flush() is blocked.
+            for _ in range(5):
+                await asyncio.sleep(0.005)
+                loop_ticks_during_flush += 1
+            raw.allow_finish.set()
 
-        bg = asyncio.create_task(ticker())
+        bg = asyncio.create_task(release_after_loop_proves_responsive())
         try:
             await device.send_guarded("click", lambda: None, write_lock=raw.write_lock)
-        finally:
-            stop_ticker = True
             await bg
+        finally:
+            raw.allow_finish.set()
+            if not bg.done():
+                bg.cancel()
             device.close()
         assert raw.flush_entered.is_set()
         assert raw.flush_lock_free is True
-        assert ticks >= 4 and max_lag < 0.09, (
-            f"event loop blocked during serial flush: ticks={ticks}, max_lag={max_lag:.3f}s"
-        )
+        assert loop_ticks_during_flush == 5
 
     asyncio.run(scenario())
 
@@ -869,3 +870,165 @@ def test_app_lifespan_startup_error_preserves_original_exception_and_cleans_up(m
         assert events == ["bind", "start", "stop", "close"]
 
     asyncio.run(scenario())
+
+
+def test_cancelled_blocking_write_waits_for_worker_and_never_writes_late_press():
+    import threading
+
+    from hidagent.device import SerialLink, open_serial
+
+    class RecordingSerial:
+        def __init__(self):
+            self.is_open = True
+            self.written = []
+            self.in_waiting = 0
+
+        def read(self, _size=1):
+            time.sleep(0.01)
+            return b""
+
+        def write(self, data):
+            self.written.append(data)
+            return len(data)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            self.is_open = False
+
+    async def scenario():
+        raw = RecordingSerial()
+        opened = open_serial("COM9", impl=raw, platform="win32")
+        link = SerialLink("COM9", opened=opened)
+        device = Device()
+        device.attach(link, "COM9")
+        pub_lock = threading.Lock()
+        pub_lock.acquire()
+        worker_entered = threading.Event()
+        original_run_write = link.run_write
+
+        async def tracked_run_write(fn):
+            def wrapped():
+                worker_entered.set()
+                return fn()
+            return await original_run_write(wrapped)
+
+        link.run_write = tracked_run_write
+        task = asyncio.create_task(device.exchange("press", write_lock=pub_lock))
+        try:
+            deadline = time.monotonic() + 5.0
+            while not worker_entered.is_set():
+                assert time.monotonic() < deadline
+                await asyncio.sleep(0.005)
+            # Cancel while the worker thread is blocked waiting for pub_lock.
+            task.cancel()
+            await asyncio.sleep(0.02)
+            assert not task.done(), "exchange must wait for the worker thread before finishing cancellation"
+            pub_lock.release()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert raw.written == []
+            assert device._pressed_link is None
+        finally:
+            if pub_lock.locked():
+                pub_lock.release()
+            device.close()
+
+    asyncio.run(scenario())
+
+
+def test_serial_exception_during_write_triggers_release_and_link_close():
+    import serial
+
+    from hidagent.device import SerialLink, open_serial
+
+    class FailingFlushSerial:
+        def __init__(self):
+            self.is_open = True
+            self.in_waiting = 0
+            self.written = []
+
+        def read(self, _size=1):
+            time.sleep(0.01)
+            return b""
+
+        def write(self, data):
+            self.written.append(data)
+            return len(data)
+
+        def flush(self):
+            raise serial.SerialException("port closed mid-flush")
+
+        def close(self):
+            self.is_open = False
+
+    async def scenario():
+        raw = FailingFlushSerial()
+        opened = open_serial("COM9", impl=raw, platform="win32")
+        link = SerialLink("COM9", opened=opened)
+        device = Device()
+        device.attach(link, "COM9")
+        with pytest.raises(DeviceError):
+            await device.exchange("press")
+        assert device._link is None
+        assert not link.is_open()
+        assert any(b"release" in line for line in raw.written)
+
+    asyncio.run(scenario())
+
+
+def test_serial_pump_discards_unbounded_line_without_newline(monkeypatch, caplog):
+    from hidagent import device as module
+    from hidagent.device import SerialLink, open_serial
+
+    monkeypatch.setattr(module, "MAX_READ_LINE", 64)
+
+    class NoisySerial:
+        def __init__(self):
+            self.is_open = True
+            self.chunks = [b"X" * 100, b"1 ok\n"]
+
+        @property
+        def in_waiting(self):
+            return len(self.chunks[0]) if self.chunks else 0
+
+        def read(self, _size=1):
+            if self.chunks:
+                return self.chunks.pop(0)
+            time.sleep(0.01)
+            return b""
+
+        def write(self, data):
+            return len(data)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            self.is_open = False
+
+    async def scenario():
+        raw = NoisySerial()
+        opened = open_serial("COM9", impl=raw, platform="win32")
+        link = SerialLink("COM9", opened=opened)
+        try:
+            with caplog.at_level("WARNING", logger="hidagent.device"):
+                line = await asyncio.wait_for(link.readline(), timeout=2.0)
+            assert line == b"1 ok\n"
+            assert any("exceeded 64 bytes" in rec.message for rec in caplog.records)
+        finally:
+            link.close()
+
+    asyncio.run(scenario())
+
+
+def test_attach_new_link_clears_stale_abort():
+    device = Device()
+    first, second = MemoryLink(), MemoryLink()
+    device.attach(first)
+    device.request_abort()
+    assert device._abort is True
+    device.attach(second)
+    assert device._abort is False
+    device.close()

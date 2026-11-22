@@ -356,3 +356,22 @@ def test_agent_stop_keeps_abort_active_when_reset_fails(setup, monkeypatch):
         assert module.device._abort is True
 
     asyncio.run(scenario())
+
+
+def test_agent_stop_clears_abort_when_failed_reset_drops_connection(setup, monkeypatch):
+    module, _guard, _link, _screen, _boxes = setup
+
+    async def disconnecting_reset():
+        module.device.close()
+        raise DeviceError("link lost during reset")
+
+    monkeypatch.setattr(module.phone, "reset", disconnecting_reset, raising=False)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=module.app), base_url="http://test") as client:
+            res = await client.post("/api/agent/stop", json={})
+            assert res.status_code == 409
+        assert module.device.connected is False
+        assert module.device._abort is False
+
+    asyncio.run(scenario())

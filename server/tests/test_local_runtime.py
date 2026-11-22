@@ -524,7 +524,7 @@ def test_stop_worker_escalates_to_sigkill_and_removes_stale_record(tmp_path, mon
     def fake_sleep(dt):
         now[0] += dt
 
-    monkeypatch.setattr(local_runtime, "_owned_worker", lambda rec: rec is not None and alive[0])
+    monkeypatch.setattr(local_runtime, "_probe_owned_worker", lambda rec: rec is not None and alive[0])
     monkeypatch.setattr(local_runtime.os, "kill", fake_kill)
     monkeypatch.setattr(local_runtime.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(local_runtime.time, "sleep", fake_sleep)
@@ -532,6 +532,65 @@ def test_stop_worker_escalates_to_sigkill_and_removes_stale_record(tmp_path, mon
     local_runtime.stop_worker({"HIDAGENT_DATA": str(tmp_path)})
     assert signals == [signal.SIGTERM, signal.SIGKILL]
     assert not record_path.exists()
+
+
+def test_stop_worker_sigkill_kills_process_group_and_recorded_children(tmp_path, monkeypatch):
+    import signal
+
+    record_path = tmp_path / "worker.json"
+    record_path.write_text(json.dumps({
+        "pid": 4321, "instance": "b" * 32, "child_pid": 4322, "clipboard_proxy_pid": 4323,
+    }))
+    alive = [True]
+    pg_kills = []
+    pid_kills = []
+    now = [0.0]
+
+    def fake_killpg(pgid, sig):
+        pg_kills.append((pgid, sig))
+        if sig == signal.SIGKILL:
+            alive[0] = False
+
+    def fake_kill(pid, sig):
+        pid_kills.append((pid, sig))
+
+    def fake_ps(cmd, **_kwargs):
+        pid = int(cmd[2])
+        if pid == 4322:
+            return subprocess.CompletedProcess(cmd, 0, stdout="python -m hidagent\n", stderr="")
+        if pid == 4323:
+            return subprocess.CompletedProcess(cmd, 0, stdout="python -m hidagent.local_runtime clipboard-proxy\n",
+                                               stderr="")
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(local_runtime, "_probe_owned_worker", lambda rec: rec is not None and alive[0])
+    monkeypatch.setattr(local_runtime.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(local_runtime.os, "killpg", fake_killpg)
+    monkeypatch.setattr(local_runtime.os, "kill", fake_kill)
+    monkeypatch.setattr(local_runtime.subprocess, "run", fake_ps)
+    monkeypatch.setattr(local_runtime.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(local_runtime.time, "sleep", lambda dt: now.__setitem__(0, now[0] + dt))
+
+    local_runtime.stop_worker({"HIDAGENT_DATA": str(tmp_path)})
+    assert pg_kills == [(4321, signal.SIGKILL)]
+    assert (4321, signal.SIGTERM) in pid_kills
+    assert (4322, signal.SIGKILL) in pid_kills and (4323, signal.SIGKILL) in pid_kills
+    assert not record_path.exists()
+
+
+def test_stop_worker_raises_when_ps_times_out(tmp_path, monkeypatch):
+    record_path = tmp_path / "worker.json"
+    record_path.write_text(json.dumps({"pid": 4321, "instance": "c" * 32}))
+
+    def slow_ps(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("ps", 2)
+
+    monkeypatch.setattr(local_runtime.subprocess, "run", slow_ps)
+    assert local_runtime._probe_owned_worker({"pid": 123, "instance": "a" * 32}) is None
+    assert local_runtime._owned_worker({"pid": 123, "instance": "a" * 32}) is False
+    with pytest.raises(RuntimeError, match="ps 超时"):
+        local_runtime.stop_worker({"HIDAGENT_DATA": str(tmp_path)})
+    assert record_path.exists()
 
 
 def test_owned_worker_returns_false_on_ps_timeout(monkeypatch):

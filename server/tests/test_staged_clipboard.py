@@ -842,3 +842,50 @@ def test_abandon_suppresses_unexpected_finish_error_without_masking_cancellation
         assert manager.transaction is None
 
     asyncio.run(scenario())
+
+
+def test_pre_write_validate_failure_marks_action_not_executed_while_post_write_marks_ambiguous(monkeypatch):
+    from hidagent.clipboard_control import PasteTransaction
+
+    async def scenario():
+        screen, provider, phone, control, manager = setup(monkeypatch)
+        prepared = await manager.prepare(prepare_body(control))
+        transaction = prepared["transaction_id"]
+        copied(provider, screen)
+        original_key = phone.key
+
+        async def drift_before_validate(combo, *, before_action=None):
+            with Image.open(io.BytesIO(field_image())) as img:
+                ImageDraw.Draw(img).rectangle((20, 10, 380, 70), fill=(20, 20, 20))
+                out = io.BytesIO()
+                img.save(out, "PNG")
+                screen._on_jpeg(out.getvalue())
+            return await original_key(combo, before_action=before_action)
+
+        monkeypatch.setattr(phone, "key", drift_before_validate)
+        result = await manager.paste(PasteTransaction(
+            transaction_id=transaction, screen_id=control.observation()["screen_id"], focused=True))
+        assert "cmd+v" not in phone.sent
+        assert result["command_acknowledged"] is False
+        assert result["action_may_have_executed"] is False
+        assert provider._needs_resolution is True
+
+        # Contrast: failure after before_action passed must stay action_may_have_executed=True.
+        monkeypatch.setattr(phone, "key", original_key)
+        provider.resolve(paste_finished=True)
+        screen._on_jpeg(field_image())
+        prepared2 = await manager.prepare(prepare_body(control))
+        copied(provider, screen)
+
+        async def fail_after_validate(combo, *, before_action=None):
+            if before_action:
+                before_action()
+            raise RuntimeError("serial ack lost after write")
+
+        monkeypatch.setattr(phone, "key", fail_after_validate)
+        result2 = await manager.paste(PasteTransaction(
+            transaction_id=prepared2["transaction_id"], screen_id=control.observation()["screen_id"], focused=True))
+        assert result2["command_acknowledged"] is False
+        assert result2["action_may_have_executed"] is True
+
+    asyncio.run(scenario())

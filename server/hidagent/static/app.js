@@ -42,19 +42,30 @@ $("motion").addEventListener("click", () => {
 });
 
 const say = (key) => { $("msg").textContent = key ? t(key) : ""; };
-async function post(path, body) {
+async function post(path, body, timeoutMs) {
+  const longPaths = new Set([
+    "/api/type", "/api/tap", "/api/swipe", "/api/scroll", "/api/calibrate/start", "/api/agent/stop",
+  ]);
+  const limit = timeoutMs ?? (longPaths.has(path) ? 60000 : 15000);
   try {
     const r = await fetch(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body || {}),
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(limit),
     });
     const data = await r.json().catch(() => ({}));
     $("msg").textContent = r.ok ? "" : data.detail || r.statusText;
     return r.ok ? data : null;
   } catch (err) {
-    $("msg").textContent = (lang === "zh" ? "请求失败或超时：" : "Request failed or timed out: ") + (err?.message || String(err));
+    const timedOut = err && (err.name === "TimeoutError" || err.name === "AbortError");
+    if (timedOut) {
+      $("msg").textContent = lang === "zh"
+        ? "请求超时已中止，请先观察手机画面确认是否已部分执行，切勿直接重试。"
+        : "Request timed out and aborted; inspect the phone screen before retrying.";
+    } else {
+      $("msg").textContent = (lang === "zh" ? "请求失败：" : "Request failed: ") + (err?.message || String(err));
+    }
     return null;
   }
 }

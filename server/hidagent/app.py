@@ -939,7 +939,7 @@ async def agent_stop():
         raise HTTPException(409, for_user(str(e))) from e
     finally:
         await asyncio.sleep(0)
-        if reset_ok and hasattr(device, "clear_abort"):
+        if (reset_ok or not getattr(device, "connected", False)) and hasattr(device, "clear_abort"):
             device.clear_abort()
     return {"ok": True}
 

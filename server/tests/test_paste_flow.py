@@ -40,6 +40,13 @@ def jpeg(banner=False, pasted=False):
 PLAIN_JPEG = jpeg()
 BANNER_JPEG = jpeg(banner=True)
 PASTED_JPEG = jpeg(pasted=True)
+SHEET_JPEG = jpeg(banner=True, pasted=True)
+
+SHEET_BOXES = [
+    ocr.TextBox("微信想要从快捷指令粘贴", (.20, .43, .80, .48), (.50, .455), .98),
+    ocr.TextBox("允许粘贴", (.22, .54, .42, .57), (.32, .557), .98),
+    ocr.TextBox("不允许粘贴", (.58, .54, .78, .57), (.68, .557), .98),
+]
 
 
 class FakeClient:
@@ -64,7 +71,13 @@ class FakeClient:
 
     def observe(self, for_click=False):
         self.seen += 1
-        raw = PASTED_JPEG if (self.pasted_visible and "paste" in self.calls and not for_click) else PLAIN_JPEG
+        clicks = self.calls.count(("click", "允许粘贴", None))
+        if self.sheet and "paste" in self.calls and clicks < self.allow_dismiss_after and not for_click:
+            raw = SHEET_JPEG
+        elif self.pasted_visible and "paste" in self.calls and not for_click:
+            raw = PASTED_JPEG
+        else:
+            raw = PLAIN_JPEG
         return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(raw).decode()}
 
     def screenshot(self):
@@ -131,9 +144,11 @@ def vision(monkeypatch):
     monkeypatch.setattr(assistive_vision, "find_button_target", lambda frame: ((.75, .95), (.69, .92, .83, .98)))
     monkeypatch.setattr(paste_flow.time, "sleep", lambda _s: None)
     monkeypatch.setattr(ocr, "read_text", lambda frame: (
-        [ocr.TextBox("第一行", (.16, .525, .40, .548), (.28, .536), .98),
-         ocr.TextBox("第二行", (.16, .552, .40, .575), (.28, .563), .98)]
-        if frame == PASTED_JPEG else []
+        list(SHEET_BOXES) if frame == SHEET_JPEG else (
+            [ocr.TextBox("第一行", (.16, .525, .40, .548), (.28, .536), .98),
+             ocr.TextBox("第二行", (.16, .552, .40, .575), (.28, .563), .98)]
+            if frame == PASTED_JPEG else []
+        )
     ))
 
 
@@ -276,7 +291,7 @@ def test_flow_corrects_or_aborts_before_hold_when_stray_cursor_lands_below_bubbl
                 return stray
             return stray if still_stray else inside
 
-    client = StrayClient()
+    client = StrayClient(sheet=False)
     if still_stray:
         with pytest.raises(paste_flow.FlowStopped) as stopped:
             paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58))
@@ -346,7 +361,7 @@ def test_flow_refuses_blind_allow_click_when_pointer_not_confirmed_in_button(vis
     assert facts["cmd_v_sent"] == 1 and facts["recovery_state"] == "paste_sent_unconfirmed"
 
 
-def test_flow_locates_visible_allow_pointer_from_for_click_frame_when_measured_pointer_is_none(vision):
+def test_flow_locates_visible_allow_pointer_from_for_click_frame_when_measured_pointer_is_none(vision, monkeypatch):
     def sheet_image(*, dot_xy=None):
         image = Image.new("RGB", (360, 778), (242, 242, 244))
         if dot_xy is not None:
@@ -358,6 +373,8 @@ def test_flow_locates_visible_allow_pointer_from_for_click_frame_when_measured_p
 
     clean_sheet = sheet_image()
     pointed_sheet = sheet_image(dot_xy=(.330, .567))
+    base_read = ocr.read_text
+    monkeypatch.setattr(ocr, "read_text", lambda frame: list(SHEET_BOXES) if frame == clean_sheet else base_read(frame))
 
     class VisualAllowClient(FakeClient):
         def observe(self, for_click=False):
@@ -366,8 +383,10 @@ def test_flow_locates_visible_allow_pointer_from_for_click_frame_when_measured_p
                 raw = pointed_sheet
             elif "paste" in self.calls and self.calls.count(("click", "允许粘贴", None)) >= self.allow_dismiss_after:
                 raw = PASTED_JPEG
-            else:
+            elif "paste" in self.calls:
                 raw = clean_sheet
+            else:
+                raw = PLAIN_JPEG
             return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(raw).decode()}
 
         def clipboard_stage(self, stage, **fields):
@@ -465,9 +484,129 @@ def test_flow_find_allow_passes_modal_region_and_ignores_outside_match(vision):
                 return {"match": {"text": text, "center": [.50, .08], "box": [.40, .06, .60, .10]}}
             return {"match": None}
 
-    client = SpoofAllowClient(confirm_conflicts=0)
+    client = SpoofAllowClient(sheet=False, confirm_conflicts=0)
     report = paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58)).as_dict()
     assert report["permission_sheet_seen"] is False
     assert ("click", "允许粘贴", None) not in client.calls
     assert all(fields.get("region") == list(paste_flow.ALLOW_MODAL_REGION)
                for _, _, fields in client.find_text_calls)
+
+
+def test_flow_ignores_plain_allow_paste_text_without_permission_sheet(vision, monkeypatch):
+    """Ordinary page text saying '允许粘贴' inside ALLOW_MODAL_REGION must never be clicked."""
+    fake_page = jpeg(banner=False, pasted=False) + b"\x00"
+    base_read = ocr.read_text
+
+    def read_page(frame):
+        if frame == fake_page:
+            return [ocr.TextBox("允许粘贴", (.22, .54, .42, .57), (.32, .557), .98)]
+        return base_read(frame)
+
+    monkeypatch.setattr(ocr, "read_text", read_page)
+
+    class PlainPageClient(FakeClient):
+        def __init__(self):
+            super().__init__(sheet=False, confirm_conflicts=0)
+            self.post_paste_observes = 0
+
+        def find_text(self, text, screen_id, **fields):
+            self.find_text_calls.append((text, screen_id, fields))
+            if text == "允许粘贴" and "paste" in self.calls:
+                return {"match": {"text": text, "center": [.32, .557], "box": [.22, .54, .42, .57]}}
+            return {"match": None}
+
+        def observe(self, for_click=False):
+            self.seen += 1
+            if "paste" in self.calls and not for_click:
+                self.post_paste_observes += 1
+                if self.post_paste_observes <= 4:
+                    return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(fake_page).decode()}
+            return super().observe(for_click=for_click)
+
+    client = PlainPageClient()
+    report = paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58)).as_dict()
+    assert report["permission_sheet_seen"] is False
+    assert ("click", "允许粘贴", None) not in client.calls
+
+
+@pytest.mark.parametrize("kind", ["read_timeout", "disk_fail_after_ack", "connect_error", "http_422"])
+def test_flow_classifies_httpx_transport_and_post_ack_disk_errors(vision, tmp_path, kind):
+    import httpx
+
+    class TransportClient(FakeClient):
+        def clipboard_stage(self, stage, **fields):
+            if stage == "paste":
+                self.calls.append(stage)
+                if kind == "read_timeout":
+                    raise httpx.ReadTimeout("timed out waiting for paste reply")
+                if kind == "connect_error":
+                    raise httpx.ConnectError("connection refused")
+                if kind == "http_422":
+                    raise RuntimeError("HTTP 422: field validation error")
+                return {"command_acknowledged": True,
+                        "image_base64": base64.b64encode(PASTED_JPEG).decode()}
+            return super().clipboard_stage(stage, **fields)
+
+    client = TransportClient(sheet=False)
+    ev_dir = tmp_path / "evidence"
+    if kind == "disk_fail_after_ack":
+        # Make 3-after-cmd-v.jpg a directory so writing it raises OSError after ACK.
+        ev_dir.mkdir()
+        (ev_dir / "3-after-cmd-v.jpg").mkdir()
+
+    with pytest.raises(paste_flow.FlowStopped) as stopped:
+        paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58),
+                       evidence_dir=ev_dir if kind == "disk_fail_after_ack" else None)
+    facts = stopped.value.report.facts
+    if kind in ("read_timeout", "disk_fail_after_ack"):
+        assert "cancel" not in client.calls
+        assert facts["recovery_state"] == "paste_sent_unconfirmed"
+        assert facts["transaction_left_open"] is True
+    else:
+        assert "cancel" in client.calls
+        assert facts["recovery_state"] == "copied_not_pasted"
+
+
+def test_verify_confirm_frame_edges_and_scrolled_long_text(monkeypatch):
+    region = (.13, .45, .77, .60)
+    boxes = []
+    monkeypatch.setattr(ocr, "read_text", lambda _frame: list(boxes))
+
+    # 1. Whitespace-only text must not silently verify as True.
+    ok, reason = paste_flow._verify_confirm_frame(None, PASTED_JPEG, region, "   \n  ")
+    assert ok is False and "visible" in reason
+
+    # 2. Low-confidence OCR box must be rejected even in relaxed center matching.
+    boxes[:] = [ocr.TextBox("你好世界", (.16, .47, .50, .50), (.33, .485), .55)]
+    ok, _ = paste_flow._verify_confirm_frame(None, PASTED_JPEG, region, "你好世界")
+    assert ok is False
+
+    # 3. Substantially overlapping external box across boundary must be rejected.
+    boxes[:] = [
+        ocr.TextBox("你好世界", (.16, .47, .50, .50), (.33, .485), .98),
+        ocr.TextBox("被截断的额外行", (.16, .58, .50, .63), (.33, .605), .98),
+    ]
+    ok, _ = paste_flow._verify_confirm_frame(None, PASTED_JPEG, region, "你好世界")
+    assert ok is False
+
+    # 4. Long 40-line pasted text scrolled to tail 4 visible rows must verify as suffix.
+    long_text = "\n".join(f"第{i}行测试文本" for i in range(1, 41))
+    boxes[:] = [
+        ocr.TextBox("第37行测试文本", (.16, .46, .55, .485), (.35, .472), .98),
+        ocr.TextBox("第38行测试文本", (.16, .49, .55, .515), (.35, .502), .98),
+        ocr.TextBox("第39行测试文本", (.16, .52, .55, .545), (.35, .532), .98),
+        ocr.TextBox("第40行测试文本", (.16, .55, .55, .575), (.35, .562), .98),
+    ]
+    ok, mode = paste_flow._verify_confirm_frame(None, PASTED_JPEG, region, long_text)
+    assert ok is True and mode == "suffix"
+
+    # 5. Long 200-char single line horizontally scrolled to tail 20 chars must verify as suffix.
+    long_line = "这是一段很长的单行回复内容" * 16 + "结尾二十个字校验锚点在这里"
+    boxes[:] = [ocr.TextBox("结尾二十个字校验锚点在这里", (.16, .50, .70, .53), (.43, .515), .98)]
+    ok, mode = paste_flow._verify_confirm_frame(None, PASTED_JPEG, region, long_line)
+    assert ok is True and mode == "suffix"
+
+    # 6. Short 2-line text with only 1 line visible must still be rejected.
+    boxes[:] = [ocr.TextBox("第二行", (.16, .50, .40, .53), (.28, .515), .98)]
+    ok, _ = paste_flow._verify_confirm_frame(None, PASTED_JPEG, region, "第一行\n第二行")
+    assert ok is False

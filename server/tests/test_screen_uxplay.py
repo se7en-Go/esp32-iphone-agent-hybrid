@@ -384,3 +384,100 @@ def test_legacy_read_drops_unbounded_garbage_above_max_jpeg(monkeypatch):
     os.close(w_fd)
     screen._read_legacy(r_fd)
     assert frames == [b"\xff\xd8ok-jpeg\xff\xd9"]
+
+
+def test_popen_oserror_backoff_does_not_hold_frame_lock_and_stop_wakes_immediately(monkeypatch):
+    import threading
+    import time
+
+    screen = UxPlayScreen()
+    started = threading.Event()
+    attempts = 0
+
+    def spawn(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            started.set()
+        raise OSError("uxplay missing")
+
+    monkeypatch.setattr("hidagent.screen_uxplay.subprocess.Popen", spawn)
+    worker = threading.Thread(target=screen._supervise, daemon=True)
+    worker.start()
+    try:
+        assert started.wait(timeout=3.0), "supervisor never reached second backoff"
+        # Wait briefly so supervisor enters the 2s backoff wait without holding _frame_lock.
+        time.sleep(0.05)
+        acquired = screen._frame_lock.acquire(blocking=False)
+        try:
+            assert acquired, "_frame_lock must not be held during Popen OSError backoff sleep"
+        finally:
+            if acquired:
+                screen._frame_lock.release()
+        t0 = time.monotonic()
+        screen.stop()
+        worker.join(timeout=1.0)
+        assert not worker.is_alive(), "stop() must wake _supervise immediately from backoff"
+        assert time.monotonic() - t0 < 0.5
+    finally:
+        screen.stop()
+        worker.join(timeout=1.0)
+
+
+def test_framed_clean_disconnect_resets_failure_backoff(monkeypatch):
+    from hidagent.uxplay_frames import BEGIN, END, HEADER, JPEG
+
+    def pack_record(kind, epoch, seq, payload):
+        return HEADER.pack(b"HAFE", 1, kind, 0, epoch, seq, len(payload), 0) + payload
+
+    monkeypatch.setenv("HIDAGENT_UXPLAY_FRAMED", "1")
+    screen = UxPlayScreen()
+    sleeps = []
+    runs = 0
+
+    class CleanChild(ReceiverProcess):
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+    def spawn(*_args, **kwargs):
+        nonlocal runs
+        runs += 1
+        w_fd = kwargs["pass_fds"][0]
+        payload = (pack_record(BEGIN, 1, 0, b"")
+                   + pack_record(JPEG, 1, 1, b"\xff\xd8framed-ok\xff\xd9")
+                   + pack_record(END, 1, 0, b""))
+        os.write(w_fd, payload)
+        if runs >= 3:
+            # Stop after the 3rd clean session finishes so we observe two restart delays.
+            pass
+        return CleanChild()
+
+    def record_sleep(delay):
+        sleeps.append(delay)
+        if len(sleeps) >= 2:
+            screen.stop()
+
+    monkeypatch.setattr("hidagent.screen_uxplay.subprocess.Popen", spawn)
+    monkeypatch.setattr("hidagent.screen_uxplay.time.sleep", record_sleep)
+    screen._supervise()
+    assert sleeps == [1, 1], f"clean framed disconnects must reset failure backoff, got {sleeps}"
+    assert screen.last_error == ""
+
+
+def test_legacy_read_drops_single_frame_exceeding_max_jpeg(monkeypatch):
+    from hidagent import screen_uxplay
+
+    monkeypatch.setattr(screen_uxplay, "MAX_JPEG", 64)
+    screen = UxPlayScreen()
+    screen._proc = ReceiverProcess()
+    frames = []
+    monkeypatch.setattr(screen, "_on_jpeg", frames.append)
+
+    r_fd, w_fd = os.pipe()
+    oversized = b"\xff\xd8" + b"A" * 80 + b"\xff\xd9"
+    normal = b"\xff\xd8ok\xff\xd9"
+    os.write(w_fd, oversized + normal)
+    os.close(w_fd)
+    screen._read_legacy(r_fd)
+    assert frames == [normal]

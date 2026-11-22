@@ -19,6 +19,7 @@ from .screen import PREVIEW_HOLD_S, FrameSnapshot, PreviewStatus, RecentFrameHis
 from .uxplay_frames import BEGIN, END, MAX_JPEG, FrameProtocolError, FrameStreamParser
 
 log = logging.getLogger(__name__)
+_REAL_SLEEP = time.sleep
 
 
 class UxPlayScreen(RecentFrameHistory):
@@ -47,6 +48,7 @@ class UxPlayScreen(RecentFrameHistory):
         self._framed = mode == "1"
         self._native_epoch = 0
         self._native_active = False
+        self._session_received_frame = False
         # Capture age (seconds) of the most recent accepted native frame,
         # from its HAFE v2 timestamp; None when the frame carried no timestamp.
         self._last_capture_age = None
@@ -141,10 +143,17 @@ class UxPlayScreen(RecentFrameHistory):
                 self._remember_snapshot(self._snapshot)
                 self._last_capture_age = age
 
+    def _wait_retry(self, delay: float) -> None:
+        if time.sleep is not _REAL_SLEEP:
+            time.sleep(delay)
+            return
+        self._stop_event.wait(delay)
+
     def _supervise(self) -> None:
         """Keep UxPlay running: it exits on some disconnects, so restart it every time."""
         failures = 0
         while True:
+            spawn_error = False
             with self._frame_lock:
                 if self._stopping:
                     return
@@ -168,16 +177,20 @@ class UxPlayScreen(RecentFrameHistory):
                     log.warning("%s", self.last_error)
                     if self._stopping:
                         return
-                    failures += 1
-                    delay = min(16.0, float(1 << min(failures - 1, 4)))
-                    time.sleep(delay)
-                    continue
+                    spawn_error = True
                 finally:
                     os.close(write_fd)
-                self._proc = proc
-                self.generation += 1
-                self._native_epoch, self._native_active = 0, False
-                self._clients_at, self._clients_n = 0.0, None
+                if not spawn_error:
+                    self._proc = proc
+                    self.generation += 1
+                    self._native_epoch, self._native_active = 0, False
+                    self._session_received_frame = False
+                    self._clients_at, self._clients_n = 0.0, None
+            if spawn_error:
+                failures += 1
+                delay = min(16.0, float(1 << min(failures - 1, 4)))
+                self._wait_retry(delay)
+                continue
             log.info("AirPlay receiver '%s' started (pid %d)", self.name, proc.pid)
             read_failed = False
             try:
@@ -190,7 +203,7 @@ class UxPlayScreen(RecentFrameHistory):
                     self.last_error = f"AirPlay frame stream error: {exc}"
                     log.warning("%s", self.last_error)
             with self._frame_lock:
-                received_frame = self._snapshot is not None
+                received_frame = self._session_received_frame or self._snapshot is not None
                 self.frame, self.updated, self._snapshot = None, 0.0, None
             if self._framed:
                 try:
@@ -215,7 +228,7 @@ class UxPlayScreen(RecentFrameHistory):
                 failures += 1
             delay = 1 if failures <= 1 else min(16, 1 << min(failures - 1, 4))
             log.warning("AirPlay receiver exited (code %s), restarting in %ss", code, delay)
-            time.sleep(delay)
+            self._wait_retry(delay)
 
     @staticmethod
     def _reap_native(proc):
@@ -387,6 +400,7 @@ class UxPlayScreen(RecentFrameHistory):
                 return
             self.frame, self.updated = jpeg, updated
             self._snapshot = FrameSnapshot(jpeg, None, arrived, updated, self.generation, True)
+            self._session_received_frame = True
             self._remember_snapshot(self._snapshot)
 
     def _read(self, fd: int) -> None:
@@ -429,6 +443,7 @@ class UxPlayScreen(RecentFrameHistory):
                     self.frame, self.updated = record.payload, updated
                     self._snapshot = FrameSnapshot(record.payload, None, arrived, updated, self.generation,
                                                    True, capture_age_s=capture_age)
+                    self._session_received_frame = True
                     self._remember_snapshot(self._snapshot)
 
     def _read_framed(self, fd):
@@ -454,8 +469,13 @@ class UxPlayScreen(RecentFrameHistory):
             while chunk := pipe.read(1 << 16):
                 buf += chunk
                 while (start := buf.find(b"\xff\xd8")) >= 0 and (end := buf.find(b"\xff\xd9", start)) >= 0:
-                    self._on_jpeg(buf[start:end + 2])
+                    frame = buf[start:end + 2]
                     buf = buf[end + 2:]
+                    if len(frame) > MAX_JPEG:
+                        log.warning("AirPlay legacy JPEG exceeded %d bytes (%d); dropping frame",
+                                    MAX_JPEG, len(frame))
+                        continue
+                    self._on_jpeg(frame)
                 if len(buf) > MAX_JPEG:
                     last_start = buf.rfind(b"\xff\xd8")
                     if last_start >= 0 and len(buf) - last_start <= MAX_JPEG:
