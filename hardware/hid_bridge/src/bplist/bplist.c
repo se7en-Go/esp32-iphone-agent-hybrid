@@ -24,8 +24,9 @@ int bp_open(bp_reader *r, const void *data, size_t len) {
   r->top = be(t + 16, 8);
   r->table = be(t + 24, 8);
   if (r->off_size < 1 || r->off_size > 8 || r->ref_size < 1 || r->ref_size > 8) return -1;
-  if (r->top >= r->count || r->table < 8 || r->count > len) return -1;
-  if (r->table + r->count * r->off_size > len - 32) return -1;
+  if (r->count == 0 || r->top >= r->count || r->table < 8 || r->table > len - 32) return -1;
+  size_t table_bytes = (len - 32) - (size_t)r->table;
+  if (r->count > table_bytes / r->off_size) return -1;
   return (int)r->top;
 }
 
@@ -44,7 +45,7 @@ static int header(const bp_reader *r, size_t pos, uint64_t *n, size_t *body) {
   if ((m >> 4) != 0 && (m >> 4) != 1 && (m >> 4) != 2 && *n == 0x0f) {  // length follows as an int object
     if (*body >= r->table || (r->buf[*body] >> 4) != 1) return -1;
     int sz = 1 << (r->buf[*body] & 0x0f);
-    if (sz > 8 || *body + 1 + sz > r->table) return -1;
+    if (sz > 8 || 1 + (size_t)sz > r->table - *body) return -1;
     *n = be(r->buf + *body + 1, sz);
     *body += 1 + sz;
   }
@@ -70,9 +71,9 @@ int bp_type(const bp_reader *r, int ref) {
 // Body of a container with `want` marker, checking that all refs fit in the object area.
 static bool container(const bp_reader *r, int ref, int want, uint64_t *n, size_t *body) {
   size_t pos = obj_at(r, ref);
-  if (!pos || header(r, pos, n, body) != want) return false;
-  uint64_t refs = want == 0xD ? *n * 2 : *n;
-  return *body + refs * r->ref_size <= r->table;
+  if (!pos || header(r, pos, n, body) != want || *body > r->table) return false;
+  uint64_t max_refs = (r->table - *body) / r->ref_size;
+  return want == 0xD ? *n <= max_refs / 2 : *n <= max_refs;
 }
 
 int bp_count(const bp_reader *r, int ref) {
@@ -86,7 +87,8 @@ int bp_array_get(const bp_reader *r, int ref, int i) {
   uint64_t n;
   size_t body;
   if (!container(r, ref, 0xA, &n, &body) || i < 0 || (uint64_t)i >= n) return -1;
-  return (int)be(r->buf + body + (size_t)i * r->ref_size, r->ref_size);
+  uint64_t v = be(r->buf + body + (size_t)i * r->ref_size, r->ref_size);
+  return v < r->count ? (int)v : -1;
 }
 
 int bp_dict_get(const bp_reader *r, int ref, const char *key) {
@@ -95,9 +97,11 @@ int bp_dict_get(const bp_reader *r, int ref, const char *key) {
   char k[128];
   if (!container(r, ref, 0xD, &n, &body)) return -1;
   for (uint64_t i = 0; i < n; i++) {
-    int kr = (int)be(r->buf + body + i * r->ref_size, r->ref_size);
-    if (bp_get_string(r, kr, k, sizeof k) && !strcmp(k, key))
-      return (int)be(r->buf + body + (n + i) * r->ref_size, r->ref_size);
+    uint64_t kr = be(r->buf + body + i * r->ref_size, r->ref_size);
+    if (kr < r->count && bp_get_string(r, (int)kr, k, sizeof k) && !strcmp(k, key)) {
+      uint64_t vr = be(r->buf + body + (n + i) * r->ref_size, r->ref_size);
+      return vr < r->count ? (int)vr : -1;
+    }
   }
   return -1;
 }
@@ -106,7 +110,7 @@ bool bp_get_uint(const bp_reader *r, int ref, uint64_t *out) {
   size_t pos = obj_at(r, ref);
   if (!pos || (r->buf[pos] >> 4) != 1) return false;
   int sz = 1 << (r->buf[pos] & 0x0f);
-  if (sz > 16 || pos + 1 + sz > r->table) return false;
+  if (sz > 16 || 1 + (size_t)sz > r->table - pos) return false;
   *out = sz == 16 ? be(r->buf + pos + 9, 8) : be(r->buf + pos + 1, sz);  // 16-byte ints: low 8 bytes
   return true;
 }
@@ -122,7 +126,7 @@ bool bp_get_real(const bp_reader *r, int ref, double *out) {
   size_t pos = obj_at(r, ref);
   if (!pos || (r->buf[pos] >> 4) != 2) return false;
   int sz = 1 << (r->buf[pos] & 0x0f);
-  if ((sz != 4 && sz != 8) || pos + 1 + sz > r->table) return false;
+  if ((sz != 4 && sz != 8) || 1 + (size_t)sz > r->table - pos) return false;
   uint64_t bits = be(r->buf + pos + 1, sz);
   if (sz == 4) {
     uint32_t b32 = (uint32_t)bits;
@@ -138,7 +142,7 @@ bool bp_get_real(const bp_reader *r, int ref, double *out) {
 bool bp_get_data(const bp_reader *r, int ref, const uint8_t **out, size_t *len) {
   size_t pos = obj_at(r, ref), body;
   uint64_t n;
-  if (!pos || header(r, pos, &n, &body) != 0x4 || body + n > r->table) return false;
+  if (!pos || header(r, pos, &n, &body) != 0x4 || body > r->table || n > r->table - body) return false;
   *out = r->buf + body;
   *len = (size_t)n;
   return true;
@@ -161,13 +165,14 @@ bool bp_get_string(const bp_reader *r, int ref, char *out, size_t cap) {
   uint64_t n;
   if (!pos || !cap) return false;
   int kind = header(r, pos, &n, &body);
+  if (body > r->table) return false;
   if (kind == 0x5) {
-    if (body + n > r->table || n >= cap) return false;
+    if (n > r->table - body || n >= cap) return false;
     memcpy(out, r->buf + body, (size_t)n);
     out[n] = 0;
     return true;
   }
-  if (kind != 0x6 || body + n * 2 > r->table) return false;
+  if (kind != 0x6 || n > (r->table - body) / 2) return false;
   for (uint64_t i = 0; i < n; i++) {
     uint32_t c = (uint32_t)be(r->buf + body + i * 2, 2);
     if (c >= 0xD800 && c < 0xDC00 && i + 1 < n) {  // surrogate pair

@@ -111,17 +111,34 @@ static bool respond(ap_conn *c, const ap_req *req, ap_resp *res) {
   return ok && !res->close;
 }
 
+static bool parse_content_length(const char *p, size_t *out) {
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p < '0' || *p > '9') return false;
+  size_t value = 0;
+  while (*p >= '0' && *p <= '9') {
+    unsigned digit = (unsigned)(*p++ - '0');
+    if (value > (MAX_REQUEST - digit) / 10) return false;
+    value = value * 10 + digit;
+  }
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p != '\0' && *p != '\r' && *p != '\n') return false;
+  *out = value;
+  return true;
+}
+
 // Handles every complete request in the connection buffer. False = close the connection.
 static bool process(ap_conn *c) {
   for (;;) {
     char *end = c->len >= 4 ? memmem(c->buf, c->len, "\r\n\r\n", 4) : NULL;
     if (!end) return c->len < MAX_REQUEST;
-    size_t head_len = end - (char *)c->buf + 4;
+    size_t head_len = (size_t)(end - (char *)c->buf) + 4;
+    if (head_len > MAX_REQUEST) return false;
     *end = 0;  // the head becomes a C string; body follows at head_len
     const char *cl = strcasestr((char *)c->buf, "\r\nContent-Length:");
-    size_t body_len = cl ? strtoul(cl + 17, NULL, 10) : 0;
-    if (head_len + body_len > MAX_REQUEST) return false;
-    if (c->len < head_len + body_len) {
+    size_t body_len = 0;
+    if (cl && (strcasestr(cl + 17, "\r\nContent-Length:") || !parse_content_length(cl + 17, &body_len))) return false;
+    if (body_len > MAX_REQUEST - head_len) return false;
+    if (c->len - head_len < body_len) {
       *end = '\r';  // wait for the rest of the body
       return true;
     }

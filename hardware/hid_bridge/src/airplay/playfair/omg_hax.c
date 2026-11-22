@@ -332,6 +332,10 @@ void decryptMessage(unsigned char* messageIn, unsigned char* decryptedMessage)
    unsigned char tmp;
    uint32_t key_schedule[11][4];
    int mode = messageIn[12];  // 0,1,2,3
+   if (mode < 0 || mode > 3) {
+      memset(decryptedMessage, 0, 128);
+      return;
+   }
    printf("mode = %02x\n", mode);
    generate_key_schedule(initial_session_key, key_schedule);
       

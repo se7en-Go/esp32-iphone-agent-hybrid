@@ -322,6 +322,7 @@ static bool movePaced(long dx, long dy, int step) {
   int sx, sy;
   bool ok = true;
   while (ok && pace_next(&p, &sx, &sy)) {
+    esp_task_wdt_reset();
     if (path == HID_PATH_BLE) ok = ble_hid_mouse(clamp8(sx), clamp8(sy), 0, 0);
     else if (path == HID_PATH_USB) moveUsbMouse(sx, sy);
     else ok = false;
@@ -339,6 +340,7 @@ static bool slamHome() {
   bool ok = true;
   for (int axis = 0; axis < 2 && ok; axis++) {
     for (int i = 0; i < HOME_REPORTS && ok; i++) {
+      esp_task_wdt_reset();
       int8_t x = axis == 0 ? -127 : 0;
       int8_t y = axis == 0 ? 0 : -127;
       if (path == HID_PATH_BLE) ok = ble_hid_mouse(x, y, 0, 0);
@@ -411,6 +413,7 @@ static int bleType(const String &text) {
   ble_hid_arm_interval(1);
   int sent = 0;
   for (unsigned i = 0; i < text.length(); i++) {
+    esp_task_wdt_reset();
     uint8_t usage = 0;
     int shift = 0;
     if (!hid_ascii(text[i], &usage, &shift)) {
@@ -460,6 +463,7 @@ String run(const String &line) {
     return slamHome() ? "ok" : down;
   }
   if (cmd == "move") {
+    if (a < -20000 || a > 20000 || b < -20000 || b > 20000) return "err move out of range";
     hid_pace_t prof;
     hid_pace_profile(path, &prof);
     int step = got >= 3 ? (int)c : prof.step;

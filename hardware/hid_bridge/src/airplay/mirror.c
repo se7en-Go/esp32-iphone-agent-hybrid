@@ -49,7 +49,7 @@ static struct {
   uint32_t remote_ip;
   uint16_t timing_rport;
   int lfd, sfd, tfd, afd[2];
-} m = {.lfd = -1, .sfd = -1, .tfd = -1, .afd = {-1, -1}};
+} m = {.done = true, .lfd = -1, .sfd = -1, .tfd = -1, .afd = {-1, -1}};
 
 // The audio stream; set by SETUP type 96 after the mirror session started. Stats outlive sessions.
 static struct {
@@ -318,7 +318,15 @@ static void mirror_task(void *arg) {
     if (m.afd[1] >= 0 && FD_ISSET(m.afd[1], &rf)) recv(m.afd[1], scratch, sizeof scratch, 0);  // sync, resends
     if (m.sfd < 0) {
       if (!FD_ISSET(m.lfd, &rf)) continue;
-      m.sfd = accept(m.lfd, NULL, NULL);
+      struct sockaddr_in peer;
+      socklen_t plen = sizeof peer;
+      int fd = accept(m.lfd, (struct sockaddr *)&peer, &plen);
+      if (fd >= 0 && m.remote_ip && peer.sin_addr.s_addr != m.remote_ip) {
+        ap_log("mirror: rejected data connection from unexpected peer");
+        close(fd);
+        continue;
+      }
+      m.sfd = fd;
       got = 0, need = 128, in_payload = false;
       m.got_codec = false;
       m.logged_no_video = false;
@@ -384,7 +392,10 @@ static void derive(const char *label, uint64_t id, const uint8_t aeskey[16], uin
 
 bool ap_mirror_start(const uint8_t aeskey[16], uint64_t stream_id, uint32_t remote_ip, uint16_t timing_rport) {
   uint8_t key[16];
-  ap_mirror_stop();
+  if (!ap_mirror_stop()) {
+    ap_log("mirror: previous session did not stop in time");
+    return false;
+  }
   derive("AirPlayStreamKey", stream_id, aeskey, key);
   derive("AirPlayStreamIV", stream_id, aeskey, m.iv0);
   memset(m.ks, 0, sizeof m.ks);
@@ -425,10 +436,11 @@ bool ap_mirror_start(const uint8_t aeskey[16], uint64_t stream_id, uint32_t remo
   return true;
 }
 
-void ap_mirror_stop(void) {
-  if (!m.run) return;
+bool ap_mirror_stop(void) {
+  if (!m.run && m.done) return true;
   m.run = false;
-  for (int i = 0; i < 50 && !m.done; i++) vTaskDelay(pdMS_TO_TICKS(10));
+  for (int i = 0; i < 150 && !m.done; i++) vTaskDelay(pdMS_TO_TICKS(10));
+  return m.done;
 }
 
 bool ap_mirror_running(void) { return m.run; }

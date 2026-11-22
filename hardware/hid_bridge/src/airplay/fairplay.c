@@ -25,7 +25,7 @@ int fairplay_setup(const uint8_t req[16], uint8_t res[142]) {
 }
 
 int fairplay_handshake(uint8_t keymsg[164], const uint8_t req[164], uint8_t res[32]) {
-  if (req[4] != 0x03) return -1;
+  if (req[4] != 0x03 || req[12] > 3) return -1;
   memcpy(keymsg, req, 164);
   memcpy(res, fp_header, 12);
   memcpy(res + 12, req + 144, 20);
@@ -33,6 +33,10 @@ int fairplay_handshake(uint8_t keymsg[164], const uint8_t req[164], uint8_t res[
 }
 
 void fairplay_decrypt(const uint8_t keymsg[164], const uint8_t in[72], uint8_t out[16]) {
+  if (keymsg[12] > 3) {
+    memset(out, 0, 16);
+    return;
+  }
   uint8_t msg[164], cipher[72];
   memcpy(msg, keymsg, 164);
   memcpy(cipher, in, 72);

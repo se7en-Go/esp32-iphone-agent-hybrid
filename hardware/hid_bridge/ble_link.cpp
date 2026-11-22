@@ -527,7 +527,18 @@ bool ble_app_active() { return appSeenMs && millis() - appSeenMs < APP_IDLE_MS &
 void ble_push_cmd(char origin, const char *line, size_t n) {
   char buf[CMD_MAX] = {origin};
   if (!n) return;
-  memcpy(buf + 1, line, n < CMD_MAX - 2 ? n : CMD_MAX - 2);
+  if (n > CMD_MAX - 2) {
+    size_t idLen = 0;
+    while (idLen < n && idLen < 16 && line[idLen] != ' ') idLen++;
+    if (idLen) {
+      char id[17];
+      memcpy(id, line, idLen);
+      id[idLen] = '\0';
+      ble_reply(String(id) + " err line too long", origin);
+    }
+    return;
+  }
+  memcpy(buf + 1, line, n);
   lastCmdMs = millis();
   xQueueSend(cmdQueue, buf, 0);  // full queue: the sender times out and retries
 }

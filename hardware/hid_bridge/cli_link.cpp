@@ -92,12 +92,12 @@ static int findClient(const uint8_t *id) {
   return -1;
 }
 
-static void plain(int slot, uint8_t type, const uint8_t *p, size_t n) {
+static bool plain(int slot, uint8_t type, const uint8_t *p, size_t n) {
   uint8_t out[80];
   n = plain_payload_fit(sizeof out, n);  // one byte is the type; never write past out[]
   out[0] = type;
   if (n && p) memcpy(out + 1, p, n);
-  notify(slot, out, n + 1, false, 1000);
+  return notify(slot, out, n + 1, false, 1000);
 }
 
 static void error(int slot, const char *why) { plain(slot, CLI_ERROR, (const uint8_t *)why, strlen(why)); }
@@ -144,11 +144,10 @@ static void hello(int slot, const uint8_t *p, size_t n) {
   if (!cli_session(clients[c].key, p + CLI_ID_LEN, bn, s.c2b, s.b2c)) return error(slot, "session failed");
   s.client = c;
   s.rx = s.txCtrl = s.txVideo = s.txAudio = 0;
-  s.welcomed = true;
   memcpy(out, bn, CLI_NONCE_LEN);
   memcpy(out + CLI_NONCE_LEN, boardId, 6);
   cli_mac(clients[c].key, "hello", p + CLI_ID_LEN, CLI_NONCE_LEN, bn, CLI_NONCE_LEN, out + CLI_NONCE_LEN + 6);
-  plain(slot, CLI_WELCOME, out, sizeof out);
+  s.welcomed = plain(slot, CLI_WELCOME, out, sizeof out);
 }
 
 static void data(int slot, const uint8_t *p, size_t n) {
@@ -209,7 +208,7 @@ int cli_slot() {
 
 bool cli_send_ctrl(char kind, const char *text, size_t n, uint32_t timeout_ms) {
   int slot = cli_slot();
-  if (slot < 0) return false;
+  if (slot < 0 || !ctrlBuf || !ctrlOut) return false;
   Session &s = sessions[slot];
   uint8_t *buf = ctrlBuf, *out = ctrlOut;
   size_t room = mtu(slot) - 3 - CLI_OVERHEAD - 1;
@@ -234,7 +233,7 @@ size_t cli_video_room() {
 
 bool cli_send_video(const uint8_t *chunk, size_t n) {
   int slot = cli_slot();
-  if (slot < 0) return false;
+  if (slot < 0 || !videoOut) return false;
   Session &s = sessions[slot];
   uint8_t *out = videoOut;
   if (n > VIDEO_CAP - CLI_OVERHEAD) return false;

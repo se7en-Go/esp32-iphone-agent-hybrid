@@ -108,7 +108,7 @@
  # hacks to fix cmake confusion due to links in path with macOS FrameWorks
 --- /dev/null
 +++ b/renderers/hafe_renderer.cpp
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,139 @@
 +#include "hafe_renderer.h"
 +#include "hafe_stream.hpp"
 +#include <gst/gst.h>
@@ -169,21 +169,33 @@
 +    uint64_t epoch = writer->begin();
 +    return epoch ? new HafeSession(epoch) : nullptr;
 +}
++static void teardown_pipeline(HafeSession *session) {
++    if (!session->pipeline) return;
++    gst_element_set_state(session->pipeline, GST_STATE_NULL);
++    if (session->source) gst_object_unref(session->source);
++    gst_object_unref(session->pipeline);
++    session->pipeline = nullptr;
++    session->source = nullptr;
++}
 +extern "C" void hafe_end(void *, void *opaque) {
 +    HafeSession *session = static_cast<HafeSession *>(opaque);
 +    if (!session) return;
 +    /* Invalidate first, then wait for this pipeline's callbacks to finish. */
 +    writer->end(session->epoch);
-+    if (session->pipeline) {
-+        gst_element_set_state(session->pipeline, GST_STATE_NULL);
-+        gst_object_unref(session->source);
-+        gst_object_unref(session->pipeline);
-+    }
++    teardown_pipeline(session);
 +    delete session;
 +}
 +extern "C" void hafe_process(void *opaque, video_decode_struct *data) {
 +    HafeSession *session = static_cast<HafeSession *>(opaque);
-+    if (!session || !writer->healthy() || data->data_len <= 0 || data->data_len > 8*1024*1024) return;
++    if (!session || !session->epoch || !writer->healthy() || data->data_len <= 0 || data->data_len > 8*1024*1024) return;
++    if (session->pipeline && session->h265 != data->is_h265) {
++        /* Codec switched mid-connection: tear down the old pipeline and start
++           a fresh epoch so the new codec pipeline builds cleanly below. */
++        writer->end(session->epoch);
++        teardown_pipeline(session);
++        session->epoch = writer->begin();
++        if (!session->epoch) return;
++    }
 +    if (!session->pipeline) {
 +        session->h265 = data->is_h265;
 +        const std::string codec = session->h265 ? "h265" : "h264";
@@ -197,7 +209,7 @@
 +        if (error || !session->pipeline) {
 +            if (error) g_error_free(error);
 +            if (session->pipeline) gst_object_unref(session->pipeline);
-+            session->pipeline = nullptr; writer->end(session->epoch); return;
++            session->pipeline = nullptr; writer->end(session->epoch); session->epoch = 0; return;
 +        }
 +        session->source = gst_bin_get_by_name(GST_BIN(session->pipeline), "hafe_source");
 +        GstElement *sink = gst_bin_get_by_name(GST_BIN(session->pipeline), "hafe_sink");
@@ -207,10 +219,12 @@
 +        g_signal_connect(sink, "new-sample", G_CALLBACK(sample), session);
 +        gst_object_unref(sink);
 +        if (gst_element_set_state(session->pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-+            writer->end(session->epoch); return;
++            writer->end(session->epoch);
++            teardown_pipeline(session);
++            session->epoch = 0;
++            return;
 +        }
 +    }
-+    if (session->h265 != data->is_h265) { writer->end(session->epoch); return; }
 +    /* appsrc max-bytes alone is advisory when block=false; check actual queue. */
 +    guint64 queued = 0;
 +    g_object_get(session->source, "current-level-bytes", &queued, nullptr);
@@ -221,21 +235,18 @@
 +           epoch; the decoder restarts and the phone's next IDR re-syncs
 +           it. The Python side treats the new epoch as a new session
 +           (generation bump, old screen_id rejected). */
-+        if (session->pipeline) {
-+            gst_element_set_state(session->pipeline, GST_STATE_NULL);
-+            gst_object_unref(session->source);
-+            gst_object_unref(session->pipeline);
-+            session->pipeline = nullptr;
-+            session->source = nullptr;
-+        }
-+        uint64_t epoch = writer->begin();
-+        if (epoch) session->epoch = epoch;
++        writer->end(session->epoch);
++        teardown_pipeline(session);
++        session->epoch = writer->begin();
 +        return;
 +    }
 +    GstBuffer *buffer = gst_buffer_new_allocate(nullptr, data->data_len, nullptr);
 +    gst_buffer_fill(buffer, 0, data->data, data->data_len);
-+    if (gst_app_src_push_buffer(GST_APP_SRC(session->source), buffer) != GST_FLOW_OK)
++    if (gst_app_src_push_buffer(GST_APP_SRC(session->source), buffer) != GST_FLOW_OK) {
 +        writer->end(session->epoch);
++        teardown_pipeline(session);
++        session->epoch = 0;
++    }
 +}
 --- /dev/null
 +++ b/renderers/hafe_renderer.h

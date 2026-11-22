@@ -95,6 +95,51 @@ static void test_bplist_utf16(void) {
   CHECK(bp_get_string(&r, bp_dict_get(&r, top, "name"), s, sizeof s) && !strcmp(s, "H\xE2\x80\x99s"));
 }
 
+static void test_bplist_integer_overflows(void) {
+  bp_reader r;
+  uint8_t buf[64];
+  // 1. table = UINT64_MAX, count = 1, off_size = 1 -> table + count*off_size wraps to 0.
+  memset(buf, 0, sizeof buf);
+  memcpy(buf, "bplist00", 8);
+  uint8_t *t = buf + sizeof buf - 32;
+  t[6] = 1; t[7] = 1;
+  t[15] = 1;  // count = 1
+  memset(t + 24, 0xff, 8);  // table = UINT64_MAX
+  CHECK(bp_open(&r, buf, sizeof buf) < 0);
+
+  // 2. dict with extended 8-byte count = UINT64_MAX (refs = n*2 wraps).
+  memset(buf, 0, sizeof buf);
+  memcpy(buf, "bplist00", 8);
+  buf[8] = 0xDF;  // dict, extended length
+  buf[9] = 0x13;  // 8-byte int
+  memset(buf + 10, 0xff, 8);  // n = UINT64_MAX
+  buf[18] = 8;    // offset table at 18: obj 0 is at 8
+  t = buf + sizeof buf - 32;
+  t[6] = 1; t[7] = 1;
+  t[15] = 1;   // count = 1
+  t[31] = 18;  // table = 18
+  int top = bp_open(&r, buf, sizeof buf);
+  CHECK(top == 0);
+  CHECK(bp_count(&r, top) == 0);
+  CHECK(bp_dict_get(&r, top, "ekey") == -1);
+
+  // 3. data object with extended 8-byte length = UINT64_MAX (body + n wraps).
+  buf[8] = 0x4F;  // data, extended length
+  buf[9] = 0x13;
+  memset(buf + 10, 0xff, 8);
+  const uint8_t *out = NULL;
+  size_t olen = 0;
+  CHECK(!bp_get_data(&r, top, &out, &olen));
+
+  // 4. UTF-16 string with n = (1ULL << 63) (n * 2 wraps to 0).
+  buf[8] = 0x6F;
+  buf[9] = 0x13;
+  memset(buf + 10, 0, 8);
+  buf[10] = 0x80;
+  char str[16];
+  CHECK(!bp_get_string(&r, top, str, sizeof str));
+}
+
 static void test_gop(void) {
   static uint8_t arena[100];
   static gop_au aus[4];
@@ -521,6 +566,7 @@ int main(void) {
   test_logring();
   test_bplist_roundtrip();
   test_bplist_utf16();
+  test_bplist_integer_overflows();
   test_gop();
   test_chunker();
   test_keystream_resync();

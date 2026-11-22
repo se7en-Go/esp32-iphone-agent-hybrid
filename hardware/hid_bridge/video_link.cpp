@@ -127,10 +127,11 @@ static bool copyAu(Sink &s, uint32_t gen, int i, gop_au *au) {
   return ok;
 }
 
-// Copies tail AU i into the sink's scratch; false if there is none (yet) or the tail broke off.
-static bool copyTail(Sink &s, uint32_t gen, int i, gop_au *au) {
+// Copies tail AU at s.tailNext into the sink's scratch; false if there is none (yet) or the tail broke off.
+static bool copyTail(Sink &s, uint32_t gen, gop_au *au) {
   xSemaphoreTake(lock, portMAX_DELAY);
-  bool ok = gop.gen == gen && tailLive && s.onTail && i < tail.n && tail.aus[i].len <= SCRATCH_CAP;
+  int i = s.tailNext;
+  bool ok = gop.gen == gen && tailLive && s.onTail && i >= 0 && i < tail.n && tail.aus[i].len <= SCRATCH_CAP;
   if (ok) {
     *au = tail.aus[i];
     memcpy(s.scratch, tail.arena + au->off, au->len);
@@ -299,17 +300,26 @@ static void streamStep(Sink &s) {
   if (!snapshot(&gen, &n, cfg, &cfg_len, &cfg_ts, &s)) return;
   if (gen != s.txGen) {
     s.txGen = gen;
-    s.next = s.tailNext = 0;
+    s.next = 0;
     s.catchingUp = true;
+    xSemaphoreTake(lock, portMAX_DELAY);
+    s.tailNext = 0;
+    xSemaphoreGive(lock);
     if (!sendAu(s, cfg, cfg_len, VF_CONFIG, cfg_ts)) { s.txGen = UINT32_MAX; unfollow(s, 'c'); return; }
+    xSemaphoreTake(lock, portMAX_DELAY);
     s.followGen = gen;
+    xSemaphoreGive(lock);
   }
   for (gop_au au; s.next < n && copyAu(s, gen, s.next, &au); s.next++)
     if (!sendAu(s, s.scratch, au.len, (au.idr ? VF_IDR : 0) | resumeFlag(s), au.ts)) { s.txGen = UINT32_MAX; unfollow(s, 'g'); return; }
   if (s.next < n) return;
   s.catchingUp = false;
-  for (gop_au au; copyTail(s, gen, s.tailNext, &au); s.tailNext++)
+  for (gop_au au; copyTail(s, gen, &au);) {
     if (!sendAu(s, s.scratch, au.len, resumeFlag(s), au.ts)) { s.txGen = UINT32_MAX; unfollow(s, 't'); return; }
+    xSemaphoreTake(lock, portMAX_DELAY);
+    if (gop.gen == gen && s.onTail) s.tailNext++;
+    xSemaphoreGive(lock);
+  }
 }
 
 static void videoTask(void *arg) {
@@ -334,21 +344,55 @@ bool video_begin() {
   gop_au *tailAus = (gop_au *)heap_caps_malloc(TAIL_AUS * sizeof(gop_au), MALLOC_CAP_SPIRAM);
   sink.scratch = (uint8_t *)heap_caps_malloc(SCRATCH_CAP, MALLOC_CAP_SPIRAM);
   sink.reqs = xQueueCreate(4, sizeof(Req));
-  if (!arena || !aus || !tailArena || !tailAus || !sink.scratch || !sink.reqs) return false;
+  lock = xSemaphoreCreateMutex();
+  if (!arena || !aus || !tailArena || !tailAus || !sink.scratch || !sink.reqs || !lock) {
+    heap_caps_free(arena);
+    heap_caps_free(aus);
+    heap_caps_free(tailArena);
+    heap_caps_free(tailAus);
+    heap_caps_free(sink.scratch);
+    sink.scratch = nullptr;
+    if (sink.reqs) { vQueueDelete(sink.reqs); sink.reqs = nullptr; }
+    if (lock) { vSemaphoreDelete(lock); lock = nullptr; }
+    return false;
+  }
   gop_init(&gop, arena, GOP_CAP, aus, MAX_AUS);
   gop_init(&tail, tailArena, TAIL_CAP, tailAus, TAIL_AUS);
-  lock = xSemaphoreCreateMutex();
-  if (xTaskCreatePinnedToCore(videoTask, "video", 6 * 1024, &sink, 2, &sink.task, 1) != pdPASS) return false;
+  if (xTaskCreatePinnedToCore(videoTask, "video", 6 * 1024, &sink, 2, &sink.task, 1) != pdPASS) {
+    gop = {};
+    tail = {};
+    heap_caps_free(arena);
+    heap_caps_free(aus);
+    heap_caps_free(tailArena);
+    heap_caps_free(tailAus);
+    heap_caps_free(sink.scratch);
+    sink.scratch = nullptr;
+    vQueueDelete(sink.reqs);
+    sink.reqs = nullptr;
+    vSemaphoreDelete(lock);
+    lock = nullptr;
+    sink.task = nullptr;
+    return false;
+  }
   return true;
 }
 
 void video_on_config(const uint8_t *sps_pps, size_t len) {
+  if (!lock || !gop.arena) return;
   xSemaphoreTake(lock, portMAX_DELAY);
   gop_set_config(&gop, sps_pps, len, millis());
   xSemaphoreGive(lock);
 }
 
 void video_on_au(const uint8_t *au, size_t len, bool idr) {
+  if (!lock || !gop.arena) return;
+  if (len > SCRATCH_CAP) {
+    xSemaphoreTake(lock, portMAX_DELAY);
+    gop.overflows++;
+    xSemaphoreGive(lock);
+    board_log("video: dropping oversized AU (%u bytes > %u)", (unsigned)len, (unsigned)SCRATCH_CAP);
+    return;
+  }
   uint32_t now = millis();
   lastAu = now;
   winBytes += len;
@@ -418,6 +462,7 @@ void video_snap(const String &id, char who) { request(id, false, 0, who); }
 void video_bench(const String &id, uint32_t kb, char who) { request(id, true, kb, who); }
 
 VideoStats video_stats(char who) {
+  if (!lock || !gop.arena) return {0, 0, 0, 0, 0, 0, false};
   bool fresh = millis() - statAt < 3000;  // mirroring stopped: report zeros, not stale numbers
   xSemaphoreTake(lock, portMAX_DELAY);
   uint32_t gopBytes = gop.used, overflows = gop.overflows;
@@ -428,6 +473,7 @@ VideoStats video_stats(char who) {
 }
 
 String video_debug() {
+  if (!lock || !gop.arena) return "uninit";
   char b[96];
   xSemaphoreTake(lock, portMAX_DELAY);
   // short: a BLE reply is one notification (a 200-char line never arrived, 2026-11-03)
