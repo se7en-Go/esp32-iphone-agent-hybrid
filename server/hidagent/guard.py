@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import secrets
@@ -20,6 +21,8 @@ from datetime import datetime
 from pathlib import Path
 
 from .paths import skill_roots
+
+log = logging.getLogger(__name__)
 
 STOP_PHRASES = ("操作频繁", "风控", "验证码")
 FLOOR_INTERVAL = 3.0
@@ -59,8 +62,11 @@ def _skill_text(skill: str) -> str:
 
 
 def _clock_hm(text: str) -> tuple[int, int]:
-    hour, _, minute = text.partition(":")
-    return int(hour), int(minute or "0")
+    hour_s, _, minute_s = text.strip().partition(":")
+    hour, minute = int(hour_s), int(minute_s or "0")
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"invalid clock time: {text!r}")
+    return hour, minute
 
 
 def limits_for(skill: str) -> dict:
@@ -70,14 +76,29 @@ def limits_for(skill: str) -> dict:
     extra: list[str] = []
     meta = _frontmatter(_skill_text(skill))
     if "min_interval_seconds" in meta:
-        interval = float(meta["min_interval_seconds"])
+        try:
+            parsed = float(meta["min_interval_seconds"])
+            if not math.isfinite(parsed):
+                raise ValueError("non-finite min_interval_seconds")
+            interval = parsed
+        except (ValueError, TypeError):
+            log.warning("invalid min_interval_seconds in skill %r; using default %.1f", skill, interval)
     if "max_per_hour" in meta:
-        per_hour = int(float(meta["max_per_hour"]))
+        try:
+            parsed = float(meta["max_per_hour"])
+            if not math.isfinite(parsed):
+                raise ValueError("non-finite max_per_hour")
+            per_hour = int(parsed)
+        except (ValueError, TypeError):
+            log.warning("invalid max_per_hour in skill %r; using default %d", skill, per_hour)
     if meta.get("quiet_hours") == "off":
         quiet = False
     elif "quiet_hours" in meta and "-" in meta["quiet_hours"]:
-        left, right = meta["quiet_hours"].split("-", 1)
-        start, end = _clock_hm(left), _clock_hm(right)
+        try:
+            left, right = meta["quiet_hours"].split("-", 1)
+            start, end = _clock_hm(left), _clock_hm(right)
+        except (ValueError, TypeError):
+            log.warning("invalid quiet_hours in skill %r; using default 23:00-07:00", skill)
     if meta.get("extra_stop"):
         extra = [part.strip() for part in meta["extra_stop"].split(",") if part.strip()]
     return {

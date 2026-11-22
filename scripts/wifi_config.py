@@ -55,7 +55,12 @@ async def _run(args: argparse.Namespace) -> None:
             ip = status.get("ip")
             print(f"net={net} ip={ip} usb={status.get('usb')}")
             if args.ap and net == "ap":
-                info = json.loads(await device.query("netinfo"))
+                try:
+                    info = json.loads(await device.query("netinfo"))
+                except (DeviceError, json.JSONDecodeError) as exc:
+                    print(f"板子已切换为 AP 热点模式，但读取热点信息失败：{exc}")
+                    print("请稍后重试查询 netinfo，或检查串口连接。")
+                    return
                 print(f"热点名称：{info.get('ssid')}")
                 print(f"热点密码：{info.get('pass')}")
                 print("密码只出现在这台电脑的终端里。不要截图，不要贴到聊天。")
@@ -85,6 +90,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ap", action="store_true", help="改回热点。仅适合电脑另有网线的情况")
     parser.add_argument("--port", default="", help="例如 COM5 或 /dev/cu.usbserial-…。留空则自动找 CH343/FTDI/CP210x")
     args = parser.parse_args(argv)
+    if args.ap and (args.ssid or args.password):
+        fail("--ap 不能与 --ssid / --password 同时使用；连接路由器请去掉 --ap，切热点请只传 --ap。")
     if not args.ap and not args.ssid:
         fail("请提供 --ssid，或在确认电脑另有网线后使用 --ap。")
     asyncio.run(_run(args))

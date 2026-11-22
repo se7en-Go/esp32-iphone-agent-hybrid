@@ -23,13 +23,18 @@ def find_bin(explicit: str) -> Path:
         if not path.is_file():
             fail(f"找不到固件文件：{path}")
         return path
+    env_bin = os.environ.get("FIRMWARE_BIN", "").strip()
+    if env_bin:
+        path = Path(env_bin)
+        if not path.is_file():
+            fail(f"FIRMWARE_BIN 指向的固件文件不存在：{path}")
+        return path
     candidates = [
-        Path(os.environ["FIRMWARE_BIN"]) if os.environ.get("FIRMWARE_BIN") else None,
         ROOT / "hardware" / "dist" / BIN_NAME,
         ROOT / "hardware" / "build" / "hid_bridge.ino.merged.bin",
     ]
     for path in candidates:
-        if path is not None and path.is_file():
+        if path.is_file():
             return path
     fail(
         "没有找到预编译固件 hardware/dist/" + BIN_NAME + "。\n"
@@ -73,7 +78,8 @@ def pick_port(explicit: str) -> str:
 def build_only() -> int:
     hardware = ROOT / "hardware"
     if sys.platform == "win32":
-        command = ["powershell", "-NoProfile", "-File", str(hardware / "build_firmware.ps1")]
+        command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                   "-File", str(hardware / "build_firmware.ps1")]
     else:
         command = ["bash", str(hardware / "build_firmware.sh")]
     print("这是开发者编译，普通刷机不需要这一步。")

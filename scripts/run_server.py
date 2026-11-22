@@ -11,12 +11,19 @@ from runtime import SERVER, fail, require_venv  # noqa: E402
 
 
 def main() -> int:
-    if sys.platform == "win32" and any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
-        print("用法: python scripts/run_server.py")
-        print("Windows 原生前台服务，板载 AirPlay；终端关闭后服务停止。")
-        print("请先运行 scripts/setup.ps1，然后运行 scripts/run-server.ps1。")
-        print("start / status / restart-worker / stop 后台管理仅用于 Unix。")
-        return 0
+    if sys.platform == "win32":
+        if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+            print("用法: python scripts/run_server.py")
+            print("Windows 原生前台服务，板载 AirPlay；终端关闭后服务停止。")
+            print("请先运行 scripts/setup.ps1，然后运行 scripts/run-server.ps1。")
+            print("start / status / restart-worker / stop 后台管理仅用于 Unix。")
+            return 0
+        if sys.argv[1:]:
+            fail(
+                "Windows 原生前台模式不支持管理子命令或附加参数："
+                + " ".join(sys.argv[1:])
+                + "。请不带参数运行 scripts/run-server.ps1，或使用 --help 查看用法。"
+            )
     python = require_venv()
     env = os.environ.copy()
     env.setdefault("HOST", "127.0.0.1")

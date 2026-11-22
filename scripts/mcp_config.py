@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -14,13 +15,14 @@ from runtime import require_venv  # noqa: E402
 def main() -> int:
     argparse.ArgumentParser(description="打印 MCP 配置片段。不包含密码或 API key。").parse_args()
     python = str(require_venv())
+    url = os.environ.get("IPHONE_AGENT_URL", "").strip() or "http://127.0.0.1:8890"
     cursor = {
         "mcpServers": {
             "iphone": {
                 "command": python,
-                "args": ["-m", "hidagent.cli", "--url", "http://127.0.0.1:8890", "mcp"],
+                "args": ["-m", "hidagent.cli", "--url", url, "mcp"],
                 "env": {
-                    "IPHONE_AGENT_URL": "http://127.0.0.1:8890",
+                    "IPHONE_AGENT_URL": url,
                     "IPHONE_MCP_ENABLE_DELEGATE": "0",
                 },
             }
@@ -31,7 +33,7 @@ def main() -> int:
     print(json.dumps(cursor, ensure_ascii=False, indent=2))
     print("\n# Codex\n")
     print(
-        "codex mcp add iphone --env IPHONE_AGENT_URL=http://127.0.0.1:8890 "
+        f"codex mcp add iphone --env IPHONE_AGENT_URL={url} "
         "--env IPHONE_MCP_ENABLE_DELEGATE=0 -- "
         f"\"{python}\" -m hidagent.cli mcp"
     )
