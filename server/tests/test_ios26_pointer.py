@@ -245,6 +245,7 @@ def test_two_point_calibration_does_not_license_a_blind_slow_mirror_tap(tmp_path
     phone = Phone(mirror, tmp_path / "calibration.json", mirror)
     assert asyncio.run(phone.start_calibration())
     phone._pos = None  # cold: re-home, then use calibration if the disc arrives too late
+    mirror.lag = 5.0  # guarantee the landing disc arrives strictly after POINTER_WAIT on slow runners
     mirror.sent.clear()
     with pytest.raises(RuntimeError, match="目标|落点"):
         asyncio.run(phone.tap_verified(463.5 / W, 371.3 / H))

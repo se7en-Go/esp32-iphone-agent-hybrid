@@ -16,8 +16,18 @@ class Trace:
     def start(self, task: str) -> None:
         if not self.enabled:
             return
-        self.dir = self.root / time.strftime("%Y%m%d-%H%M%S")
-        self.dir.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        suffix = 0
+        while True:
+            name = stamp if suffix == 0 else f"{stamp}-{suffix}"
+            candidate = self.root / name
+            try:
+                candidate.mkdir(exist_ok=False)
+                self.dir = candidate
+                break
+            except FileExistsError:
+                suffix += 1
         self._n = 0
         self.write(kind="task", task=task)
 

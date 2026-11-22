@@ -1,9 +1,12 @@
 """Opt-in, bounded local pointer evidence. Never included in API responses or logs."""
 
 import json
+import logging
 import os
 import time
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 class PointerDiagnostics:
@@ -42,7 +45,8 @@ class PointerDiagnostics:
             return None
         try:
             return cls(Path(directory), prefix=prefix)
-        except OSError:
+        except OSError as exc:
+            log.warning("pointer diagnostics disabled for %s: %s: %s", directory, type(exc).__name__, exc)
             return None  # Diagnostics must never change the physical operation.
 
     def _write(self, name: str, data: bytes):

@@ -1,8 +1,26 @@
 """HTTP client for the iPhone control server, shared by the CLI and optional MCP bridge."""
 
+import logging
+import math
 import os
 
 import httpx
+
+log = logging.getLogger(__name__)
+
+
+def _client_timeout() -> float:
+    raw = os.environ.get("IPHONE_AGENT_TIMEOUT", "").strip()
+    if not raw:
+        return 60.0
+    try:
+        value = float(raw)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("timeout must be a positive finite number")
+        return value
+    except ValueError:
+        log.warning("invalid IPHONE_AGENT_TIMEOUT=%r; using default 60s", raw)
+        return 60.0
 
 
 class IPhoneClient:
@@ -11,8 +29,8 @@ class IPhoneClient:
         parsed = httpx.URL(url)
         if parsed.scheme not in ("http", "https") or not parsed.host or parsed.query or parsed.fragment:
             raise ValueError("server URL must be an HTTP(S) URL without a query or fragment")
-        timeout = float(os.environ.get("IPHONE_AGENT_TIMEOUT", "60"))
-        self.http = httpx.Client(base_url=url.rstrip("/"), timeout=timeout, transport=transport, trust_env=False)
+        self.http = httpx.Client(base_url=url.rstrip("/"), timeout=_client_timeout(),
+                                 transport=transport, trust_env=False)
 
     def __enter__(self):
         return self

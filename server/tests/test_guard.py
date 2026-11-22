@@ -187,3 +187,73 @@ def test_reload_cannot_clear_an_unpersisted_trip(tmp_path, monkeypatch):
     assert guard.tripped and guard.reason == "风控"
     guard._save()
     assert Guard(path=path).tripped
+
+
+def test_malformed_skill_frontmatter_falls_back_to_safe_defaults(tmp_path, monkeypatch):
+    from hidagent.guard import limits_for
+
+    skill = tmp_path / "broken"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nmin_interval_seconds: abc\nmax_per_hour: nope\nquiet_hours: 25:99-07:00\n---\nbody\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HIDAGENT_SKILLS", str(tmp_path))
+    limits = limits_for("broken")
+    assert limits["min_interval"] == 8.0
+    assert limits["max_per_hour"] == 20
+    assert limits["quiet"] is True
+    assert limits["quiet_start"] == (23, 0) and limits["quiet_end"] == (7, 0)
+
+
+def test_trace_start_creates_unique_dirs_within_same_second(tmp_path, monkeypatch):
+    from hidagent.debug import Trace
+
+    monkeypatch.setattr("hidagent.debug.time.strftime", lambda _fmt: "20261122-120000")
+    t1 = Trace(tmp_path)
+    t1.start("task-1")
+    t2 = Trace(tmp_path)
+    t2.start("task-2")
+    assert t1.dir != t2.dir
+    assert (t1.dir / "steps.jsonl").exists() and (t2.dir / "steps.jsonl").exists()
+
+
+def test_agent_parse_command_rejects_out_of_range_plain_text_coords():
+    from hidagent.agent import parse_command
+
+    assert parse_command("tap 500 500") == {"action": "tap", "x": 500, "y": 500}
+    with pytest.raises(ValueError, match="0..1000"):
+        parse_command("tap 1200 500")
+    with pytest.raises(ValueError, match="0..1000"):
+        parse_command("tap -10 500")
+    with pytest.raises(ValueError, match="0..1000"):
+        parse_command("path 100 100 1500 200")
+    with pytest.raises(ValueError, match="positive"):
+        parse_command("circle 500 500 0")
+
+
+def test_env_numeric_parsers_fall_back_safely(monkeypatch):
+    from hidagent.client import IPhoneClient
+    from hidagent.screen import Screen
+
+    monkeypatch.setenv("VIDEO_FPS", "not-a-number")
+    assert Screen().fps == 8
+    monkeypatch.setenv("VIDEO_FPS", "999")
+    assert Screen().fps == 60
+    monkeypatch.setenv("IPHONE_AGENT_TIMEOUT", "abc")
+    with IPhoneClient("http://127.0.0.1:8890") as client:
+        assert client.http.timeout.read == 60.0
+
+
+def test_screen_can_restart_after_stop(monkeypatch):
+    from hidagent.screen import Screen
+
+    screen = Screen()
+    screen.start()
+    first_thread = screen._thread
+    assert first_thread is not None and screen._stopping is False
+    screen.stop()
+    assert screen._thread is None and screen._stopping is True
+    screen.start()
+    assert screen._thread is not None and screen._thread is not first_thread and screen._stopping is False
+    screen.stop()

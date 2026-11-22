@@ -11,7 +11,6 @@ def skill_roots() -> list[Path]:
         roots.append(Path(env))
     # server/hidagent/paths.py → 仓库根目录 / skills
     roots.append(Path(__file__).resolve().parents[2] / "skills")
-    roots.append(Path.cwd() / "skills")
     found: list[Path] = []
     for root in roots:
         if root.is_dir() and root not in found:

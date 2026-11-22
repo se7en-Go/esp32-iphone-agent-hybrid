@@ -19,6 +19,7 @@ from typing import Literal
 from . import freshness, video7201, vision
 
 log = logging.getLogger(__name__)
+_REAL_SLEEP = time.sleep
 PREVIEW_HOLD_S = 15.0
 
 
@@ -88,6 +89,21 @@ class RecentFrameHistory:
                          and 0 <= now - frame.arrived <= 4)
 
 
+def _parse_fps(raw: str | None, default: int = 8) -> int:
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("invalid VIDEO_FPS=%r; using default %d", raw, default)
+        return default
+    if value < 1 or value > 60:
+        clamped = max(1, min(60, value))
+        log.warning("VIDEO_FPS=%d out of range 1..60; clamped to %d", value, clamped)
+        return clamped
+    return value
+
+
 class Screen(RecentFrameHistory):
     def __init__(self, host: str = "", token: str = "", port: int = 7201,
                  fps: int | None = None, quality: int = 75):
@@ -95,7 +111,7 @@ class Screen(RecentFrameHistory):
         self._fixed_token = token
         self.port = port
         self.quality = quality
-        self.fps = fps if fps is not None else int(os.environ.get("VIDEO_FPS", "8"))
+        self.fps = fps if fps is not None else _parse_fps(os.environ.get("VIDEO_FPS"))
         self.frame: bytes | None = None
         self.updated = 0.0
         # board millis() of the access unit behind `frame` (None: unknown). See video7201.run_tcp.
@@ -112,6 +128,7 @@ class Screen(RecentFrameHistory):
         self._device = None
         self._started = False
         self._stopping = False
+        self._thread: threading.Thread | None = None
         self._session_ok = False
         self._transport_stalled = False
         self._last_heartbeat_at: float | None = None
@@ -125,12 +142,14 @@ class Screen(RecentFrameHistory):
 
     def start(self) -> None:
         with self._frame_lock:
-            if self._started:
+            if self._thread is not None and self._thread.is_alive():
                 return
             self._started = True
             self._stopping = False
             self._stop.clear()
-        threading.Thread(target=self._supervise, name="screen-7201", daemon=True).start()
+            self._thread = threading.Thread(target=self._supervise, name="screen-7201", daemon=True)
+            thread = self._thread
+        thread.start()
 
     def stop(self) -> None:
         # Eligibility changes share the same lock as final HID validation/write.
@@ -140,11 +159,17 @@ class Screen(RecentFrameHistory):
             self._stopping = True
             self._stop.set()
             self._session_ok = False
+            thread = self._thread
         for sock in list(self._sockets):
             try:
                 sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        with self._frame_lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = None
 
     def _endpoint(self) -> tuple[str, str]:
         host = self._fixed_host or os.environ.get("BOARD_HOST", "").strip()
@@ -158,35 +183,46 @@ class Screen(RecentFrameHistory):
             host = ""
         return host, token
 
+    def _wait_retry(self, seconds: float) -> None:
+        if time.sleep is not _REAL_SLEEP:
+            time.sleep(seconds)
+            return
+        self._stop.wait(seconds)
+
     def _supervise(self) -> None:
-        while not self._stopping:
-            host, token = self._endpoint()
-            if not host or not token:
+        try:
+            while not self._stopping:
+                host, token = self._endpoint()
+                if not host or not token:
+                    self._on_disconnect()
+                    self.last_error = "还没有板子的 IP 或 vtok。COM 口连上之后，服务会从 0 netinfo 里读。"
+                    self._wait_retry(1)
+                    continue
+                with self._frame_lock:
+                    if self._stopping:
+                        return
+                    self._stop.clear()
+                    if self._decoder_for != (host, token):  # another board or a rebooted one
+                        self._decoder, self._decoder_for = video7201.H264Decoder(), (host, token)
+                        self._clock_not_before = time.monotonic()
+                try:
+                    video7201.run_tcp(
+                        host, self.port, token, self._on_jpeg, self._stop,
+                        quality=self.quality, max_fps=max(1, self.fps),
+                        on_ready=self._on_ready, on_stall=self._on_stall, sockets=self._sockets,
+                        on_ts=self._on_ts, decoder=self._decoder, on_heartbeat=self._on_heartbeat,
+                    )
+                    self.last_error = "7201 连接结束了，正在重连。"
+                except Exception as exc:
+                    self.last_error = _friendly_video_error(exc)
+                    log.info("screen: %s", self.last_error)
                 self._on_disconnect()
-                self.last_error = "还没有板子的 IP 或 vtok。COM 口连上之后，服务会从 0 netinfo 里读。"
-                time.sleep(1)
-                continue
+                if not self._stopping:
+                    self._wait_retry(1)
+        finally:
             with self._frame_lock:
-                if self._stopping:
-                    return
-                self._stop.clear()
-                if self._decoder_for != (host, token):  # another board or a rebooted one
-                    self._decoder, self._decoder_for = video7201.H264Decoder(), (host, token)
-                    self._clock_not_before = time.monotonic()
-            try:
-                video7201.run_tcp(
-                    host, self.port, token, self._on_jpeg, self._stop,
-                    quality=self.quality, max_fps=max(1, self.fps),
-                    on_ready=self._on_ready, on_stall=self._on_stall, sockets=self._sockets,
-                    on_ts=self._on_ts, decoder=self._decoder, on_heartbeat=self._on_heartbeat,
-                )
-                self.last_error = "7201 连接结束了，正在重连。"
-            except Exception as exc:
-                self.last_error = _friendly_video_error(exc)
-                log.info("screen: %s", self.last_error)
-            self._on_disconnect()
-            if not self._stopping:
-                time.sleep(1)
+                if self._thread is threading.current_thread():
+                    self._thread = None
 
     def _on_disconnect(self) -> None:
         with self._frame_lock:

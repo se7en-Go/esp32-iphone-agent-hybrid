@@ -151,10 +151,16 @@ def parse_command(line: str) -> dict:
     if keys == ("points",):
         if len(numbers) < 4 or len(numbers) % 2:
             raise ValueError(f"path needs 2+ x y pairs: {line[:100]}")
+        if any(not (0 <= value <= 1000) for value in numbers):
+            raise ValueError(f"path coordinates must be in 0..1000: {line[:100]}")
         return {"action": name, "points": [numbers[i:i + 2] for i in range(0, len(numbers), 2)][:20]}
     if len(numbers) != len(keys):
         raise ValueError(f"{name} needs {len(keys)} numbers: {line[:100]}")
+    if numbers and any(not (0 <= value <= 1000) for value in numbers):
+        raise ValueError(f"{name} coordinates must be in 0..1000: {line[:100]}")
     action = {"action": name, **dict(zip(keys, numbers, strict=True))}
+    if name == "circle" and action["r"] <= 0:
+        raise ValueError(f"circle radius must be positive: {line[:100]}")
     if name == "tap" and "precise" in rest.lower():
         action["precise"] = True
     return action

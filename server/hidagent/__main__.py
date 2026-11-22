@@ -33,7 +33,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s
 logging.getLogger("hidagent").setLevel(logging.DEBUG if debug else logging.INFO)
 
 host = os.environ.get("HOST", "127.0.0.1")
-port = int(os.environ.get("PORT", "8890"))
+raw_port = os.environ.get("PORT", "8890").strip() or "8890"
+try:
+    port = int(raw_port)
+except ValueError as exc:
+    raise SystemExit(f"环境变量 PORT={raw_port!r} 不是合法整数端口（1..65535）。") from exc
+if not (1 <= port <= 65535):
+    raise SystemExit(f"环境变量 PORT={port} 超出有效范围（1..65535）。")
 if os.environ.get("HIDAGENT_CLIPBOARD_KEY") and host not in ("127.0.0.1", "localhost", "::1"):
     raise SystemExit("剪贴板模式的控制 API 必须监听 127.0.0.1；手机端请使用 hidagent.clipboard_proxy。")
 print(f"网页控制台：http://{host}:{port}")
