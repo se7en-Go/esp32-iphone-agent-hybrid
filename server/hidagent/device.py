@@ -381,8 +381,6 @@ class Device:
         self._last = self._beat = time.time()
         if previous is not link:
             self._abort = False
-            if self._pressed_link is previous:
-                self._pressed_link = None
         if previous is not None and previous is not link:
             previous.close()
 
