@@ -46,6 +46,7 @@ static void reset() {
   sink = Sink{};
   sink.who = FROM_APP;
   sink.scratch = scratch;
+  lock = xSemaphoreCreateMutex();
   gop_init(&gop, arena, sizeof arena, aus, 2);
   gop_init(&tail, tailArena, sizeof tailArena, tailAus, 4);
   tailLive = tailTrimmed = false;
@@ -115,9 +116,31 @@ static void test_new_idr_does_not_replay_previous_frozen_tail() {
   puts("ok new_idr_does_not_replay_previous_frozen_tail");
 }
 
+static void test_uninitialized_video_callbacks_and_stats_never_take_null_lock() {
+  lock = nullptr;
+  gop = {};
+  tail = {};
+  video_on_config(config, sizeof config);
+  video_on_au(idr, sizeof idr, true);
+  VideoStats st = video_stats(FROM_APP);
+  assert(st.gop_bytes == 0 && st.overflows == 0 && !st.frozen);
+  assert(video_debug() == "uninit");
+  puts("ok uninitialized_video_callbacks_and_stats_never_take_null_lock");
+}
+
+static void test_oversized_au_is_dropped_without_jamming_gop() {
+  reset();
+  uint32_t before = gop.overflows;
+  video_on_au(predicted, SCRATCH_CAP + 1, false);
+  assert(gop.overflows == before + 1);
+  puts("ok oversized_au_is_dropped_without_jamming_gop");
+}
+
 int main() {
+  test_uninitialized_video_callbacks_and_stats_never_take_null_lock();
   test_frozen_gop_plain_hello_replays_config_idr_and_tail();
   test_frozen_gop_rejects_incomplete_tail();
   test_frozen_gop_trim_during_replay_stops_tail();
   test_new_idr_does_not_replay_previous_frozen_tail();
+  test_oversized_au_is_dropped_without_jamming_gop();
 }

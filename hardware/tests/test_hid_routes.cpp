@@ -13,7 +13,7 @@ static int pref = HID_PREF_AUTO;
 static bool usbMounted, usbSuspended, bleConnected, bleSession;
 static bool bleButton, bleKey, bleConsumerHeld, usbButton, usbKey, usbConsumer;
 static uint8_t bleButtons;
-static int wakeups, usbMoves;
+static int wakeups, usbMoves, wdtResets;
 static bool failBleRelease;
 static bool failUsbReport;
 static uint32_t nowMs;
@@ -25,6 +25,7 @@ static size_t usbReconnectReportStart;
 static std::vector<std::string> events;
 using esp_event_base_t = const char *;
 unsigned long millis() { return nowMs; }
+void esp_task_wdt_reset() { wdtResets++; }
 void delay(int ms) {
   nowMs += ms;
   if (suspendUsbDuringDelay) usbSuspended = true;
@@ -125,6 +126,7 @@ static void reset() {
   mouse.cachedButtons = 0;
   usbAcceptedButtons.clear();
   wakeups = usbMoves = 0;
+  wdtResets = 0;
   memset(heldReports, 0, sizeof heldReports);
   memset(releasePending, 0, sizeof releasePending);
   memset(releaseStarted, 0, sizeof releaseStarted);
@@ -553,6 +555,30 @@ static void middle_button_and_checked_release() {
   puts("ok middleclick/middlepress, checked release, arg rejection, and left/homescreen preserved");
 }
 
+static void watchdog_fed_during_ble_type_and_long_move_and_extreme_move_rejected() {
+  reset();
+  pref = HID_PREF_BLE;
+  usbMounted = false;
+  bleConnected = bleSession = true;
+  String longText = "type ";
+  for (int i = 0; i < 450; i++) longText += 'a';
+  wdtResets = 0;
+  assert(run(longText) == "ok");
+  assert(wdtResets == 450);
+
+  wdtResets = 0;
+  assert(run("move 1200 0") == "ok");
+  assert(wdtResets >= 40);
+
+  wdtResets = 0;
+  assert(run("home") == "ok");
+  assert(wdtResets == HOME_REPORTS * 2);
+
+  assert(run("move 25000 0") == "err move out of range");
+  assert(run("move 0 -25000") == "err move out of range");
+  puts("ok watchdog fed during bleType/movePaced/slamHome and extreme move rejected");
+}
+
 int main(int argc, char **argv) {
   // Individual cases allow recording both regressions against the old sketch.
   if (argc == 2 && std::string(argv[1]) == "detach") { detached_routes_stop_blocking(); return 0; }
@@ -581,4 +607,5 @@ int main(int argc, char **argv) {
   keyboard_consumer_failures();
   accepted_behaviors();
   middle_button_and_checked_release();
+  watchdog_fed_during_ble_type_and_long_move_and_extreme_move_rejected();
 }

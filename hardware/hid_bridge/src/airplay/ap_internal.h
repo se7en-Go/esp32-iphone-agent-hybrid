@@ -49,7 +49,7 @@ void fairplay_decrypt(const uint8_t keymsg[164], const uint8_t in[72], uint8_t o
 
 // ---- mirror.c (mirror TCP data channel, NTP timing, audio ports) ----
 bool ap_mirror_start(const uint8_t aeskey[16], uint64_t stream_id, uint32_t remote_ip, uint16_t timing_rport);
-void ap_mirror_stop(void);
+bool ap_mirror_stop(void);
 bool ap_mirror_running(void);
 bool ap_mirror_streaming(void);
 // The audio stream of the running mirror session (SETUP type 96): ct is its compression type; only AAC-ELD

@@ -8,7 +8,7 @@ MBEDTLS := $(firstword $(wildcard $(BREW)/opt/mbedtls@3 $(BREW)/opt/mbedtls) /us
 
 HOST_CFLAGS = -std=c11 -Wall -Wextra -g -fsanitize=address,undefined -I../hid_bridge
 
-test: test_main.c $(SRC)/bplist/bplist.c $(SRC)/video/gop.c $(SRC)/airplay/keystream.c $(SRC)/cli/cli_proto.c $(SRC)/hid/arbiter.c $(SRC)/hid/pace.c $(SRC)/log/logring.c $(SRC)/airplay/mdns.c $(SRC)/airplay/audio.c $(SRC)/heard/heard.c plain_bound pair_window ble_ingress video_recovery command_line hid_transport hid_routes ble_hid
+test: test_main.c $(SRC)/bplist/bplist.c $(SRC)/video/gop.c $(SRC)/airplay/keystream.c $(SRC)/cli/cli_proto.c $(SRC)/hid/arbiter.c $(SRC)/hid/pace.c $(SRC)/log/logring.c $(SRC)/airplay/mdns.c $(SRC)/airplay/audio.c $(SRC)/heard/heard.c plain_bound pair_window ble_ingress video_recovery command_line hid_transport hid_routes ble_hid airplay_bounds
 	$(CC) $(CFLAGS) -Istubs -I$(MBEDTLS)/include -o $@ $(filter %.c,$^) -L$(MBEDTLS)/lib -lmbedcrypto -lm
 	./test
 	./plain_bound
@@ -19,6 +19,7 @@ test: test_main.c $(SRC)/bplist/bplist.c $(SRC)/video/gop.c $(SRC)/airplay/keyst
 	./hid_transport
 	./hid_routes
 	./ble_hid
+	./airplay_bounds
 
 plain_bound: test_plain_bound.c
 	$(CC) $(HOST_CFLAGS) -o $@ $<
@@ -51,11 +52,19 @@ hid_routes: test_hid_routes.cpp hid_routes.inc route_stubs/Arduino.h $(SRC)/hid/
 ble_hid: test_ble_hid.cpp ../hid_bridge/ble_hid.cpp $(SRC)/ble/advertising_gate.h $(wildcard ble_stubs/*.h ble_stubs/nimble/nimble/host/include/host/*.h) $(SRC)/hid/transport.c
 	$(CXX) -std=c++17 -Wall -Wextra -g -fsanitize=address,undefined -Ible_stubs -o $@ test_ble_hid.cpp $(SRC)/hid/transport.c
 
+airplay_bounds: test_airplay_bounds.c $(SRC)/bplist/bplist.c $(SRC)/airplay/fairplay.c $(SRC)/airplay/playfair/playfair.c $(SRC)/airplay/playfair/omg_hax.c $(SRC)/airplay/playfair/sap_hash.c $(SRC)/airplay/playfair/hand_garble.c $(SRC)/airplay/playfair/modified_md5.c
+	$(CC) -std=c11 -w -g -fsanitize=address -c $(SRC)/airplay/playfair/playfair.c -o pf_playfair.o
+	$(CC) -std=c11 -w -g -fsanitize=address -c $(SRC)/airplay/playfair/omg_hax.c -o pf_omg_hax.o
+	$(CC) -std=c11 -w -g -fsanitize=address -c $(SRC)/airplay/playfair/sap_hash.c -o pf_sap_hash.o
+	$(CC) -std=c11 -w -g -fsanitize=address -c $(SRC)/airplay/playfair/hand_garble.c -o pf_hand_garble.o
+	$(CC) -std=c11 -w -g -fsanitize=address -c $(SRC)/airplay/playfair/modified_md5.c -o pf_modified_md5.o
+	$(CC) $(CFLAGS) -o $@ test_airplay_bounds.c $(SRC)/bplist/bplist.c $(SRC)/airplay/fairplay.c pf_playfair.o pf_omg_hax.o pf_sap_hash.o pf_hand_garble.o pf_modified_md5.o -lm
+
 sim_board:
 	$(MAKE) -C sim cli_sim
 
 clean:
-	rm -f test plain_bound pair_window ble_ingress video_recovery video_gop.o command_line hid_transport hid_routes hid_routes.inc route_transport.o route_keys.o route_pace.o ble_hid
+	rm -f test plain_bound pair_window ble_ingress video_recovery video_gop.o command_line hid_transport hid_routes hid_routes.inc route_transport.o route_keys.o route_pace.o ble_hid airplay_bounds pf_*.o
 	$(MAKE) -C sim clean
 
 .PHONY: clean sim_board

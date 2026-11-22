@@ -104,7 +104,9 @@ static void serve(int fd) {
         writeRecord(NULL, 0);
         xSemaphoreGive(lock);
       } else if (authed && !strcmp(line, "resync")) {
+        xSemaphoreTake(lock, portMAX_DELAY);
         resync = true;
+        xSemaphoreGive(lock);
       } else if (authed && !strcmp(line, "audio")) {
         audioWanted = true;
         board_log("wv: app wants audio");
@@ -177,9 +179,12 @@ bool wv_take_resume(uint32_t *ts) {
 }
 
 bool wv_take_resync() {
-  if (!resync) return false;
+  if (!lock) return false;
+  xSemaphoreTake(lock, portMAX_DELAY);
+  bool asked = resync;
   resync = false;
-  return true;
+  xSemaphoreGive(lock);
+  return asked;
 }
 
 // ---- audio: the mirror task queues frames, audioTask writes them as records to the app (TCP 7201) and to a CLI
