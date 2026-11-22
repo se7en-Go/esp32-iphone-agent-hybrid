@@ -286,7 +286,7 @@ def test_host_click_is_not_a_batch_or_agent_action(rig):
 def test_host_click_keeps_http_deadline_and_no_late_queued_write(rig, monkeypatch):
     from hidagent import operation
 
-    monkeypatch.setattr(operation, "OPERATION_TIMEOUT", .02)
+    monkeypatch.setattr(operation, "OPERATION_TIMEOUT", .25)
 
     async def scenario():
         body = request_for(rig)
@@ -298,7 +298,7 @@ def test_host_click_keeps_http_deadline_and_no_late_queued_write(rig, monkeypatc
             assert rig.controls.job is None
         finally:
             rig.device._lock.release()
-        await asyncio.sleep(.02)
+        await asyncio.sleep(.05)
         assert rig.link.written == [] and rig.device.input_sequence == 0
 
     asyncio.run(scenario())

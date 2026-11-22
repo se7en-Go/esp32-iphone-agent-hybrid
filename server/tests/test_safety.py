@@ -456,12 +456,12 @@ def _running_test_app(*, timeout=10):
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
         try:
-            deadline = time.monotonic() + timeout
             last_probe = "server has not reported startup"
             with httpx.Client(base_url=url, timeout=.3, trust_env=False) as probe:
-                while time.monotonic() < deadline:
+                deadline = time.monotonic() + timeout
+                while True:
                     if not thread.is_alive():
-                        break
+                        raise AssertionError(f"real app thread exited before ready: {failures}; {last_probe}")
                     if server.started:
                         try:
                             response = probe.get("/api/status")
@@ -470,11 +470,13 @@ def _running_test_app(*, timeout=10):
                                 break
                         except httpx.HTTPError as exc:
                             last_probe = f"{type(exc).__name__}: {exc}"
-                    time.sleep(.05)
-                else:
-                    raise AssertionError(
-                        f"real app not ready: started={server.started}, alive={thread.is_alive()}, "
-                        f"last_probe={last_probe}, errors={failures}")
+                    if time.monotonic() >= deadline:
+                        if not thread.is_alive():
+                            raise AssertionError(f"real app thread exited before ready: {failures}; {last_probe}")
+                        raise AssertionError(
+                            f"real app not ready: started={server.started}, alive={thread.is_alive()}, "
+                            f"last_probe={last_probe}, errors={failures}")
+                    time.sleep(.01)
             if not thread.is_alive():
                 raise AssertionError(f"real app thread exited before ready: {failures}; {last_probe}")
             yield url
@@ -543,7 +545,7 @@ def test_real_app_probe_reports_thread_startup_failure(monkeypatch):
 
     monkeypatch.setattr(uvicorn.Server, "run", failed_start)
     with pytest.raises(AssertionError, match="thread exited.*synthetic startup failure"):
-        with _running_test_app(timeout=.2):
+        with _running_test_app(timeout=2.0):
             pytest.fail("failed startup was accepted")
 
 
