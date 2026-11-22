@@ -250,9 +250,10 @@ def test_screen_can_restart_after_stop(monkeypatch):
 
     screen = Screen()
     screen.start()
-    assert screen._started is True
+    first_thread = screen._thread
+    assert first_thread is not None and screen._stopping is False
     screen.stop()
-    assert screen._started is False and screen._stopping is False
+    assert screen._thread is None and screen._stopping is True
     screen.start()
-    assert screen._started is True
+    assert screen._thread is not None and screen._thread is not first_thread and screen._stopping is False
     screen.stop()

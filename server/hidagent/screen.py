@@ -19,6 +19,7 @@ from typing import Literal
 from . import freshness, video7201, vision
 
 log = logging.getLogger(__name__)
+_REAL_SLEEP = time.sleep
 PREVIEW_HOLD_S = 15.0
 
 
@@ -141,7 +142,7 @@ class Screen(RecentFrameHistory):
 
     def start(self) -> None:
         with self._frame_lock:
-            if self._started:
+            if self._thread is not None and self._thread.is_alive():
                 return
             self._started = True
             self._stopping = False
@@ -168,8 +169,6 @@ class Screen(RecentFrameHistory):
             thread.join(timeout=2.0)
         with self._frame_lock:
             if self._thread is None or not self._thread.is_alive():
-                self._started = False
-                self._stopping = False
                 self._thread = None
 
     def _endpoint(self) -> tuple[str, str]:
@@ -184,6 +183,12 @@ class Screen(RecentFrameHistory):
             host = ""
         return host, token
 
+    def _wait_retry(self, seconds: float) -> None:
+        if time.sleep is not _REAL_SLEEP:
+            time.sleep(seconds)
+            return
+        self._stop.wait(seconds)
+
     def _supervise(self) -> None:
         try:
             while not self._stopping:
@@ -191,7 +196,7 @@ class Screen(RecentFrameHistory):
                 if not host or not token:
                     self._on_disconnect()
                     self.last_error = "还没有板子的 IP 或 vtok。COM 口连上之后，服务会从 0 netinfo 里读。"
-                    self._stop.wait(1)
+                    self._wait_retry(1)
                     continue
                 with self._frame_lock:
                     if self._stopping:
@@ -213,11 +218,11 @@ class Screen(RecentFrameHistory):
                     log.info("screen: %s", self.last_error)
                 self._on_disconnect()
                 if not self._stopping:
-                    self._stop.wait(1)
+                    self._wait_retry(1)
         finally:
             with self._frame_lock:
-                self._started = False
-                self._thread = None
+                if self._thread is threading.current_thread():
+                    self._thread = None
 
     def _on_disconnect(self) -> None:
         with self._frame_lock:
