@@ -49,6 +49,8 @@ PING_WINDOW = 8.0
 RELEASE_TIMEOUT = 1.0
 SERIAL_WRITE_TIMEOUT = 0.5
 MAX_WIRE_LINE = 512
+MAX_READ_LINE = 65536
+SERIAL_IO_ERRORS = (OSError, serial.SerialException, asyncio.TimeoutError)
 HID_COMMANDS = {"home", "move", "press", "release", "click", "middlepress", "middleclick",
                 "scroll", "type", "key", "homescreen"}
 FIXED_ID = {"netinfo", "status", "net"}
@@ -243,6 +245,10 @@ class SerialLink:
                 line = bytes(self._buf[:nl + 1])
                 del self._buf[:nl + 1]
                 self._post(line)
+            if len(self._buf) > MAX_READ_LINE:
+                log.warning("serial reader line buffer exceeded %d bytes without newline on %s; discarding",
+                            MAX_READ_LINE, getattr(self, "_port", "<serial>"))
+                self._buf.clear()
         if self._buf and not self._closed:
             log.debug("serial reader discarding %d partial bytes on %s",
                       len(self._buf), getattr(self, "_port", "<serial>"))
@@ -257,12 +263,18 @@ class SerialLink:
     def write_nowait(self, data: bytes) -> None:
         if self._closed:
             raise OSError("serial closed")
-        self._ser.write(data)
+        try:
+            self._ser.write(data)
+        except serial.SerialException as exc:
+            raise OSError(str(exc)) from exc
 
     def flush(self) -> None:
         if self._closed:
             raise OSError("serial closed")
-        self._ser.flush()
+        try:
+            self._ser.flush()
+        except serial.SerialException as exc:
+            raise OSError(str(exc)) from exc
 
     def write(self, data: bytes) -> None:
         self.write_nowait(data)
@@ -367,6 +379,10 @@ class Device:
         self.board_status = {}
         self.board_clock_sample = None
         self._last = self._beat = time.time()
+        if previous is not link:
+            self._abort = False
+            if self._pressed_link is previous:
+                self._pressed_link = None
         if previous is not None and previous is not link:
             previous.close()
 
@@ -456,7 +472,7 @@ class Device:
             return
         try:
             self._write_release(link)
-        except OSError:
+        except (OSError, serial.SerialException):
             link.close()
             self._pressed_link = None
             if self._link is link:
@@ -478,7 +494,7 @@ class Device:
 
         try:
             await shield_cleanup(release())
-        except (OSError, asyncio.TimeoutError):
+        except SERIAL_IO_ERRORS:
             # A reset is only allowed after attempting release on the original link.
             link.close()
             if self._link is link:
@@ -504,6 +520,7 @@ class Device:
                 raise DeviceError(f"串口命令超过 {MAX_WIRE_LINE} 字节上限，未发送。")
             wire = wire_body + b"\n"
             blocking = bool(getattr(link, "blocking_write", False) and hasattr(link, "run_write"))
+            write_cancelled = threading.Event()
 
             def _commit_and_write() -> None:
                 # 板子收到这一行之后才选 USB 或 BLE。两条路都先经过这把锁里的熔断复查，没有第二条写手机的路。
@@ -517,6 +534,10 @@ class Device:
                             raise DeviceError("输入校验的画面来源锁已变化，未继续操作。")
                         publication_lock = attempt.write_lock
                     with publication_lock if publication_lock is not None else nullcontext():
+                        if write_cancelled.is_set():
+                            raise asyncio.CancelledError
+                        if self._abort and name not in {"release", "home"}:
+                            raise DeviceError("已紧急停止，后面的内容没有发出。")
                         if name in HID_COMMANDS and name != "release":
                             check_operation()
                         if before_write is not None:
@@ -551,13 +572,15 @@ class Device:
 
             try:
                 if blocking:
-                    write_fut = asyncio.ensure_future(link.run_write(_commit_and_write))
+                    write_task = asyncio.ensure_future(link.run_write(_commit_and_write))
                     try:
-                        await write_fut
+                        await asyncio.shield(write_task)
                     except asyncio.CancelledError:
-                        # Let an already-started serial write finish (bounded by write_timeout)
+                        write_cancelled.set()
+                        # Wait for the already-started writer thread to exit (bounded by
+                        # write_timeout) so _pressed_link reflects the true write boundary
                         # before cancellation cleanup writes release or closes the port.
-                        await shield_cleanup(asyncio.gather(write_fut, return_exceptions=True))
+                        await shield_cleanup(asyncio.gather(write_task, return_exceptions=True))
                         raise
                 else:
                     _commit_and_write()
@@ -571,7 +594,7 @@ class Device:
                     if self._link is link:
                         self._link = None
                 raise
-            except (OSError, asyncio.TimeoutError) as exc:
+            except SERIAL_IO_ERRORS as exc:
                 await self._release_held(link)
                 link.close()
                 if self._link is link:

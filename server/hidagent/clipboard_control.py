@@ -208,13 +208,19 @@ class StagedClipboardControls:
         controls.consume(request.screen_id, caret_scope=item.guard.region)
         item.guard()
         item.provider.stage_start_paste(item.nonce)
+        validate_failed = False
 
         def validate():
-            self._session(item)
-            if fresh_frame(controls.screen, since=copied["copied_at"]) is None:
-                raise ValueError("fresh post-copy frame lost before paste; observe again")
-            item.guard()
-            item.provider.stage_validate_paste(item.nonce)
+            nonlocal validate_failed
+            try:
+                self._session(item)
+                if fresh_frame(controls.screen, since=copied["copied_at"]) is None:
+                    raise ValueError("fresh post-copy frame lost before paste; observe again")
+                item.guard()
+                item.provider.stage_validate_paste(item.nonce)
+            except (RuntimeError, ValueError, HTTPException):
+                validate_failed = True
+                raise
 
         try:
             with item.provider.stage_write(item.nonce, "key cmd+v"):
@@ -232,8 +238,10 @@ class StagedClipboardControls:
             raise
         except (RuntimeError, ValueError, HTTPException) as exc:
             state = self._abandon(item, suppress_errors=True)
+            # Only post-validation errors may have written bytes to HID;
+            # a failure inside before_action rejected strictly before write.
             return {**self._evidence(), **state, "command_acknowledged": False, "effect_verified": False,
-                    "action_may_have_executed": True, "error": str(exc), "phase": "cancelled"}
+                    "action_may_have_executed": not validate_failed, "error": str(exc), "phase": "cancelled"}
         result = self.status(item.nonce)
         if fresh_frame(controls.screen, since=item.completed_at) is None:
             controls.invalidate()
