@@ -27,19 +27,24 @@ def _visible_text(text):
     return "".join(unicodedata.normalize("NFC", text).split())
 
 
-def _is_permission_prompt(boxes):
+def permission_prompt(boxes):
+    """Return the prompt and both OCR buttons from the same system paste sheet."""
     modal = [item for item in boxes if item.conf >= _MIN_CONFIDENCE
              and .13 < item.center[0] < .87 and .27 < item.center[1] < .75]
     allow = [item for item in modal if ocr.normalize_text(item.text) in _ALLOW]
     deny = [item for item in modal if ocr.normalize_text(item.text) in _DENY]
     if len(allow) != 1 or len(deny) != 1:
-        return False
+        return None
     button_top = min(allow[0].box[1], deny[0].box[1])
     if abs(allow[0].center[1] - deny[0].center[1]) > .10:
-        return False
+        return None
     prompt = "".join(ocr.normalize_text(item.text) for item in modal
                      if button_top - .17 < item.center[1] < button_top)
-    return _PASTE_FROM.search(prompt) is not None
+    return (prompt, allow[0], deny[0]) if _PASTE_FROM.search(prompt) else None
+
+
+def _is_permission_prompt(boxes):
+    return permission_prompt(boxes) is not None
 
 
 def _inside(item, region):
@@ -649,7 +654,79 @@ def _matches_wrapped_lines(added: tuple[str, ...], expected: tuple[str, ...]) ->
     return idx == len(added)
 
 
-def _verify_before_after_sync(before, after, original, current, region, expected) -> bool:
+def _notes_enabled_share_box(before, after, original, current, region):
+    """Recognize the disabled-to-enabled share arrow in an empty Apple Notes editor."""
+    width, height = before.size
+    for items in (original, current):
+        titles = [item for item in items if item.conf >= _MIN_CONFIDENCE
+                  and ocr.normalize_text(item.text) in {"icloud全部备忘录", "icloud全部備忘錄", "allicloud"}
+                  and .08 < item.center[0] < .4 and .04 < item.center[1] < region[1]]
+        done = [item for item in items if item.conf >= _MIN_CONFIDENCE
+                and ocr.normalize_text(item.text) in {"完成", "done"}
+                and .82 < item.center[0] < .98 and .04 < item.center[1] < region[1]]
+        if len(titles) != 1 or len(done) != 1 or abs(titles[0].center[1] - done[0].center[1]) > .012:
+            return None
+    cy = round(done[0].center[1] * height)
+    crop = (round(.54 * width), cy - round(.055 * width), round(.725 * width), cy + round(.055 * width))
+    if crop[1] < 0 or crop[3] >= region[1] * height:
+        return None
+
+    grey = Image.new("L", before.crop(crop).size)
+    gold = Image.new("L", grey.size)
+    for y in range(grey.height):
+        for x in range(grey.width):
+            position = crop[0] + x, crop[1] + y
+            old = before.getpixel(position)
+            r, g, b = after.getpixel(position)
+            if min(old) >= 180 and max(old) <= 241 and max(old) - min(old) <= 10:
+                grey.putpixel((x, y), 255)
+            if r - b > 34 and g - b > 25 and -8 <= r - g < 100:
+                gold.putpixel((x, y), 255)
+    bounds, active = grey.getbbox(), gold.getbbox()
+    if not bounds or not active:
+        return None
+    x0, y0, x1, y1 = bounds
+    w, h = x1 - x0, y1 - y0
+    if not (.036 * width <= w <= .067 * width and 1.1 * w <= h <= 1.45 * w):
+        return None
+    # Brighter active strokes can include an extra antialiased pixel on
+    # either edge. The control's center must stay at the same position.
+    if (abs((x0 + x1) - (active[0] + active[2])) > 2 * max(1, .0025 * width)
+            or abs((y0 + y1) - (active[1] + active[3])) > 2 * max(1, .0025 * width)):
+        return None
+    # Match the open-top tray, central shaft and arrowhead in both states.
+    glyph = Image.new("L", grey.size)
+    draw = ImageDraw.Draw(glyph)
+    for line in (((.27, .16), (.5, .02), (.73, .16)), ((.5, .02), (.5, .60)),
+                 ((.36, .28), (.09, .28), (.04, .35), (.04, .88), (.10, .96),
+                  (.90, .96), (.96, .88), (.96, .35), (.90, .28), (.67, .28))):
+        draw.line([(round(x0 + a * (w - 1)), round(y0 + b * (h - 1))) for a, b in line], fill=255)
+    tolerance = 2 * max(1, round(.14 * w)) + 1
+    band = glyph.filter(ImageFilter.MaxFilter(tolerance))
+    for ink in (grey, gold):
+        if (ImageChops.subtract(ink, band).getbbox()
+                or ImageChops.subtract(glyph, ink.filter(ImageFilter.MaxFilter(tolerance))).getbbox()):
+            return None
+    # Do not excuse edits in the rectangle or inside the tray: only neutral
+    # grey on white may become yellow on white along the proven strokes.
+    for y in range(y0 - 2, y1 + 2):
+        for x in range(x0 - 2, x1 + 2):
+            if not (0 <= x < grey.width and 0 <= y < grey.height):
+                return None
+            position = crop[0] + x, crop[1] + y
+            old = before.getpixel(position)
+            new = after.getpixel(position)
+            noise = 28 if min(old) >= 229 and min(new) >= 223 else 12
+            if max(abs(a - b) for a, b in zip(old, new, strict=True)) <= noise:
+                continue
+            if (not band.getpixel((x, y)) or min(old) < 175 or max(old) - min(old) > 15
+                    or new[0] < 145 or new[1] < 135 or new[0] < new[1] - 16 or new[1] < new[2] - 16):
+                return None
+    return ((crop[0] + x0 - 2) / width, (crop[1] + y0 - 2) / height,
+            (crop[0] + x1 + 2) / width, (crop[1] + y1 + 2) / height)
+
+
+def _verify_before_after_sync(before, after, original, current, region, expected, *, notes_only=False) -> bool:
     original_image, current_image = _image(before), _image(after)
     if original_image.size != current_image.size:
         return False
@@ -680,10 +757,12 @@ def _verify_before_after_sync(before, after, original, current, region, expected
     if grown is None:
         if not _same_field_outline(original_image, current_image, region):
             return False
-        if _same_context(original, current, region):
+        if not notes_only and _same_context(original, current, region):
             return True
     elif len(current_lines) < 2:
         return False  # only multi-line text grows the field
+    if notes_only and (grown is not None or original_lines != () or suggestion_bar is None):
+        return False
     if suggestion_bar is None and (grown is not None or assistive_box is None):
         return False
     extra = []
@@ -694,10 +773,13 @@ def _verify_before_after_sync(before, after, original, current, region, expected
         if key_box is not None:
             extra.append(key_box)
     ignored = (assistive_box,) if assistive_box is not None else ()
-    if (_same_context(original, current, current_region,
-                      suggestion_bar=suggestion_bar, ignored_boxes=ignored)
-            and not _outside_visual_changed(before, after, current_region, suggestion_bar, extra)):
-        return True
+    if _same_context(original, current, current_region, suggestion_bar=suggestion_bar, ignored_boxes=ignored):
+        if not notes_only and not _outside_visual_changed(before, after, current_region, suggestion_bar, extra):
+            return True
+        if grown is None and original_lines == () and suggestion_bar is not None:
+            share = _notes_enabled_share_box(original_image, current_image, original, current, region)
+            if share and not _outside_visual_changed(before, after, region, suggestion_bar, [*extra, share]):
+                return True
     if grown is None:
         return False
     split_bounds = _header_viewport_bounds(original, current, region, current_region, ignored_boxes=ignored)
@@ -716,20 +798,21 @@ def _verify_before_after_sync(before, after, original, current, region, expected
     )
 
 
-async def _verify_before_after_uncached(read_fn, before, after, region, expected) -> bool:
+async def _verify_before_after_uncached(read_fn, before, after, region, expected, *, notes_only) -> bool:
     original = await read_fn(before)
     current = await read_fn(after)
-    return await asyncio.to_thread(_verify_before_after_sync, before, after, original, current, region, expected)
+    return await asyncio.to_thread(_verify_before_after_sync, before, after, original, current, region, expected,
+                                   notes_only=notes_only)
 
 
-async def _verify_before_after(before, after, region, expected) -> bool:
+async def _verify_before_after(before, after, region, expected, *, notes_only=False) -> bool:
     global _PAIR_CACHE
     read_fn = ocr.read_text_async
-    key = (hashlib.sha256(before).digest(), hashlib.sha256(after).digest(), region, expected)
+    key = (hashlib.sha256(before).digest(), hashlib.sha256(after).digest(), region, expected, notes_only)
     cached = _PAIR_CACHE
     if cached is not None and cached[0] is read_fn and cached[1] == key:
         return cached[2]
-    verified = await _verify_before_after_uncached(read_fn, before, after, region, expected)
+    verified = await _verify_before_after_uncached(read_fn, before, after, region, expected, notes_only=notes_only)
     _PAIR_CACHE = (read_fn, key, verified)
     return verified
 
@@ -750,7 +833,7 @@ def _same_frame_sizes(*frames: bytes) -> bool:
     return len(sizes) == 1
 
 
-async def verify_before_after_for_permission(before, after, region, observed_text) -> bool:
+async def verify_before_after_for_permission(before, after, region, observed_text, *, notes_only=False) -> bool:
     """Verify before/after paste state alone before scanning permission-sheet candidates."""
     if not before or not after or before == after or region is None:
         return False
@@ -759,7 +842,7 @@ async def verify_before_after_for_permission(before, after, region, observed_tex
         expected = _expected_lines(observed_text)
         if not expected:
             return False
-        return await _verify_before_after(before, after, region, expected)
+        return await _verify_before_after(before, after, region, expected, notes_only=notes_only)
     except (ocr.OCRError, OSError, ValueError):
         return False
 

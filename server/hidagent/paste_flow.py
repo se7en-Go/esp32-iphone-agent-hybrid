@@ -13,15 +13,16 @@ from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import httpx
-from PIL import Image, ImageChops
+from PIL import Image
 
 from . import assistive_vision
 
 PRE_DISPATCH = ("未发送原地点击", "未发送点击", "等待点击期间原画面已变化")
-ALLOW_LABELS = ("允许粘贴", "Allow Paste")
+ALLOW_LABELS = {"允许粘贴", "允許貼上", "allowpaste"}
 ALLOW_MODAL_REGION = (0.13, 0.27, 0.87, 0.75)
 PASTE_ATTEMPTS = 3  # pre-dispatch 409 retries for the paste stage; Cmd+V is still sent at most once
-ALLOW_DISMISS_ATTEMPTS = 2  # at most one follow-up click if the first click only wakes an auto-hidden pointer
+ALLOW_POINT_ATTEMPTS = 3
+ALLOW_CHECK_ATTEMPTS = 4
 
 # What a caller must do next for each terminal state. Never contains text or ids.
 RECOVERY = {
@@ -259,40 +260,6 @@ def _pointer_in_box(moved: dict | None, box) -> tuple[float, float] | None:
     return None
 
 
-def _locate_pointer_in_box(before: bytes | None, after: bytes | None, box) -> tuple[float, float] | None:
-    """Locate a dark visible AssistiveTouch pointer disc strictly inside `box`."""
-    if not before or not after or before == after:
-        return None
-    try:
-        with Image.open(io.BytesIO(before)) as first, Image.open(io.BytesIO(after)) as second:
-            if first.size != second.size:
-                return None
-            w = min(360, first.width)
-            h = max(1, round(first.height * w / first.width))
-            a = first.convert("L").resize((w, h), Image.Resampling.BILINEAR)
-            b = second.convert("L").resize((w, h), Image.Resampling.BILINEAR)
-    except (OSError, ValueError):
-        return None
-    dark = ImageChops.subtract(a, b)
-    x0, x1 = max(0, round(box[0] * w)), min(w, round(box[2] * w))
-    y0, y1 = max(0, round(box[1] * h)), min(h, round(box[3] * h))
-    dpix, bpix = dark.load(), b.load()
-    pts = []
-    for py in range(y0, y1):
-        for px in range(x0, x1):
-            if dpix[px, py] > 35 and bpix[px, py] < 175:
-                pts.append((px / w, py / h))
-    if not 35 <= len(pts) <= 600:
-        return None
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    if max(xs) - min(xs) > .12 or max(ys) - min(ys) > .06:
-        return None
-    cx = sum(xs) / len(xs)
-    cy = sum(ys) / len(ys)
-    return (cx, cy) if box[0] < cx < box[2] and box[1] < cy < box[3] else None
-
-
 def _frame(observation):
     if not observation.get("screen_id") or not observation.get("image_base64"):
         raise RuntimeError("AssistiveTouch verification requires a fresh observation")
@@ -484,6 +451,167 @@ def _hold(client, report, landing, stage):
     raise RuntimeError("AssistiveTouch hold kept changing before dispatch")
 
 
+def _page_header(items):
+    from . import ocr, paste_confirmation
+
+    return tuple((ocr.normalize_text(item.text), item.center) for item in sorted(items, key=lambda it: it.center[0])
+                 if .055 < item.center[1] < .14 and item.conf >= paste_confirmation._MIN_CONFIDENCE)
+
+
+def _on_prepared_page(prepared, current, expect_title):
+    from . import ocr
+
+    wanted = ocr.normalize_text(expect_title) if expect_title else None
+    for label, center in prepared:
+        # With no caller-provided title, use a distinctive left/centre heading
+        # from the actual prepare frame; generic navigation controls recur across apps.
+        if wanted:
+            if label != wanted:
+                continue
+        elif (center[0] > .8 or len(label) < 3
+              or label in {"back", "done", "edit", "cancel", "search", "more", "save", "返回", "完成", "取消"}):
+            continue
+        if any(label == text and math.dist(center, position) < .045 for text, position in current):
+            return True
+    return False
+
+
+class _AllowTarget(NamedTuple):
+    prompt: str
+    header: tuple
+    label: str
+    center: tuple[float, float]
+    box: tuple[float, float, float, float]
+    deny_center: tuple[float, float]
+
+    def same_sheet(self, other):
+        from . import ocr
+
+        if other is None:
+            return False
+        return (self.prompt == other.prompt and len(self.header) == len(other.header)
+                and all(a == b and math.dist(p, q) < .045
+                        for (a, p), (b, q) in zip(self.header, other.header, strict=True))
+                and ocr.normalize_text(self.label) == ocr.normalize_text(other.label)
+                and _inside(other.center, self.box) and _inside(self.center, other.box)
+                and math.dist(self.deny_center, other.deny_center) < .025)
+
+
+def _allow_target(frame):
+    from . import ocr, paste_confirmation
+
+    items = ocr.read_text(frame)
+    prompt = paste_confirmation.permission_prompt(items)
+    if prompt is None:
+        return None
+    description, allow, deny = prompt
+    left, top, right, bottom = allow.box
+    x0, y0, x1, y1 = ALLOW_MODAL_REGION
+    if not (x0 < left < right < x1 and y0 < top < bottom < y1
+            and _inside(allow.center, allow.box) and _inside(deny.center, deny.box)):
+        raise RuntimeError("Allow Paste button is outside the permission prompt")
+    box = (max(x0, left - .02), max(y0, top - .012), min(x1, right + .02), min(y1, bottom + .012))
+    if box[0] < deny.box[2] and deny.box[0] < box[2] and box[1] < deny.box[3] and deny.box[1] < box[3]:
+        raise RuntimeError("Allow and Deny Paste buttons overlap")
+    return _AllowTarget(description, _page_header(items), allow.text, allow.center, box, deny.center)
+
+
+def _stale_permission_ticket(exc):
+    reason = str(exc)
+    return reason.startswith("HTTP 409:") and any(marker in reason for marker in (
+        "screen changed since", "screen_id expired", "invalid or consumed screen_id"))
+
+
+def _next_allow_observation(client, report, moved, *, for_click=False):
+    """Wait passively for a distinct publication of this move."""
+    stage = "allow_click_observe" if for_click else "allow_correction_observe"
+    for attempt in range(ALLOW_CHECK_ATTEMPTS):
+        try:
+            observed = _observe(client, report, for_click=for_click, stage=stage)
+        except RuntimeError as exc:
+            if not _stale_permission_ticket(exc):
+                raise
+        else:
+            at, after = _published(moved), _published(observed)
+            if after < at or (after == at and _frame(moved) != _frame(observed)):
+                raise RuntimeError("Allow Paste observation publication changed inconsistently")
+            if after > at and observed["screen_id"] != moved["screen_id"]:
+                return observed
+        if attempt + 1 < ALLOW_CHECK_ATTEMPTS:
+            report.retry("allow_paste_publication")
+            time.sleep(.12)
+    raise RuntimeError("Allow Paste pointer has no independent post-move frame")
+
+
+def _press_allow(client, report, expected, transaction):
+    """A move may be repeated; dispatch at most one acknowledged permission click."""
+    from . import ocr
+
+    if ocr.normalize_text(expected.label) not in ALLOW_LABELS:
+        raise RuntimeError("no explicit Allow Paste button in the permission prompt")
+    miss = None
+    for attempt in range(ALLOW_POINT_ATTEMPTS):
+        observed = (_next_allow_observation(client, report, miss[0]) if miss
+                    else _observe(client, report, stage="allow_observe"))
+        target = _allow_target(_frame(observed))
+        if not expected.same_sheet(target):
+            raise RuntimeError("paste permission prompt changed before pointing")
+        fields = {"x": target.center[0], "y": target.center[1], "target_box": list(target.box), "measure_only": True}
+        if miss and _measurement(observed) != miss[1]:
+            raise RuntimeError("Allow Paste pointer measurement changed before re-aiming")
+        if attempt:
+            # Relative HID correction also guards the original AssistiveTouch target.
+            # For this system button, acquire and measure a new absolute point.
+            fields["rehome"] = True
+        miss = None
+        try:
+            with _Stage(report, "allow_point"):
+                moved = client.control("point", observed["screen_id"], **fields)
+        except RuntimeError as exc:
+            if not _stale_permission_ticket(exc) or attempt + 1 == ALLOW_POINT_ATTEMPTS:
+                raise
+            report.retry("allow_paste_point")
+            continue
+        report.server_timing_ms.setdefault("allow_point", []).append(moved.get("timing_ms"))
+        if moved.get("command_acknowledged") is not True:
+            raise RuntimeError("Allow Paste move was not acknowledged")
+        if moved.get("fresh") is not True or moved.get("pointer_seen") is not True:
+            report.retry("allow_paste_point")
+            continue
+        measured = _measurement(moved)
+        if not _inside(measured.point, target.box):
+            miss = (moved, measured)
+            report.retry("allow_paste_point")
+            continue
+        clicking = _next_allow_observation(client, report, moved, for_click=True)
+        current = _allow_target(_frame(clicking))
+        if not expected.same_sheet(current) or not target.same_sheet(current):
+            raise RuntimeError("paste permission prompt changed before clicking")
+        if (clicking.get("for_click") is not True
+                or _measurement(clicking) != measured or not _inside(measured.point, current.box)):
+            raise RuntimeError("Allow Paste pointer was not confirmed on the current button")
+        # This request may have been cancelled or expired while the
+        # pointer was being measured. A light read preserves the click ticket.
+        state = client.clipboard_stage("status", transaction_id=transaction, include_observation=False)
+        ttl = state.get("expires_in_seconds")
+        if (state.get("transaction_id") != transaction or state.get("phase") != "awaiting_confirmation"
+                or state.get("copied") is not True or state.get("paste_sent") is not True
+                or type(ttl) not in (int, float) or not math.isfinite(ttl) or ttl <= 0):
+            raise RuntimeError("paste transaction is no longer awaiting permission and confirmation")
+        with _Stage(report, "allow_click"):
+            result = client.click_observed(clicking["screen_id"], *measured.point, list(current.box),
+                                           target_label=current.label)
+        report.server_timing_ms.setdefault("allow_click", []).append(result.get("timing_ms"))
+        if result.get("command_acknowledged") is True:
+            return result
+        error = (result.get("error") or "").lower()
+        if (result.get("action_may_have_executed") is not False or not any(reason in error for reason in PRE_DISPATCH)
+                or any(reason in error for reason in ("cancel", "abort", "取消", "急停", "已停止", "紧急停止"))):
+            raise RuntimeError("Allow Paste click was not acknowledged; dispatch is uncertain")
+        report.retry("allow_paste_click")
+    raise RuntimeError("Allow Paste pointer or click was not confirmed")
+
+
 def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=False,
         light_status=True, copy_timeout=20.0, confirm_attempts=4, evidence=None, evidence_dir=None):
     """Prepare -> copy -> one Cmd+V -> optional permission sheet -> confirm. Never sends."""
@@ -622,125 +750,50 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
         if not pasted.get("command_acknowledged"):
             raise RuntimeError(f"Cmd+V was not acknowledged: {pasted.get('error')}")
 
-        def _find_allow(sid, frame=None):
-            x0, y0, x1, y1 = ALLOW_MODAL_REGION
-            for label in ALLOW_LABELS:
-                try:
-                    hit = client.find_text(label, sid, exact=True, region=list(ALLOW_MODAL_REGION))
-                except RuntimeError:
-                    continue
-                match = hit.get("match")
-                if match:
-                    cx, cy = match["center"]
-                    if not (x0 < cx < x1 and y0 < cy < y1):
-                        continue
-                    if frame is None:
-                        continue
-                    from . import ocr, paste_confirmation
-                    if not paste_confirmation._is_permission_prompt(ocr.read_text(frame)):
-                        continue
-                    return match
-            return None
-
         sheet = False
         with _Stage(report, "permission_sheet"):
-            screen_id = pasted.get("screen_id")  # the post-Cmd+V evidence frame, when fresh
-            sheet_frame = base64.b64decode(pasted["image_base64"]) if pasted.get("image_base64") else None
-            for _ in range(4):
+            # Post-Cmd+V evidence can precede the settled sheet. It is only for
+            # detection; point and click each use a newly observed ticket.
+            observed = pasted
+            for attempt in range(ALLOW_CHECK_ATTEMPTS):
+                if not observed.get("image_base64") or not observed.get("screen_id"):
+                    observed = client.observe()
                 with _Stage(report, "sheet_find"):
-                    if screen_id is None or sheet_frame is None:
-                        obs = client.observe()
-                        screen_id = obs["screen_id"]
-                        sheet_frame = base64.b64decode(obs["image_base64"]) if obs.get("image_base64") else None
-                    found = _find_allow(screen_id, sheet_frame)
-                if found is None:
-                    screen_id = None
-                    sheet_frame = None
-                    time.sleep(.3)
-                    continue
-                sheet = True
-                report.facts["permission_sheet_seen"] = True
-                report.facts["permission_sheet_dismissed"] = False
-
-                def allow_bounds(match):
-                    (cx, cy), (left, top, right, bottom) = match["center"], match["box"]
-                    box_ = [max(0., left - .02), max(0., top - .012), min(1., right + .02), min(1., bottom + .012)]
-                    return cx, cy, box_
-
-                def point_to_allow(sid, cx, cy, box_, *, rehome_flag=False):
-                    fields = {"target_box": box_}
-                    if rehome_flag:
-                        fields["rehome"] = True
-                    with _Stage(report, "allow_point"):
-                        try:
-                            moved_ = client.control("point", sid, x=cx, y=cy, **fields)
-                        except RuntimeError as exc:
-                            if "422" not in str(exc):
-                                raise
-                            moved_ = client.control("point", sid, x=cx, y=cy)
-                    report.server_timing_ms.setdefault("allow_point", []).append(moved_.get("timing_ms"))
-                    return moved_
-
-                x, y, allow_box = allow_bounds(found)
-                moved = point_to_allow(screen_id, x, y, allow_box)
-                rehomed = False
-                for dismiss_attempt in range(ALLOW_DISMISS_ATTEMPTS):
-                    result = None
-                    with _Stage(report, "allow_click"):
-                        for _ in range(3):
-                            try:
-                                clicking = client.observe(for_click=True)
-                            except RuntimeError as exc:
-                                if "409" not in str(exc):
-                                    raise
-                                report.retry("allow_paste_click")
-                                time.sleep(.25)
-                                continue
-                            clicking_frame = (base64.b64decode(clicking["image_base64"])
-                                              if clicking.get("image_base64") else None)
-                            click_xy = (_locate_pointer_in_box(sheet_frame, clicking_frame, allow_box)
-                                        or _pointer_in_box(moved, allow_box))
-                            if click_xy is None:
-                                if not rehomed:
-                                    rehomed = True
-                                    reobs = client.observe()
-                                    moved = point_to_allow(reobs["screen_id"], x, y, allow_box, rehome_flag=True)
-                                    report.retry("allow_paste_point")
-                                    continue
-                                raise RuntimeError("Allow Paste pointer was not confirmed inside button")
-                            result = client.click_observed(clicking["screen_id"], click_xy[0], click_xy[1], allow_box,
-                                                           target_label=found["text"])
-                            report.server_timing_ms.setdefault("allow_click", []).append(result.get("timing_ms"))
-                            if result.get("command_acknowledged"):
-                                keep("3b-allow-click" if dismiss_attempt == 0 else f"3b-allow-click-{dismiss_attempt}",
-                                     result)
-                                break
-                            report.retry("allow_paste_click")
-                        else:
-                            raise RuntimeError("could not press Allow Paste")
-                    check_sid = result.get("screen_id") if result else None
-                    check_frame = (base64.b64decode(result["image_base64"])
-                                   if result and result.get("image_base64") else None)
-                    if check_sid is None or check_frame is None:
-                        post = client.observe()
-                        keep("3b-allow-check" if dismiss_attempt == 0 else f"3b-allow-check-{dismiss_attempt}", post)
-                        check_sid = post["screen_id"]
-                        check_frame = base64.b64decode(post["image_base64"]) if post.get("image_base64") else None
-                    still_open = _find_allow(check_sid, check_frame)
-                    if still_open is None:
-                        report.facts["permission_sheet_dismissed"] = True
+                    candidate = _frame(observed)
+                    found = _allow_target(candidate)
+                if found is not None:
+                    # The pasted text can itself contain permission labels. When
+                    # it is already visible in the original field, only confirm.
+                    if _verify_confirm_frame(prepare_frame, candidate, target_box, text, expect_title=expect_title)[0]:
                         break
-                    if dismiss_attempt < ALLOW_DISMISS_ATTEMPTS - 1:
-                        report.retry("allow_paste_dismiss")
-                        found = still_open
-                        sheet_frame = check_frame
-                        x, y, allow_box = allow_bounds(found)
-                        moved = None
-                        rehomed = False
-                        time.sleep(.15)
-                        continue
-                    raise RuntimeError("Allow Paste permission sheet did not dismiss")
-                break
+                    from . import ocr
+                    if not _on_prepared_page(_page_header(ocr.read_text(prepare_frame)), found.header, expect_title):
+                        raise RuntimeError("paste permission prompt is not on the verified original page")
+                    sheet = True
+                    report.facts.update(permission_sheet_seen=True, permission_sheet_dismissed=False)
+                    clicked = _press_allow(client, report, found, transaction)
+                    keep("3b-allow-click", clicked)
+                    # An ACK is already a dispatch. Only observe now, even if
+                    # iOS keeps the permission sheet visible during animation.
+                    for check in range(ALLOW_CHECK_ATTEMPTS):
+                        post = client.observe()
+                        raw = _frame(post)
+                        keep(f"3b-allow-check-{check}", post)
+                        remaining = _allow_target(raw)
+                        if remaining is not None and not found.same_sheet(remaining):
+                            raise RuntimeError("paste permission prompt changed after clicking")
+                        if remaining is None and _verify_confirm_frame(
+                                prepare_frame, raw, target_box, text, expect_title=expect_title)[0]:
+                            report.facts["permission_sheet_dismissed"] = True
+                            break
+                        if check + 1 < ALLOW_CHECK_ATTEMPTS:
+                            time.sleep(.2)
+                    else:
+                        raise RuntimeError("Allow Paste permission sheet did not dismiss with the expected text")
+                    break
+                if attempt + 1 < ALLOW_CHECK_ATTEMPTS:
+                    time.sleep(.3)
+                    observed = {}
         report.facts["permission_sheet_seen"] = sheet
 
         with _Stage(report, "confirm"):
