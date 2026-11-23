@@ -257,6 +257,51 @@ def _header_viewport_bounds(before, after, region, current_region,
     return (y_lo, y_hi) if y_lo < y_hi else None
 
 
+def _rgb_difference(first: Image.Image, second: Image.Image) -> Image.Image:
+    red, green, blue = ImageChops.difference(first, second).split()
+    return ImageChops.lighter(ImageChops.lighter(red, green), blue)
+
+
+def _scroll_split(before: Image.Image, shifted: Image.Image, after: Image.Image,
+                  y_lo: int, y_hi: int, fixed_visible: Image.Image, moved_visible: Image.Image) -> int:
+    """Find one native-pixel boundary between the fixed and shifted references."""
+    width = before.width
+    band = (0, y_lo, width, y_hi)
+    actual = after.crop(band)
+    fixed = ImageChops.multiply(_rgb_difference(before.crop(band), actual), fixed_visible.crop(band)).tobytes()
+    moved = ImageChops.multiply(_rgb_difference(shifted.crop(band), actual), moved_visible.crop(band)).tobytes()
+    cost, best_cost, best_y = 0, 0, y_lo
+    for offset in range(0, len(fixed), width):
+        cost += sum(v for v in fixed[offset:offset + width] if v > 4)
+        cost -= sum(v for v in moved[offset:offset + width] if v > 4)
+        if cost < best_cost:
+            best_cost, best_y = cost, y_lo + offset // width + 1
+    return best_y
+
+
+def _fractional_scroll_row(fixed: Image.Image, moved: Image.Image, actual: Image.Image,
+                           visible: Image.Image, hard: Image.Image):
+    """Fit one coverage fraction shared by the full-width source boundary row."""
+    visibility = visible.tobytes()
+    numerator, denominator = 0, 0
+    channels = zip(fixed.tobytes(), moved.tobytes(), actual.tobytes(), strict=True)
+    for index, (original, shifted, observed) in enumerate(channels):
+        if visibility[index // 3]:
+            delta = shifted - original
+            numerator += delta * (observed - original)
+            denominator += delta * delta
+    if not 0 < numerator < denominator:
+        return None
+
+    blended = Image.blend(fixed, moved, numerator / denominator)
+    hard_error = ImageChops.multiply(_rgb_difference(hard, actual), visible)
+    blend_error = ImageChops.multiply(_rgb_difference(blended, actual), visible)
+    improvement = sum(hard_error.tobytes()) - sum(blend_error.tobytes())
+    if improvement <= 0:
+        return None
+    return improvement, blended
+
+
 def _scrolled_viewport_match(
     before: bytes,
     after: bytes,
@@ -278,41 +323,39 @@ def _scrolled_viewport_match(
         return None
     w, h = diff0.size
     ow, oh = original_image.size
-    y_lo_px = max(round(.06 * h), round(split_bounds[0] * h))
+    y_lo = max(round(.06 * oh), math.ceil(split_bounds[0] * oh))
+    y_hi = min(round((current_region[1] - .10) * oh), math.floor(split_bounds[1] * oh))
     y_bot_px = round(current_region[1] * h)
-    y_hi_px = min(y_bot_px - round(.10 * h), round(split_bounds[1] * h))
-    if not (y_lo_px < y_hi_px < y_bot_px):
+    y_hi_px = math.ceil(y_hi * h / oh)
+    if not (y_lo < y_hi and y_hi_px < y_bot_px):
         return None
 
-    before_360 = original_image.resize((w, h), Image.Resampling.BILINEAR)
     after_360 = current_image.resize((w, h), Image.Resampling.BILINEAR)
     after_360_aa = after_360.filter(_VERTICAL_AA)
 
-    def shifted_pair(d_orig: float):
-        # Resample at native resolution before 360p downsampling and apply symmetric 1D vertical
-        # anti-aliasing inside the viewport band to absorb fractional-pixel row phase residuals.
-        a_full = original_image.transform((ow, oh), Image.Transform.AFFINE, (1, 0, 0, 0, 1, d_orig),
-                                          resample=Image.Resampling.BICUBIC)
-        a_360 = a_full.resize((w, h), Image.Resampling.BILINEAR)
-        red, green, blue = ImageChops.difference(a_360.filter(_VERTICAL_AA), after_360_aa).split()
-        sd = ImageChops.lighter(ImageChops.lighter(red, green), blue)
-        if assistive_box is not None:
-            sdraw = ImageDraw.Draw(sd)
-            _mask_normalized_box(sdraw, assistive_box, sd.size)
-            _mask_normalized_box(
-                sdraw,
-                (assistive_box[0], max(0., assistive_box[1] - d_orig / oh),
-                 assistive_box[2], max(0., assistive_box[3] - d_orig / oh)),
-                sd.size,
-            )
-        return a_360, sd
+    def shifted_image(d_orig: float) -> Image.Image:
+        return original_image.transform((ow, oh), Image.Transform.AFFINE, (1, 0, 0, 0, 1, d_orig),
+                                        resample=Image.Resampling.BICUBIC)
+
+    def mask_scrolled_assistive(diff: Image.Image, delta: float, *, top: float = 0.) -> None:
+        if assistive_box is None:
+            return
+        left, y0, right, y1 = assistive_box
+        draw = ImageDraw.Draw(diff)
+        for box_top, box_bottom in ((y0, y1), (y0 - delta, y1 - delta)):
+            if box_bottom > top:
+                _mask_normalized_box(draw, (left, max(top, box_top), right, box_bottom), diff.size)
 
     def eval_shift(d_orig: float):
-        a_360, sd = shifted_pair(d_orig)
+        # Resample at native resolution before 360p downsampling and apply symmetric 1D vertical
+        # anti-aliasing inside the viewport band to absorb fractional-pixel row phase residuals.
+        a_360 = shifted_image(d_orig).resize((w, h), Image.Resampling.BILINEAR)
+        sd = _rgb_difference(a_360.filter(_VERTICAL_AA), after_360_aa)
+        mask_scrolled_assistive(sd, d_orig / oh)
         hist = sd.crop((0, y_hi_px, w, y_bot_px)).histogram()
         outliers = sum(hist[25:])
         energy = sum(level * count for level, count in enumerate(hist[5:], 5))
-        return (outliers, energy, abs(d_orig - growth_delta * oh)), d_orig, a_360, sd
+        return (outliers, energy, abs(d_orig - growth_delta * oh)), d_orig, sd
 
     delta_px = growth_delta * oh
     max_err = max(4., .006 * oh)
@@ -324,31 +367,48 @@ def _scrolled_viewport_match(
     best_coarse = best[1]
     fine_steps = [min(high, max(low, best_coarse + k * .1)) for k in range(-9, 10) if k != 0]
     best = min((best, *(eval_shift(d) for d in fine_steps)), key=lambda item: item[0])
-    _, best_d, a_360, sd = best
+    _, best_d, sd = best
 
-    d0_bytes = diff0.tobytes()
-    sd_bytes = sd.tobytes()
-    row0 = [sum(v for v in d0_bytes[y * w:(y + 1) * w] if v > 4) for y in range(y_lo_px, y_hi_px)]
-    rows = [sum(v for v in sd_bytes[y * w:(y + 1) * w] if v > 4) for y in range(y_lo_px, y_hi_px)]
-    pref, suf = 0, sum(rows)
-    best_cost, best_y = None, y_lo_px
-    for i in range(len(row0) + 1):
-        cost = pref + suf
-        if best_cost is None or cost < best_cost:
-            best_cost, best_y = cost, y_lo_px + i
-        if i < len(row0):
-            pref += row0[i]
-            suf -= rows[i]
+    shifted = shifted_image(best_d)
+    fixed_visible = Image.new("L", (ow, oh), 255)
+    if assistive_box is not None:
+        _mask_normalized_box(ImageDraw.Draw(fixed_visible), assistive_box, fixed_visible.size)
+    moved_visible = fixed_visible.copy()
+    mask_scrolled_assistive(moved_visible, best_d / oh)
+    split = _scroll_split(original_image, shifted, current_image, y_lo, y_hi, fixed_visible, moved_visible)
+    best_y = round(split * h / oh)
+    expected = original_image.copy()
+    expected.paste(shifted.crop((0, split, ow, round(y_bot_px * oh / h))), (0, split))
+
+    clipped_row = None
+    for row in range(max(y_lo, split - 1), min(y_hi, split + 1)):
+        band = (0, row, ow, row + 1)
+        fit = _fractional_scroll_row(original_image.crop(band), shifted.crop(band), current_image.crop(band),
+                                     moved_visible.crop(band), expected.crop(band))
+        if fit is not None and (clipped_row is None or fit[0] > clipped_row[1]):
+            clipped_row = row, *fit
+    if clipped_row is not None:
+        row, _, blended = clipped_row
+        expected.paste(blended, (0, row))
+    comp_before_360 = expected.resize((w, h), Image.Resampling.BILINEAR)
 
     comp = diff0.copy()
     comp.paste(sd.crop((0, best_y, w, y_bot_px)), (0, best_y))
-    comp_before_360 = before_360.copy()
-    comp_before_360.paste(a_360.crop((0, best_y, w, y_bot_px)), (0, best_y))
+    # Bilinear resizing followed by vertical AA can sample two rows across the
+    # split. Compare those rows against a reference clipped before resizing so
+    # the same split is visible in both images. Skip extra smoothing here to
+    # preserve evidence of edits on either side of the boundary.
+    seam_top = max(int(screen_compare.STATUS_HEIGHT * h) + 1, best_y - 2)
+    seam_bottom = min(y_bot_px, best_y + 2)
+    seam = (0, seam_top, w, seam_bottom)
+    seam_diff = _rgb_difference(comp_before_360, after_360)
+    mask_scrolled_assistive(seam_diff, best_d / oh, top=best_y / h)
+    comp.paste(seam_diff.crop(seam), seam[:2])
     if _diff_has_unexpected_changes(before, after, comp, current_region, suggestion_bar, extra,
                                     mask_before=comp_before_360, mask_after=after_360,
                                     assistive_box=assistive_box):
         return None
-    return best_y / h, best_d / oh
+    return split / oh, best_d / oh
 
 
 def _ignored_across_scroll(item, ignored_boxes, dy: float) -> bool:
@@ -379,29 +439,54 @@ def _same_context_scrolled(before, after, region, current_region, *, split_y: fl
     if lower_unique is None or not lower_unique or len(header_unique) + len(lower_unique) < 3:
         return False
 
-    before_vp = [i for i in orig_anchors if split_y <= i.center[1] <= region[1]
-                 and not _ignored_across_scroll(i, ignored_boxes, -scroll_delta)]
-    after_vp = [i for i in curr_anchors if split_y <= i.center[1] <= current_region[1]
-                and not _ignored_across_scroll(i, ignored_boxes, scroll_delta)]
+    before_vp = [i for i in orig_anchors if split_y <= i.center[1] <= region[1]]
+    after_vp = [i for i in curr_anchors if split_y <= i.center[1] <= current_region[1]]
+    tol_x = tol_y = .008
+    occluders = [(left + tol_x, top, right - tol_x, bottom)
+                 for left, top, right, bottom in ignored_boxes if right - left > 2 * tol_x]
+
+    def visible_and_grazing(items, dy):
+        if not ignored_boxes:
+            return items, []
+        visible, grazing = [], []
+        for item in items:
+            if not _ignored_across_scroll(item, ignored_boxes, dy):
+                visible.append(item)
+            elif not _ignored_across_scroll(item, occluders, dy):
+                grazing.append(item)
+        return visible, grazing
+
+    # Match clear anchors first so near-button duplicates cannot replace them
+    # in the displacement check. Only interior button overlap excuses a line.
+    visible_before, grazing_before = visible_and_grazing(before_vp, -scroll_delta)
+    visible_after, grazing_after = visible_and_grazing(after_vp, scroll_delta)
     matched_vp, unmatched_before, unmatched_after = _match_shifted_anchors(
-        before_vp, after_vp, dy=scroll_delta, tol_x=.008, tol_y=.008)
-    if len(matched_vp) >= 2 and abs(median(b.center[1] - a.center[1] for b, a in matched_vp) - scroll_delta) > .006:
+        visible_before, visible_after, dy=scroll_delta, tol_x=tol_x, tol_y=tol_y)
+    visible_shifts = [b.center[1] - a.center[1] for b, a in matched_vp]
+    if len(visible_shifts) >= 2 and abs(median(visible_shifts) - scroll_delta) > .006:
         return False
+
+    # The same line's OCR box can graze the button in only one frame. It still
+    # needs a same-label match within the scroll tolerances.
+    if grazing_before or grazing_after:
+        _, unmatched_before, unmatched_after = _match_shifted_anchors(
+            unmatched_before + grazing_before, unmatched_after + grazing_after,
+            dy=scroll_delta, tol_x=tol_x, tol_y=tol_y)
+
     top_margin, bot_margin = .010, .012
-    strict_before = {
-        id(i) for i in before_vp
-        if (i.box[1] - scroll_delta >= split_y + top_margin
-            and i.box[3] <= region[1] - bot_margin
-            and i.box[3] - scroll_delta <= current_region[1] - bot_margin)
-    }
-    strict_after = {
-        id(i) for i in after_vp
-        if (i.box[1] >= split_y + top_margin
-            and i.box[3] <= current_region[1] - bot_margin
-            and i.box[3] + scroll_delta <= region[1] - bot_margin)
-    }
-    return (not any(id(i) in strict_before for i in unmatched_before)
-            and not any(id(i) in strict_after for i in unmatched_after))
+    unexpected_before = any(
+        i.box[1] - scroll_delta >= split_y + top_margin
+        and i.box[3] <= region[1] - bot_margin
+        and i.box[3] - scroll_delta <= current_region[1] - bot_margin
+        for i in unmatched_before
+    )
+    unexpected_after = any(
+        i.box[1] >= split_y + top_margin
+        and i.box[3] <= current_region[1] - bot_margin
+        and i.box[3] + scroll_delta <= region[1] - bot_margin
+        for i in unmatched_after
+    )
+    return not unexpected_before and not unexpected_after
 
 
 def _edge_profile(pixels, horizontal, edge, start, stop, radius):

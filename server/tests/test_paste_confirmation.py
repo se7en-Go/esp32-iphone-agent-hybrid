@@ -332,6 +332,77 @@ def test_matches_wrapped_lines_preserves_newlines_and_rejects_edits():
     assert _matches_wrapped_lines(("多余行",), ()) is False
 
 
+@pytest.mark.parametrize(
+    ("before_right", "after_right", "after_text", "confirmed"),
+    [
+        pytest.param(.800, .804, "Chat history", True, id="after-box-grazes-button"),
+        pytest.param(.804, .800, "Chat history", True, id="before-box-grazes-button"),
+        pytest.param(.804, .806, "Changed history", False, id="changed-text-grazes-button"),
+        pytest.param(.804, None, "", False, id="removed-text-grazes-button"),
+        pytest.param(None, .804, "New history", False, id="added-text-grazes-button"),
+    ],
+)
+def test_scrolled_context_checks_visible_text_at_assistive_edge(before_right, after_right, after_text, confirmed):
+    from hidagent.paste_confirmation import _same_context_scrolled
+
+    before_region = (.14, .53, .76, .58)
+    after_region = (.14, .45, .76, .58)
+    stationary = [label("Conversation", .50, .09), label("Space", .50, .88), label("Return", .89, .88)]
+    before = stationary + [label("Another message", .32, .27)]
+    after = stationary + [label("Another message", .32, .19)]
+    if before_right is not None:
+        before.append(ocr.TextBox("Chat history", (.20, .42, before_right, .44),
+                                  ((.20 + before_right) / 2, .43), .99))
+    if after_right is not None:
+        after.append(ocr.TextBox(after_text, (.20, .34, after_right, .36),
+                                 ((.20 + after_right) / 2, .35), .99))
+
+    assert _same_context_scrolled(
+        before, after, before_region, after_region, split_y=.11, scroll_delta=.08,
+        ignored_boxes=((.802, .40, .98, .48),),
+    ) is confirmed
+
+
+@pytest.mark.parametrize("visible_before", [True, False])
+def test_scrolled_context_allows_an_anchor_occluded_by_assistive_button(visible_before):
+    from hidagent.paste_confirmation import _same_context_scrolled
+
+    stationary = [label("Conversation", .50, .09), label("Space", .50, .88), label("Return", .89, .88)]
+    before = stationary + [label("Another message", .32, .27)]
+    after = stationary + [label("Another message", .32, .19)]
+    if visible_before:
+        before.append(label("Covered text", .90, .51))
+    else:
+        after.append(label("Revealed text", .90, .35))
+
+    assert _same_context_scrolled(
+        before, after, (.14, .55, .76, .58), (.14, .47, .76, .58), split_y=.11, scroll_delta=.08,
+        ignored_boxes=((.802, .40, .98, .48),),
+    ) is True
+
+
+@pytest.mark.parametrize("drift", [0., .007])
+@pytest.mark.parametrize("button_side_right", [.804, .840], ids=["grazing", "occluded"])
+def test_scrolled_context_checks_visible_displacement_with_repeated_button_side_text(drift, button_side_right):
+    from hidagent.paste_confirmation import _same_context_scrolled
+
+    def repeated_line(left, right, y):
+        return ocr.TextBox("Repeated line", (left, y - .010, right, y + .010), (.50, y), .99)
+
+    stationary = [label("Conversation", .50, .09), label("Space", .50, .88), label("Return", .89, .88)]
+    before = stationary + [label("Another message", .32, .30), repeated_line(.20, .80, .430),
+                           repeated_line(1 - button_side_right, button_side_right, .423)]
+    # With drift, both repeated lines are closer to the other line's expected
+    # location. The occluded line must not take either visible anchor's place.
+    after = stationary + [label("Another message", .32, .22 - drift), repeated_line(.20, .80, .350 - drift),
+                          repeated_line(1 - button_side_right, button_side_right, .343 + drift)]
+
+    assert _same_context_scrolled(
+        before, after, (.14, .55, .76, .58), (.14, .47, .76, .58), split_y=.11, scroll_delta=.08,
+        ignored_boxes=((.802, .40, .98, .48),),
+    ) is (drift == 0.)
+
+
 def test_permission_confirmation_accepts_stationary_assistive_without_suggestion_bar(monkeypatch):
     from hidagent import paste_confirmation, screen_compare
 
@@ -368,3 +439,68 @@ def test_permission_confirmation_accepts_stationary_assistive_without_suggestion
 
     assert asyncio.run(verify_case(after)) is True
     assert asyncio.run(verify_case(tampered)) is False
+
+
+@pytest.mark.parametrize("edit", [
+    pytest.param(None, id="clipped-avatar"),
+    pytest.param((87, -1, -75), id="header-edge-edit"),
+    pytest.param((87, 0, -75), id="viewport-edge-edit"),
+    pytest.param((20, -2, -55), id="header-edit-over-avatar"),
+    pytest.param((20, -1, -80), id="header-edge-edit-over-avatar"),
+    pytest.param((20, 1, 65), id="viewport-edit-over-avatar"),
+])
+@pytest.mark.parametrize(("fractional_edge", "overlay"), [
+    pytest.param(False, False, id="pixel-aligned-cut"),
+    pytest.param(True, False, id="fractional-cut"),
+    pytest.param(True, True, id="fractional-cut-with-stationary-overlay"),
+])
+def test_rigid_scroll_verifies_avatar_clipped_at_header_edge(edit, fractional_edge, overlay):
+    from hidagent.paste_confirmation import _scrolled_viewport_match
+
+    width, height = 500, 1080
+    split_y = 117
+    scroll = 77.1
+    original = Image.new("RGB", (width, height), (246, 246, 243))
+    draw = ImageDraw.Draw(original)
+    draw.rectangle((0, 0, width, split_y - 1), fill=(223, 226, 230))
+    draw.rectangle((165, 94, 330, 99), fill=(45, 50, 52))
+    draw.rectangle((17, 167, 70, 204), fill=(15, 34, 55))
+    draw.rectangle((85, 201, 340, 235), fill=(205, 196, 221))
+    draw.rectangle((260, 320, 462, 375), fill=(149, 211, 139))
+    draw.rectangle((25, 400, 310, 460), fill=(174, 185, 201))
+    draw.rectangle((0, 635, width, height), fill=(207, 212, 219))
+
+    viewport_bottom = 493
+    after = original.copy()
+    shifted = original.transform(original.size, Image.Transform.AFFINE, (1, 0, 0, 0, 1, scroll),
+                                 resample=Image.Resampling.BICUBIC)
+    after.paste(shifted.crop((0, split_y, width, viewport_bottom)), (0, split_y))
+    if fractional_edge:
+        seam_row = (0, split_y, width, split_y + 1)
+        mixed = Image.blend(original.crop(seam_row), shifted.crop(seam_row), .55)
+        after.paste(mixed, seam_row[:2])
+    if edit is not None:
+        x, offset, delta = edit
+        y = split_y + offset
+        color = tuple(value + delta for value in after.getpixel((x, y)))
+        ImageDraw.Draw(after).line((x, y, x + 47, y), fill=color)
+    assistive_box = None
+    if overlay:
+        for image in (original, after):
+            ImageDraw.Draw(image).rectangle((411, 104, 489, 169), fill=(70, 70, 70))
+        assistive_box = (402 / width, 95 / height, 498 / width, 179 / height)
+
+    def encoded(image):
+        result = io.BytesIO()
+        image.save(result, "PNG")
+        return result.getvalue()
+
+    match = _scrolled_viewport_match(
+        encoded(original), encoded(after), original, after, (0., viewport_bottom / height, 1., .56),
+        None, (), growth_delta=77 / height, split_bounds=(.0965, .1214), assistive_box=assistive_box,
+    )
+    if edit is not None:
+        assert match is None
+    else:
+        assert match is not None
+        assert match == pytest.approx((split_y / height, scroll / height), abs=.002)
