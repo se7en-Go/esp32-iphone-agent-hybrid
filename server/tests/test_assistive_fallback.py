@@ -4,6 +4,7 @@ import json
 import time
 
 import pytest
+from fake_clock import ManualClock
 from home_scene import draw_home
 from PIL import Image, ImageDraw
 
@@ -120,11 +121,13 @@ def test_unsupported_consumer_home_continues_to_keyboard(tmp_path):
 @pytest.mark.parametrize("error", [PointerLandingError, TargetChangedError])
 @pytest.mark.parametrize("successful_command", ["homescreen", "key cmd+h"])
 def test_confirmed_no_pointer_click_can_use_consumer_home(tmp_path, monkeypatch, error, successful_command):
+    clock = ManualClock()
+    clock.install(monkeypatch)
     screen = Screen()
 
     def change_screen(command):
         if command == successful_command:
-            asyncio.get_running_loop().call_soon(screen.show, app_frame(home=True))
+            clock.call_later(.01, screen.show, app_frame(home=True))
 
     device = Device(change_screen)
     phone = make_phone(tmp_path, device, screen)

@@ -139,19 +139,50 @@ def _validate_caret_scope(caret_scope) -> tuple[float, float, float, float] | No
     return left, top, right, bottom
 
 
+def _dark_pointer_edges(patch, center, frame_width):
+    """Native-pixel radii of four strong outward edges around a visible dark cursor."""
+    x, y = center
+    start, stop = max(2, round(.014 * frame_width)), max(6, round(.038 * frame_width))
+    if x - stop < 0 or y - stop < 0 or x + stop >= patch.width or y + stop >= patch.height:
+        return None
+    pixels = patch.convert("L").load()
+    radii = []
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        levels = [pixels[x + r * dx, y + r * dy] for r in range(start, stop + 1)]
+        contrast = [b - a for a, b in zip(levels[:-2], levels[2:], strict=True)]
+        if max(contrast) < 32:
+            return None
+        radii.append(start + 1 + contrast.index(max(contrast)))
+    # Reject unrelated UI edges with an implausible or markedly off-centre disc.
+    return radii if max(radii) - min(radii) <= max(2, round(.005 * frame_width)) else None
+
+
+def _strict_rgb_noise(difference, mask=None):
+    stats = ImageStat.Stat(difference, mask)
+    return max(high for _, high in stats.extrema) <= 5 and sum(stats.mean) / 3 <= .15
+
+
+def _outside_cursor_blocks_matches(difference, region, blocks):
+    outer = Image.new("L", difference.size, 255)
+    outer.paste(0, (blocks[0] - region[0], blocks[1] - region[1],
+                    blocks[2] - region[0], blocks[3] - region[1]))
+    return outer.getbbox() is not None and _strict_rgb_noise(difference, outer)
+
+
 def _host_observed_pixels_match(before: bytes, current: bytes, pointer_xy, *,
-                                caret_frames=(), caret_scope=None) -> bool:
+                                caret_frames=(), caret_scope=None, correction_target=None) -> bool:
     """Host-only stationary evidence: unchanged page plus tiny native RGB noise.
 
-    No caller-supplied mask, target-box exemption, resizing, pointer estimation
-    or CV confirmation is used. In particular, a faded/moved pointer must still
-    pass the stricter native-pixel neighborhood even if page comparison ignores it.
+    The host supplies the position. A larger, oscillating JPEG residual needs
+    independent evidence of the same native edges around that exact position.
     """
     try:
         with Image.open(io.BytesIO(before)) as image:
             original = image.convert("RGB")
+            quantization = getattr(image, "quantization", None)
         with Image.open(io.BytesIO(current)) as image:
             latest = image.convert("RGB")
+            same_jpeg = bool(quantization) and quantization == getattr(image, "quantization", None)
     except (OSError, TypeError, ValueError):
         return False
     if original.size != latest.size:
@@ -162,10 +193,66 @@ def _host_observed_pixels_match(before: bytes, current: bytes, pointer_xy, *,
     width, height = original.size
     x, y = round(pointer_xy[0] * width), round(pointer_xy[1] * height)
     radius = max(32, math.ceil(.064 * width))
-    region = (max(0, x - radius), max(0, y - radius), min(width, x + radius + 1), min(height, y + radius + 1))
-    difference = ImageChops.difference(original.crop(region), latest.crop(region))
-    return (max(high for _, high in difference.getextrema()) <= 5
-            and sum(ImageStat.Stat(difference).mean) / 3 <= .15)
+    def neighborhood(cx, cy):
+        return max(0, cx - radius), max(0, cy - radius), min(width, cx + radius + 1), min(height, cy + radius + 1)
+
+    region = neighborhood(x, y)
+    first, last = original.crop(region), latest.crop(region)
+    difference = ImageChops.difference(first, last)
+    target_difference = None
+    if correction_target is not None:
+        tx, ty = correction_target
+        target_region = neighborhood(round(tx * width), round(ty * height))
+        target_patch = ImageChops.difference(original.crop(target_region), latest.crop(target_region))
+        if not _strict_rgb_noise(target_patch):
+            target_difference = target_patch
+    if target_difference is None and _strict_rgb_noise(difference):
+        return True
+    if (not same_jpeg or max(high for _, high in difference.getextrema()) > 12
+            or sum(ImageStat.Stat(difference).mean) / 3 > .5):
+        return False
+
+    # JPEG ringing alternates around edges. A coherent brightness or colour
+    # shift in even one local tile is incompatible with that explanation.
+    signed = ImageChops.subtract(first, last, offset=128)
+    tiles = (max(1, first.width // 16), max(1, first.height // 16))
+    if signed.resize(tiles, Image.Resampling.BOX).getextrema() != ((128, 128),) * 3:
+        return False
+    center = x - region[0], y - region[1]
+    edges = _dark_pointer_edges(first, center, width)
+    if edges is None or edges != _dark_pointer_edges(last, center, width):
+        return False
+    # Extra ringing is plausible only in the native 8x8 JPEG blocks occupied
+    # by this cursor. Neighbouring UI keeps the original RGB limits.
+    left, right, up, down = edges
+    # Each edge came from a difference across its two adjacent pixels.
+    block_bounds = ((x - left - 1) // 8 * 8, (y - up - 1) // 8 * 8,
+                    ((x + right + 1) // 8 + 1) * 8, ((y + down + 1) // 8 + 1) * 8)
+    if not _outside_cursor_blocks_matches(difference, region, block_bounds):
+        return False
+    # A JPEG AC residual oscillates within its own block. A new stroke can
+    # have the same peak and average but predominantly one sign.
+    for bx in range(block_bounds[0], block_bounds[2], 8):
+        for by in range(block_bounds[1], block_bounds[3], 8):
+            xx, yy = bx - region[0], by - region[1]
+            for lo, hi in signed.crop((xx, yy, xx + 8, yy + 8)).getextrema():
+                positive, negative = hi - 128, 128 - lo
+                if max(positive, negative) > 5 and 2 * min(positive, negative) < max(positive, negative):
+                    return False
+    if target_difference is None:
+        return True
+    # For a correction, the aim can differ from the measured cursor. Protect
+    # its original pixels too, excusing only the already verified cursor blocks.
+    if not _outside_cursor_blocks_matches(target_difference, target_region, block_bounds):
+        return False
+    target = assistive_vision.track_button_target(before)
+    if target is None:
+        return False
+    observed = assistive_vision.track_button_target(current, previous=target)
+    if observed is None or not assistive_vision.same_button(target, observed):
+        return False
+    return all(t.safe_box[0] < tx < t.safe_box[2] and t.safe_box[1] < ty < t.safe_box[3]
+               for t in (target, observed))
 
 
 @dataclass(frozen=True)
@@ -199,15 +286,26 @@ class _PointerMeasurement:
                 and 0 <= time.monotonic() - self.issued < HOST_OBSERVATION_TTL)
 
     def evidence(self, phone, current):
-        if not self.current_session(phone) or not self.newer(current, self.source):
+        def reject(reason):
+            diagnostics = getattr(phone, "_pointer_diagnostics", None)
+            if diagnostics:
+                diagnostics.event("measurement_rejected", reason=reason,
+                                  source_updated=self.source.updated, candidate_updated=current.updated)
             return {}
+
+        if not self.current_session(phone):
+            return reject("input_session_changed")
+        if not self.newer(current, self.source):
+            return reject("publication_not_newer")
         frozen = SimpleNamespace(snapshot=current, _freshness_phone=phone)
         if freshness.fresh_frame(frozen, since=max(self.last_input_at, self.session_started_at)) is None:
-            return {}
+            return reject("frame_not_fresh_after_input")
         if not _host_observed_pixels_match(self.source.frame, current.frame, self.xy,
                                           caret_frames=getattr(phone.screen, "recent_frames", ()),
-                                          caret_scope=self.caret_scope) or not self.current_session(phone):
-            return {}
+                                          caret_scope=self.caret_scope):
+            return reject("page_or_pointer_changed")
+        if not self.current_session(phone):
+            return reject("input_session_changed")
         return {"pointer_measurement_id": self.id, "pointer_seen": True,
                 "measured_pointer": {"x": self.xy[0], "y": self.xy[1]}}
 
@@ -1539,6 +1637,9 @@ class Phone:
             caret_scope = correction[0].caret_scope
         self._point_measurement = None
 
+        if measure_only:
+            self._pointer_diagnostics = None
+
         def before_measurement_write():
             # Device invokes this inside the HID write lock, before its single
             # sequence increment. A later corrective/probe write retires all
@@ -1553,19 +1654,29 @@ class Phone:
             expected_sequence = seq + 1 if type(seq) is int else None
 
         def record_measurement(xy, source):
+            diagnostics = self._pointer_diagnostics
             if (self.device is not device or expected_sequence is None
                     or device.input_sequence != expected_sequence or device.links != link
                     or device.abort_epoch != epoch or source.generation != observed.generation
                     or not all(math.isfinite(value) and 0 < value < 1 for value in xy)):
+                if diagnostics:
+                    diagnostics.event("measurement_source", result="invalid_session_or_point")
                 return
             # Older streams may recognize a plausible return before the mirror
             # allowance expires. Never export those pixels as causal evidence.
             frozen = SimpleNamespace(snapshot=source, _freshness_phone=self)
             if freshness.fresh_frame(frozen, since=max(device.last_input_at, device.session_started_at)) is None:
+                if diagnostics:
+                    diagnostics.event("measurement_source", result="frame_not_fresh_after_input",
+                                      capture_age_s=source.capture_age_s, updated=source.updated,
+                                      last_input_at=device.last_input_at)
                 return
             self._point_measurement = _PointerMeasurement(
                 xy, source, device, link, epoch, expected_sequence, device.last_input_at,
                 device.session_started_at, caret_scope, time.monotonic())
+            if diagnostics:
+                diagnostics.event("measurement_source", result="recorded", capture_age_s=source.capture_age_s,
+                                  updated=source.updated, last_input_at=device.last_input_at)
 
         def same_session():
             if self._stopped(epoch):
@@ -1625,7 +1736,7 @@ class Phone:
             current = freshness.require_fresh(self.screen)
             if (not measured.evidence(self, current)
                     or not _host_observed_pixels_match(
-                        original.frame, current.frame, (x, y),
+                        original.frame, current.frame, measured.xy, correction_target=(x, y),
                         caret_frames=getattr(self.screen, "recent_frames", ()), caret_scope=caret_scope)):
                 raise PointerLandingError("纠偏前指针或目标证据已变化，未发送移动。")
             self._position_before, self._position_from = current.frame, measured.xy

@@ -241,20 +241,28 @@ def test_fresh_frame_without_capture_time_keeps_arrival_rule(monkeypatch):
     assert observed is not None and observed.frame == b"late JPEG"
 
 
-def test_remote_snapshot_carries_capture_age_with_transit(monkeypatch):
-    """Receiver metadata age plus the IPC transit since publication."""
+@pytest.mark.parametrize(("capture_age", "post_action"), [(0.03, True), (0.13, False)])
+def test_remote_snapshot_capture_time_is_stable_across_polls(monkeypatch, capture_age, post_action):
     clock = ManualClock()
     clock.install(monkeypatch)
-    screen = UxPlayScreen()
-    screen._proc = ReceiverProcess()
-    monkeypatch.setattr(screen, "_clients", lambda: None)
+    screen = UxPlayScreen(socket_path="test.sock")
+    action_at = clock.time()
+    clock.advance(0.10)
     metadata = {"instance": "a" * 32, "generation": 0, "running": True, "live": True,
-                "updated": clock.time(), "arrived": clock.monotonic() - 0.12, "capture_age_s": 0.05}
+                "updated": clock.time(), "arrived": clock.monotonic(), "capture_age_s": capture_age}
+    # Poll the same publication after 15 ms and again after 115 ms.
+    for delay in (0.015, 0.10):
+        clock.advance(delay)
+        screen._accept_remote(metadata, b"remote JPEG")
+        observed = require_fresh(screen)
+        assert observed.updated == metadata["updated"]
+        assert observed.capture_age_s == capture_age
+        assert (fresh_frame(screen, since=action_at) is not None) == post_action
+
+    clock.advance(MAX_FRAME_AGE)
     screen._accept_remote(metadata, b"remote JPEG")
-    observed = require_fresh(screen)
-    assert observed.frame == b"remote JPEG"
-    assert observed.capture_age_s is not None
-    assert abs(observed.capture_age_s - 0.17) < 0.02
+    assert screen.live
+    assert fresh_frame(screen) is None
 
 
 def test_recent_frames_retains_distinct_same_tick_frames_and_ignores_duplicates(monkeypatch):

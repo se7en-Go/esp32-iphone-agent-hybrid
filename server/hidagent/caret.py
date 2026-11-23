@@ -224,6 +224,14 @@ def _bounded_field(image, box):
         channels = ImageChops.difference(image, Image.new("RGB", image.size, image.getpixel(seed))).split()
         background = ImageChops.lighter(ImageChops.lighter(*channels[:2]), channels[2])
         background = background.point(lambda value: 255 if value <= 8 else 0)
+        # A solid path from the seed to an image edge proves this component
+        # cannot enclose a field. Avoid flooding a whole borderless Notes page
+        # while the receiver is publishing newer pointer observations.
+        y = seed[1]
+        paths = ((0, y, sx + 1, y + 1), (sx, y, w, y + 1),
+                 (sx, 0, sx + 1, y + 1), (sx, y, sx + 1, h))
+        if any(background.crop(path).getextrema()[0] == 255 for path in paths):
+            continue
         ImageDraw.floodfill(background, seed, 128)
         bounds = background.point(lambda value: 255 if value == 128 else 0).getbbox()
         if bounds is None:

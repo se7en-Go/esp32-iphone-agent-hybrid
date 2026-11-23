@@ -178,6 +178,14 @@ def test_borderless_editor_caret_never_masks_new_content(edit):
     assert observation_changed(editor_frame(1), editor_frame(0, edit=edit), caret_frames=editor_history())
 
 
+def test_borderless_editor_blink_does_not_flood_fill_the_entire_page(monkeypatch):
+    def unexpected_flood(*args, **kwargs):
+        pytest.fail("a connected path to the image edge already rules out a bounded field")
+
+    monkeypatch.setattr(ImageDraw, "floodfill", unexpected_flood)
+    assert not observation_changed(editor_frame(1), editor_frame(0), caret_frames=editor_history())
+
+
 def test_borderless_editor_requires_complete_amber_blink():
     assert observation_changed(editor_frame(1), editor_frame(0), caret_frames=editor_history((1, 1, 0)))
 

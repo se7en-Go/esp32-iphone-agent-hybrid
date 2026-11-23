@@ -729,8 +729,11 @@ class Controls:
             extra["effect_frame_received_at"] = effect_snapshot.updated
         accepted, fresh_done, deadline = await self._response_frame(completed_at, session)
         after, diff, usable = None, None, False
+        measurement_id = extra.get("_expected_measurement")
+        replacement = False
         diff_started = time.perf_counter()
         while accepted is not None:
+            proved = False
             after = accepted.frame
             if include_diff:
                 budget = min(remaining_operation_time() - .05, deadline - time.monotonic())
@@ -752,15 +755,33 @@ class Controls:
             if (not self._response_session_valid(session) or current is None
                     or time.monotonic() >= deadline):
                 break
+            if measurement_id and current != accepted:
+                measurement = self.phone._point_measurement
+                if (measurement is None or measurement.id != measurement_id
+                        or not measurement.newer(current, accepted)):
+                    break
             if current.frame == accepted.frame:
-                measurement_id = extra.get("_expected_measurement")
                 shot = (self.observation(current, issuing_measurement=measurement_id) if measurement_id
                         else self.observation(current))
+                proved = bool(measurement_id and shot.get("pointer_measurement_id") == measurement_id)
+                if replacement and not proved:
+                    break
                 latest = fresh_frame(self.screen, since=completed_at)
                 if (not self._response_session_valid(session) or latest is None
                         or time.monotonic() >= deadline):
                     break
                 if latest.frame == current.frame:
+                    if proved:
+                        measurement = self.phone._point_measurement
+                        if (measurement is None or measurement.id != measurement_id
+                                or not measurement.current_session(self.phone)):
+                            break
+                        if latest != current:
+                            if not measurement.newer(latest, current):
+                                break
+                            # Identical pixels and a strictly newer causal publication.
+                            self._observation = latest
+                            shot["frame_received_at"] = latest.updated
                     home_verified = (home_unconfirmed is not None
                                      and home_unconfirmed.clicked_at <= completed_at
                                      and home_unconfirmed.same_contact(self.phone, self.screen)
@@ -777,11 +798,24 @@ class Controls:
                             extra["effect_verified"] = True
                     usable = True
                     break
+                accepted = current
                 current = latest
             self.invalidate()
             size = self._frame_size(accepted.frame)[1:]
             if self._frame_size(current.frame)[1:] != size:
                 break
+            if measurement_id:
+                # Every replacement must independently preserve the *original* move's
+                # pointer and page. Carry the quiet interval across these publications
+                # only; redoing quiet after each JPEG can starve a live mirror.
+                measurement = self.phone._point_measurement
+                if (measurement is None or measurement.id != measurement_id
+                        or not measurement.newer(current, accepted)
+                        or not (proved or measurement.evidence(self.phone, accepted))):
+                    break
+                replacement = True
+                accepted = current
+                continue
             accepted, _, _ = await self._response_frame(completed_at, session, deadline=deadline,
                                                          expected_size=size)
         settled_done = time.perf_counter()
