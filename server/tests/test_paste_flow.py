@@ -46,10 +46,12 @@ FIELD = (.13, .52, .77, .58)
 TEXT = "第一行\n第二行"
 HOLD = ("click", "辅助触控", .9)
 
+PAGE_HEADER = ocr.TextBox("实验笔记本", (.12, .06, .42, .10), (.27, .08), .99)
 SHEET_BOXES = [
     ocr.TextBox("微信想要从快捷指令粘贴", (.20, .43, .80, .48), (.50, .455), .98),
     ocr.TextBox("允许粘贴", (.22, .54, .42, .57), (.32, .557), .98),
     ocr.TextBox("不允许粘贴", (.58, .54, .78, .57), (.68, .557), .98),
+    PAGE_HEADER,
 ]
 
 
@@ -92,7 +94,7 @@ class FakeClient:
 
     def observe(self, for_click=False):
         clicks = self.calls.count(("click", "允许粘贴", None))
-        if self.sheet and "paste" in self.calls and clicks < self.allow_dismiss_after and not for_click:
+        if self.sheet and "paste" in self.calls and clicks < self.allow_dismiss_after:
             raw = SHEET_JPEG
         elif self.pasted_visible and "paste" in self.calls and not for_click:
             raw = PASTED_JPEG
@@ -116,7 +118,10 @@ class FakeClient:
                 mp = {"x": fields["x"] + .005, "y": fields["y"] + .003}
             else:
                 mp = self.allow_measured_pointer
-            return {"command_acknowledged": True, "measured_pointer": mp, "pointer_seen": mp is not None}
+            if mp is not None:
+                self.pointer_proof = {"measured_pointer": mp, "pointer_seen": True,
+                                      "pointer_measurement_id": f"allow-{self.seen}"}
+            return {**self.frame(SHEET_JPEG), "command_acknowledged": True, "fresh": True}
         if name == "point":
             self.bubble_moves.append((fields["x"], fields["y"]))
             self.pointer_proof = {"pointer_measurement_id": f"move-{len(self.bubble_moves)}",
@@ -145,6 +150,9 @@ class FakeClient:
             return {"transaction_id": "tx"}
         if stage == "status":
             assert fields.get("include_observation") is False
+            if "paste" in self.calls and fields.get("transaction_id") == "tx":
+                return {"transaction_id": "tx", "phase": "awaiting_confirmation", "copied": True,
+                        "paste_sent": True, "expires_in_seconds": 30.}
             copied = not self.never_copy and (self.copied_on_prepare or self.claimed)
             return {"copied": copied, "claimed": self.claimed or copied,
                     "phase": "awaiting_paste" if copied else "awaiting_copy"}
@@ -176,7 +184,7 @@ def offline_ocr(monkeypatch):
         list(SHEET_BOXES) if frame == SHEET_JPEG else (
             [ocr.TextBox("第一行", (.16, .525, .40, .548), (.28, .536), .98),
              ocr.TextBox("第二行", (.16, .552, .40, .575), (.28, .563), .98)]
-            if frame == PASTED_JPEG else []
+            if frame == PASTED_JPEG else [PAGE_HEADER]
         )
     ))
 
@@ -629,7 +637,7 @@ def test_flow_stops_in_permission_sheet_when_allow_click_ack_does_not_dismiss(vi
         paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58))
     assert "did not dismiss" in str(stopped.value)
     assert client.calls.count("paste") == 1
-    assert client.calls.count(("click", "允许粘贴", None)) == paste_flow.ALLOW_DISMISS_ATTEMPTS
+    assert client.calls.count(("click", "允许粘贴", None)) == 1
     assert "confirm" not in client.calls and "cancel" not in client.calls
     facts = stopped.value.report.facts
     assert facts["permission_sheet_seen"] is True and facts["permission_sheet_dismissed"] is False
@@ -637,12 +645,19 @@ def test_flow_stops_in_permission_sheet_when_allow_click_ack_does_not_dismiss(vi
     assert facts["recovery_state"] == "paste_sent_unconfirmed"
 
 
-def test_flow_recovers_when_first_allow_click_only_wakes_pointer_and_second_dismisses(vision):
-    client = FakeClient(allow_dismiss_after=2)
-    report = paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58)).as_dict()
-    assert client.calls.count("paste") == 1
-    assert client.calls.count(("click", "允许粘贴", None)) == 2
-    assert report["retries"]["allow_paste_dismiss"] == 1
+def test_flow_waits_for_allow_dismissal_without_a_second_click(vision):
+    class AnimatingClient(FakeClient):
+        post_click_frames = 0
+
+        def observe(self, for_click=False):
+            if ("click", "允许粘贴", None) in self.calls and self.post_click_frames < 2:
+                self.post_click_frames += 1
+                return self.frame(SHEET_JPEG, for_click=for_click)
+            return super().observe(for_click=for_click)
+
+    client = AnimatingClient()
+    report = paste_flow.run(client, TEXT, FIELD).as_dict()
+    assert client.calls.count("paste") == client.calls.count(("click", "允许粘贴", None)) == 1
     assert report["permission_sheet_seen"] is True and report["permission_sheet_dismissed"] is True
     assert report["phase"] == "completed"
 
@@ -661,7 +676,7 @@ def test_flow_refuses_blind_allow_click_when_pointer_not_confirmed_in_button(vis
     assert facts["cmd_v_sent"] == 1 and facts["recovery_state"] == "paste_sent_unconfirmed"
 
 
-def test_flow_locates_visible_allow_pointer_from_for_click_frame_when_measured_pointer_is_none(vision, monkeypatch):
+def test_flow_rejects_an_unmeasured_dark_disc_on_the_allow_button(vision, monkeypatch):
     def sheet_image(*, dot_xy=None):
         image = Image.new("RGB", (360, 778), (242, 242, 244))
         if dot_xy is not None:
@@ -696,11 +711,9 @@ def test_flow_locates_visible_allow_pointer_from_for_click_frame_when_measured_p
             return res
 
     client = VisualAllowClient(allow_measured_pointer=None)
-    report = paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58)).as_dict()
-    assert report["phase"] == "completed" and report["permission_sheet_dismissed"] is True
-    allow_clicks = [(x, y) for x, y, _box, fields in client.click_calls if fields.get("target_label") == "允许粘贴"]
-    assert len(allow_clicks) == 1
-    assert allow_clicks[0] == pytest.approx((.330, .567), abs=.01)
+    with pytest.raises(paste_flow.FlowStopped, match="not confirmed"):
+        paste_flow.run(client, TEXT, FIELD)
+    assert client.calls.count("paste") == 1 and ("click", "允许粘贴", None) not in client.calls
 
 
 def test_flow_refuses_confirm_when_pasted_text_is_not_observed(vision):
@@ -773,21 +786,10 @@ def test_flow_treats_ambiguous_paste_dispatch_as_paste_sent_unconfirmed(vision, 
     assert facts["recovery_state"] == "paste_sent_unconfirmed"
 
 
-def test_flow_find_allow_passes_modal_region_and_ignores_outside_match(vision):
-    class SpoofAllowClient(FakeClient):
-        def find_text(self, text, screen_id, **fields):
-            self.find_text_calls.append((text, screen_id, fields))
-            if text == "允许粘贴":
-                # Spoofed match inside header bar outside modal band must be ignored.
-                return {"match": {"text": text, "center": [.50, .08], "box": [.40, .06, .60, .10]}}
-            return {"match": None}
-
-    client = SpoofAllowClient(sheet=False, confirm_conflicts=0)
-    report = paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58)).as_dict()
-    assert report["permission_sheet_seen"] is False
-    assert ("click", "允许粘贴", None) not in client.calls
-    assert all(fields.get("region") == list(paste_flow.ALLOW_MODAL_REGION)
-               for _, _, fields in client.find_text_calls)
+def test_permission_match_ignores_allow_label_in_header(monkeypatch):
+    outside = ocr.TextBox("允许粘贴", (.40, .06, .60, .10), (.5, .08), .99)
+    monkeypatch.setattr(ocr, "read_text", lambda _: [SHEET_BOXES[0], outside, SHEET_BOXES[2]])
+    assert paste_flow._allow_target(SHEET_JPEG) is None
 
 
 def test_flow_ignores_plain_allow_paste_text_without_permission_sheet(vision, monkeypatch):

@@ -13,6 +13,107 @@ from test_host_observed_click import setup
 from hidagent import freshness
 from hidagent.app import ControlAction
 from hidagent.control import Controls
+from hidagent.device import DeviceError
+from hidagent.text_target import PointerLandingError
+
+
+@pytest.mark.parametrize("background", ["idle", "explicit"])
+def test_cold_point_blocks_only_idle_input_between_home_and_move(tmp_path, monkeypatch, background):
+    async def scenario():
+        phone, device, _, link = setup(tmp_path)
+        phone.span = {"w": 500, "h": 1080}
+        homed, finished = asyncio.Event(), asyncio.Event()
+        send = device.send
+
+        async def pause_after_home(command):
+            await send(command)
+            if command == "home":
+                homed.set()
+                await finished.wait()
+
+        async def interleave():
+            await homed.wait()
+            try:
+                if background == "idle":
+                    with pytest.raises(DeviceError, match="paused"):
+                        await device._nudge_idle()
+                else:
+                    await send("move 1 0")
+            finally:
+                finished.set()
+
+        async def verify(x, y, epoch, observed, same_session, **kwargs):
+            same_session()
+            return x, y
+
+        monkeypatch.setattr(device, "send", pause_after_home)
+        monkeypatch.setattr(phone, "_confirm_point_landing", verify)
+        task = asyncio.create_task(interleave())
+        try:
+            point = phone.point_verified(.104, .467, measure_only=True, rehome=True)
+            if background == "idle":
+                assert await point == (.104, .467)
+                final_move = b"move 52 504"
+            else:
+                with pytest.raises(PointerLandingError, match="sequence=2/3"):
+                    await point
+                final_move = b"move 1 0"
+            await task
+            assert [line.split(b" ", 1)[1].strip() for line in link.written] == [b"release", b"home", final_move]
+            assert device._host_observation_lease is None
+            await device._nudge_idle()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            device.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_measurement_waits_for_the_outstanding_idle_return(tmp_path, monkeypatch, cancel):
+    async def scenario():
+        phone, device, _, link = setup(tmp_path)
+        forward, allow_return = asyncio.Event(), asyncio.Event()
+        guarded = device.send_guarded
+
+        async def delayed(command, before_write, **kwargs):
+            if command == "move -1 0":
+                forward.set()
+                await allow_return.wait()
+            await guarded(command, before_write, **kwargs)
+
+        async def position(*args):
+            assert device.input_sequence == 2 and not device._idle_nudge_inflight
+
+        async def verify(x, y, *args, **kwargs):
+            return x, y
+
+        monkeypatch.setattr(device, "send_guarded", delayed)
+        monkeypatch.setattr(phone, "point", position)
+        monkeypatch.setattr(phone, "_confirm_point_landing", verify)
+        nudge = asyncio.create_task(device._nudge_idle())
+        try:
+            await forward.wait()
+            point = asyncio.create_task(phone.point_verified(.5, .5, measure_only=True))
+            await asyncio.sleep(0)
+            assert device._idle_nudge_paused() and not point.done()
+            if cancel:
+                point.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await point
+            allow_return.set()
+            await nudge
+            if not cancel:
+                assert await point == (.5, .5)
+            assert device._host_observation_lease is None
+            assert [line.split(b" ", 1)[1].strip() for line in link.written] == [b"move 1 0", b"move -1 0"]
+        finally:
+            allow_return.set()
+            await asyncio.gather(nudge, return_exceptions=True)
+            device.close()
+
+    asyncio.run(scenario())
 
 
 @pytest.fixture

@@ -88,6 +88,22 @@ class HostObservationLease:
         return (not self._released and self.device._host_observation_lease is self
                 and time.monotonic() < self.expires_monotonic)
 
+    async def wait_for_idle_return(self, timeout: float) -> None:
+        async def drain():
+            # The serial writer may already have passed the forward guard in
+            # another thread. Cross its write lock before sampling the flag.
+            async with self.device._lock:
+                pass
+            while self.device._idle_nudge_inflight and self.active:
+                await asyncio.sleep(.02)
+
+        try:
+            await asyncio.wait_for(drain(), timeout)
+        except asyncio.TimeoutError as exc:
+            raise DeviceError("后台保活移动尚未完成，未开始指针测量。") from exc
+        if not self.active:
+            raise DeviceError("指针测量的设备连接或观察租约已失效。")
+
     def release(self) -> None:
         self._released = True
         if self.device._host_observation_lease is self:

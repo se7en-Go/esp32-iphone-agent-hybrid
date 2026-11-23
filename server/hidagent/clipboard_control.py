@@ -357,12 +357,17 @@ class StagedClipboardControls:
                         verified = (frame, updated, generation)
                         item.sheet_evidence = verified
                         break
-            if verified is None:
+            if verified is not None:
+                _sheet_frame, sheet_updated, sheet_generation = verified
+                evidence["confirmation_evidence"] = "paste_permission_dismissed"
+                evidence["sheet_frame_updated"] = sheet_updated
+                evidence["sheet_frame_generation"] = sheet_generation
+            elif await paste_confirmation.verify_before_after_for_permission(
+                original.frame, after, item.guard.region, request.observed_text, notes_only=True
+            ):
+                evidence["confirmation_evidence"] = "notes_share_enabled"
+            else:
                 raise
-            _sheet_frame, sheet_updated, sheet_generation = verified
-            evidence["confirmation_evidence"] = "paste_permission_dismissed"
-            evidence["sheet_frame_updated"] = sheet_updated
-            evidence["sheet_frame_generation"] = sheet_generation
         if evidence:
             if self._lookup(item.nonce) is not item:
                 raise ValueError("clipboard transaction changed during confirmation")

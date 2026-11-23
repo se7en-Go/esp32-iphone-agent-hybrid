@@ -1631,6 +1631,7 @@ class Phone:
         link = getattr(self.device, "links", 0)
         device = self.device
         expected_sequence = None
+        lease = None
         if correction is not None:
             if not measure_only or correction[0] is not self._point_measurement:
                 raise PointerLandingError("先前的指针测量已失效，未执行纠偏。")
@@ -1639,6 +1640,12 @@ class Phone:
 
         if measure_only:
             self._pointer_diagnostics = None
+
+        def sequence_error():
+            return PointerLandingError(
+                f"指针测量期间设备或输入序列已变化，未继续移动。"
+                f" (sequence={expected_sequence}/{device.input_sequence}, "
+                f"links={link}/{device.links}, epoch={epoch}/{device.abort_epoch}; expected/actual)")
 
         def before_measurement_write():
             # Device invokes this inside the HID write lock, before its single
@@ -1650,7 +1657,9 @@ class Phone:
             if (self.device is not device or getattr(device, "links", None) != link
                     or getattr(device, "abort_epoch", None) != epoch
                     or (expected_sequence is not None and seq != expected_sequence)):
-                raise PointerLandingError("指针测量期间设备或输入序列已变化，未继续移动。")
+                raise sequence_error()
+            if not lease.active:
+                raise PointerLandingError("指针测量的观察租约已失效，未继续移动。")
             expected_sequence = seq + 1 if type(seq) is int else None
 
         def record_measurement(xy, source):
@@ -1686,7 +1695,9 @@ class Phone:
                 raise RuntimeError("指针定位期间设备或画面连接已变化，请重新观察。")
             if measure_only and (self.device is not device or (expected_sequence is not None
                     and getattr(device, "input_sequence", None) != expected_sequence)):
-                raise PointerLandingError("指针测量期间设备或输入序列已变化，未继续移动。")
+                raise sequence_error()
+            if measure_only and not lease.active:
+                raise PointerLandingError("指针测量的观察租约已失效，未继续移动。")
 
         self._pointer_seen = self._pointer_confirmed = False
         self._pointer_escape_attempted = False
@@ -1699,6 +1710,10 @@ class Phone:
         if rehome:
             self._pos = None
         try:
+            if measure_only:
+                lease = device.acquire_host_observation_lease()
+                await lease.wait_for_idle_return(OBSERVATION_REFRESH_WAIT)
+                same_session()
             self._record_pointer_measurement = record_measurement if measure_only else None
             with (input_attempt(inherit=True, before_write=before_measurement_write) if measure_only
                   else nullcontext()):
@@ -1712,6 +1727,8 @@ class Phone:
             self._point_measurement = None
             raise
         finally:
+            if lease is not None:
+                lease.release()
             self._record_pointer_measurement = None
             self._pointer_caret_scope = prev_scope
             if not self._pointer_confirmed:
