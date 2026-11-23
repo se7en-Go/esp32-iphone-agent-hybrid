@@ -10,6 +10,8 @@ from PIL import Image, ImageChops, ImageFilter
 
 Point = tuple[float, float]
 Box = tuple[float, float, float, float]
+_DETECTION_SHORT_SIDE = 240
+_CENTRE_JITTER_PIXELS = 1.5
 # Normalized icon regions for the default six-item top-level menu.
 MENU_ICON_REGIONS = (
     (.35, .08, .65, .28),  # Top centre.
@@ -21,7 +23,7 @@ MENU_ICON_REGIONS = (
 
 def _small(frame: bytes) -> Image.Image:
     image = Image.open(io.BytesIO(frame)).convert("RGB")
-    scale = min(1, 240 / min(image.size))
+    scale = min(1, _DETECTION_SHORT_SIDE / min(image.size))
     return image.resize((round(image.width * scale), round(image.height * scale)), Image.Resampling.BILINEAR)
 
 
@@ -110,15 +112,22 @@ def _translucent_buttons(image, gray, near):
     return found
 
 
+class _ButtonScan(NamedTuple):
+    best: tuple[Point, Box] | None
+    multiple_positions: bool
+    outer_radius_fraction: float | None  # Relative to the frame's short side.
+
+
 @lru_cache(maxsize=16)
-def _find_button_target_cached(frame: bytes, near: Point | None = None) -> tuple[Point, Box] | None:
+def _find_button_target_cached(frame: bytes, near: Point | None = None) -> _ButtonScan:
     image = _small(frame)
     gray = image.convert("L")
     w, h = image.size
     short = min(w, h)
     data = gray.tobytes()
     edge = [i for i in range(w*h) if min(i % w, w-1-i % w, i // w, h-1-i // w) < short * .2]
-    candidates = _translucent_buttons(image, gray, near)
+    outer = _translucent_buttons(image, gray, near)
+    candidates = list(outer)
     for threshold in (70, 110, 150, 190, 225, 245):
         mask = bytearray(w*h)
         for i in edge:
@@ -157,7 +166,15 @@ def _find_button_target_cached(frame: bytes, near: Point | None = None) -> tuple
             distance = math.dist(point, near) if near is not None else 0
             contrast = max(median(rim)-core, core-median(outside))
             candidates.append((contrast - distance*80, point, (left/w, top/h, right/w, bottom/h)))
-    return max(candidates)[1:] if candidates else None
+    if not candidates:
+        return _ButtonScan(None, False, None)
+    _, (cx, cy), box = max(candidates)
+    multiple_positions = any(math.hypot((x-cx)*w, (y-cy)*h) > _CENTRE_JITTER_PIXELS
+                             for _, (x, y), _ in candidates)
+    # This detector returns the interior .85 of the outer radius. The bright-core
+    # detector returns only the visible core and cannot measure the physical extent.
+    outer_fraction = max(((b[3] - b[1]) * h / (2 * .85 * short) for _, _, b in outer), default=None)
+    return _ButtonScan(((cx, cy), box), multiple_positions, outer_fraction)
 
 
 def find_button_target(frame: bytes, near: Point | None = None) -> tuple[Point, Box] | None:
@@ -166,7 +183,7 @@ def find_button_target(frame: bytes, near: Point | None = None) -> tuple[Point, 
     iOS 26 captures use a pale centre with two grey rings. Older appearances use a
     white outline on a dark rounded square. A single filled pointer disc fails both.
     """
-    return _find_button_target_cached(frame, near)
+    return _find_button_target_cached(frame, near).best
 
 
 def find_button(frame: bytes, near: Point | None = None) -> Point | None:
@@ -250,6 +267,80 @@ def stationary_button_at(frame: bytes, target: tuple[Point, Box]) -> bool:
                 ):
                     return True
     return _stationary_outlined_or_layered_at(image, gray, x, y, box)
+
+
+class ButtonTarget(NamedTuple):
+    """Observed centre, detector bounds and safe interior in normalized frame coordinates."""
+
+    point: Point
+    box: Box
+    safe_box: Box
+    size: tuple[int, int]
+    probe_radius_px: float
+
+    @property
+    def probe_box(self) -> Box:
+        """Exterior for a bounded motion-only probe; never a click authorization."""
+        x, y = self.point
+        rx, ry = (self.probe_radius_px / length for length in self.size)
+        return max(0., x - rx), max(0., y - ry), min(1., x + rx), min(1., y + ry)
+
+
+def _button_radius(point: Point, box: Box, size: tuple[int, int]) -> float:
+    x, y = point
+    left, top, right, bottom = box
+    w, h = size
+    return min((x - left) * w, (right - x) * w, (y - top) * h, (bottom - y) * h)
+
+
+def same_button(previous: ButtonTarget, current: ButtonTarget) -> bool:
+    """Check centre stability and compatible ring sizes for two visually verified observations."""
+    if previous.size != current.size:
+        return False
+    w, h = current.size
+    dx = (current.point[0] - previous.point[0]) * w
+    dy = (current.point[1] - previous.point[1]) * h
+    jitter = _CENTRE_JITTER_PIXELS * max(1.0, min(w, h) / _DETECTION_SHORT_SIDE)
+    radii = [_button_radius(target.point, target.box, target.size) for target in (previous, current)]
+    # A bright core can measure around half the outer ring's diameter.
+    return math.hypot(dx, dy) <= jitter and max(radii) <= 2 * min(radii) + jitter
+
+
+def track_button_target(frame: bytes, previous: ButtonTarget | None = None) -> ButtonTarget | None:
+    """Locate the button afresh, corroborating a parked cursor's occlusion from visible rings."""
+    with Image.open(io.BytesIO(frame)) as image:
+        size = image.size
+    if previous is not None and previous.size != size:
+        previous = None
+    detected = find_button_target(frame)
+    scan = _find_button_target_cached(frame, None)
+    if scan.multiple_positions:
+        return None
+    if detected is None:
+        if previous is not None and stationary_button_at(frame, (previous.point, previous.box)):
+            return previous
+        return None
+    (x, y), box = detected
+    w, h = size
+    radius = _button_radius((x, y), box, size)
+    # Stay inside the detected disc, even at the corners. Cap the square's size
+    # because the same button can be measured by its wide outer ring or bright core.
+    half = min(radius / math.sqrt(2), .024 * min(w, h))
+    safe_box = x - half / w, y - half / h, x + half / w, y + half / h
+    # With only a core, bound the possible exterior by the stationary detector's
+    # maximum outer radius. This estimate only sizes the motion to uncover the pointer.
+    probe_radius = .11 * min(w, h)
+    if scan.outer_radius_fraction is not None:
+        probe_radius = (scan.outer_radius_fraction * min(w, h)
+                        + _CENTRE_JITTER_PIXELS * max(1., min(w, h) / _DETECTION_SHORT_SIDE))
+    current = ButtonTarget((x, y), box, safe_box, size, probe_radius)
+    if previous is not None:
+        if same_button(previous, current):
+            if scan.outer_radius_fraction is None:
+                current = current._replace(probe_radius_px=previous.probe_radius_px)
+        elif stationary_button_at(frame, (previous.point, previous.box)):
+            return None  # Two distinct positions still have button evidence on this frame.
+    return current
 
 
 def _icon_boxes(image: Image.Image, box: tuple[int, int, int, int]):

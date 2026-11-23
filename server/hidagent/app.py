@@ -276,6 +276,8 @@ class ActionStep(BaseModel):
     segments: int = Field(default=48, ge=12, le=128, strict=True)
     hold: bool = True
     rehome: bool = False
+    measure_only: bool = False
+    correct_from_measurement_id: str | None = Field(default=None, min_length=1, max_length=64)
     duration: float = Field(default=.8, ge=.3, le=3, allow_inf_nan=False)
 
 
@@ -488,6 +490,7 @@ def control_capabilities():
         "limits": {"path_points": 256, "circle_segments": [12, 128], "long_press_seconds": [.3, 3],
                    "batch_steps": 8, "observation_seconds": 30},
         "features": {
+            "point_measurement": True,
             "clipboard": {"configured": phone.clipboard is not None, "staged": True,
                           "protocol": getattr(phone.clipboard, "protocol", None),
                           "legacy_paste_available": clipboard_mode_options(phone.clipboard)["clipboard_available"],

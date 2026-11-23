@@ -6,6 +6,7 @@ import io
 
 import pytest
 from PIL import Image, ImageDraw
+from test_assistive_vision import button_frame
 from test_staged_clipboard import prepare_body, setup
 
 from hidagent import assistive_vision, ocr, paste_flow
@@ -41,6 +42,9 @@ PLAIN_JPEG = jpeg()
 BANNER_JPEG = jpeg(banner=True)
 PASTED_JPEG = jpeg(pasted=True)
 SHEET_JPEG = jpeg(banner=True, pasted=True)
+FIELD = (.13, .52, .77, .58)
+TEXT = "第一行\n第二行"
+HOLD = ("click", "辅助触控", .9)
 
 SHEET_BOXES = [
     ocr.TextBox("微信想要从快捷指令粘贴", (.20, .43, .80, .48), (.50, .455), .98),
@@ -65,42 +69,66 @@ class FakeClient:
         self.pasted_visible = pasted_visible
         self.find_text_calls = []
         self.screenshots = 0
+        self.pointer_proof = {}
+        self.bubble_moves = []
+        self.holds_at_prepare = 0
 
     def capabilities(self):
-        return {"features": {"clipboard": {"trigger_configured": self.trigger_configured}}}
+        return {"features": {"point_measurement": True, "clipboard": {"trigger_configured": self.trigger_configured}}}
+
+    def frame(self, raw, *, for_click=False):
+        self.seen += 1
+        with Image.open(io.BytesIO(raw)) as image:
+            width, height = image.size
+        return {**self.pointer_proof, "screen_id": f"s{self.seen}", "frame_received_at": float(self.seen),
+                "for_click": for_click,
+                "width": width, "height": height, "image_base64": base64.b64encode(raw).decode()}
+
+    def bubble_scene(self):
+        return PLAIN_JPEG
+
+    def bubble_landing(self, x, y):
+        return {"x": x + .005, "y": y + .003}
 
     def observe(self, for_click=False):
-        self.seen += 1
         clicks = self.calls.count(("click", "允许粘贴", None))
         if self.sheet and "paste" in self.calls and clicks < self.allow_dismiss_after and not for_click:
             raw = SHEET_JPEG
         elif self.pasted_visible and "paste" in self.calls and not for_click:
             raw = PASTED_JPEG
         else:
-            raw = PLAIN_JPEG
-        return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(raw).decode()}
+            raw = self.bubble_scene()
+        return self.frame(raw, for_click=for_click)
 
     def screenshot(self):
         self.screenshots += 1
         if "status" in self.calls and self.overlay_frames > 0:
             self.overlay_frames -= 1
             return BANNER_JPEG
-        return PLAIN_JPEG
+        return self.bubble_scene()
 
     def control(self, name, screen_id, **fields):
         self.calls.append(name)
         self.control_calls.append((name, fields))
         if name == "point" and "paste" in self.calls:
+            self.pointer_proof = {}
             if self.allow_measured_pointer == "auto":
                 mp = {"x": fields["x"] + .005, "y": fields["y"] + .003}
             else:
                 mp = self.allow_measured_pointer
             return {"command_acknowledged": True, "measured_pointer": mp, "pointer_seen": mp is not None}
+        if name == "point":
+            self.bubble_moves.append((fields["x"], fields["y"]))
+            self.pointer_proof = {"pointer_measurement_id": f"move-{len(self.bubble_moves)}",
+                                  "pointer_seen": True,
+                                  "measured_pointer": self.bubble_landing(fields["x"], fields["y"])}
+            return {**self.frame(self.bubble_scene()), "fresh": True, "command_acknowledged": True}
         return {"command_acknowledged": True}
 
     def click_observed(self, screen_id, x, y, box, **fields):
         self.calls.append(("click", fields.get("target_label"), fields.get("duration")))
         self.click_calls.append((x, y, box, fields))
+        self.pointer_proof = {}
         return {"command_acknowledged": True, "timing_ms": {"total": 1}}
 
     def find_text(self, text, screen_id, **fields):
@@ -113,11 +141,13 @@ class FakeClient:
     def clipboard_stage(self, stage, **fields):
         self.calls.append(stage)
         if stage == "prepare":
+            self.holds_at_prepare = self.calls.count(HOLD)
             return {"transaction_id": "tx"}
         if stage == "status":
             assert fields.get("include_observation") is False
-            copied = not self.never_copy and (self.copied_on_prepare or ("click", "辅助触控", .9) in self.calls)
-            return {"copied": copied, "phase": "awaiting_paste" if copied else "awaiting_copy"}
+            copied = not self.never_copy and (self.copied_on_prepare or self.claimed)
+            return {"copied": copied, "claimed": self.claimed or copied,
+                    "phase": "awaiting_paste" if copied else "awaiting_copy"}
         if stage == "paste":
             if self.paste_conflicts:
                 self.paste_conflicts -= 1
@@ -136,12 +166,11 @@ class FakeClient:
 
     @property
     def claimed(self):
-        return ("click", "辅助触控", .9) in self.calls and not self.never_claim
+        return self.calls.count(HOLD) > self.holds_at_prepare and not self.never_claim
 
 
 @pytest.fixture
-def vision(monkeypatch):
-    monkeypatch.setattr(assistive_vision, "find_button_target", lambda frame: ((.75, .95), (.69, .92, .83, .98)))
+def offline_ocr(monkeypatch):
     monkeypatch.setattr(paste_flow.time, "sleep", lambda _s: None)
     monkeypatch.setattr(ocr, "read_text", lambda frame: (
         list(SHEET_BOXES) if frame == SHEET_JPEG else (
@@ -150,6 +179,11 @@ def vision(monkeypatch):
             if frame == PASTED_JPEG else []
         )
     ))
+
+
+@pytest.fixture
+def vision(monkeypatch, offline_ocr):
+    monkeypatch.setattr(assistive_vision, "find_button_target", lambda frame: ((.75, .95), (.69, .92, .83, .98)))
 
 
 def test_flow_pastes_once_handles_sheet_and_reconfirms_same_transaction(vision):
@@ -236,81 +270,347 @@ def test_flow_attributes_trigger_key_when_prepare_already_copied(vision):
     assert report["cmd_v_sent"] == 1 and report["phase"] == "completed"
 
 
+def test_trigger_key_waits_for_copy_without_falling_back_to_a_hold(vision):
+    client = FakeClient(trigger_configured=True, never_copy=True)
+    with pytest.raises(paste_flow.FlowStopped) as stopped:
+        paste_flow.run(client, TEXT, FIELD, copy_timeout=0)
+    assert client.calls.count("prepare") == 1 and "status" in client.calls
+    assert HOLD not in client.calls and "paste" not in client.calls
+    assert stopped.value.report.facts["cmd_v_sent"] == 0
+
+
+@pytest.mark.parametrize("already_copied", [False, True])
+def test_existing_shortcut_claim_or_copy_prevents_a_duplicate_trigger(vision, already_copied):
+    class ClaimedClient(FakeClient):
+        def clipboard_stage(self, stage, **fields):
+            result = super().clipboard_stage(stage, **fields)
+            if stage == "status":
+                copied = already_copied or self.calls.count("status") > 1
+                return {"phase": "awaiting_paste" if copied else "awaiting_copy",
+                        "claimed": True, "copied": copied}
+            return result
+
+    client = ClaimedClient(trigger_configured=False, sheet=False, confirm_conflicts=0)
+    report = paste_flow.run(client, TEXT, FIELD).as_dict()
+    assert "status" in client.calls and HOLD not in client.calls
+    assert client.calls.count("prepare") == client.calls.count("paste") == report["cmd_v_sent"] == 1
+
+
 def test_flow_waits_for_transient_shortcut_banner_before_paste(vision):
     client = FakeClient(overlay_frames=2)
     report = paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58)).as_dict()
     assert client.overlay_frames == 0
     assert "wait_overlay_clear" in report["stages_ms"]
     assert client.calls.count("paste") == 1 and report["phase"] == "completed"
-    assert client.control_calls[0] == ("point", {"x": .75, "y": .95, "target_box": [.69, .92, .83, .98],
-                                                  "rehome": True})
+    name, point = client.control_calls[0]
+    assert name == "point" and point["rehome"] is point["measure_only"] is True
+    assert (point["x"], point["y"]) == pytest.approx((.75, .95))
+    left, top, right, bottom = point["target_box"]
+    assert left < point["x"] < right and top < point["y"] < bottom
 
 
-@pytest.mark.parametrize("still_stray", [False, True])
-def test_flow_corrects_or_aborts_before_hold_when_stray_cursor_lands_below_bubble(monkeypatch, still_stray):
-    def bubble_scene(*, dot_xy=None):
-        image = Image.new("RGB", (360, 778), "white")
-        draw = ImageDraw.Draw(image)
-        if dot_xy is not None:
-            cx, cy = round(dot_xy[0] * 360), round(dot_xy[1] * 778)
-            draw.ellipse((cx - 9, cy - 9, cx + 9, cy + 9), fill=(110, 110, 110))
-        output = io.BytesIO()
-        image.save(output, "JPEG", quality=92)
-        return output.getvalue()
+def assert_stopped_before_prepare(client, stopped):
+    assert "prepare" not in client.calls and HOLD not in client.calls
+    assert "paste" not in client.calls and "confirm" not in client.calls
+    facts = stopped.value.report.facts
+    assert facts["recovery_state"] == "not_copied" and facts["copied"] is False
+    assert facts["cmd_v_sent"] == 0
+    assert 1 <= len(client.bubble_moves) <= 2
 
-    clean = bubble_scene()
-    pasted_scene = bubble_scene(dot_xy=(.25, .55))
-    stray = bubble_scene(dot_xy=(.89, .41))
-    inside = bubble_scene(dot_xy=(.89, .36))
 
-    monkeypatch.setattr(assistive_vision, "find_button_target",
-                        lambda _frame: ((.89, .36), (.82, .33, .96, .39)))
-    monkeypatch.setattr(paste_flow.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(ocr, "read_text", lambda frame: (
-        [ocr.TextBox("第一行", (.16, .525, .40, .548), (.28, .536), .98),
-         ocr.TextBox("第二行", (.16, .552, .40, .575), (.28, .563), .98)]
-        if frame == pasted_scene else []
-    ))
-
-    class StrayClient(FakeClient):
-        def observe(self, for_click=False):
-            self.seen += 1
-            raw = pasted_scene if ("paste" in self.calls and not for_click) else clean
-            return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(raw).decode()}
-
+@pytest.mark.parametrize("mode", ["ack_only", "echo_only", "unseen", "stale", "no_frame"])
+def test_bubble_move_requires_positive_independent_evidence(vision, mode):
+    class NoProofClient(FakeClient):
         def control(self, name, screen_id, **fields):
-            box = fields.get("target_box")
-            # Same rule as Controls._plan: a supplied box must contain the point.
-            if box is not None and not (box[0] < fields["x"] < box[2] and box[1] < fields["y"] < box[3]):
-                raise RuntimeError("HTTP 409: target_box must contain the tap in normalized observed coordinates")
+            receipt = super().control(name, screen_id, **fields)
+            if mode == "ack_only":
+                self.pointer_proof.clear()
+                return {"command_acknowledged": True}
+            if mode == "echo_only":
+                self.pointer_proof.clear()
+                return {**self.frame(self.bubble_scene()), "fresh": True, "command_acknowledged": True,
+                        "x": fields["x"], "y": fields["y"]}
+            if mode == "unseen":
+                self.pointer_proof["pointer_seen"] = receipt["pointer_seen"] = False
+            elif mode == "stale":
+                receipt["fresh"] = False
+            else:
+                receipt.pop("image_base64")
+            return receipt
+
+    client = NoProofClient()
+    with pytest.raises(paste_flow.FlowStopped) as stopped:
+        paste_flow.run(client, TEXT, FIELD)
+    assert_stopped_before_prepare(client, stopped)
+
+
+@pytest.mark.parametrize("prewarm", [False, True])
+def test_every_bubble_hold_clicks_measured_point_instead_of_requested_center(vision, prewarm):
+    client = FakeClient(sheet=False, confirm_conflicts=0)
+    report = paste_flow.run(client, TEXT, FIELD, prewarm=prewarm).as_dict()
+    assert report["phase"] == "completed" and report["cmd_v_sent"] == 1
+    clicks = [(x, y) for x, y, box, args in client.click_calls if args.get("target_label") == "辅助触控"]
+    assert len(clicks) == (2 if prewarm else 1)
+    for x, y in clicks:
+        assert (x, y) == pytest.approx((.755, .953))
+    assert client.calls.count("prepare") == client.calls.count("paste") == 1
+
+
+@pytest.mark.parametrize("mode", ["other_measurement", "same_frame", "changed_coordinate", "no_current_proof"])
+def test_independent_observation_is_bound_to_the_current_move(vision, mode):
+    class MismatchedClient(FakeClient):
+        def control(self, name, screen_id, **fields):
+            self.move_frame = super().control(name, screen_id, **fields)
+            return self.move_frame
+
+        def observe(self, for_click=False):
+            observed = super().observe(for_click)
+            if self.bubble_moves:
+                if mode == "other_measurement":
+                    observed["pointer_measurement_id"] = "different-move-or-session"
+                elif mode == "same_frame":
+                    observed["screen_id"] = self.move_frame["screen_id"]
+                    observed["frame_received_at"] = self.move_frame["frame_received_at"]
+                elif mode == "changed_coordinate":
+                    observed["measured_pointer"] = {"x": .71, "y": .93}
+                else:
+                    observed.pop("pointer_measurement_id", None)
+            return observed
+
+    client = MismatchedClient()
+    with pytest.raises(paste_flow.FlowStopped) as stopped:
+        paste_flow.run(client, TEXT, FIELD)
+    assert_stopped_before_prepare(client, stopped)
+
+
+@pytest.mark.parametrize("second_hits", [True, False])
+def test_bubble_corrects_once_after_confirmed_miss(offline_ocr, second_hits):
+    size = (500, 1080)
+    raw = button_frame((.89, .455), size)
+    target = assistive_vision.track_button_target(raw)
+    positions = []
+
+    class MissClient(FakeClient):
+        def bubble_scene(self):
+            return raw
+
+        def bubble_landing(self, x, y):
+            requested = x * size[0], y * size[1]
+            fields = self.control_calls[-1][1]
+            if fields.get("correct_from_measurement_id") is None:
+                # Absolute motion reproduces the original 40 px vertical bias.
+                px, py = requested[0], requested[1] + 40
+            else:
+                assert fields["correct_from_measurement_id"] == self.pointer_proof["pointer_measurement_id"]
+                px, py = positions[-1]
+                gain = .9 if second_hits else 0.0  # An effective relative HID move or a stalled one.
+                px += gain * (requested[0] - px)
+                py += gain * (requested[1] - py)
+            positions.append((px, py))
+            return {"x": px / size[0], "y": py / size[1]}
+
+    client = MissClient(sheet=False, confirm_conflicts=0)
+    if second_hits:
+        report = paste_flow.run(client, TEXT, FIELD).as_dict()
+        assert report["phase"] == "completed" and report["cmd_v_sent"] == 1
+        held_x, held_y, click_box, _ = client.click_calls[0]
+        assert (held_x * size[0], held_y * size[1]) == pytest.approx(positions[-1])
+        assert click_box == pytest.approx(target.safe_box)
+    else:
+        with pytest.raises(paste_flow.FlowStopped) as stopped:
+            paste_flow.run(client, TEXT, FIELD)
+        assert_stopped_before_prepare(client, stopped)
+    assert len(client.bubble_moves) == len(positions) == 2
+    assert "correct_from_measurement_id" not in client.control_calls[0][1]
+    assert client.control_calls[1][1]["correct_from_measurement_id"] == "move-1"
+    first_error, second_error = [py - target.point[1] * size[1] for _, py in positions]
+    assert first_error == pytest.approx(40)
+    assert second_error == pytest.approx(4 if second_hits else 40)
+    for _name, fields in client.control_calls:
+        assert fields["measure_only"] is True
+        assert (fields["x"], fields["y"]) == pytest.approx(target.point)
+        assert fields["target_box"] == pytest.approx(target.probe_box)
+        assert fields["target_box"][0] < target.safe_box[0]
+        assert fields["target_box"][2] > target.safe_box[2]
+
+
+@pytest.mark.parametrize("destination", [(.91, .36), (.09, .64)])
+@pytest.mark.parametrize("move_after", ["point", "prepare"])
+def test_moving_button_reaims_before_prepare_and_stops_after_prepare(offline_ocr, destination, move_after):
+    initial = (.91, .64)
+    images = {initial: button_frame(initial), destination: button_frame(destination)}
+
+    class MovingClient(FakeClient):
+        def bubble_scene(self):
+            return images[destination if move_after in self.calls else initial]
+
+    client = MovingClient(sheet=False, confirm_conflicts=0)
+    if move_after == "prepare":
+        with pytest.raises(paste_flow.FlowStopped) as stopped:
+            paste_flow.run(client, TEXT, FIELD)
+        assert client.calls.count("prepare") == client.calls.count("cancel") == 1
+        assert "paste" not in client.calls and HOLD not in client.calls
+        assert stopped.value.report.facts["recovery_state"] == "not_copied"
+        return
+
+    report = paste_flow.run(client, TEXT, FIELD).as_dict()
+    assert len(client.bubble_moves) == 2
+    assert client.bubble_moves[0] == pytest.approx(initial, abs=.01)
+    assert client.bubble_moves[1] == pytest.approx(destination, abs=.01)
+    x, y, box, fields = client.click_calls[0]
+    assert fields["target_label"] == "辅助触控"
+    assert (x, y) == pytest.approx(destination, abs=.012)
+    assert box[0] < x < box[2] and box[1] < y < box[3]
+    assert client.calls.count(HOLD) == client.calls.count("paste") == report["cmd_v_sent"] == 1
+
+
+def test_legacy_point_schema_rejection_does_not_bypass_positive_evidence(vision):
+    class LegacyClient(FakeClient):
+        def control(self, name, screen_id, **fields):
+            assert fields["measure_only"] is True
+            if "rehome" in fields or "target_box" in fields:
+                self.calls.append("legacy_schema_rejection")
+                raise RuntimeError("HTTP 422: unknown field rehome")
+            super().control(name, screen_id, **fields)
+            self.pointer_proof.clear()
+            return {"command_acknowledged": True}
+
+    client = LegacyClient()
+    with pytest.raises(paste_flow.FlowStopped) as stopped:
+        paste_flow.run(client, TEXT, FIELD)
+    assert "legacy_schema_rejection" in client.calls
+    assert_stopped_before_prepare(client, stopped)
+
+
+def test_old_server_rejecting_measure_only_never_receives_a_plain_point(vision):
+    class LegacyClient(FakeClient):
+        def control(self, name, screen_id, **fields):
+            self.control_calls.append((name, fields))
+            if fields.get("measure_only"):
+                raise RuntimeError("HTTP 422: unknown field measure_only")
             return super().control(name, screen_id, **fields)
 
-        def screenshot(self):
-            self.screenshots += 1
-            if self.calls.count("point") == 1:
-                return stray
-            return stray if still_stray else inside
+    client = LegacyClient()
+    with pytest.raises(paste_flow.FlowStopped):
+        paste_flow.run(client, TEXT, FIELD)
+    assert len(client.control_calls) == 2
+    first, last = [fields for _, fields in client.control_calls]
+    assert first["rehome"] is first["measure_only"] is last["measure_only"] is True
+    assert "target_box" in first and "target_box" not in last and "rehome" not in last
+    assert not client.bubble_moves and "prepare" not in client.calls and HOLD not in client.calls
 
-    client = StrayClient(sheet=False)
-    if still_stray:
-        with pytest.raises(paste_flow.FlowStopped) as stopped:
-            paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58))
-        assert "outside AssistiveTouch" in str(stopped.value)
-        assert stopped.value.report.retries["point_bubble_miss"] == 1
-        assert ("click", "辅助触控", .9) not in client.calls
-        assert "prepare" not in client.calls and "paste" not in client.calls
-        assert stopped.value.report.facts["recovery_state"] == "not_copied"
+
+def test_old_server_that_ignores_unknown_fields_receives_no_input(vision):
+    client = FakeClient()
+    client.capabilities = lambda: {"features": {"clipboard": {"trigger_configured": False}}}
+    with pytest.raises(paste_flow.FlowStopped, match="point_measurement support"):
+        paste_flow.run(client, TEXT, FIELD)
+    assert client.control_calls == [] and client.calls == []
+
+
+@pytest.mark.parametrize("stale_field", ["screen_id", "frame_received_at", "pointer_measurement_id"])
+def test_correction_requires_new_frame_of_that_same_miss(vision, stale_field):
+    class UncorroboratedMissClient(FakeClient):
+        def bubble_landing(self, x, y):
+            return {"x": .75, "y": .99}
+
+        def control(self, name, screen_id, **fields):
+            self.move_receipt = super().control(name, screen_id, **fields)
+            return self.move_receipt
+
+        def observe(self, for_click=False):
+            observed = super().observe(for_click)
+            if self.bubble_moves:
+                observed[stale_field] = ("another-move" if stale_field == "pointer_measurement_id"
+                                         else self.move_receipt[stale_field])
+            return observed
+
+    client = UncorroboratedMissClient()
+    with pytest.raises(paste_flow.FlowStopped) as stopped:
+        paste_flow.run(client, TEXT, FIELD)
+    assert_stopped_before_prepare(client, stopped)
+    assert len(client.bubble_moves) == 1
+
+
+@pytest.mark.parametrize("defect", ["different_measurement", "normal_ticket"])
+def test_stale_click_ticket_after_prepare_never_dispatches_a_hold(vision, defect):
+    class StaleClickClient(FakeClient):
+        def observe(self, for_click=False):
+            result = super().observe(for_click)
+            if for_click and "prepare" in self.calls:
+                if defect == "different_measurement":
+                    result["pointer_measurement_id"] = "after-another-action-or-session"
+                else:
+                    result["for_click"] = False
+            return result
+
+    client = StaleClickClient()
+    with pytest.raises(paste_flow.FlowStopped) as stopped:
+        paste_flow.run(client, TEXT, FIELD)
+    assert client.calls.count("prepare") == client.calls.count("cancel") == 1
+    assert HOLD not in client.calls and "paste" not in client.calls
+    assert stopped.value.report.facts["cmd_v_sent"] == 0
+
+
+@pytest.mark.parametrize("mode", ["timeout_after_dispatch", "cancelled_409", "unacked_may_have_executed",
+                                  "missing_write_boundary"])
+def test_hold_with_ambiguous_dispatch_is_never_repeated(vision, mode):
+    class AmbiguousHoldClient(FakeClient):
+        def click_observed(self, screen_id, x, y, box, **fields):
+            super().click_observed(screen_id, x, y, box, **fields)
+            if mode == "timeout_after_dispatch":
+                raise TimeoutError("read timed out after dispatch")
+            if mode == "cancelled_409":
+                raise RuntimeError("HTTP 409: host click stopped; observe before continuing")
+            if mode == "missing_write_boundary":
+                return {"command_acknowledged": False, "error": "未发送原地点击"}
+            return {"command_acknowledged": False, "action_may_have_executed": True,
+                    "error": "未发送原地点击 (unreliable message after timeout)"}
+
+    client = AmbiguousHoldClient()
+    with pytest.raises(paste_flow.FlowStopped) as stopped:
+        paste_flow.run(client, TEXT, FIELD)
+    assert client.calls.count(HOLD) == 1
+    assert client.calls.count("prepare") == 1 and "paste" not in client.calls
+    facts = stopped.value.report.facts
+    assert facts["cmd_v_sent"] == 0 and facts["hold_may_have_executed"] is True
+    assert "Do not automatically repeat" in facts["next_action"]
+
+
+@pytest.mark.parametrize("lose_measurement", [True, False])
+def test_predispatch_hold_rejection_requires_a_new_verified_ticket(vision, lose_measurement):
+    class RejectedHoldClient(FakeClient):
+        def __init__(self):
+            super().__init__(sheet=False)
+            self.tickets = []
+
+        def click_observed(self, screen_id, x, y, box, **fields):
+            self.tickets.append(screen_id)
+            if len(self.tickets) == 1:
+                if lose_measurement:
+                    self.pointer_proof.clear()
+                return {"command_acknowledged": False, "action_may_have_executed": False,
+                        "error": "等待点击期间原画面已变化"}
+            return super().click_observed(screen_id, x, y, box, **fields)
+
+    client = RejectedHoldClient()
+    if lose_measurement:
+        with pytest.raises(paste_flow.FlowStopped):
+            paste_flow.run(client, TEXT, FIELD)
+        assert len(client.tickets) == 1 and HOLD not in client.calls and "paste" not in client.calls
     else:
-        report = paste_flow.run(client, "第一行\n第二行", (.13, .52, .77, .58)).as_dict()
-        assert report["retries"]["point_bubble_miss"] == 1
-        assert "point_bubble" not in report["retries"]  # the correction was not rejected
-        bubble_points = [fields for name, fields in client.control_calls if name == "point" and fields["x"] > .8]
-        assert len(bubble_points) == 2
-        assert bubble_points[0]["rehome"] is True and bubble_points[0]["target_box"] == [.82, .33, .96, .39]
-        assert "rehome" not in bubble_points[1]
-        assert bubble_points[1]["y"] < .33 and "target_box" not in bubble_points[1]  # aim outside the box
-        assert ("click", "辅助触控", .9) in client.calls
-        assert report["phase"] == "completed"
+        result = paste_flow.run(client, TEXT, FIELD).as_dict()
+        assert len(set(client.tickets)) == len(client.tickets) == 2
+        assert result["retries"]["shortcut_hold"] == client.calls.count(HOLD) == result["cmd_v_sent"] == 1
+
+
+def test_bubble_keeps_caret_evidence_scoped_to_the_verified_field(vision, monkeypatch):
+    client = FakeClient(sheet=False, confirm_conflicts=0)
+    scheduler_box = (.14, .53, .16, .56)
+    monkeypatch.setattr(paste_flow, "wait_caret_plateau", lambda client, box: box == scheduler_box)
+    paste_flow.run(client, TEXT, FIELD, caret_box=scheduler_box)
+    assert client.control_calls[0][1]["caret_scope"] == list(FIELD)
+    assert client.click_calls[0][3]["caret_scope"] == list(FIELD)
 
 
 def test_flow_clicks_measured_allow_pointer_not_ocr_center(vision):
@@ -378,7 +678,6 @@ def test_flow_locates_visible_allow_pointer_from_for_click_frame_when_measured_p
 
     class VisualAllowClient(FakeClient):
         def observe(self, for_click=False):
-            self.seen += 1
             if for_click and "paste" in self.calls:
                 raw = pointed_sheet
             elif "paste" in self.calls and self.calls.count(("click", "允许粘贴", None)) >= self.allow_dismiss_after:
@@ -387,7 +686,7 @@ def test_flow_locates_visible_allow_pointer_from_for_click_frame_when_measured_p
                 raw = clean_sheet
             else:
                 raw = PLAIN_JPEG
-            return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(raw).decode()}
+            return self.frame(raw, for_click=for_click)
 
         def clipboard_stage(self, stage, **fields):
             res = super().clipboard_stage(stage, **fields)
@@ -437,10 +736,9 @@ def test_flow_rechecks_title_and_empty_draft_on_prepare_frame(monkeypatch, drift
 
     class DriftClient(FakeClient):
         def observe(self, for_click=False):
-            self.seen += 1
             # First observe is initial check; after point_bubble, prepare_observe sees drifted frame.
             raw = drifted_jpg if "point" in self.calls else initial_jpg
-            return {"screen_id": f"s{self.seen}", "image_base64": base64.b64encode(raw).decode()}
+            return self.frame(raw, for_click=for_click)
 
     client = DriftClient()
     with pytest.raises(paste_flow.FlowStopped) as stopped:
