@@ -127,15 +127,10 @@ class UxPlayScreen(RecentFrameHistory):
                 self._last_capture_age = None
                 return
             if jpeg:
-                # Keep receiver publication clocks. Polling an unchanged snapshot must
-                # never make old pixels eligible for a new input operation.
-                # The receiver stamps the capture age at publication; add the
-                # IPC transit since then, so `updated - capture_age_s` stays
-                # the capture wall time (never later than the true capture).
+                # Both updated and capture age refer to receiver publication.
+                # Polling the same frame later must preserve its capture time.
                 age = metadata.get("capture_age_s")
-                if type(age) in (int, float) and age >= 0:
-                    age = age + max(0.0, time.monotonic() - metadata["arrived"])
-                else:
+                if not (type(age) in (int, float) and age >= 0):
                     age = None
                 self.frame, self.updated = jpeg, metadata["updated"]
                 self._snapshot = FrameSnapshot(jpeg, None, metadata["arrived"], self.updated,
