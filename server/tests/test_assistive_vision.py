@@ -1,6 +1,7 @@
 """AssistiveTouch recognition using generated frames and the existing iOS 26 captures."""
 
 import io
+import math
 from pathlib import Path
 
 import pytest
@@ -285,3 +286,127 @@ def test_find_button_target_and_find_panel_cache_repeated_frame_bytes():
     p1 = assistive_vision.find_panel(frame)
     p2 = assistive_vision.find_panel(frame)
     assert p1 == p2 and assistive_vision._find_panel_cached.cache_info().hits >= 1
+
+
+def layered_button_scene(center, *, pointer_offset=None, size=(500, 1080)):
+    image = Image.new("RGB", size, "#f6f6fa")
+    draw = ImageDraw.Draw(image)
+    x, y = center
+    for radius, gray in ((40, 35), (31, 104), (25, 147), (19, 248)):
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=(gray,) * 3)
+    if pointer_offset is not None:
+        px, py = x + pointer_offset[0], y + pointer_offset[1]
+        draw.ellipse((px - 12, py - 12, px + 12, py + 12), fill="#808080")
+    return encoded(image)
+
+
+@pytest.mark.parametrize("center", [(448, 490), (52, 250), (448, 800)])
+def test_tracked_target_keeps_a_conservative_interior_across_ring_changes(center):
+    from hidagent import assistive_vision as vision
+
+    plain = layered_button_scene(center)
+    occluded = layered_button_scene(center, pointer_offset=(-8, 39))
+    initial = vision.track_button_target(plain)
+    hovered = vision.track_button_target(occluded, previous=initial)
+    assert initial is not None and hovered is not None
+    large_width = initial.box[2] - initial.box[0]
+    small_width = hovered.box[2] - hovered.box[0]
+    assert large_width > 1.5 * small_width  # Actual outer-ring → bright-core detector switch.
+    assert vision.same_button(initial, hovered)
+    for target in (initial, hovered):
+        x, y = target.point
+        left, top, right, bottom = target.safe_box
+        assert left < x < right and top < y < bottom
+        # The outside edge and its surrounding grey cursor remain outside the safe region.
+        assert right - left < small_width
+        assert (right - left) * 500 == pytest.approx((bottom - top) * 1080)
+    assert hovered.safe_box == pytest.approx(initial.safe_box, abs=.003)
+
+
+@pytest.mark.parametrize("destination", [(448, 380), (52, 490)])
+def test_tracked_target_reacquires_moved_button_and_rejects_absent_button(destination):
+    from hidagent import assistive_vision as vision
+
+    first = vision.track_button_target(layered_button_scene((448, 490)))
+    moved = vision.track_button_target(layered_button_scene(destination), previous=first)
+    assert moved is not None and not vision.same_button(first, moved)
+    assert moved.point == pytest.approx((destination[0] / 500, destination[1] / 1080), abs=.003)
+    blank = Image.new("RGB", (500, 1080), "#f6f6fa")
+    ImageDraw.Draw(blank).ellipse((436, 478, 460, 502), fill="#808080")
+    assert vision.track_button_target(encoded(blank), previous=first) is None
+
+
+def test_tracking_rejects_two_distinct_concentric_buttons_even_with_previous_position():
+    from hidagent import assistive_vision as vision
+
+    left = layered_button_scene((52, 490))
+    right = layered_button_scene((448, 490))
+    with Image.open(io.BytesIO(left)) as left_image, Image.open(io.BytesIO(right)) as right_image:
+        left_image.paste(right_image.crop((250, 0, 500, 1080)), (250, 0))
+        both = encoded(left_image)
+    assert vision.find_button_target(both) is not None  # Legacy API can rank candidates.
+    for previous in (None, vision.track_button_target(left), vision.track_button_target(right)):
+        assert vision.track_button_target(both, previous) is None
+
+
+def test_same_button_rejects_a_radically_smaller_ring_at_unchanged_center():
+    from hidagent import assistive_vision as vision
+
+    first = vision.track_button_target(layered_button_scene((448, 490)))
+    x, y = first.point
+    w, h = first.size
+    small_box = x - 9 / w, y - 9 / h, x + 9 / w, y + 9 / h
+    assert not vision.same_button(first, first._replace(box=small_box))
+
+
+def test_parked_cursor_requires_fresh_visible_rings_to_reuse_previous_location():
+    from hidagent import assistive_vision as vision
+
+    frame = transparent_list_button(glyph=False)
+    first = vision.track_button_target(frame)
+    x, y = (coord * length for coord, length in zip(first.point, first.size, strict=True))
+    with Image.open(io.BytesIO(frame)) as image:
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((x - 14, y - 6, x + 14, y + 22), fill="#808080")
+        partial = encoded(image)
+        draw.ellipse((x - 45, y - 45, x + 45, y + 45), fill="#808080")
+        full = encoded(image)
+    assert vision.track_button_target(partial) is None
+    assert vision.track_button_target(partial, previous=first) == first
+    assert vision.track_button_target(full, previous=first) is None
+
+
+@pytest.mark.parametrize("center", [(448, 490), (52, 490)])
+def test_measuring_escape_clears_outer_ring_and_cursor_even_when_only_core_is_visible(tmp_path, center):
+    from test_pointer_session import setup_phone
+
+    from hidagent import assistive_vision as vision
+
+    phone, _, mirror = setup_phone(tmp_path)
+    phone.span = {"w": 270, "h": 584}
+    plain = layered_button_scene(center)
+    obscured = layered_button_scene(center, pointer_offset=(-8, 39))
+    first = vision.track_button_target(plain)
+    hovered = vision.track_button_target(obscured, previous=first)
+    no_history = vision.track_button_target(obscured)
+    assert hovered.probe_radius_px == pytest.approx(first.probe_radius_px, abs=2)
+    for frame, target in ((plain, first), (obscured, hovered), (obscured, no_history)):
+        mirror.frame = frame
+        axis, units = phone._target_escape_probe(target.point, target.probe_box)
+        destination = [v * n for v, n in zip(target.point, target.size, strict=True)]
+        offset_px = units * target.size[axis] / phone.span["wh"[axis]]
+        destination[axis] += offset_px
+        assert abs(offset_px) <= .18 * 500
+        # Clear the painted 40px outer ring by the probe's full 27.5px clearance.
+        assert math.dist(destination, center) >= 40 + .055 * 500
+        assert target.probe_box[0] < target.safe_box[0] < target.safe_box[2] < target.probe_box[2]
+
+
+def test_escape_envelope_is_not_inherited_across_a_move_or_resized_frame():
+    from hidagent import assistive_vision as vision
+
+    previous = vision.track_button_target(layered_button_scene((52, 490)))
+    for center, size in (((448, 490), (500, 1080)), ((52, 490), (500, 1100))):
+        frame = layered_button_scene(center, pointer_offset=(-8, 39), size=size)
+        fresh = vision.track_button_target(frame)
+        assert vision.track_button_target(frame, previous=previous) == fresh

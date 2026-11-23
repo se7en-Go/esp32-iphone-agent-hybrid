@@ -148,6 +148,7 @@ def test_observed_hold_requires_both_ok_replies_for_command_acknowledged(rig, re
     assert result.status_code == 200, result.text
     payload = result.json()
     assert not payload["command_acknowledged"] and payload["error"]
+    assert payload["action_may_have_executed"] is True
     assert not payload.get("held") and not payload["effect_verified"]
     assert [line.split(b" ", 1)[1].strip() for line in rig.link.written] == [b"press", b"release"]
 
@@ -323,6 +324,7 @@ def test_capabilities_describes_host_evidence_without_claiming_calibration_or_cv
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=module.app),
                                      base_url="http://127.0.0.1") as client:
             payload = (await client.get("/api/control/capabilities")).json()
+            assert payload["features"]["point_measurement"] is True
             feature = payload["features"]["host_observed_click"]
             assert feature["evidence_source"] == "host_observed"
             assert feature["single_click_only"] is False
@@ -382,16 +384,18 @@ def test_passive_click_waits_for_current_source_without_input(rig):
     asyncio.run(scenario())
 
 
-def test_qualified_click_abandons_changed_frame_instead_of_waiting_for_original_to_return(rig):
+@pytest.mark.parametrize("contact", [{}, {"duration": .3}])
+def test_qualified_click_abandons_changed_frame_instead_of_waiting_for_original_to_return(rig, contact):
     async def scenario():
         response = await passive_observation()
-        body = from_shot(response.json())
+        body = {**from_shot(response.json()), **contact}
         rig.now[0] += 6
         task = asyncio.create_task(post(body))
         await asyncio.sleep(.02)
         rig.screen._on_jpeg(jpeg("black"))
         denied = await asyncio.wait_for(task, .5)
         assert denied.status_code == 200 and not denied.json()["command_acknowledged"]
+        assert denied.json()["action_may_have_executed"] is False
         assert denied.json()["screen_id"] is None
         rig.screen._on_jpeg(jpeg())
         assert (await post(body)).status_code == 409  # A -> B -> A does not revive a consumed ticket

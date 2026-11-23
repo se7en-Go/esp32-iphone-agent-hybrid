@@ -7,11 +7,15 @@ this module adds no masks or exemptions. It stops before any Send control.
 
 import base64
 import io
+import math
 import time
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import httpx
 from PIL import Image, ImageChops
+
+from . import assistive_vision
 
 PRE_DISPATCH = ("未发送原地点击", "未发送点击", "等待点击期间原画面已变化")
 ALLOW_LABELS = ("允许粘贴", "Allow Paste")
@@ -244,42 +248,6 @@ def _verify_confirm_frame(prepare_frame, confirm_frame, target_box, text, *, exp
     return False, "pasted text was not observed in target field"
 
 
-def _stray_cursor_outside_bubble(before: bytes | None, after: bytes | None, point: tuple[float, float],
-                                 box: tuple[float, float, float, float]) -> tuple[float, float] | None:
-    """Locate an arriving grey pointer disc near (but outside) the AssistiveTouch box."""
-    if not before or not after:
-        return None
-    try:
-        with Image.open(io.BytesIO(before)) as first, Image.open(io.BytesIO(after)) as second:
-            if first.size != second.size:
-                return None
-            w = min(360, first.width)
-            h = max(1, round(first.height * w / first.width))
-            dark = ImageChops.subtract(
-                first.convert("L").resize((w, h), Image.Resampling.BILINEAR),
-                second.convert("L").resize((w, h), Image.Resampling.BILINEAR),
-            )
-    except (OSError, ValueError):
-        return None
-    x0, x1 = max(0, round((box[0] - .12) * w)), min(w, round((box[2] + .06) * w))
-    y0, y1 = max(round(.06 * h), round((box[1] - .12) * h)), min(h, round((box[3] + .12) * h))
-    bx0, by0, bx1, by1 = box[0] - .008, box[1] - .008, box[2] + .008, box[3] + .008
-    pixels = dark.load()
-    pts = []
-    for py in range(y0, y1):
-        yn = py / h
-        for px in range(x0, x1):
-            if pixels[px, py] > 16:
-                xn = px / w
-                if not (bx0 <= xn <= bx1 and by0 <= yn <= by1):
-                    pts.append((xn, yn))
-    if not 40 <= len(pts) <= 600:
-        return None
-    sx = sum(px for px, _ in pts) / len(pts)
-    sy = sum(py for _, py in pts) / len(pts)
-    return (sx, sy) if abs(sx - point[0]) <= .10 and abs(sy - point[1]) <= .10 else None
-
-
 def _pointer_in_box(moved: dict | None, box) -> tuple[float, float] | None:
     mp = (moved or {}).get("measured_pointer")
     if isinstance(mp, dict):
@@ -325,19 +293,192 @@ def _locate_pointer_in_box(before: bytes | None, after: bytes | None, box) -> tu
     return (cx, cy) if box[0] < cx < box[2] and box[1] < cy < box[3] else None
 
 
-def _hold(client, report, point, box, caret_box, stage):
+def _frame(observation):
+    if not observation.get("screen_id") or not observation.get("image_base64"):
+        raise RuntimeError("AssistiveTouch verification requires a fresh observation")
+    return base64.b64decode(observation["image_base64"])
+
+
+def _published(observation):
+    value = observation.get("frame_received_at")
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise RuntimeError("AssistiveTouch observation has no publication time")
+    return value
+
+
+class _MeasuredPointer(NamedTuple):
+    id: str
+    point: tuple[float, float]
+
+
+def _measurement(observation):
+    token = observation.get("pointer_measurement_id")
+    point = _pointer_in_box(observation, (0, 0, 1, 1))
+    if observation.get("pointer_seen") is not True or not isinstance(token, str) or not token or point is None:
+        raise RuntimeError("AssistiveTouch pointer landing was not confirmed")
+    return _MeasuredPointer(token, point)
+
+
+def _inside(point, box):
+    return box[0] < point[0] < box[2] and box[1] < point[1] < box[3]
+
+
+class _BubblePointer:
+    """One acquisition budget, from pointing to a verified prepare/hold."""
+
+    def __init__(self, client, report, caret_box, field_box, check_context):
+        self.client = client
+        self.report = report
+        self.caret_box = caret_box
+        self.caret_scope = list(field_box) if caret_box else None
+        self.check_context = check_context
+        self.attempts = 0
+        self.target = None
+        self.proof = None
+        self.published = None
+
+    def sync_caret(self):
+        if self.caret_box:
+            with _Stage(self.report, "caret_sync"):
+                wait_caret_plateau(self.client, self.caret_box)
+
+    def _target_on(self, observed):
+        target = assistive_vision.track_button_target(_frame(observed), previous=self.target)
+        if target is None:
+            raise RuntimeError("AssistiveTouch button not visible")
+        if self.target is not None and target.size != self.target.size:
+            raise RuntimeError("AssistiveTouch observation geometry changed")
+        return target
+
+    def _move(self, correction):
+        legacy = False
+        for attempt in range(4):
+            self.sync_caret()
+            observed = _observe(self.client, self.report)
+            self.check_context(_frame(observed))
+            current = self._target_on(observed)
+            aim = current.point
+            args = {"measure_only": True}
+            if self.caret_scope is not None:
+                args["caret_scope"] = self.caret_scope
+            if not legacy:
+                args["target_box"] = list(current.probe_box)
+            if correction is not None:
+                previous, measurement = correction
+                if assistive_vision.same_button(previous, current):
+                    if _measurement(observed) != measurement:
+                        raise RuntimeError("AssistiveTouch correction lost its measured landing")
+                    args["correct_from_measurement_id"] = measurement.id
+            self.target = current
+            if self.attempts == 1 and not legacy:
+                args["rehome"] = True
+            try:
+                with _Stage(self.report, "point_bubble_action"):
+                    moved = self.client.control("point", observed["screen_id"], x=aim[0], y=aim[1], **args)
+                self.report.server_timing_ms.setdefault("point_bubble", []).append(moved.get("timing_ms"))
+                return moved, "relative" if "correct_from_measurement_id" in args else "absolute"
+            except RuntimeError as exc:
+                if str(exc).startswith("HTTP 422:") and not legacy and correction is None:
+                    legacy = True
+                elif not str(exc).startswith("HTTP 409:"):
+                    raise
+                if attempt == 3:
+                    raise
+                self.report.retry("point_bubble")
+
+    def _next_publication(self, moved):
+        # Two different screen tickets may wrap the same cached publication.
+        published = _published(moved)
+        for _ in range(6):
+            observed = _observe(self.client, self.report, stage="point_bubble_verify")
+            if observed.get("screen_id") != moved["screen_id"] and _published(observed) > published:
+                return observed
+            time.sleep(.12)
+        raise RuntimeError("AssistiveTouch pointer has no independent post-move frame")
+
+    def _verify_move(self, moved, entry):
+        """Return a corroborated miss for one correction, or discard a relocated target."""
+        if moved.get("command_acknowledged") is not True or moved.get("fresh") is not True:
+            raise RuntimeError("AssistiveTouch move did not produce a fresh acknowledged observation")
+        aimed = self.target
+        self.target = self._target_on(moved)
+        if assistive_vision.same_button(aimed, self.target):
+            measured = _measurement(moved)
+            entry["measured"] = measured.point
+            observed = self._next_publication(moved)
+            self.target = self._target_on(observed)
+            if assistive_vision.same_button(aimed, self.target):
+                if _measurement(observed) != measured:
+                    raise RuntimeError("AssistiveTouch pointer measurement changed after the move")
+                entry["corroborated"] = True
+                if _inside(measured.point, self.target.safe_box):
+                    entry["outcome"] = "verified"
+                    self.proof, self.published = measured, _published(observed)
+                    return None
+                entry["outcome"] = "outside"
+                return self.target, measured
+        entry["outcome"] = "button_moved"
+        return None
+
+    def acquire(self):
+        correction = None
+        self.proof = None
+        while self.attempts < 2:
+            self.attempts += 1
+            with _Stage(self.report, "point_bubble"):
+                moved, mode = self._move(correction)
+                entry = {"target": self.target.point, "safe_box": self.target.safe_box,
+                         "probe_box": self.target.probe_box, "aim": self.target.point, "mode": mode,
+                         "measured": None, "corroborated": False, "outcome": "unconfirmed"}
+                self.report.facts.setdefault("bubble_attempts", []).append(entry)
+                correction = self._verify_move(moved, entry)
+            if self.proof is not None:
+                return
+            if self.attempts < 2:
+                self.report.retry("point_bubble_miss")
+        raise RuntimeError("pointer landed outside AssistiveTouch button or target moved; nothing was pasted")
+
+    def verified_observation(self, stage, *, for_click=False):
+        self.sync_caret()
+        observed = _observe(self.client, self.report, for_click=for_click, stage=stage)
+        if for_click and observed.get("for_click") is not True:
+            raise RuntimeError("AssistiveTouch hold requires a qualified for_click observation")
+        self.check_context(_frame(observed))
+        current = self._target_on(observed)
+        if not assistive_vision.same_button(self.target, current):
+            if for_click or self.attempts == 2:
+                raise RuntimeError("AssistiveTouch button moved before dispatch")
+            self.report.retry("point_bubble_miss")
+            self.target = current
+            self.acquire()
+            return self.verified_observation(stage)
+        if (_published(observed) < self.published or _measurement(observed) != self.proof
+                or not _inside(self.proof.point, current.safe_box)):
+            raise RuntimeError("AssistiveTouch pointer is no longer verified in the current button")
+        self.target = current
+        return observed
+
+
+def _hold(client, report, landing, stage):
     for _ in range(5):
-        if caret_box:
-            with _Stage(report, "caret_sync"):
-                wait_caret_plateau(client, caret_box)
-        observed = _observe(client, report, for_click=True, stage=f"{stage}_observe")
-        with _Stage(report, stage):
-            result = client.click_observed(observed["screen_id"], point[0], point[1], list(box),
-                                           target_label="辅助触控", duration=.9)
+        observed = landing.verified_observation(f"{stage}_observe", for_click=True)
+        scope = {"caret_scope": landing.caret_scope} if landing.caret_scope is not None else {}
+        try:
+            with _Stage(report, stage):
+                result = client.click_observed(
+                    observed["screen_id"], *landing.proof.point, list(landing.target.safe_box),
+                    target_label="辅助触控", duration=.9, **scope)
+        except (RuntimeError, OSError, httpx.HTTPError) as exc:
+            # A cancelled host-click can return HTTP 409 after the press write.
+            if not (isinstance(exc, httpx.ConnectError) or str(exc).startswith("HTTP 422:")):
+                report.facts["hold_may_have_executed"] = True
+            raise
         report.server_timing_ms.setdefault(stage, []).append(result.get("timing_ms"))
         if result.get("command_acknowledged") is True:
             return result
-        if not any(marker in (result.get("error") or "") for marker in PRE_DISPATCH):
+        if result.get("action_may_have_executed") is not False or not any(
+                marker in (result.get("error") or "") for marker in PRE_DISPATCH):
+            report.facts["hold_may_have_executed"] = True
             raise RuntimeError(f"AssistiveTouch hold not acknowledged: {result.get('error')}")
         report.retry(stage)
     raise RuntimeError("AssistiveTouch hold kept changing before dispatch")
@@ -346,8 +487,6 @@ def _hold(client, report, point, box, caret_box, stage):
 def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=False,
         light_status=True, copy_timeout=20.0, confirm_attempts=4, evidence=None, evidence_dir=None):
     """Prepare -> copy -> one Cmd+V -> optional permission sheet -> confirm. Never sends."""
-    from . import assistive_vision
-
     report = Report()
     began = time.perf_counter()
 
@@ -357,87 +496,43 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
     transaction = None
     report.facts.update(copied=False, cmd_v_sent=0, action_may_have_executed=False)
     try:
-        trigger_configured = False
-        if hasattr(client, "capabilities"):
-            caps = client.capabilities() or {}
-            trigger_configured = bool(((caps.get("features") or {}).get("clipboard") or {}).get("trigger_configured"))
+        caps = client.capabilities() if hasattr(client, "capabilities") else {}
+        features = (caps or {}).get("features") or {}
+        # Legacy action schemas ignore unknown fields and can execute a normal
+        # calibrated point. Negotiate before sending the first positioning input.
+        if features.get("point_measurement") is not True:
+            raise RuntimeError("paste-flow requires a control server with point_measurement support")
+        trigger_configured = bool((features.get("clipboard") or {}).get("trigger_configured"))
         report.facts["trigger_configured"] = trigger_configured
         first = _observe(client, report, stage="initial_observe")
         frame = base64.b64decode(first["image_base64"])
         _verify_target_context(frame, target_box, expect_title=expect_title, report=report)
-        bubble = assistive_vision.find_button_target(frame)
+
+        def check_context(raw):
+            if raw != frame:
+                _verify_target_context(raw, target_box, expect_title=expect_title, report=report)
+
+        landing = _BubblePointer(client, report, caret_box, target_box, check_context)
+        landing.target = assistive_vision.track_button_target(frame)
         for _ in range(6):
-            if bubble is not None:
+            if landing.target is not None:
                 break
-            time.sleep(.25)  # an idle, dimmed button may be missed in a single frame
-            bubble = assistive_vision.find_button_target(client.screenshot())
-        if bubble is None:
+            time.sleep(.25)
+            landing.target = assistive_vision.track_button_target(client.screenshot())
+        if landing.target is None:
             raise RuntimeError("AssistiveTouch button not visible")
-        point, box = bubble
 
-        def point_to_bubble(aim_x, aim_y, *, rehome_flag):
-            # The server requires target_box to contain the aim point. A
-            # correction aim may sit outside the button by design; send the box
-            # only when it contains the aim, and verify the landing afterwards.
-            fields = {"target_box": list(box)} if box[0] < aim_x < box[2] and box[1] < aim_y < box[3] else {}
-            if rehome_flag:
-                fields["rehome"] = True
-            for attempt in range(4):
-                if caret_box:
-                    with _Stage(report, "caret_sync"):
-                        wait_caret_plateau(client, caret_box)
-                observed = client.observe()
-                try:
-                    with _Stage(report, "point_bubble_action"):
-                        try:
-                            moved = client.control("point", observed["screen_id"], x=aim_x, y=aim_y, **fields)
-                        except RuntimeError as exc:
-                            if "422" not in str(exc) or not fields:
-                                raise
-                            fields.clear()  # older server: plain point without target_box/rehome
-                            moved = client.control("point", observed["screen_id"], x=aim_x, y=aim_y)
-                    report.server_timing_ms.setdefault("point_bubble", []).append(moved.get("timing_ms"))
-                    return base64.b64decode(observed["image_base64"]) if observed.get("image_base64") else None
-                except RuntimeError as exc:
-                    if "409" not in str(exc) or attempt == 3:
-                        raise
-                    report.retry("point_bubble")
-            return None
-
-        with _Stage(report, "point_bubble"):
-            before_point = point_to_bubble(point[0], point[1], rehome_flag=True)
-        time.sleep(.8)
-        after_point = client.screenshot()
-        # The hovered button is opaque; refine its centre and bounds from a fresh frame.
-        hovered = assistive_vision.find_button_target(after_point)
-        if hovered is not None and box[0] < hovered[0][0] < box[2]:
-            point, box = hovered
-        stray = _stray_cursor_outside_bubble(before_point, after_point, point, box)
-        if stray is not None:
-            report.retry("point_bubble_miss")
-            cx = min(.99, max(.01, point[0] + (point[0] - stray[0])))
-            cy = min(.99, max(.01, point[1] + (point[1] - stray[1])))
-            with _Stage(report, "point_bubble"):
-                point_to_bubble(cx, cy, rehome_flag=False)
-            time.sleep(.8)
-            after_point = client.screenshot()
-            hovered = assistive_vision.find_button_target(after_point)
-            if hovered is not None and box[0] < hovered[0][0] < box[2]:
-                point, box = hovered
-            if _stray_cursor_outside_bubble(before_point, after_point, point, box) is not None:
-                raise RuntimeError("pointer landed outside AssistiveTouch button; nothing was pasted")
+        landing.acquire()
         if prewarm:
-            _hold(client, report, point, box, caret_box, "prewarm_hold")
+            _hold(client, report, landing, "prewarm_hold")
             time.sleep(2.5)
-
-        if caret_box:
-            with _Stage(report, "caret_sync"):
-                wait_caret_plateau(client, caret_box)
-        observed = _observe(client, report, stage="prepare_observe")
-        prepare_frame = base64.b64decode(observed["image_base64"]) if observed.get("image_base64") else None
+            # A hold is a new input. Acquire independent evidence for the
+            # formal copy trigger even when the ball appears stationary.
+            landing = _BubblePointer(client, report, caret_box, target_box, check_context)
+            landing.acquire()
+        observed = landing.verified_observation("prepare_observe")
+        prepare_frame = _frame(observed)
         keep("1-prepare-original", observed)
-        if prepare_frame and prepare_frame != frame:
-            _verify_target_context(prepare_frame, target_box, expect_title=expect_title, report=report)
         with _Stage(report, "prepare"):
             prepared = client.clipboard_stage("prepare", screen_id=observed["screen_id"], text=text,
                                               focused=True, target_box=list(target_box))
@@ -457,28 +552,26 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
                     fields.pop("include_observation")  # older server: full status only
                     report.facts["light_status"] = False
 
-        polls = 0
-        copied = False
+        state = poll_status()
+        polls = 1
         if trigger_configured:
-            with _Stage(report, "wait_copied"):
+            trigger = "trigger_key"
+        elif state.get("claimed") or state.get("copied"):
+            trigger = "already_claimed"
+        else:
+            _hold(client, report, landing, "shortcut_hold")
+            trigger = "assistive_touch_hold"
+            state = poll_status()
+            polls += 1
+        with _Stage(report, "wait_copied"):
+            deadline = time.monotonic() + copy_timeout
+            while not (state.get("copied") and state.get("phase") == "awaiting_paste"):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Shortcut did not acknowledge a copy")
+                time.sleep(.25)
                 state = poll_status()
                 polls += 1
-                if state.get("copied") and state.get("phase") == "awaiting_paste":
-                    copied = True
-                    report.facts["copy_trigger"] = "trigger_key"
-        if not copied:
-            _hold(client, report, point, box, caret_box, "shortcut_hold")
-            with _Stage(report, "wait_copied"):
-                deadline = time.monotonic() + copy_timeout
-                while True:
-                    state = poll_status()
-                    polls += 1
-                    if state.get("copied") and state.get("phase") == "awaiting_paste":
-                        break
-                    if time.monotonic() > deadline:
-                        raise RuntimeError("Shortcut did not acknowledge a copy")
-                    time.sleep(.25)
-            report.facts["copy_trigger"] = "assistive_touch_hold"
+        report.facts["copy_trigger"] = trigger
         report.facts["status_polls"] = polls
         report.facts["copied"] = True
 
@@ -722,6 +815,10 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
             _recovery(report, "claimed_not_confirmed")
         else:
             _recovery(report, "not_copied")
+        if report.facts.get("hold_may_have_executed"):
+            report.facts["next_action"] = (
+                "The AssistiveTouch hold may have been dispatched. Inspect the Shortcut and clipboard "
+                "state before any further input. Do not automatically repeat the hold or paste.")
         raise FlowStopped(str(exc), report) from exc
     finally:
         report.stages["total"] = (time.perf_counter() - began) * 1000

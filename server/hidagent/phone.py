@@ -14,8 +14,10 @@ import logging
 import math
 import os
 import time
+import uuid
 from collections import deque
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
@@ -164,6 +166,50 @@ def _host_observed_pixels_match(before: bytes, current: bytes, pointer_xy, *,
     difference = ImageChops.difference(original.crop(region), latest.crop(region))
     return (max(high for _, high in difference.getextrema()) <= 5
             and sum(ImageStat.Stat(difference).mean) / 3 <= .15)
+
+
+@dataclass(frozen=True)
+class _PointerMeasurement:
+    xy: tuple[float, float]
+    source: freshness.FrameSnapshot
+    device: object
+    links: int
+    epoch: int
+    sequence: int
+    last_input_at: float
+    session_started_at: float
+    caret_scope: tuple[float, float, float, float] | None
+    issued: float
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+    @staticmethod
+    def newer(frame, older):
+        return (frame.generation == older.generation and frame.updated > older.updated
+                and (older.frame_ts is None or (frame.frame_ts is not None
+                     and freshness.board_delta(frame.frame_ts, older.frame_ts) > 0))
+                and (older.capture_age_s is None or (frame.capture_age_s is not None
+                     and frame.updated - frame.capture_age_s > older.updated - older.capture_age_s)))
+
+    def current_session(self, phone):
+        device = phone.device
+        return (device is self.device and device.links == self.links and device.abort_epoch == self.epoch
+                and device.input_sequence == self.sequence and device.last_input_at == self.last_input_at
+                and device.session_started_at == self.session_started_at
+                and freshness.snapshot(phone.screen).generation == self.source.generation
+                and 0 <= time.monotonic() - self.issued < HOST_OBSERVATION_TTL)
+
+    def evidence(self, phone, current):
+        if not self.current_session(phone) or not self.newer(current, self.source):
+            return {}
+        frozen = SimpleNamespace(snapshot=current, _freshness_phone=phone)
+        if freshness.fresh_frame(frozen, since=max(self.last_input_at, self.session_started_at)) is None:
+            return {}
+        if not _host_observed_pixels_match(self.source.frame, current.frame, self.xy,
+                                          caret_frames=getattr(phone.screen, "recent_frames", ()),
+                                          caret_scope=self.caret_scope) or not self.current_session(phone):
+            return {}
+        return {"pointer_measurement_id": self.id, "pointer_seen": True,
+                "measured_pointer": {"x": self.xy[0], "y": self.xy[1]}}
 
 
 @dataclass(frozen=True, init=False)
@@ -415,6 +461,8 @@ class Phone:
         self._pointer_confirmed = False
         self._pointer_escape_attempted = False
         self._pointer_pair_verified = False
+        self._point_measurement = None
+        self._record_pointer_measurement = None
         self._pointer_overlay = None
         self._pointer_reference = None
         self._pointer_diagnostics = None
@@ -784,7 +832,7 @@ class Phone:
                         if (selected := on_arrival(current)) is not None:
                             return selected
                     if freshness.fresh_frame(self.screen, since=sent) == current:
-                        if (selected := select(current.frame)) is not None:
+                        if (selected := select(current)) is not None:
                             return selected
                     cursor = current.updated
                 await self.screen.fresh(cursor, min(.1, max(0, deadline - time.monotonic())))
@@ -795,14 +843,15 @@ class Phone:
                     diagnostics.capture(phase, latest.frame, latest.updated)
                 if latest.generation != observed.generation:
                     raise RuntimeError("指针定位期间画面连接已变化，请重新观察。")
-                if (selected := select(latest.frame)) is not None:
+                if (selected := select(latest)) is not None:
                     return selected
             return None
 
         outward = []
         early = deque(maxlen=4)
 
-        def remember(frame):
+        def remember(snapshot):
+            frame = snapshot.frame
             if frame not in outward:
                 outward.append(frame)
             return frame if len(outward) >= sample_limit else None
@@ -865,7 +914,8 @@ class Phone:
                 diagnostics.event("result", pointer=None, reason="no_outward_or_stopped")
             return None
 
-        def locate(returned):
+        def locate(snapshot):
+            returned = snapshot.frame
             context_regions = self._pointer_context_regions()
             caret_scope = getattr(self, "_pointer_caret_scope", None)
             if not ble and screen_compare.observation_changed(
@@ -873,7 +923,12 @@ class Phone:
                 caret_frames=getattr(self.screen, "recent_frames", ()), context_regions=context_regions,
                 caret_scope=caret_scope):
                 return None
-            for frame in dict.fromkeys([*reversed(outward), *reversed(early)]):
+            # Arrival before the outward capture boundary may help schedule an
+            # escape probe; it cannot establish movement for a measurement ID.
+            candidates = list(reversed(outward))
+            if self._record_pointer_measurement is None:
+                candidates.extend(reversed(early))
+            for frame in dict.fromkeys(candidates):
                 pair = None if vertical else vision.pointer_move(frame, returned, near, -shift, reach, strict=True)
                 prior_frame, prior_pointer = reference or (None, None)
                 if ble and prior_frame is not None:
@@ -920,11 +975,13 @@ class Phone:
                     self._pointer_overlay = pair[1], returned
                     if self._pointer_reference is None and prior_pointer is not None:
                         self._pointer_reference = prior_pointer, prior_frame, returned
+                if self._record_pointer_measurement is not None:
+                    self._record_pointer_measurement(pair[1], snapshot)
                 return pair[1]
             return None
 
         if sample_limit == 1:
-            returned = await capture_after(time.time(), lambda frame: frame)
+            returned = await capture_after(time.time(), lambda snapshot: snapshot)
             result = locate(returned) if returned is not None else None
             if diagnostics:
                 diagnostics.event("result", pointer=result)
@@ -934,8 +991,9 @@ class Phone:
         def find_early_return(snapshot):
             # Only probe frames with completely unknown capture timing early;
             # HAFE/2 frames carry capture_age_s and must prove post-return capture.
-            if snapshot.frame_ts is None and getattr(snapshot, "capture_age_s", None) is None:
-                return locate(snapshot.frame)
+            if (self._record_pointer_measurement is None and snapshot.frame_ts is None
+                    and getattr(snapshot, "capture_age_s", None) is None):
+                return locate(snapshot)
             return None
 
         result = await capture_after(return_started, locate, on_arrival=find_early_return)
@@ -1047,6 +1105,8 @@ class Phone:
             if status == "changed":
                 return None
             if status == "found":
+                if self._record_pointer_measurement is not None:
+                    self._record_pointer_measurement(landing, snap)
                 if self._pace == BLE_PACE:
                     self._pointer_overlay = landing, snap.frame
                 return landing
@@ -1465,12 +1525,47 @@ class Phone:
     @bounded_operation
     @_serialized
     async def point_verified(self, x: float, y: float, *, target_box=None, rehome: bool = False,
-                             caret_scope=None) -> tuple[float, float]:
+                             caret_scope=None, measure_only=False, correction=None) -> tuple[float, float]:
         """Use measured landings and verify every correction before it can authorize a click."""
         caret_scope = _validate_caret_scope(caret_scope)
         observed = freshness.require_fresh(self.screen)
         epoch = getattr(self.device, "abort_epoch", 0)
         link = getattr(self.device, "links", 0)
+        device = self.device
+        expected_sequence = None
+        if correction is not None:
+            if not measure_only or correction[0] is not self._point_measurement:
+                raise PointerLandingError("先前的指针测量已失效，未执行纠偏。")
+            caret_scope = correction[0].caret_scope
+        self._point_measurement = None
+
+        def before_measurement_write():
+            # Device invokes this inside the HID write lock, before its single
+            # sequence increment. A later corrective/probe write retires all
+            # earlier positions, including those from this same point action.
+            nonlocal expected_sequence
+            self._point_measurement = None
+            seq = getattr(device, "input_sequence", None)
+            if (self.device is not device or getattr(device, "links", None) != link
+                    or getattr(device, "abort_epoch", None) != epoch
+                    or (expected_sequence is not None and seq != expected_sequence)):
+                raise PointerLandingError("指针测量期间设备或输入序列已变化，未继续移动。")
+            expected_sequence = seq + 1 if type(seq) is int else None
+
+        def record_measurement(xy, source):
+            if (self.device is not device or expected_sequence is None
+                    or device.input_sequence != expected_sequence or device.links != link
+                    or device.abort_epoch != epoch or source.generation != observed.generation
+                    or not all(math.isfinite(value) and 0 < value < 1 for value in xy)):
+                return
+            # Older streams may recognize a plausible return before the mirror
+            # allowance expires. Never export those pixels as causal evidence.
+            frozen = SimpleNamespace(snapshot=source, _freshness_phone=self)
+            if freshness.fresh_frame(frozen, since=max(device.last_input_at, device.session_started_at)) is None:
+                return
+            self._point_measurement = _PointerMeasurement(
+                xy, source, device, link, epoch, expected_sequence, device.last_input_at,
+                device.session_started_at, caret_scope, time.monotonic())
 
         def same_session():
             if self._stopped(epoch):
@@ -1478,6 +1573,9 @@ class Phone:
             if (freshness.require_fresh(self.screen).generation != observed.generation
                     or getattr(self.device, "links", 0) != link):
                 raise RuntimeError("指针定位期间设备或画面连接已变化，请重新观察。")
+            if measure_only and (self.device is not device or (expected_sequence is not None
+                    and getattr(device, "input_sequence", None) != expected_sequence)):
+                raise PointerLandingError("指针测量期间设备或输入序列已变化，未继续移动。")
 
         self._pointer_seen = self._pointer_confirmed = False
         self._pointer_escape_attempted = False
@@ -1490,17 +1588,54 @@ class Phone:
         if rehome:
             self._pos = None
         try:
-            await self.point(x, y)
-            return await self._confirm_point_landing(x, y, epoch, observed, same_session, target_box=target_box)
+            self._record_pointer_measurement = record_measurement if measure_only else None
+            with (input_attempt(inherit=True, before_write=before_measurement_write) if measure_only
+                  else nullcontext()):
+                if correction is None:
+                    await self.point(x, y)
+                else:
+                    await self._correct_measured_point(x, y, correction, epoch, caret_scope)
+                return await self._confirm_point_landing(
+                    x, y, epoch, observed, same_session, target_box=target_box, measure_only=measure_only)
+        except BaseException:
+            self._point_measurement = None
+            raise
         finally:
+            self._record_pointer_measurement = None
             self._pointer_caret_scope = prev_scope
             if not self._pointer_confirmed:
                 # An unconfirmed landing leaves the relative accumulator untrusted;
                 # re-home before the next move rather than carrying drift forward.
                 self._pos = None
 
+    async def _correct_measured_point(self, x, y, correction, epoch, caret_scope):
+        measured, original = correction
+        if not self.calibrated:
+            raise PointerLandingError("指针未校准，未执行纠偏。")
+        with Image.open(io.BytesIO(original.frame)) as image:
+            width, height = image.size
+        ex, ey = x - measured.xy[0], y - measured.xy[1]
+        distance = math.hypot(ex * width, ey * height)
+        scale = min(1., .08 * min(width, height) / distance) if distance else 1.
+        dx, dy = self._delta_units(ex * scale, ey * scale)
+        if not (dx or dy):
+            raise PointerLandingError("实测偏差小于最小移动量，未执行纠偏。")
+
+        def before_write():
+            current = freshness.require_fresh(self.screen)
+            if (not measured.evidence(self, current)
+                    or not _host_observed_pixels_match(
+                        original.frame, current.frame, (x, y),
+                        caret_frames=getattr(self.screen, "recent_frames", ()), caret_scope=caret_scope)):
+                raise PointerLandingError("纠偏前指针或目标证据已变化，未发送移动。")
+            self._position_before, self._position_from = current.frame, measured.xy
+
+        self._pos = None  # A relative step has no trusted absolute HID accumulator.
+        await self._send(epoch, f"move {dx} {dy}", before_write=before_write)
+        self._position_completed = time.time()
+
     async def _confirm_point_landing(self, x: float, y: float, epoch: int, observed, same_session,
-                                     *, target_box=None) -> tuple[float, float]:
+                                     *, target_box=None, measure_only=False) -> tuple[float, float]:
         same_session()
         self._pointer_spots = ((x, y),)
         found = await self._find_pointer((x, y), epoch=epoch, quick=True, required=True)
@@ -1521,8 +1656,15 @@ class Phone:
             same_session()
             return measured
 
-        if found is None:
+        if found is None or (measure_only and self._point_measurement is None):
             found = await escape_target((self._position_before, None))
+        if measure_only:
+            # Bubble acquisition owns the bounded correction after a second
+            # independent frame. A first sighting cannot alter calibration.
+            if found is not None and max(abs(found[0] - x), abs(found[1] - y)) <= AIM_TOLERANCE:
+                self._pointer_confirmed = True
+                return found
+            return x, y
         highlight_landing = False
         if found is None:
             found = self._menu_highlight_landing((x, y))

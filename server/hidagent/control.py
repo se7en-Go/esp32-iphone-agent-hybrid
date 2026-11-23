@@ -79,6 +79,7 @@ class Controls:
         self._input_observation = None
         self._host_observation = None
         self._verified_caret_scope = None
+        self._point_response = None
         self.job = None
 
     def remember_verified_caret_scope(self, region, *, device, links: int, epoch: int, generation: int) -> None:
@@ -128,7 +129,7 @@ class Controls:
             width, height = image.size
         return frame, width, height
 
-    def observation(self, accepted=None):
+    def observation(self, accepted=None, *, issuing_measurement=None):
         self.invalidate()
         try:
             accepted = accepted or require_fresh(self.screen)
@@ -147,7 +148,12 @@ class Controls:
             device, getattr(device, "links", None), getattr(device, "abort_epoch", None),
             getattr(device, "input_sequence", None), getattr(device, "last_input_at", None),
             getattr(device, "session_started_at", None))
-        return {"screen_id": token, "width": width, "height": height,
+        measurement = getattr(self.phone, "_point_measurement", None)
+        evidence = {}
+        if measurement is not None and (measurement.id == issuing_measurement
+                or (self._point_response and self._point_response[0] == measurement.id)):
+            evidence = measurement.evidence(self.phone, accepted)
+        return {"screen_id": token, "width": width, "height": height, **evidence,
                 "frame_received_at": accepted.updated, "expires_in_seconds": 30,
                 "coordinate_spaces": {"normalized": "0..1", "pixels": "0..width-1, 0..height-1"},
                 "image_base64": base64.b64encode(frame).decode()}
@@ -321,6 +327,8 @@ class Controls:
         same_session()
         ensure = getattr(self.phone, "ensure_observation", None)
         if ensure is not None and fresh_frame(self.screen, max_age=OBSERVATION_ENTRY_MAX_AGE) is None:
+            if plan.get("correct_from_measurement_id"):
+                raise ValueError("correction needs a fresh passive observation; pointer was not moved")
             before_refresh()
             await ensure(before_refresh=before_refresh)
             same_session()
@@ -331,6 +339,14 @@ class Controls:
             caret_scope=caret_scope)
         plan.update(navigation_context=navigation, target_frame=before, observation=original,
                     before_session=same_session)
+        if measurement_id := plan.get("correct_from_measurement_id"):
+            measured = getattr(self.phone, "_point_measurement", None)
+            issued = self._point_response
+            if (measured is None or measured.id != measurement_id or issued is None or issued[0] != measurement_id
+                    or not measured.newer(original, issued[1])
+                    or not measured.evidence(self.phone, original)):
+                raise ValueError("correction needs the same measured pointer in an independent new observation")
+            plan["correction"] = measured, original
         return plan, before, ticket[1]
 
     async def find_text(self, screen_id, text, nth=1, exact=False, region=None):
@@ -400,6 +416,12 @@ class Controls:
         data = request.model_dump()
         name = request.action
         extra: dict = {}
+        measure_only = getattr(request, "measure_only", False)
+        correction = getattr(request, "correct_from_measurement_id", None)
+        if measure_only and name != "point":
+            raise ValueError("measure_only requires a point action")
+        if correction and (not measure_only or request.rehome or request.target_box is None):
+            raise ValueError("correction requires measure_only, a target_box and no rehome")
         if request.repeat != 1 and (name != "key" or request.text.lower() not in ("backspace", "left", "right")):
             raise ValueError("repeat>1 only supports editing keys backspace/left/right; never repeat Enter")
 
@@ -435,6 +457,10 @@ class Controls:
                 planned["target_box"] = box
             if name == "point" and getattr(request, "rehome", False):
                 planned["rehome"] = True
+            if measure_only:
+                planned["measure_only"] = True
+            if correction:
+                planned["correct_from_measurement_id"] = correction
             if name == "scroll":
                 planned["lines"] = request.lines
             if name == "long_press":
@@ -556,6 +582,11 @@ class Controls:
             return result
         elif name == "point":
             kwargs = {}
+            if planned.get("measure_only"):
+                kwargs["measure_only"] = True
+                extra.update(_expected_measurement=None, measured_pointer=None, pointer_seen=False)
+            if planned.get("correction") is not None:
+                kwargs["correction"] = planned["correction"]
             if "target_box" in planned:
                 kwargs["target_box"] = planned["target_box"]
             if planned.get("rehome"):
@@ -569,6 +600,16 @@ class Controls:
             # point_verified returns the request when its final correction is
             # unconfirmed, even if it saw a pointer earlier in the movement.
             extra["pointer_seen"] = confirmed
+            if planned.get("measure_only"):
+                measured = self.phone._point_measurement
+                extra["_expected_measurement"] = measured.id if measured is not None else None
+                extra["measured_pointer"] = None
+                extra["pointer_seen"] = False
+                if measured is not None:
+                    # Localization already waited for pixels after the last HID
+                    # write. Start settling at that write, while the cursor is
+                    # still visible. Evidence also requires a newer source frame.
+                    return measured.last_input_at
         elif name == "swipe":
             x1, y1, x2, y2 = planned["swipe"]
             await self.phone.swipe(x1, y1, x2, y2, hold=planned["hold"],
@@ -712,7 +753,9 @@ class Controls:
                     or time.monotonic() >= deadline):
                 break
             if current.frame == accepted.frame:
-                shot = self.observation(current)
+                measurement_id = extra.get("_expected_measurement")
+                shot = (self.observation(current, issuing_measurement=measurement_id) if measurement_id
+                        else self.observation(current))
                 latest = fresh_frame(self.screen, since=completed_at)
                 if (not self._response_session_valid(session) or latest is None
                         or time.monotonic() >= deadline):
@@ -755,6 +798,13 @@ class Controls:
         tap_timing = extra.pop("timing_ms", {})
         if tap_timing:
             tap_timing["diff"] = round(tap_timing.get("diff", 0) + (captured - diff_started) * 1000, 2)
+        if "_expected_measurement" in extra:
+            expected = extra.pop("_expected_measurement")
+            if expected is not None and shot.get("pointer_measurement_id") == expected:
+                extra.update(measured_pointer=shot["measured_pointer"], pointer_seen=True)
+                self._point_response = expected, self._observation
+            else:
+                shot.pop("pointer_measurement_id", None)
         return {**shot, "command_acknowledged": acknowledged, "fresh": usable,
                 "changed": vision.changed(before, after) if usable else None,
                 "screen_diff": diff,
@@ -917,8 +967,9 @@ class Controls:
         label = getattr(request, "target_label", "")
         if duration is not None and is_send_target(label, label):
             raise ValueError("host-observed hold cannot target a Send control")
+        scope = send_target_scope(is_send_target(label, label)) if duration is None else nullcontext()
         try:
-            with send_target_scope(is_send_target(label, label)) if duration is None else nullcontext():
+            with input_attempt(inherit=True) as contact, scope:
                 result = await self.phone.click_observed(
                     observation=observation, pointer_xy=pointer, target_box=box,
                     expected_device=inputs.device, expected_links=inputs.links,
@@ -935,6 +986,9 @@ class Controls:
             self.clear_verified_caret_scope()
         except (RuntimeError, OSError) as exc:
             error = str(exc)
+        # Device marks the contact at the actual UART write, before its ACK.
+        # A frame rejection before that boundary can be observed afresh.
+        extra["action_may_have_executed"] = contact.written
         return await self._respond(before, completed_at or time.time(), began, ready, acknowledged, error, extra,
                                    True, False, response_session)
 
@@ -946,6 +1000,8 @@ class Controls:
         observed_at = self.ticket[1] if self.ticket else 0
         before, width, height = self.consume(screen_id)
         plans = [self._plan(request, width, height) for request in requests]
+        if any(plan.get("measure_only") for plan in plans):
+            raise ValueError("measure_only requires a single observed point outside a batch")
         for plan in plans:
             plan["target_frame"] = before
             plan["observation"] = self._observation
