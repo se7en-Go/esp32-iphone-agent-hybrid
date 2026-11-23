@@ -665,3 +665,103 @@ def test_confirm_short_circuits_before_after_and_keeps_event_loop_responsive(mon
         assert ticks >= 2
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["admission", "consumption"])
+@pytest.mark.parametrize("outcome", [
+    "transient", "permanent", "deadline", "changed_session", "replacement_ticket", "replay",
+])
+def test_confirm_rechecks_the_same_ticket_after_a_transient_visual_change(monkeypatch, phase, outcome):
+    from dataclasses import replace
+
+    from fake_clock import ManualClock
+
+    from hidagent import clipboard_control, freshness, screen_compare
+
+    async def scenario():
+        screen, provider, phone, control, manager = setup(monkeypatch)
+        prepared = await manager.prepare(prepare_body(control))
+        transaction = prepared["transaction_id"]
+        copied(provider, screen)
+        await manager.paste(PasteTransaction(
+            transaction_id=transaction, screen_id=control.observation()["screen_id"], focused=True))
+        seen = field_image(text=True)
+        if outcome == "permanent":
+            changed = changed_scene("orange")
+        else:
+            with Image.open(io.BytesIO(seen)) as image:
+                # Glyph-sized animation in the original input field still counts as a change.
+                ImageDraw.Draw(image).rectangle((180, 251, 200, 270), fill=(67, 68, 69))
+                output = io.BytesIO()
+                image.save(output, "PNG")
+                changed = output.getvalue()
+        assert screen_compare.observation_changed(seen, changed)
+        screen._on_jpeg(seen)
+        issued = control.observation()["screen_id"]
+        if phase == "admission":
+            screen._on_jpeg(changed)
+        else:
+            guard_class = type(manager.transaction.guard)
+            original_check = guard_class.__call__
+
+            def check(guard, *, stage):
+                accepted = original_check(guard, stage=stage)
+                if stage == "accept":
+                    screen._on_jpeg(changed)
+                return accepted
+
+            monkeypatch.setattr(guard_class, "__call__", check)
+
+        waits = []
+        replacement = None
+        deadline_clock = ManualClock()
+        if outcome == "deadline":
+            monkeypatch.setattr(clipboard_control, "time", deadline_clock)
+
+        async def next_frame(since, timeout):
+            nonlocal replacement
+            assert since == screen.updated
+            assert 0 < timeout <= 1.5
+            waits.append(since)
+            if outcome == "permanent" and len(waits) > 1:
+                return None
+            if len(waits) == 1:
+                screen._on_jpeg(changed)
+                return changed
+            if outcome == "deadline":
+                deadline_clock.advance(timeout)
+            if outcome == "changed_session":
+                phone.device.abort_epoch += 1
+            screen._on_jpeg(seen)
+            if outcome == "replacement_ticket":
+                replacement = control.observation()["screen_id"]
+            if outcome == "replay":
+                screen._snapshot = replace(freshness.snapshot(screen), capture_age_s=1.)
+            return seen
+
+        monkeypatch.setattr(screen, "fresh", next_frame)
+        confirmation = ConfirmPaste(
+            transaction_id=transaction, screen_id=issued, observed_text="你好00123", confirmed=True)
+        failures = {
+            "permanent": (ValueError, "screen changed since observation"),
+            "deadline": (ValueError, "screen changed since observation"),
+            "changed_session": (RuntimeError, "clipboard input session changed"),
+            "replacement_ticket": (ValueError, "invalid or consumed screen_id"),
+            "replay": (ValueError, "confirmation requires a fresh post-paste observation"),
+        }
+        if outcome == "transient":
+            receipt = await manager.confirm(confirmation)
+            assert receipt["phase"] == "completed" and receipt["effect_verified"] is True
+            assert control.ticket[0] != issued
+        else:
+            error, message = failures[outcome]
+            with pytest.raises(error, match=message):
+                await manager.confirm(confirmation)
+            assert (manager.transaction is None) is (outcome == "changed_session")
+            if outcome == "replacement_ticket":
+                assert control.ticket[0] == replacement
+        assert len(waits) == 2
+        assert waits[0] < waits[1]
+        assert phone.sent.count("cmd+v") == 1
+
+    asyncio.run(scenario())

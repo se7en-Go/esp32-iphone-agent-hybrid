@@ -20,6 +20,7 @@ from .operation import check_operation
 from .text_input import select_type_mode
 
 log = logging.getLogger(__name__)
+_CONFIRM_SETTLE_TIMEOUT = 1.5
 
 
 class TransactionId(BaseModel):
@@ -249,6 +250,32 @@ class StagedClipboardControls:
         return {**result, "command_acknowledged": True, "effect_verified": False,
                 "verification_required": "Inspect the inserted text in the original field; confirm separately."}
 
+    async def _validate_confirmation_ticket(self, item, controls, screen_id):
+        """Wait briefly for the original ticket to match a new frame after a transient change."""
+        deadline = time.monotonic() + _CONFIRM_SETTLE_TIMEOUT
+
+        def rejected(reason, current):
+            nonlocal changed_at
+            changed_at = current.updated if reason == "layout_changed" else None
+
+        while True:
+            check_operation()
+            changed_at = None
+            try:
+                controls._validate_ticket(controls.ticket, screen_id, caret_scope=item.guard.region,
+                                          on_reject=rejected)
+            except ValueError:
+                remaining = deadline - time.monotonic()
+                if changed_at is None or remaining <= 0:
+                    raise
+                arrived = await controls.screen.fresh(changed_at, remaining)
+                check_operation()
+                self._session(item)
+                if arrived is None or time.monotonic() >= deadline:
+                    raise
+            else:
+                return
+
     async def confirm(self, request):
         item = self._lookup(request.transaction_id)
         if request.confirmed is not True:
@@ -259,7 +286,8 @@ class StagedClipboardControls:
             raise ValueError("paste has not been sent")
         self._session(item)
         controls = self.get_controls()
-        controls._validate_ticket(controls.ticket, request.screen_id, caret_scope=item.guard.region)
+        ticket = controls.ticket
+        await self._validate_confirmation_ticket(item, controls, request.screen_id)
         if not self._post_event_evidence(controls, item.completed_at):
             raise ValueError("confirmation requires a fresh post-paste observation")
         evidence = {}
@@ -338,10 +366,18 @@ class StagedClipboardControls:
         if evidence:
             if self._lookup(item.nonce) is not item:
                 raise ValueError("clipboard transaction changed during confirmation")
-            self._session(item)
-            if not self._post_event_evidence(controls, item.completed_at):
+        self._session(item)
+        if evidence and fresh_frame(controls.screen, since=item.completed_at) is None:
+            raise ValueError("confirmation requires a fresh post-paste observation")
+        try:
+            await self._validate_confirmation_ticket(item, controls, request.screen_id)
+            # The selected frame was already fresh and causal at admission.
+            # Require a live post-paste frame again after the final comparison.
+            if fresh_frame(controls.screen, since=item.completed_at) is None:
                 raise ValueError("confirmation requires a fresh post-paste observation")
-        controls.consume(request.screen_id, caret_scope=item.guard.region)
+        finally:
+            if controls.ticket is ticket:
+                controls.invalidate()
         state = item.provider.stage_finish(item.nonce, confirmed=True)
         self.transaction = None
         if item.guard.region is not None and hasattr(controls, "remember_verified_caret_scope"):

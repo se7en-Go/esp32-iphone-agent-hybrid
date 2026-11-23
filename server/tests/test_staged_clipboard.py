@@ -236,7 +236,10 @@ def test_host_confirmation_requires_exact_text_and_post_paste_frame(monkeypatch)
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("transition", ["accepted", "unproved", "new_page", "new_session", "new_device", "new_screen"])
+@pytest.mark.parametrize("transition", [
+    "accepted", "accepted_after_ocr", "stale_after_ocr", "changed_after_ocr",
+    "unproved", "new_page", "new_session", "new_device", "new_screen",
+])
 def test_permission_confirmation_keeps_the_original_transaction_and_current_ticket(monkeypatch, transition):
     from hidagent import feedback, paste_confirmation
     from hidagent.clipboard_control import ConfirmPaste, PasteTransaction
@@ -264,7 +267,13 @@ def test_permission_confirmation_keeps_the_original_transaction_and_current_tick
             if not calls:
                 assert presented == sheet
             calls.append(presented)
-            if transition == "new_page":
+            if transition in {"accepted_after_ocr", "stale_after_ocr", "changed_after_ocr"}:
+                # Expire the selected frame while the permission verifier runs.
+                after_ocr = time.time() + 6
+                monkeypatch.setattr(time, "time", lambda: after_ocr)
+            if transition == "accepted_after_ocr":
+                screen._on_jpeg(after)
+            if transition in {"new_page", "changed_after_ocr"}:
                 screen._on_jpeg(changed_scene("green"))
             if transition == "new_session":
                 phone.device.links += 1
@@ -287,14 +296,20 @@ def test_permission_confirmation_keeps_the_original_transaction_and_current_tick
         request = ConfirmPaste(transaction_id=prepared["transaction_id"],
                                screen_id=control.observation()["screen_id"],
                                observed_text="你好00123", confirmed=True)
-        if transition == "accepted":
+        if transition in {"new_page", "changed_after_ocr"}:
+            async def no_later_frame(_since, _timeout):
+                return None
+
+            monkeypatch.setattr(screen, "fresh", no_later_frame)
+        if transition in {"accepted", "accepted_after_ocr"}:
             receipt = await manager.confirm(request)
             assert receipt["phase"] == "completed" and receipt["effect_verified"]
             assert receipt["confirmation_evidence"] == "paste_permission_dismissed"
             assert receipt["verified_by"] == "host_observation" and not receipt["server_content_verified"]
             assert provider.current() == {"active": False, "needs_resolution": False}
         else:
-            with pytest.raises((ValueError, RuntimeError, HTTPException)):
+            error = {"stale_after_ocr": "fresh post-paste", "changed_after_ocr": "screen changed since observation"}
+            with pytest.raises((ValueError, RuntimeError, HTTPException), match=error.get(transition)):
                 await manager.confirm(request)
             if transition in {"new_session", "new_device", "new_screen"}:
                 assert provider.current() == {"active": False, "needs_resolution": True}
@@ -337,6 +352,77 @@ def test_router_releases_shared_lock_after_prepare(monkeypatch):
             assert (await client.get("/observe")).status_code == 200
             assert (await client.post("/api/control/clipboard/cancel", json={
                 "transaction_id": result.json()["transaction_id"]})).status_code == 200
+
+    asyncio.run(scenario())
+
+
+def test_confirm_http_accepts_first_request_after_transient_frame_and_slow_ocr(monkeypatch):
+    from hidagent import feedback, paste_confirmation
+    from hidagent.clipboard_control import create_control_router
+
+    def scene(color):
+        with Image.open(io.BytesIO(field_image(text=True))) as image:
+            ImageDraw.Draw(image).rectangle((60, 80, 345, 150), fill=color)
+            output = io.BytesIO()
+            image.save(output, "PNG")
+            return output.getvalue()
+
+    async def scenario():
+        screen, provider, phone, control, _ = setup(monkeypatch)
+        sheet, pasted, transient = scene("blue"), scene("orange"), scene("green")
+        lock = asyncio.Lock()
+        compared = []
+
+        async def capture(_screen, _completed_at):
+            screen._on_jpeg(sheet)
+            return sheet
+
+        async def verify(_original, presented, selected, _region, text):
+            compared.append(presented)
+            if presented != sheet:
+                return False
+            assert selected == pasted and text == "你好00123"
+            wall_clock = time.time
+            monkeypatch.setattr(time, "time", lambda: wall_clock() + 6)
+            screen._on_jpeg(pasted)
+            return True
+
+        async def settled(since, timeout):
+            assert 0 < timeout <= 1.5 and since == screen.updated
+            screen._on_jpeg(pasted)
+            return pasted
+
+        async def connected(_request, awaitable):
+            return await awaitable
+
+        monkeypatch.setattr(feedback, "wait_after_action", capture)
+        monkeypatch.setattr(paste_confirmation, "verify_after_paste_permission", verify)
+        app = FastAPI()
+        app.include_router(create_control_router(lambda: control, lambda: lock, lambda: None,
+                                                 lambda: None, connected))
+        path = "/api/control/clipboard"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            prepared = await client.post(f"{path}/prepare", json=prepare_body(control).model_dump())
+            assert prepared.status_code == 200
+            copied(provider, screen)
+            transaction = {"transaction_id": prepared.json()["transaction_id"]}
+            dispatched = await client.post(f"{path}/paste", json={
+                **transaction, "screen_id": control.observation()["screen_id"], "focused": True,
+            })
+            assert dispatched.status_code == 200
+            screen._on_jpeg(pasted)
+            selected = control.observation()["screen_id"]
+            screen._on_jpeg(transient)
+            monkeypatch.setattr(screen, "fresh", settled)
+            confirmed = await client.post(f"{path}/confirm", json={
+                **transaction, "screen_id": selected, "observed_text": "你好00123", "confirmed": True,
+            })
+        assert confirmed.status_code == 200
+        assert confirmed.json()["confirmation_evidence"] == "paste_permission_dismissed"
+        assert confirmed.json()["effect_verified"]
+        assert compared == [sheet]
+        assert phone.sent == ["ctrl+alt+p", "cmd+v"]
+        assert provider.current() == {"active": False, "needs_resolution": False}
 
     asyncio.run(scenario())
 
