@@ -910,3 +910,123 @@ def test_verify_confirm_frame_edges_and_scrolled_long_text(monkeypatch):
     boxes[:] = [ocr.TextBox("第二行", (.16, .50, .40, .53), (.28, .515), .98)]
     ok, _ = paste_flow._verify_confirm_frame(None, PASTED_JPEG, region, "第一行\n第二行")
     assert ok is False
+
+
+@pytest.mark.parametrize("change", [None, "gone", "source", "page", "button"])
+def test_allow_refresh_after_two_unmeasured_moves_clicks_once_or_stops(vision, monkeypatch, change):
+    """Two real point receipts preceded the historical stale third ticket."""
+    client = FakeClient(confirm_conflicts=0, trigger_configured=True, copied_on_prepare=True)
+    original_control, original_observe = client.control, client.observe
+    points = 0
+    refreshed = False
+    changed = b"changed-permission-scene"
+    boxes = list(SHEET_BOXES)
+    if change == "gone":
+        boxes = [PAGE_HEADER]
+    elif change == "source":
+        boxes[0] = ocr.TextBox("微信想要从相册粘贴", boxes[0].box, boxes[0].center, .98)
+    elif change == "page":
+        boxes[-1] = ocr.TextBox("另一个群", PAGE_HEADER.box, PAGE_HEADER.center, .99)
+    elif change == "button":
+        boxes[1] = ocr.TextBox("允许粘贴", (.46, .54, .50, .57), (.48, .557), .98)
+    original_read = ocr.read_text
+    monkeypatch.setattr(ocr, "read_text", lambda raw: boxes if raw == changed else original_read(raw))
+
+    def point(name, screen_id, **fields):
+        nonlocal points, refreshed
+        if name == "point" and "paste" in client.calls:
+            points += 1
+            if points == 3:
+                refreshed = True
+                raise RuntimeError("HTTP 409: screen changed since observation; observe again")
+            client.allow_measured_pointer = None if points < 3 else "auto"
+        return original_control(name, screen_id, **fields)
+
+    def observe(for_click=False):
+        if refreshed and change is not None:
+            return {**original_observe(for_click), "image_base64": base64.b64encode(changed).decode()}
+        return original_observe(for_click)
+
+    monkeypatch.setattr(client, "control", point)
+    monkeypatch.setattr(client, "observe", observe)
+    if change is None:
+        report = paste_flow.run(client, TEXT, FIELD, confirm_attempts=1).as_dict()
+        assert report["phase"] == "completed" and report["effect_verified"]
+        assert len(client.click_calls) == 1
+        assert client.calls.count("confirm") == 1
+        assert points == 4
+    else:
+        with pytest.raises(paste_flow.FlowStopped, match="permission prompt changed"):
+            paste_flow.run(client, TEXT, FIELD, confirm_attempts=1)
+        assert client.click_calls == []
+        assert "confirm" not in client.calls
+    assert client.calls.count("paste") == 1
+
+
+@pytest.mark.parametrize("failure", ["stale_forever", "click_unknown", "initial_wrong_source"])
+def test_allow_refresh_is_bounded_and_never_repeats_uncertain_click(vision, monkeypatch, failure):
+    client = FakeClient(confirm_conflicts=0, trigger_configured=True, copied_on_prepare=True)
+    points = clicks = 0
+    original_control = client.control
+    if failure == "initial_wrong_source":
+        original_read = ocr.read_text
+        prompt = SHEET_BOXES[0]
+        changed = [ocr.TextBox("微信想要从相册粘贴", prompt.box, prompt.center, .98), *SHEET_BOXES[1:]]
+        monkeypatch.setattr(ocr, "read_text", lambda raw: changed if raw == SHEET_JPEG else original_read(raw))
+
+    def point(name, screen_id, **fields):
+        nonlocal points
+        if name == "point":
+            points += 1
+            if failure == "stale_forever":
+                raise RuntimeError("HTTP 409: screen changed since observation; observe again")
+        return original_control(name, screen_id, **fields)
+
+    def click(*args, **kwargs):
+        nonlocal clicks
+        clicks += 1
+        raise RuntimeError("Allow Paste click dispatch is uncertain")
+
+    monkeypatch.setattr(client, "control", point)
+    monkeypatch.setattr(client, "click_observed", click)
+    with pytest.raises(paste_flow.FlowStopped):
+        paste_flow.run(client, TEXT, FIELD, confirm_attempts=1)
+    assert client.calls.count("paste") == 1
+    assert "confirm" not in client.calls
+    assert clicks == (1 if failure == "click_unknown" else 0)
+    assert points == {"stale_forever": 3, "click_unknown": 1, "initial_wrong_source": 0}[failure]
+
+
+def test_paste_flow_exits_permission_check_early_once_direct_paste_verified(vision, monkeypatch):
+    toast_frame = b"toast-banner-over-header"
+    original_read = ocr.read_text
+    pasted_boxes = list(original_read(PASTED_JPEG))
+    toast_boxes = [ocr.TextBox("微信-粘贴自：快捷指令", PAGE_HEADER.box, PAGE_HEADER.center, .98), *pasted_boxes]
+    pasted_with_header = [PAGE_HEADER, *pasted_boxes]
+    monkeypatch.setattr(ocr, "read_text", lambda raw: (
+        toast_boxes if raw == toast_frame else (pasted_with_header if raw == PASTED_JPEG else original_read(raw))
+    ))
+
+    class DirectToastClient(FakeClient):
+        def __init__(self):
+            super().__init__(sheet=False, confirm_conflicts=0, trigger_configured=True, copied_on_prepare=True)
+            self.post_paste_observes = 0
+
+        def clipboard_stage(self, stage, **fields):
+            result = super().clipboard_stage(stage, **fields)
+            if stage == "paste":
+                return {**result, "image_base64": base64.b64encode(toast_frame).decode()}
+            return result
+
+        def observe(self, for_click=False):
+            if "paste" in self.calls:
+                self.post_paste_observes += 1
+            return super().observe(for_click=for_click)
+
+    client = DirectToastClient()
+    report = paste_flow.run(client, TEXT, FIELD, expect_title="实验笔记本", confirm_attempts=1).as_dict()
+    assert report["phase"] == "completed" and report["effect_verified"] is True
+    assert client.calls.count("confirm") == 1
+    # One post-paste observe clears the header toast; one observe runs confirm
+    # (vs 4 + 1 without early exit when ALLOW_CHECK_ATTEMPTS == 4).
+    assert client.post_paste_observes == 2

@@ -112,6 +112,7 @@ TAP_POINTER_WAIT = 0.12  # opportunistic disc check; a late/hidden pointer uses 
 TAP_EFFECT_WAIT = 1.75  # one mirror-lag window after the click; no automatic retry
 WAKE_NUDGE = 2
 WAKE_OUTWARD_HOLD = .05  # separate the two reports; only the completed return authorizes a new frame
+POINTER_RETURN_QUIET_SECONDS = .15  # independent post-return publications, not just post-write capture
 POINTER_FADE_SECONDS = 3.0
 OBSERVATION_REFRESH_WAIT = 3.5
 OBSERVATION_ENTRY_MAX_AGE = 1.0  # leave motion/verification time inside the unchanged 5-second write limit
@@ -1012,7 +1013,12 @@ class Phone:
                 diagnostics.event("result", pointer=None, reason="no_outward_or_stopped")
             return None
 
+        pending_return = None
+        with Image.open(io.BytesIO(baseline)) as image:
+            measurement_size = image.size
+
         def locate(snapshot):
+            nonlocal pending_return
             returned = snapshot.frame
             context_regions = self._pointer_context_regions()
             caret_scope = getattr(self, "_pointer_caret_scope", None)
@@ -1060,6 +1066,25 @@ class Phone:
                     continue
                 if diagnostics:
                     diagnostics.event("pair", matched=True, coordinates=pair)
+                if ble and self._record_pointer_measurement is not None:
+                    # HAFE capture after HID acknowledgement is causal, but can
+                    # still show iOS animating the return/hover. Do not publish
+                    # that first pair as a landing. Require a distinct fresh
+                    # publication with the same strict pixels and paired pose.
+                    previous = pending_return
+                    stable = (previous is not None and _PointerMeasurement.newer(snapshot, previous[1])
+                              and math.hypot(*((a - b) * size for a, b, size in
+                                               zip(pair[1], previous[0], measurement_size, strict=True))) <= 2
+                              and _host_observed_pixels_match(previous[1].frame, returned, previous[0],
+                                                              caret_frames=getattr(self.screen, "recent_frames", ()),
+                                                              caret_scope=caret_scope))
+                    if not stable:
+                        pending_return = (pair[1], snapshot)
+                    if not stable or snapshot.updated - previous[1].updated < POINTER_RETURN_QUIET_SECONDS:
+                        if diagnostics:
+                            diagnostics.event("return_unsettled", pointer=pair[1],
+                                              reason="first_or_changed_pair" if not stable else "quiet_window")
+                        return None
                 if ble:
                     if (any(abs(p - t) > BLE_PAIRED_MAX_MISS for p, t in zip(pair[1], near, strict=True))
                             or screen_compare.observation_changed(
@@ -1076,6 +1101,7 @@ class Phone:
                 if self._record_pointer_measurement is not None:
                     self._record_pointer_measurement(pair[1], snapshot)
                 return pair[1]
+            pending_return = None
             return None
 
         if sample_limit == 1:
@@ -2786,6 +2812,12 @@ class Phone:
         if before_action is not None:
             before_action()
         await self._send(getattr(self.device, "abort_epoch", 0), f"key {combo}", before_write=before_action)
+
+    @_serialized
+    async def middleclick(self, *, before_action: Callable[[], None] | None = None) -> None:
+        if before_action is not None:
+            before_action()
+        await self._send(getattr(self.device, "abort_epoch", 0), "middleclick", before_write=before_action)
 
     @property
     def app_search_available(self) -> bool:

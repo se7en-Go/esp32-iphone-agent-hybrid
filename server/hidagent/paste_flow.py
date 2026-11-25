@@ -8,6 +8,7 @@ this module adds no masks or exemptions. It stops before any Send control.
 import base64
 import io
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -549,8 +550,13 @@ def _press_allow(client, report, expected, transaction):
 
     if ocr.normalize_text(expected.label) not in ALLOW_LABELS:
         raise RuntimeError("no explicit Allow Paste button in the permission prompt")
+    # This flow stages through Shortcuts, never an arbitrary clipboard source.
+    source = expected.prompt.translate(str.maketrans("", "", '“”「」\"'))
+    if not re.search(r"(?:[从從](?:快捷指令|捷徑)(?:粘贴|貼上)|pastefromshortcuts(?:$|[^a-z]))", source):
+        raise RuntimeError("paste permission prompt changed or has an unexpected source")
     miss = None
-    for attempt in range(ALLOW_POINT_ATTEMPTS):
+    attempt = stale_attempts = 0
+    while attempt < ALLOW_POINT_ATTEMPTS:
         observed = (_next_allow_observation(client, report, miss[0]) if miss
                     else _observe(client, report, stage="allow_observe"))
         target = _allow_target(_frame(observed))
@@ -568,10 +574,15 @@ def _press_allow(client, report, expected, transaction):
             with _Stage(report, "allow_point"):
                 moved = client.control("point", observed["screen_id"], **fields)
         except RuntimeError as exc:
-            if not _stale_permission_ticket(exc) or attempt + 1 == ALLOW_POINT_ATTEMPTS:
+            # Rejected before point dispatch: refresh and recheck the same sheet.
+            # A stale ticket must not consume the independent pointer-correction
+            # budget (the recorded failure had already used two measurements).
+            stale_attempts += 1
+            if not _stale_permission_ticket(exc) or stale_attempts >= ALLOW_POINT_ATTEMPTS:
                 raise
             report.retry("allow_paste_point")
             continue
+        attempt += 1
         report.server_timing_ms.setdefault("allow_point", []).append(moved.get("timing_ms"))
         if moved.get("command_acknowledged") is not True:
             raise RuntimeError("Allow Paste move was not acknowledged")
@@ -626,12 +637,12 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
     try:
         caps = client.capabilities() if hasattr(client, "capabilities") else {}
         features = (caps or {}).get("features") or {}
-        # Legacy action schemas ignore unknown fields and can execute a normal
-        # calibrated point. Negotiate before sending the first positioning input.
-        if features.get("point_measurement") is not True:
-            raise RuntimeError("paste-flow requires a control server with point_measurement support")
         trigger_configured = bool((features.get("clipboard") or {}).get("trigger_configured"))
         report.facts["trigger_configured"] = trigger_configured
+        # Legacy action schemas ignore unknown fields and can execute a normal
+        # calibrated point. Negotiate before sending the first positioning input.
+        if not trigger_configured and features.get("point_measurement") is not True:
+            raise RuntimeError("paste-flow requires a control server with point_measurement support")
         first = _observe(client, report, stage="initial_observe")
         frame = base64.b64decode(first["image_base64"])
         _verify_target_context(frame, target_box, expect_title=expect_title, report=report)
@@ -640,30 +651,54 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
             if raw != frame:
                 _verify_target_context(raw, target_box, expect_title=expect_title, report=report)
 
-        landing = _BubblePointer(client, report, caret_box, target_box, check_context)
-        landing.target = assistive_vision.track_button_target(frame)
-        for _ in range(6):
-            if landing.target is not None:
-                break
-            time.sleep(.25)
-            landing.target = assistive_vision.track_button_target(client.screenshot())
-        if landing.target is None:
-            raise RuntimeError("AssistiveTouch button not visible")
-
-        landing.acquire()
-        if prewarm:
-            _hold(client, report, landing, "prewarm_hold")
-            time.sleep(2.5)
-            # A hold is a new input. Acquire independent evidence for the
-            # formal copy trigger even when the ball appears stationary.
+        if trigger_configured:
+            for attempt in range(3):
+                if attempt > 0:
+                    time.sleep(.25)
+                if caret_box:
+                    with _Stage(report, "caret_sync"):
+                        wait_caret_plateau(client, caret_box)
+                if attempt > 0 or caret_box:
+                    observed = _observe(client, report, stage="prepare_observe")
+                    check_context(_frame(observed))
+                else:
+                    observed = first
+                prepare_frame = _frame(observed)
+                keep("1-prepare-original", observed)
+                try:
+                    with _Stage(report, "prepare"):
+                        prepared = client.clipboard_stage("prepare", screen_id=observed["screen_id"], text=text,
+                                                          focused=True, target_box=list(target_box))
+                    break
+                except RuntimeError as exc:
+                    if not str(exc).startswith("HTTP 409:") or attempt == 2:
+                        raise
+                    report.retry("prepare")
+        else:
             landing = _BubblePointer(client, report, caret_box, target_box, check_context)
+            landing.target = assistive_vision.track_button_target(frame)
+            for _ in range(6):
+                if landing.target is not None:
+                    break
+                time.sleep(.25)
+                landing.target = assistive_vision.track_button_target(client.screenshot())
+            if landing.target is None:
+                raise RuntimeError("AssistiveTouch button not visible")
+
             landing.acquire()
-        observed = landing.verified_observation("prepare_observe")
-        prepare_frame = _frame(observed)
-        keep("1-prepare-original", observed)
-        with _Stage(report, "prepare"):
-            prepared = client.clipboard_stage("prepare", screen_id=observed["screen_id"], text=text,
-                                              focused=True, target_box=list(target_box))
+            if prewarm:
+                _hold(client, report, landing, "prewarm_hold")
+                time.sleep(2.5)
+                # A hold is a new input. Acquire independent evidence for the
+                # formal copy trigger even when the ball appears stationary.
+                landing = _BubblePointer(client, report, caret_box, target_box, check_context)
+                landing.acquire()
+            observed = landing.verified_observation("prepare_observe")
+            prepare_frame = _frame(observed)
+            keep("1-prepare-original", observed)
+            with _Stage(report, "prepare"):
+                prepared = client.clipboard_stage("prepare", screen_id=observed["screen_id"], text=text,
+                                                  focused=True, target_box=list(target_box))
         transaction = prepared["transaction_id"]
         time.sleep(.6)
         fields = {"transaction_id": transaction}
@@ -790,6 +825,8 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
                             time.sleep(.2)
                     else:
                         raise RuntimeError("Allow Paste permission sheet did not dismiss with the expected text")
+                    break
+                if _verify_confirm_frame(prepare_frame, candidate, target_box, text, expect_title=expect_title)[0]:
                     break
                 if attempt + 1 < ALLOW_CHECK_ATTEMPTS:
                     time.sleep(.3)

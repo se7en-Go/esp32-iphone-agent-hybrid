@@ -366,6 +366,9 @@ def test_probe_measurement_requires_own_causal_outward_and_return(rig, monkeypat
                 clock.call_later(.01 if outward == "stale" else .09, publish_outward)
             if data.endswith(b"move -25 0\n"):
                 clock.call_later(.09, screen._on_jpeg, returned)
+                # Causality alone no longer exports an animating first return.
+                # Publish an independent stationary return after the quiet window.
+                clock.call_later(.26, screen._on_jpeg, returned)
 
         async def initial_move(x, y):
             await phone._send(device.abort_epoch, "move 9 0")
