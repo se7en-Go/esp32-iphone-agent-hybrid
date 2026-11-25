@@ -210,9 +210,21 @@ def _translucent_pointer_fade(visible, background, points, width):
                   / (len(core)*alpha) for c in range(3))
     if not 24 <= min(color) <= max(color) <= 100 or max(color)-min(color) > 20:
         return False
+    def steep_bg_edge(point):
+        px, py = point
+        center = bl.getpixel(point)
+        return any(
+            abs(center - bl.getpixel((px + ox, py + oy))) >= 40
+            for ox in (-1, 0, 1) for oy in (-1, 0, 1)
+            if (ox or oy) and 0 <= px + ox < bl.width and 0 <= py + oy < bl.height
+        )
+
     gray = (mean_a-scale*mean_b)/alpha
     core_errors = [abs(al.getpixel(p)-scale*bl.getpixel(p)-alpha*gray) for p in core]
-    if max(core_errors) > 12 or sum(core_errors)/len(core_errors) > 4:
+    core_spikes = [p for p, err in zip(core, core_errors, strict=True) if err > 12]
+    if (max(core_errors) > 24 or len(core_spikes) > 2
+            or not all(steep_bg_edge(p) for p in core_spikes)
+            or sum(core_errors)/len(core_errors) > 4):
         return False  # raw luminance retains even thin glyph edits; no blur here
     pixels = [(x, y) for y in range(a.height) for x in range(a.width)]
     around = [p for p in pixels if math.hypot(p[0]-cx, p[1]-cy) > radius+2]
@@ -227,13 +239,18 @@ def _translucent_pointer_fade(visible, background, points, width):
         for dy in (0, -.25, .25):
             for dr in (0, -.25, -.5, .25, -.75):
                 for edge in (1., 1.5, 2., 1.375):
-                    coverages, errors = [], []
+                    coverages, errors, edge_spikes = [], [], 0
                     for p in pixels:
                         coverage = max(0., min(1., (radius+dr+edge/2-math.hypot(p[0]-cx-dx, p[1]-cy-dy))/edge))
                         coverages.append(alpha*coverage)
-                        errors.append(abs(al.getpixel(p)-(bl.getpixel(p)*(1-alpha*coverage)+gray*alpha*coverage)))
-                        if errors[-1] > 18:
+                        err = abs(al.getpixel(p)-(bl.getpixel(p)*(1-alpha*coverage)+gray*alpha*coverage))
+                        errors.append(err)
+                        if err > 24:
                             break
+                        if err > 18:
+                            edge_spikes += 1
+                            if edge_spikes > 3 or not steep_bg_edge(p):
+                                break
                     if len(errors) != len(pixels) or sum(errors)/len(errors) > 3:
                         continue
                     predicted = b.copy()

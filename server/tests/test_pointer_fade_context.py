@@ -148,3 +148,43 @@ def test_dark_glyph_edits_under_fading_pointer_remain_visible(edit):
         draw.rectangle((66, 82, 68, 92), fill=(248, 248, 248))
     assert observation_changed(encode(clean), encode(edited))
     assert observation_changed(encode(pointer(clean)), encode(edited))
+
+
+def _perturb(image, coords, delta):
+    out = image.copy()
+    for x, y in coords:
+        r, g, b = out.getpixel((x, y))
+        out.putpixel((x, y), (max(0, min(255, r + delta)), max(0, min(255, g + delta)), max(0, min(255, b + delta))))
+    return out
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_translucent_pointer_tolerates_isolated_steep_edge_h264_spike(reverse):
+    clean = dark_glyph_frame()
+    # Perturb 1 steep-edge stroke boundary (y=83 sits right on top of y=84 ink) -> ~21.9 core spike.
+    vis = _perturb(pointer(clean), [(65, 83), (66, 83), (65, 84), (66, 84)], 20)
+    pair = (encode(clean), encode(vis)) if reverse else (encode(vis), encode(clean))
+    assert not observation_changed(*pair)
+
+
+def test_translucent_pointer_rejects_flat_background_spike_and_large_edge_edit():
+    clean = dark_glyph_frame()
+    # Flat background pixels inside the disc (~(60, 90), >=2px clear of strokes) have no steep gradient.
+    flat_spike = _perturb(pointer(clean), [(59, 89), (60, 89), (59, 90), (60, 90)], -26)
+    assert observation_changed(encode(flat_spike), encode(clean))
+
+    # Steep-edge change exceeding the 24-luma cap must still fail.
+    large_edge = _perturb(pointer(clean), [(65, 83), (66, 83), (65, 84), (66, 84)], 42)
+    assert observation_changed(encode(large_edge), encode(clean))
+
+    # More than 2 steep-edge spikes inside the core must still fail.
+    many_edge_spikes = _perturb(
+        pointer(clean),
+        [
+            (64, 86), (65, 86), (64, 87), (65, 87),
+            (72, 86), (73, 86), (72, 87), (73, 87),
+            (67, 94), (68, 94), (67, 95), (68, 95),
+        ],
+        26,
+    )
+    assert observation_changed(encode(many_edge_spikes), encode(clean))
