@@ -16,10 +16,10 @@ Before wiring the board's USB port to the iPhone, check that the **USB-OTG / IN-
 
 ## Optional iPhone settings
 
-- **Exact Chinese and multiline paste.** Set up the [clipboard Shortcut](docs/PASTE_INPUT.md) and assign it to **Long Press** under AssistiveTouch. The agent can trigger the shortcut through the ESP32, paste with `Cmd+V`, and verify the text. Handle the iOS paste permission prompt if it appears.
-- **Middle-button Home.** With compatible BLE firmware, map **Button 3** to **Home** under the connected device's AssistiveTouch settings and verify the mapping using `middle-click-home enable`. See the [MCP and CLI guide](docs/MCP_CLI.md).
-- **Full Keyboard Access.** Configure it only if you want to try a keyboard chord for the Shortcut. AssistiveTouch Long Press is the verified clipboard trigger.
+- **Exact Chinese and multiline paste.** Set up the [clipboard Shortcut](docs/PASTE_INPUT.md). For triggering, **Button 3 (`middleclick`, recommended)** via `HIDAGENT_CLIPBOARD_TRIGGER_KEY=middleclick` binds the Shortcut to mouse Button 3 and skips locating and holding the AssistiveTouch orb (mutually exclusive with Middle-button Home); alternatively, assign it to AssistiveTouch **Long Press**. The agent triggers the Shortcut, pastes once with `Cmd+V`, and verifies the text—either directly when iOS **Paste from Other Apps** is set to **Allow**, or after handling the iOS paste permission prompt.
+- **Middle-button Home.** With compatible BLE firmware, map **Button 3** to **Home** under the connected device's AssistiveTouch settings and verify with `middle-click-home enable` (shared with the `middleclick` clipboard trigger; choose one). See the [MCP and CLI guide](docs/MCP_CLI.md).
+- **Full Keyboard Access.** Configure it only if you want to try a keyboard chord for the Shortcut. Button 3 (`middleclick`) and AssistiveTouch Long Press are the verified clipboard triggers.
 
-macOS with the independent AirPlay receiver and ESP32 BLE has been tested on a real iPhone, including middle-button Home and confirmed Chinese paste after the iOS permission prompt. Windows automated checks pass. The full Windows physical-device flow and WeChat message sending still need device-level validation.
+macOS with the independent AirPlay receiver and ESP32 BLE has been tested on a real iPhone, including middle-button Home, `middleclick` clipboard triggering, both prompted and no-modal (**Allow**) Chinese paste, and protected keyboard `Enter` (`key enter`) sending in live WeChat chats. Windows automated checks pass; the full Windows physical-device flow still needs device-level validation.
 
 [Runtime and restart commands](docs/RUNTIME.md) · [MCP and CLI](docs/MCP_CLI.md) · [Troubleshooting](docs/troubleshooting.md) · [Project notices](NOTICE)
