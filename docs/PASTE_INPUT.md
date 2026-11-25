@@ -4,7 +4,7 @@ USB/BLE HID 只能发送键盘、鼠标事件，**不能直接设置 iPhone 剪�
 
 ## 宿主 AI 推荐路线：分阶段粘贴
 
-分阶段流程为 `prepare → 查看复制状态与画面 → paste → 查看完整输入结果 → confirm`。每阶段返回后释放控制锁，AI 可以继续观察。首次配置时需要导入快捷指令、设置配对信息、允许网络访问并选择触发方式。已真机验证的入口是辅助触控「长按」。iOS 是否显示跨 App 粘贴提示取决于实际场景和授权状态。
+分阶段流程为 `prepare → 查看复制状态与画面 → paste → 查看完整输入结果 → confirm`。每阶段返回后释放控制锁，AI 可以继续观察。首次配置时需要导入快捷指令、设置配对信息、允许网络访问并选择触发方式。已真机验证的入口包括外接鼠标中键（`HIDAGENT_CLIPBOARD_TRIGGER_KEY=middleclick`，推荐）与辅助触控「长按」。iOS 是否显示跨 App 粘贴提示取决于目标 App「从其他 App 粘贴」权限及实际授权状态。
 
 **使用本仓库生成的新模板时，服务端须设置 `HIDAGENT_CLIPBOARD_PROTOCOL=staged-v1`。** 这样普通 `type` 的 `auto` 模式仍将可打印 ASCII/数字作为键盘事件输入；中文、Unicode、换行文本以及显式 `type --mode paste` 会立即提示使用下列分阶段接口，不发布旧协议任务、不等待 TTL，也不发送触发键。新模板不会处理旧同步协议，不能仅配置 URL/Key 后就让普通 `auto` 输入走旧同步粘贴。
 
@@ -45,7 +45,10 @@ python3 scripts/build_clipboard_shortcut.py \
 1. 按下文配置本机服务和仅转发剪贴板的 8891 监听器，并设置 `HIDAGENT_CLIPBOARD_PROTOCOL=staged-v1`；受管服务可写入私密 `runtime.env`。
 2. 在 iPhone 导入签名文件，按设置问题填服务器地址和配对 Key，确认快捷指令名称；可命名为 `ESP32 Agent Clipboard`。
 3. 首次允许该快捷指令访问自己的剪贴板服务。若 iOS 提供“始终允许”，可选择它；不能伪造或绕过系统权限结果。
-4. 在 iPhone「设置 → 辅助功能 → 触控 → 辅助触控 → 长按」选择刚导入的快捷指令。用这条路线时，宿主在 `prepare` 后通过 ESP32 长按可见的悬浮按钮。若另行验证过键盘组合键，也可以按 [组合键绑定说明](#绑定服务端触发组合键) 配置 `HIDAGENT_CLIPBOARD_TRIGGER_KEY`。`Control+Option+P` 在已记录的 iPhone 11 Pro 真机环境中仍待验证。
+4. 绑定触发入口（推荐外接鼠标中键）：
+   - **推荐（中键触发 `middleclick`）**：在 iPhone「设置 → 辅助功能 → 触控 → 辅助触控 → 设备」进入已连接的 ESP32，将鼠标「按钮 3」设为 `ESP32 Agent Clipboard`，并在服务端配置 `HIDAGENT_CLIPBOARD_TRIGGER_KEY=middleclick`（与「中键回主屏幕」二选一，可在粘贴阶段跳过寻球与长按）。
+   - **备选（长按悬浮球）**：在 iPhone「设置 → 辅助功能 → 触控 → 辅助触控 → 长按」选择 `ESP32 Agent Clipboard`。未配置 `HIDAGENT_CLIPBOARD_TRIGGER_KEY` 时，宿主在 `prepare` 后通过 ESP32 长按可见的悬浮按钮触发。
+   - 若另行验证过键盘组合键，也可按 [组合键绑定说明](#绑定服务端触发组合键) 配置为 `ctrl+alt+p` 等组合键（`Control+Option+P` 在已记录的 iPhone 11 Pro 真机环境中仍待验证）。
 5. 在空白测试输入框中运行分阶段流程，验证复制、浮层退出、原焦点恢复和准确文字。不得仅凭文件签名成功宣称手机粘贴已验收。
 
 模板动作只有：领取 staged-v1 待办 → 获取结构化正文 → 检查 `copy_allowed` → 按文本原样本地复制 → 发送复制 ACK → 结束。没有自定义提醒、没有发送动作，也不自动声称输入完成。没有待办、旧协议待办、下载错误或过期响应缺少 `copy_allowed` 时，不复制错误正文。
@@ -93,7 +96,7 @@ iPhone 与服务器须在同一可互通局域网，快捷指令须允许获取�
    ./server/.venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(32))'
    export HIDAGENT_CLIPBOARD_KEY='替换为上面生成的密钥'
    export HIDAGENT_CLIPBOARD_BASE_URL='http://computer.local:8891'
-   export HIDAGENT_CLIPBOARD_TRIGGER_KEY='ctrl+alt+p'
+   export HIDAGENT_CLIPBOARD_TRIGGER_KEY='middleclick'
    export HIDAGENT_CLIPBOARD_TTL=60
    export HOST=127.0.0.1
    export PORT=8890
@@ -106,7 +109,7 @@ iPhone 与服务器须在同一可互通局域网，快捷指令须允许获取�
    .\server\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(32))"
    $env:HIDAGENT_CLIPBOARD_KEY='替换为上面生成的密钥'
    $env:HIDAGENT_CLIPBOARD_BASE_URL='http://computer.local:8891'
-   $env:HIDAGENT_CLIPBOARD_TRIGGER_KEY='ctrl+alt+p'
+   $env:HIDAGENT_CLIPBOARD_TRIGGER_KEY='middleclick'
    $env:HIDAGENT_CLIPBOARD_TTL='60'
    $env:HOST='127.0.0.1'
    $env:PORT='8890'
@@ -129,7 +132,7 @@ iPhone 与服务器须在同一可互通局域网，快捷指令须允许获取�
 
 3. 防火墙只需允许手机所在的**专用局域网**访问 TCP **8891**。本机控制台仍用 `http://127.0.0.1:8890`，不开放 8890 的入站规则。手机 URL 均使用 **8891**。不要将控制服务的 `HOST` 改为 `0.0.0.0`：完整控制 API 没有身份验证；配置剪贴板后，标准启动入口会拒绝这种绑定。若修改控制端口，须同步修改终端二的 `--control-port`；若修改剪贴板端口，须同步修改 BASE_URL 和手机 URL。
 
-4. 密钥为 32–256 位随机字母、数字、下划线或减号。TTL 默认 60 秒，可设 1–300 秒，覆盖领取、焦点确认和粘贴完成确认的全程。省略 `HIDAGENT_CLIPBOARD_TRIGGER_KEY` 即手动触发模式。使用组合键时，在手机上完成下文的绑定。使用旧同步入口时，CLI/MCP 超时至少比 TTL 多 5 秒。
+4. 密钥为 32–256 位随机字母、数字、下划线或减号。TTL 默认 60 秒，可设 1–300 秒，覆盖领取、焦点确认和粘贴完成确认的全程。推荐设置 `HIDAGENT_CLIPBOARD_TRIGGER_KEY=middleclick`（对应 iPhone 外接鼠标「按钮 3」）；若改用全键盘控制快捷键（如 `ctrl+alt+p`），请按下面说明绑定对应组合键；省略该变量则使用辅助触控长按或手动触发。使用旧同步入口时，CLI/MCP 超时至少比 TTL 多 5 秒。
 
 剪贴板监听器的配对与一次性令牌检查仍由本机服务执行，不会绕过确认步骤。不要映射到公网；HTTP 仅用于可信局域网，需要传输保密时再配置手机信任证书的 HTTPS。监听器关闭访问日志，避免一次性令牌 URL 留在日志中。
 
@@ -180,6 +183,8 @@ iPhone 与服务器须在同一可互通局域网，快捷指令须允许获取�
 4. 在新画面逐字核对两行，包括换行和 `00123`，再用 `paste-confirm` 确认。画面不明或内容有误时，先核对事务状态并按恢复流程处理。
 
 关闭 iOS 的「允许粘贴」弹窗可能让镜像重新绘制。若原画面比对无法确认，启用本机 OCR 的服务会检查实际弹出的授权页，以及关闭后仍可识别的原输入框、周围文字和新出现的框内内容。在同一笔事务的授权页已确认、输入框位置与完整正文都匹配时，确认允许可靠定位到的键盘联想栏随文字刷新。`paste-confirm` 仍要求新的画面凭证和宿主逐字确认的完整文本。通过后会返回 `confirmation_evidence=paste_permission_dismissed`。原事务只发送一次 Cmd+V。
+
+若已在目标 App 的 iOS 设置中将「从其他 App 粘贴」设为「允许」，`Cmd+V` 会直接写入而不弹出授权弹窗，确认通过后返回 `confirmation_evidence=direct_paste_verified`。针对微信等聊天输入框，`confirm` 阶段还支持结构化聊天区核验：在严格校验顶部会话标题、无弹窗遮挡、输入框边界与多行增高、逐字正文及底部键盘与「发送」键状态的前提下，容忍上方实时聊天记录滚动或新增气泡带来的局部变化。
 
 ## 旧同步协议的第一次完整测试
 
