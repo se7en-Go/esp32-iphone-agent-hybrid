@@ -174,14 +174,19 @@ def _translucent_pointer_fade(visible, background, points, width):
     left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
     w, h = right-left+1, bottom-top+1
     if not (.03*width <= min(w, h) <= max(w, h) <= .067*width
-            and .85 <= w/h <= 1.18 and .65 <= len(points)/(w*h) <= .88):
+            and .85 <= w/h <= 1.18 and .55 <= len(points)/(w*h) <= .88):
         return False
     cx, cy, radius = (left+right)/2, (top+bottom)/2, (w+h)/4
     footprint = set(points)
     ideal = {(x, y) for y in range(top, bottom+1) for x in range(left, right+1)
              if math.hypot(x-cx, y-cy) <= radius}
+    # Dark glyph strokes close to the pointer's neutral gray tint produce
+    # diff <= 24 inside the disc, creating interior holes (ideal - footprint)
+    # without protruding outside the circle. Keep outward protrusions strict
+    # and let the full-patch radial compositing model below verify every pixel.
     if (any(math.hypot(x-cx, y-cy) > radius+1 for x, y in footprint)
-            or len(footprint ^ ideal) > .12*len(ideal)):
+            or len(footprint - ideal) > .12*len(ideal)
+            or len(ideal - footprint) > .28*len(ideal)):
         return False
     margin = 4
     box = left-margin, top-margin, right+margin+1, bottom+margin+1
