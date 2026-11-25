@@ -629,6 +629,31 @@ def _return_key_box(original, current, suggestion_bar):
     return (max(.74, x - .13), max(suggestion_bar[1] + .12, y - .034), min(1., x + .12), min(.94, y + .032))
 
 
+def _return_key_enabled(before: Image.Image, after: Image.Image, key_box) -> bool:
+    """Confirm the return/send key transitioned from neutral grey to active iOS blue."""
+    w, h = before.size
+    x0 = max(0, min(w, round(key_box[0] * w)))
+    y0 = max(0, min(h, round(key_box[1] * h)))
+    x1 = max(0, min(w, round(key_box[2] * w)))
+    y1 = max(0, min(h, round(key_box[3] * h)))
+    if x1 <= x0 or y1 <= y0:
+        return False
+    b_raw = before.crop((x0, y0, x1, y1)).tobytes()
+    a_raw = after.crop((x0, y0, x1, y1)).tobytes()
+    n = len(b_raw) // 3
+    if n <= 0 or len(a_raw) != len(b_raw):
+        return False
+    blue_before = grey_to_blue = 0
+    for idx in range(0, len(b_raw), 3):
+        r0, g0, b0 = b_raw[idx], b_raw[idx + 1], b_raw[idx + 2]
+        r1, b1 = a_raw[idx], a_raw[idx + 2]
+        if b0 >= 150 and b0 - r0 >= 50:
+            blue_before += 1
+        if max(r0, g0, b0) - min(r0, g0, b0) <= 30 and b1 >= 150 and b1 - r1 >= 50:
+            grey_to_blue += 1
+    return blue_before / n <= .05 and grey_to_blue / n >= .30
+
+
 _PAIR_CACHE: tuple[object, tuple, bool] | None = None
 
 
@@ -709,8 +734,14 @@ def _notes_enabled_share_box(before, after, original, current, region):
             return None
     # Do not excuse edits in the rectangle or inside the tray: only neutral
     # grey on white may become yellow on white along the proven strokes.
-    for y in range(y0 - 2, y1 + 2):
-        for x in range(x0 - 2, x1 + 2):
+    # The enabled glyph has a slightly larger antialiased footprint than
+    # the disabled one. Validate the union, including its pale JPEG fringe;
+    # never exempt an unchecked toolbar rectangle.
+    fringe = gold.filter(ImageFilter.MaxFilter(9))
+    left, top = min(x0, active[0]) - 3, min(y0, active[1]) - 3
+    right, bottom = max(x1, active[2]) + 3, max(y1, active[3]) + 3
+    for y in range(top, bottom):
+        for x in range(left, right):
             if not (0 <= x < grey.width and 0 <= y < grey.height):
                 return None
             position = crop[0] + x, crop[1] + y
@@ -719,19 +750,54 @@ def _notes_enabled_share_box(before, after, original, current, region):
             noise = 28 if min(old) >= 229 and min(new) >= 223 else 12
             if max(abs(a - b) for a, b in zip(old, new, strict=True)) <= noise:
                 continue
+            if (fringe.getpixel((x, y)) and min(old) >= 245 and max(old) - min(old) <= 12
+                    and min(new[:2]) >= 240 and new[2] >= 200
+                    and min(new[:2]) - new[2] >= 12 and abs(new[0] - new[1]) <= 16):
+                continue
             if (not band.getpixel((x, y)) or min(old) < 175 or max(old) - min(old) > 15
                     or new[0] < 145 or new[1] < 135 or new[0] < new[1] - 16 or new[1] < new[2] - 16):
                 return None
-    return ((crop[0] + x0 - 2) / width, (crop[1] + y0 - 2) / height,
-            (crop[0] + x1 + 2) / width, (crop[1] + y1 + 2) / height)
+    return ((crop[0] + left) / width, (crop[1] + top) / height,
+            (crop[0] + right) / width, (crop[1] + bottom) / height)
 
 
-def _verify_before_after_sync(before, after, original, current, region, expected, *, notes_only=False) -> bool:
+def _notes_outside_visual_changed(before, after, original, current, region, suggestion_bar, extra):
+    """Keep all context checks; discount only proven Done-label JPEG blue chroma.
+
+    The recorded unchanged gold Done strokes differed by up to 46 in blue,
+    creating a seven-pixel residual. Do not mask its rectangle: red/green,
+    dark strokes, larger changes and every other region remain checked.
+    Called only after the Notes share transition and context have matched.
+    """
+    diff = screen_compare._difference(before, after, 360)
+    if diff is None:
+        return True
+    labels = [[item for item in items if ocr.normalize_text(item.text) in {"完成", "done"}
+               and item.conf >= _MIN_CONFIDENCE and .82 < item.center[0] < .98
+               and .04 < item.center[1] < region[1]] for items in (original, current)]
+    if all(len(items) == 1 for items in labels) and labels[0][0].box == labels[1][0].box:
+        box = labels[0][0].box
+        first = _image(before).resize(diff.size, Image.Resampling.BILINEAR)
+        second = _image(after).resize(diff.size, Image.Resampling.BILINEAR)
+        width, height = diff.size
+        for y in range(max(0, math.floor(box[1] * height)), min(height, math.ceil(box[3] * height))):
+            for x in range(max(0, math.floor(box[0] * width)), min(width, math.ceil(box[2] * width))):
+                old, new = first.getpixel((x, y)), second.getpixel((x, y))
+                dr, dg, db = (abs(a - b) for a, b in zip(old, new, strict=True))
+                if (dr <= 12 and dg <= 12 and db <= 48
+                        and all(r >= 175 and g >= 145 and b <= min(r, g) + 12 for r, g, b in (old, new))):
+                    diff.putpixel((x, y), max(dr, dg))
+    return _diff_has_unexpected_changes(before, after, diff, region, suggestion_bar, extra)
+
+
+def _verify_paste_transition(before, after, original, current, region, expected,
+                             *, notes_only=False, require_visual=False) -> str | None:
+    """Verify before/after paste state and return the evidence label, or None if rejected."""
     original_image, current_image = _image(before), _image(after)
     if original_image.size != current_image.size:
-        return False
+        return None
     if _is_permission_prompt(original) or _is_permission_prompt(current):
-        return False
+        return None
     suggestion_bar = _located_suggestion_bar(before, after, region)
     assistive_box = screen_compare.stationary_assistive_button_box(before, after, exclude=(region,))
     grown = _grown_field(original_image, current_image, region, suggestion_bar, assistive_box=assistive_box)
@@ -743,6 +809,8 @@ def _verify_before_after_sync(before, after, original, current, region, expected
             current_region = grown[0] if grown else region
     original_lines = _field_lines(original, region)
     current_lines = _field_lines(current, current_region)
+    if require_visual and original_lines != ():
+        return None
     # The pasted text must be new and appear after the existing field
     # text: the current lines end with the expected lines, and the lines
     # before them are exactly the lines that were there before the paste.
@@ -753,21 +821,24 @@ def _verify_before_after_sync(before, after, original, current, region, expected
                 and current_lines[:len(original_lines)] == original_lines
                 and _matches_wrapped_lines(current_lines[len(original_lines):], expected))
     if not appended:
-        return False
+        return None
     if grown is None:
         if not _same_field_outline(original_image, current_image, region):
-            return False
-        if not notes_only and _same_context(original, current, region):
-            return True
+            return None
+        if not notes_only and not require_visual and _same_context(original, current, region):
+            return "direct_paste_verified"
     elif len(current_lines) < 2:
-        return False  # only multi-line text grows the field
+        return None  # only multi-line text grows the field
     if notes_only and (grown is not None or original_lines != () or suggestion_bar is None):
-        return False
-    if suggestion_bar is None and (grown is not None or assistive_box is None):
-        return False
+        return None
+    if not require_visual and suggestion_bar is None and (grown is not None or assistive_box is None):
+        return None
+    if require_visual and grown is not None and suggestion_bar is None:
+        return None
     extra = []
     if grown is not None:
         extra.extend(grown[1])
+    key_box = None
     if original_lines == () and suggestion_bar is not None:
         key_box = _return_key_box(original, current, suggestion_bar)
         if key_box is not None:
@@ -775,27 +846,188 @@ def _verify_before_after_sync(before, after, original, current, region, expected
     ignored = (assistive_box,) if assistive_box is not None else ()
     if _same_context(original, current, current_region, suggestion_bar=suggestion_bar, ignored_boxes=ignored):
         if not notes_only and not _outside_visual_changed(before, after, current_region, suggestion_bar, extra):
-            return True
+            if (not require_visual or grown is not None
+                    or (key_box is not None and _return_key_enabled(original_image, current_image, key_box))):
+                return "direct_paste_verified"
         if grown is None and original_lines == () and suggestion_bar is not None:
             share = _notes_enabled_share_box(original_image, current_image, original, current, region)
-            if share and not _outside_visual_changed(before, after, region, suggestion_bar, [*extra, share]):
-                return True
+            if share and not _notes_outside_visual_changed(
+                    before, after, original, current, region, suggestion_bar, [*extra, share]):
+                return "notes_share_enabled"
     if grown is None:
-        return False
+        return None
     split_bounds = _header_viewport_bounds(original, current, region, current_region, ignored_boxes=ignored)
     if split_bounds is None:
-        return False
+        return None
     scrolled = _scrolled_viewport_match(
         before, after, original_image, current_image, current_region, suggestion_bar, extra,
         growth_delta=grown[2], split_bounds=split_bounds, assistive_box=assistive_box,
     )
     if scrolled is None:
-        return False
+        return None
     split_y, scroll_delta = scrolled
-    return _same_context_scrolled(
+    if _same_context_scrolled(
         original, current, region, current_region,
         split_y=split_y, scroll_delta=scroll_delta, suggestion_bar=suggestion_bar, ignored_boxes=ignored,
-    )
+    ):
+        return "direct_paste_verified"
+    return None
+
+
+def _verify_before_after_sync(before, after, original, current, region, expected, *, notes_only=False) -> bool:
+    return _verify_paste_transition(
+        before, after, original, current, region, expected, notes_only=notes_only, require_visual=False,
+    ) is not None
+
+
+def _chat_composer_layout(before: bytes, after: bytes, region: tuple[float, float, float, float]):
+    """Return the QuickType strip if `region` is a lower chat composer, else None."""
+    if region[1] < .35:
+        return None
+    suggestion_bar = _located_suggestion_bar(before, after, region)
+    if suggestion_bar is None or not 0 <= suggestion_bar[0] - region[3] <= .04:
+        return None
+    return suggestion_bar
+
+
+def _verify_chat_structural_sync(
+    before: bytes,
+    after: bytes,
+    original,
+    current,
+    region: tuple[float, float, float, float],
+    expected: tuple[str, ...],
+    *,
+    require_visual: bool = True,
+) -> tuple[str, tuple[float, float]] | None:
+    """Verify a chat-composer paste while decoupling only the live chat history stream.
+
+    Keeps full verification of: conversation header bar (OCR + pixels), no
+    permission modal or AssistiveTouch menu panel, input-field outline/growth,
+    exact verbatim pasted text, return/send key transition, lower keyboard
+    anchors, and keyboard pixels.
+    """
+    original_image, current_image = _image(before), _image(after)
+    if original_image.size != current_image.size:
+        return None
+    if _is_permission_prompt(original) or _is_permission_prompt(current):
+        return None
+    if assistive_vision.find_panel(before) is not None or assistive_vision.find_panel(after) is not None:
+        return None
+    suggestion_bar = _chat_composer_layout(before, after, region)
+    if suggestion_bar is None:
+        return None
+    key_box = _return_key_box(original, current, suggestion_bar)
+    if key_box is None:
+        return None
+    assistive_box = screen_compare.stationary_assistive_button_box(before, after, exclude=(region,))
+    grown = _grown_field(original_image, current_image, region, suggestion_bar, assistive_box=assistive_box)
+    current_region = grown[0] if grown else region
+    if assistive_box is not None and _boxes_overlap(assistive_box, current_region):
+        assistive_box = None
+        if grown is not None:
+            grown = _grown_field(original_image, current_image, region, suggestion_bar, assistive_box=None)
+            current_region = grown[0] if grown else region
+    original_lines = _field_lines(original, region)
+    current_lines = _field_lines(current, current_region)
+    if require_visual and original_lines != ():
+        return None
+    appended = (original_lines is not None and current_lines is not None
+                and len(current_lines) >= len(original_lines)
+                and current_lines[:len(original_lines)] == original_lines
+                and _matches_wrapped_lines(current_lines[len(original_lines):], expected))
+    if not appended:
+        return None
+    if grown is None:
+        if not _same_field_outline(original_image, current_image, region):
+            return None
+        if require_visual and not _return_key_enabled(original_image, current_image, key_box):
+            return None
+    elif len(current_lines) < 2:
+        return None
+    ignored = (assistive_box,) if assistive_box is not None else ()
+    orig_anchors = _context_anchors(original, region, suggestion_bar=suggestion_bar, ignored_boxes=ignored)
+    curr_anchors = _context_anchors(current, current_region, suggestion_bar=suggestion_bar, ignored_boxes=ignored)
+    orig_header = [i for i in orig_anchors if i.center[1] <= .105]
+    curr_header = [i for i in curr_anchors if i.center[1] <= .105]
+    header_unique = _stationary_anchors_match(orig_header, curr_header)
+    if header_unique is None or not header_unique:
+        return None
+    orig_lower = [i for i in orig_anchors if i.center[1] > region[3]]
+    curr_lower = [i for i in curr_anchors if i.center[1] > region[3]]
+    lower_unique = _stationary_anchors_match(orig_lower, curr_lower)
+    if lower_unique is None or not lower_unique or len(header_unique) + len(lower_unique) < 3:
+        return None
+    header_bottom = max(max(i.box[3] for i in orig_header), max(i.box[3] for i in curr_header)) + .004
+    composer_top = min(region[1], current_region[1])
+    if not header_bottom < composer_top - .10:
+        return None
+    diff = screen_compare._difference(before, after, 360)
+    if diff is None:
+        return None
+    viewport = (header_bottom, composer_top)
+    extra = [*(grown[1] if grown is not None else ()), key_box, (0., viewport[0], 1., viewport[1])]
+    if _diff_has_unexpected_changes(before, after, diff, current_region, suggestion_bar, extra,
+                                    assistive_box=assistive_box):
+        return None
+    return "direct_paste_verified", viewport
+
+
+async def verify_chat_structural_paste(before, after, region, observed_text, *,
+                                       require_visual: bool = True) -> tuple[str, tuple[float, float]] | None:
+    """Confirm a chat paste structurally, tolerating live activity only in the chat viewport."""
+    if not before or not after or before == after or region is None:
+        return None
+    try:
+        region = ocr.validate_region(region)
+        expected = _expected_lines(observed_text)
+        if not expected or _chat_composer_layout(before, after, region) is None:
+            return None
+        read_fn = ocr.read_text_async
+        original = await read_fn(before)
+        current = await read_fn(after)
+        return await asyncio.to_thread(
+            _verify_chat_structural_sync, before, after, original, current, region, expected,
+            require_visual=require_visual,
+        )
+    except (ocr.OCRError, OSError, ValueError):
+        return None
+
+
+def chat_viewport_only_changed(before: bytes, after: bytes, viewport: tuple[float, float], *,
+                               caret_frames=(), caret_scope=None) -> bool:
+    """True when header, pasted draft field, and keyboard pixels stayed intact across `before` -> `after`."""
+    if not before or not after:
+        return False
+    if assistive_vision.find_panel(before) is not None or assistive_vision.find_panel(after) is not None:
+        return False
+    diff = screen_compare._difference(before, after, 360)
+    if diff is None:
+        return False
+    draw = ImageDraw.Draw(diff)
+    _mask_normalized_box(draw, (0., viewport[0], 1., viewport[1]), diff.size)
+    exclude = (caret_scope,) if caret_scope is not None else ()
+    assistive_box = screen_compare.stationary_assistive_button_box(before, after, exclude=exclude)
+    if assistive_box is not None:
+        _mask_normalized_box(draw, assistive_box, diff.size)
+    for frame in (before, after):
+        button = assistive_vision.find_button_target(frame)
+        if button is not None:
+            _, (left, top, right, bottom) = button
+            pad = .015
+            _mask_normalized_box(
+                draw,
+                (max(0., left - pad), max(0., top - pad), min(1., right + pad), min(1., bottom + pad)),
+                diff.size,
+            )
+    screen_compare.mask_caret_blink(before, after, diff, caret_frames, scope=caret_scope)
+    screen_compare.mask_clock_ticks(before, after, diff)
+    screen_compare.mask_pointer_highlights(before, after, diff)
+    screen_compare._mask_pointer_discs(before, after, diff, max_discs=2)
+    screen_compare._mask_translucent_pointer_fade(before, after, diff)
+    values = diff.tobytes()
+    return not (sum(value for value in values if value > 4) / len(values) > .8
+                or any(len(points) >= 6 for points in screen_compare._regions(diff, 24)))
 
 
 async def _verify_before_after_uncached(read_fn, before, after, region, expected, *, notes_only) -> bool:
@@ -831,6 +1063,33 @@ def _same_frame_sizes(*frames: bytes) -> bool:
         with Image.open(io.BytesIO(frame)) as image:
             sizes.add(image.size)
     return len(sizes) == 1
+
+
+async def verify_direct_paste(before, after, region, observed_text) -> str | None:
+    """Confirm a direct sheet-less paste via OCR plus strict pixel-level change verification."""
+    if not before or not after or before == after or region is None:
+        return None
+    try:
+        region = ocr.validate_region(region)
+        expected = _expected_lines(observed_text)
+        if not expected:
+            return None
+        read_fn = ocr.read_text_async
+        original = await read_fn(before)
+        current = await read_fn(after)
+        direct = await asyncio.to_thread(
+            _verify_paste_transition, before, after, original, current, region, expected,
+            notes_only=False, require_visual=True,
+        )
+        if direct is not None:
+            return direct
+        structural = await asyncio.to_thread(
+            _verify_chat_structural_sync, before, after, original, current, region, expected,
+            require_visual=True,
+        )
+        return structural[0] if structural is not None else None
+    except (ocr.OCRError, OSError, ValueError):
+        return None
 
 
 async def verify_before_after_for_permission(before, after, region, observed_text, *, notes_only=False) -> bool:

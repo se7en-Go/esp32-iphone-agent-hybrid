@@ -765,3 +765,114 @@ def test_confirm_rechecks_the_same_ticket_after_a_transient_visual_change(monkey
         assert phone.sent.count("cmd+v") == 1
 
     asyncio.run(scenario())
+
+
+def _jpeg_variants(image_bytes: bytes, qualities: tuple[int, ...]) -> list[bytes]:
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        rgb = img.convert("RGB")
+        variants = []
+        for quality in qualities:
+            buf = io.BytesIO()
+            rgb.save(buf, "JPEG", quality=quality)
+            variants.append(buf.getvalue())
+    return variants
+
+
+def test_confirm_deduplicates_visually_identical_non_sheet_toast_frames(monkeypatch):
+    from hidagent import feedback, ocr, paste_confirmation
+
+    async def scenario():
+        screen, provider, _phone, control, manager = setup(monkeypatch)
+        toast_frames = _jpeg_variants(changed_scene("teal"), tuple(range(80, 92)))
+        after = changed_scene("orange")
+        ocr_calls = []
+
+        async def capture(_screen, _completed_at):
+            for frame in toast_frames:
+                screen._on_jpeg(frame)
+            return toast_frames[-1]
+
+        async def precheck(*_args, **_kwargs):
+            return True
+
+        async def read_text_async(frame):
+            ocr_calls.append(frame)
+            return []
+
+        async def direct(_orig, _aft, _reg, _text):
+            return "direct_paste_verified"
+
+        monkeypatch.setattr(feedback, "wait_after_action", capture)
+        monkeypatch.setattr(paste_confirmation, "verify_before_after_for_permission", precheck)
+        monkeypatch.setattr(paste_confirmation, "_verify_before_after", precheck)
+        monkeypatch.setattr(paste_confirmation, "verify_direct_paste", direct)
+        monkeypatch.setattr(ocr, "read_text_async", read_text_async)
+
+        prepared = await manager.prepare(prepare_body(control))
+        copied(provider, screen)
+        await manager.paste(PasteTransaction(
+            transaction_id=prepared["transaction_id"],
+            screen_id=control.observation()["screen_id"],
+            focused=True,
+        ))
+        screen._on_jpeg(after)
+        receipt = await manager.confirm(ConfirmPaste(
+            transaction_id=prepared["transaction_id"],
+            screen_id=control.observation()["screen_id"],
+            observed_text="你好00123",
+            confirmed=True,
+        ))
+        assert receipt["phase"] == "completed" and receipt["effect_verified"] is True
+        assert receipt["confirmation_evidence"] == "direct_paste_verified"
+        assert len(ocr_calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_confirm_still_finds_permission_sheet_after_duplicate_toast_frames(monkeypatch):
+    from hidagent import feedback, paste_confirmation
+
+    async def scenario():
+        screen, provider, _phone, control, manager = setup(monkeypatch)
+        toast_frames = _jpeg_variants(changed_scene("teal"), tuple(range(82, 90)))
+        sheet = changed_scene("blue")
+        after = changed_scene("orange")
+        verify_calls = []
+
+        async def capture(_screen, _completed_at):
+            screen._on_jpeg(sheet)
+            for frame in toast_frames:
+                screen._on_jpeg(frame)
+            return toast_frames[-1]
+
+        async def precheck(_orig, _aft, _reg, _text):
+            return True
+
+        async def verify(_original, presented, _selected, _region, _text):
+            verify_calls.append(presented)
+            return presented == sheet
+
+        monkeypatch.setattr(feedback, "wait_after_action", capture)
+        monkeypatch.setattr(paste_confirmation, "verify_before_after_for_permission", precheck)
+        monkeypatch.setattr(paste_confirmation, "verify_after_paste_permission", verify)
+
+        prepared = await manager.prepare(prepare_body(control))
+        copied(provider, screen)
+        await manager.paste(PasteTransaction(
+            transaction_id=prepared["transaction_id"],
+            screen_id=control.observation()["screen_id"],
+            focused=True,
+        ))
+        screen._on_jpeg(after)
+        receipt = await manager.confirm(ConfirmPaste(
+            transaction_id=prepared["transaction_id"],
+            screen_id=control.observation()["screen_id"],
+            observed_text="你好00123",
+            confirmed=True,
+        ))
+        assert receipt["phase"] == "completed" and receipt["effect_verified"] is True
+        assert receipt["confirmation_evidence"] == "paste_permission_dismissed"
+        assert len(verify_calls) <= 2
+        assert verify_calls[-1] == sheet
+
+    asyncio.run(scenario())

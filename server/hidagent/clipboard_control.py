@@ -186,9 +186,12 @@ class StagedClipboardControls:
         try:
             validate()
             if provider.trigger_key:
-                command = f"key {provider.trigger_key}"
+                command = provider.trigger_command
                 with provider.stage_write(nonce, command):
-                    await phone.key(provider.trigger_key, before_action=validate)
+                    if command == "middleclick":
+                        await phone.middleclick(before_action=validate)
+                    else:
+                        await phone.key(provider.trigger_key, before_action=validate)
         except BaseException:
             self._abandon(item, suppress_errors=True)
             raise
@@ -250,7 +253,7 @@ class StagedClipboardControls:
         return {**result, "command_acknowledged": True, "effect_verified": False,
                 "verification_required": "Inspect the inserted text in the original field; confirm separately."}
 
-    async def _validate_confirmation_ticket(self, item, controls, screen_id):
+    async def _validate_confirmation_ticket(self, item, controls, screen_id, *, live_viewport=None):
         """Wait briefly for the original ticket to match a new frame after a transient change."""
         deadline = time.monotonic() + _CONFIRM_SETTLE_TIMEOUT
 
@@ -265,6 +268,17 @@ class StagedClipboardControls:
                 controls._validate_ticket(controls.ticket, screen_id, caret_scope=item.guard.region,
                                           on_reject=rejected)
             except ValueError:
+                if changed_at is not None and live_viewport is not None:
+                    from . import paste_confirmation
+                    current = snapshot(controls.screen)
+                    if (current.frame and controls.ticket is not None and controls.ticket[0] == screen_id
+                            and current.generation == item.guard.original.generation
+                            and await asyncio.to_thread(
+                                paste_confirmation.chat_viewport_only_changed,
+                                controls.ticket[2], current.frame, live_viewport,
+                                caret_frames=getattr(controls.screen, "recent_frames", ()),
+                                caret_scope=item.guard.region)):
+                        return
                 remaining = deadline - time.monotonic()
                 if changed_at is None or remaining <= 0:
                     raise
@@ -291,6 +305,7 @@ class StagedClipboardControls:
         if not self._post_event_evidence(controls, item.completed_at):
             raise ValueError("confirmation requires a fresh post-paste observation")
         evidence = {}
+        live_viewport: tuple[float, float] | None = None
         try:
             # Allow text changes only inside the original observed input area.
             await asyncio.to_thread(item.guard, stage="accept")
@@ -310,10 +325,14 @@ class StagedClipboardControls:
             result = controls._observation
             after = result.frame
             original = item.guard.original
-            if (verify is paste_confirmation._default_verify_after_paste_permission
-                    and not await paste_confirmation.verify_before_after_for_permission(
-                        original.frame, after, item.guard.region, request.observed_text)):
-                raise
+            chat_structural = None
+            if verify is paste_confirmation._default_verify_after_paste_permission:
+                chat_structural = await paste_confirmation.verify_chat_structural_paste(
+                    original.frame, after, item.guard.region, request.observed_text)
+                if (not await paste_confirmation.verify_before_after_for_permission(
+                        original.frame, after, item.guard.region, request.observed_text)
+                        and chat_structural is None):
+                    raise
             seen = {original.frame, after}
             verified = None
             # A sheet this transaction already verified stays usable even
@@ -335,6 +354,7 @@ class StagedClipboardControls:
                 # window before confirm still verifies.
                 candidates = tuple(reversed(item.post_paste_frames)) + tuple(
                     getattr(controls.screen, "recent_frames", ()))
+                checked_frames: list[bytes] = []
                 for snapshot in candidates:
                     frame = getattr(snapshot, "frame", None)
                     updated = getattr(snapshot, "updated", None)
@@ -348,9 +368,22 @@ class StagedClipboardControls:
                     # A permission sheet dims and covers the page, so it differs
                     # from both the original page and the result page. Skip
                     # plain pre-sheet or post-sheet frames before OCR (~1 s/frame).
-                    if (not await asyncio.to_thread(screen_compare.observation_changed, after, frame)
-                            or not await asyncio.to_thread(screen_compare.observation_changed, original.frame, frame)):
+                    if (not await asyncio.to_thread(screen_compare.observation_changed, after, frame,
+                                                    caret_scope=item.guard.region)
+                            or not await asyncio.to_thread(screen_compare.observation_changed, original.frame, frame,
+                                                           caret_scope=item.guard.region)):
                         continue
+                    # AirPlay JPEG re-encodes visually identical toast banners with
+                    # distinct bytes; OCR only one representative per distinct visual.
+                    duplicate = False
+                    for prev in checked_frames:
+                        if not await asyncio.to_thread(screen_compare.observation_changed, prev, frame,
+                                                       caret_scope=item.guard.region):
+                            duplicate = True
+                            break
+                    if duplicate:
+                        continue
+                    checked_frames.append(frame)
                     if await verify(
                             original.frame, frame, after,
                             item.guard.region, request.observed_text):
@@ -362,10 +395,17 @@ class StagedClipboardControls:
                 evidence["confirmation_evidence"] = "paste_permission_dismissed"
                 evidence["sheet_frame_updated"] = sheet_updated
                 evidence["sheet_frame_generation"] = sheet_generation
-            elif await paste_confirmation.verify_before_after_for_permission(
-                original.frame, after, item.guard.region, request.observed_text, notes_only=True
-            ):
-                evidence["confirmation_evidence"] = "notes_share_enabled"
+                if chat_structural is not None:
+                    live_viewport = chat_structural[1]
+            elif verify is paste_confirmation._default_verify_after_paste_permission:
+                if chat_structural is not None:
+                    evidence["confirmation_evidence"], live_viewport = chat_structural
+                elif (direct := await paste_confirmation.verify_direct_paste(
+                        original.frame, after, item.guard.region, request.observed_text
+                )) is not None:
+                    evidence["confirmation_evidence"] = direct
+                else:
+                    raise
             else:
                 raise
         if evidence:
@@ -375,7 +415,8 @@ class StagedClipboardControls:
         if evidence and fresh_frame(controls.screen, since=item.completed_at) is None:
             raise ValueError("confirmation requires a fresh post-paste observation")
         try:
-            await self._validate_confirmation_ticket(item, controls, request.screen_id)
+            await self._validate_confirmation_ticket(
+                item, controls, request.screen_id, live_viewport=live_viewport)
             # The selected frame was already fresh and causal at admission.
             # Require a live post-paste frame again after the final comparison.
             if fresh_frame(controls.screen, since=item.completed_at) is None:

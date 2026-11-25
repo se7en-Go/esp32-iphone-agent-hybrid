@@ -262,9 +262,14 @@ class AssistiveTouch:
             return False
         return peer == saved["peer"] and pair_seq == saved["pair_seq"]
 
+    def _middle_click_reserved_for_clipboard(self) -> bool:
+        return getattr(getattr(self.phone, "clipboard", None), "trigger_key", None) == "middleclick"
+
     def _middle_click_home_enabled(self) -> bool:
         """Enable mouse middle-button Home only when firmware, BLE peer id, and pairing generation all match."""
-        return self._middle_click_supported_by_firmware() and self._middle_click_verified_for_device()
+        return (not self._middle_click_reserved_for_clipboard()
+                and self._middle_click_supported_by_firmware()
+                and self._middle_click_verified_for_device())
 
     def middle_click_home_status(self) -> dict:
         self._sync_middle_click_binding()
@@ -279,6 +284,7 @@ class AssistiveTouch:
         device_key = self._device_key()
         bindings = self._verified_middle_click_bindings()
         verified_for_device = bool(device_key) and device_key in bindings
+        reserved = self._middle_click_reserved_for_clipboard()
         return {
             "supported_by_firmware": supported,
             "ble_active": ble_active,
@@ -287,7 +293,8 @@ class AssistiveTouch:
             "ble_pair_seq": pair_seq,
             "verified_for_device": verified_for_device,
             "verified_devices_count": len(bindings),
-            "enabled": supported and ble_active and self._middle_click_verified_for_device(),
+            "reserved_for_clipboard": reserved,
+            "enabled": (not reserved) and supported and ble_active and self._middle_click_verified_for_device(),
             "command": "middleclick",
             "preferred_route": self._saved.get("verified_route"),
         }
@@ -425,6 +432,8 @@ class AssistiveTouch:
 
     async def verify_and_enable_middle_click_home(self, *, observation=None, before_write=None) -> float:
         """Send one `middleclick` from a non-Home app, confirm Home via fresh video, then persist."""
+        if self._middle_click_reserved_for_clipboard():
+            raise ValueError("中键当前已分配给剪贴板触发，不能同时启用中键回主屏幕。")
         device = self.phone.device
         epoch = getattr(device, "abort_epoch", 0)
         self._home_link, self._home_epoch = getattr(device, "links", 0), epoch

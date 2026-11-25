@@ -91,9 +91,12 @@ class CompanionClipboard:
             raise ValueError("HIDAGENT_CLIPBOARD_PROTOCOL 只能是 legacy-v1 或 staged-v1。")
         if trigger_key is not None:
             parts = trigger_key.split("+")
-            if (not re.fullmatch(r"(?:(?:ctrl|alt|shift|cmd)\+){1,3}[a-z0-9]", trigger_key)
-                    or len(set(parts)) != len(parts) or trigger_key == "cmd+v"):
-                raise ValueError("HIDAGENT_CLIPBOARD_TRIGGER_KEY 需要绑定快捷指令的组合键，例如 ctrl+alt+p。")
+            is_combo = (re.fullmatch(r"(?:(?:ctrl|alt|shift|cmd)\+){1,3}[a-z0-9]", trigger_key)
+                        and len(set(parts)) == len(parts) and trigger_key != "cmd+v")
+            if trigger_key != "middleclick" and not is_combo:
+                raise ValueError(
+                    "HIDAGENT_CLIPBOARD_TRIGGER_KEY 需要绑定快捷指令的组合键（例如 ctrl+alt+p）或 middleclick。"
+                )
         self.base_url = base_url.rstrip("/")
         self._key = key
         self.ttl = ttl
@@ -124,6 +127,12 @@ class CompanionClipboard:
     @property
     def legacy_paste_available(self) -> bool:
         return self.protocol == "legacy-v1"
+
+    @property
+    def trigger_command(self) -> str | None:
+        if self.trigger_key is None:
+            return None
+        return "middleclick" if self.trigger_key == "middleclick" else f"key {self.trigger_key}"
 
     def authorized(self, authorization: str) -> bool:
         return secrets.compare_digest(authorization.encode(), f"Bearer {self._key}".encode())
@@ -315,13 +324,14 @@ class CompanionClipboard:
     def check_input(self, command: str) -> None:
         """Device gate: no second input/copy can interleave a staged clipboard transaction."""
         item = self._active()
-        if item is None or item.host_nonce is None or command.split(" ", 1)[0].lower() not in {"key", "type"}:
+        if (item is None or item.host_nonce is None
+                or command.split(" ", 1)[0].lower() not in {"key", "type", "middleclick"}):
             return
         if _STAGED_WRITE.get() != (self, item.host_nonce, command):
             raise DeviceError("分阶段剪贴板输入尚未确认，请先完成或取消；未发送新的键盘输入。")
         if command == "key cmd+v":
             self.stage_validate_paste(item.host_nonce)
-        elif command != f"key {self.trigger_key}" or item.paste_started:
+        elif command != self.trigger_command or item.paste_started:
             raise DeviceError("unexpected keyboard command during staged paste")
 
     def validate_paste(self) -> None:
@@ -362,8 +372,8 @@ class CompanionClipboard:
 
     async def _run(self, item: _Pending, stopped: Callable[[], bool],
                    send: Callable[[str], Awaitable[None]]) -> None:
-        if self.trigger_key is not None:
-            await send(f"key {self.trigger_key}")
+        if self.trigger_command is not None:
+            await send(self.trigger_command)
         await self._wait(item, lambda: item.acknowledged, stopped)
         # 给快捷指令 HTTP 动作和浮层留出退出时间；完成仍须单独确认。
         await asyncio.sleep(0.5)
