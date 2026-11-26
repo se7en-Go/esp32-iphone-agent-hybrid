@@ -380,3 +380,63 @@ def test_single_character_change_in_header_composer_or_target_invalidates_token(
     out = io.BytesIO()
     image.save(out, "PNG")
     assert observation_changed(before, out.getvalue())
+
+
+def _flat_gray_disc_scene(*, with_disc=True, rim=True, dot_color=(135, 135, 140),
+                          textured_bg=False, extra_stroke=False, green_caret=False, two_discs=False):
+    image = Image.new("RGB", (500, 1080), (212, 212, 222))
+    draw = ImageDraw.Draw(image)
+    if textured_bg:
+        for y in range(880, 1040, 14):
+            draw.rectangle((60, y, 220, y + 5), fill=(40, 40, 45))
+    def paste_disc(cx, cy):
+        if rim:
+            draw.ellipse((cx - 13, cy - 13, cx + 13, cy + 13), fill=(157, 157, 167))
+        draw.ellipse((cx - 11, cy - 11, cx + 11, cy + 11), fill=dot_color)
+    if with_disc:
+        paste_disc(114, 992)
+    if two_discs:
+        paste_disc(320, 992)
+    if extra_stroke:
+        draw.rectangle((128, 990, 136, 996), fill=(30, 30, 30))
+    if green_caret:
+        draw.rectangle((77, 582, 80, 610), fill=(9, 199, 101))
+    out = io.BytesIO()
+    image.save(out, "PNG")
+    return out.getvalue()
+
+
+@pytest.mark.parametrize("disappearing", [True, False])
+def test_flat_background_pointer_disc_masked_only_in_observation_changed(monkeypatch, disappearing):
+    from hidagent import screen_compare
+
+    before = _flat_gray_disc_scene(with_disc=True)
+    after = _flat_gray_disc_scene(with_disc=False)
+    if not disappearing:
+        before, after = after, before
+    # Simulate _discs splitting on antialiased rim so _mask_pointer_discs alone would miss it.
+    monkeypatch.setattr(screen_compare, "_discs", lambda *_a, **_kw: [])
+    residuals = []
+    assert not observation_changed(before, after, residual_out=residuals)
+    assert residuals == []
+    # effect_changed must NOT mask flat-background pointer discs on its own when _discs fails.
+    assert effect_changed(before, after)
+
+
+def test_flat_background_pointer_disc_rejects_caret_textured_colored_rim_edit_and_multi():
+    bg = _flat_gray_disc_scene(with_disc=False)
+    for bad in (
+        _flat_gray_disc_scene(with_disc=False, green_caret=True),
+        _flat_gray_disc_scene(with_disc=True, dot_color=(30, 120, 235)),
+        _flat_gray_disc_scene(with_disc=True, extra_stroke=True),
+        _flat_gray_disc_scene(with_disc=True, two_discs=True),
+    ):
+        residuals = []
+        assert observation_changed(bad, bg, residual_out=residuals)
+        assert residuals and residuals[0]["count"] >= 6
+
+    textured_with_disc = _flat_gray_disc_scene(with_disc=True, textured_bg=True)
+    textured_bg = _flat_gray_disc_scene(with_disc=False, textured_bg=True)
+    residuals = []
+    assert observation_changed(textured_with_disc, textured_bg, residual_out=residuals)
+    assert residuals and residuals[0]["count"] >= 6

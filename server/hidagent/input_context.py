@@ -1,6 +1,7 @@
 """Keep typing in its observed field, including while firmware ACKs are pending."""
 
 import io
+import logging
 from functools import lru_cache
 
 from PIL import Image
@@ -9,6 +10,8 @@ from . import screen_compare
 from .caret import focused_region as _focused_region
 from .caret import temporal_focused_region
 from .freshness import require_fresh
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=8)
@@ -129,10 +132,14 @@ class InputContextGuard:
     def __call__(self, *, stage="context"):
         current = require_fresh(self.screen)
         region = self.region if stage in {"accept", "chunk"} else None
-        if (current.generation != self.original.generation
-                or screen_compare.observation_changed(
-                    self.original.frame, current.frame, input_region=region,
-                    caret_frames=getattr(self.screen, "recent_frames", ()), caret_scope=self.region,
-                    allow_assistive_opacity=self.allow_assistive_opacity)):
+        if current.generation != self.original.generation:
+            raise RuntimeError("screen changed since the original observation; observe again before acting")
+        residuals: list = []
+        if screen_compare.observation_changed(
+            self.original.frame, current.frame, input_region=region,
+            caret_frames=getattr(self.screen, "recent_frames", ()), caret_scope=self.region,
+            allow_assistive_opacity=self.allow_assistive_opacity, residual_out=residuals,
+        ):
+            logger.info("input context guard rejected (stage=%s): residuals=%s", stage, residuals)
             raise RuntimeError("screen changed since the original observation; observe again before acting")
         return current

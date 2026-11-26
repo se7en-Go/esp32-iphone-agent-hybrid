@@ -52,7 +52,59 @@ def _inside(item, region):
     return region[0] <= left and region[1] <= top and right <= region[2] and bottom <= region[3]
 
 
-def _field_lines(items, region):
+def _filter_stationary_field_icons(
+    items,
+    before_image: Image.Image,
+    after_image: Image.Image,
+    region: tuple[float, float, float, float],
+    *,
+    expected: tuple[str, ...] = (),
+):
+    """Drop an isolated stationary bottom-right UI icon hallucination (e.g. mic chrome)."""
+    if before_image.size != after_image.size or region[2] - region[0] > .70:
+        return items
+    w, h = before_image.size
+    field_items = [item for item in items if _inside(item, region)]
+    drop_indices: set[int] = set()
+    for idx, item in enumerate(items):
+        if not _inside(item, region):
+            continue
+        left, top, right, bottom = item.box
+        text = _visible_text(item.text)
+        if not (
+            left >= region[2] - .12
+            and top >= region[3] - .06
+            and 0 < right - left <= .07
+            and 0 < bottom - top <= .055
+            and 0 < len(text) <= 2
+            and not all(ch in _TERMINAL_CJK_PUNCT for ch in text)
+            and not (expected and expected[-1].endswith(text))
+            and not any(_boxes_overlap(item.box, other.box) for other in field_items if other is not item)
+        ):
+            continue
+        x0 = max(0, min(w, round(left * w)))
+        y0 = max(0, min(h, round(top * h)))
+        x1 = max(0, min(w, round(right * w)))
+        y1 = max(0, min(h, round(bottom * h)))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        b_crop = before_image.crop((x0, y0, x1, y1))
+        gray = b_crop.convert("L").tobytes()
+        if not gray or max(gray) - min(gray) < 40:
+            continue
+        b_raw = b_crop.tobytes()
+        a_raw = after_image.crop((x0, y0, x1, y1)).tobytes()
+        if not b_raw or len(b_raw) != len(a_raw):
+            continue
+        diffs = [abs(a - b) for a, b in zip(b_raw, a_raw, strict=True)]
+        if sum(diffs) / len(diffs) <= 2.5 and max(diffs) <= 18:
+            drop_indices.add(idx)
+    if len(drop_indices) != 1:
+        return items
+    return [item for idx, item in enumerate(items) if idx not in drop_indices]
+
+
+def _field_rows(items, region):
     left, top, right, bottom = region
     visible = []
     for item in items:
@@ -70,8 +122,84 @@ def _field_lines(items, region):
         if not rows or abs(rows[-1][0].center[1] - item.center[1]) > height / 2:
             rows.append([])
         rows[-1].append(item)
-    return tuple(_visible_text("".join(item.text for item in sorted(row, key=lambda item: item.center[0])))
-                 for row in rows)
+    return [sorted(row, key=lambda item: item.center[0]) for row in rows]
+
+
+def _field_lines(items, region):
+    rows = _field_rows(items, region)
+    if rows is None:
+        return None
+    return tuple(_visible_text("".join(item.text for item in row)) for row in rows)
+
+
+def _has_stationary_corner_icon(before_image: Image.Image, region: tuple[float, float, float, float]) -> bool:
+    """True when the bottom-right composer corner already contains high-contrast UI chrome (e.g. mic)."""
+    if region[2] - region[0] > .70:
+        return False
+    w, h = before_image.size
+    slot = (
+        max(0, min(w, round((region[2] - .11) * w))),
+        max(0, min(h, round((region[3] - .045) * h))),
+        max(0, min(w, round((region[2] - .01) * w))),
+        max(0, min(h, round((region[3] - .005) * h))),
+    )
+    if slot[2] <= slot[0] or slot[3] <= slot[1]:
+        return False
+    gray = before_image.crop(slot).convert("L").tobytes()
+    return bool(gray) and min(gray) <= 160 and max(gray) - min(gray) >= 60
+
+
+def _corner_faded_rows(
+    rows,
+    before_image: Image.Image,
+    after_image: Image.Image,
+    region: tuple[float, float, float, float],
+) -> dict[int, str]:
+    """Return lower-right row indices whose rightmost glyph was physically bleached by chrome fade."""
+    if (not rows or len(rows) < 2 or before_image.size != after_image.size
+            or not _has_stationary_corner_icon(before_image, region)):
+        return {}
+    before_gray = before_image.convert("L")
+    gray = after_image.convert("L")
+    w, h = gray.size
+    faded: dict[int, str] = {}
+    for r_idx in (len(rows) - 2, len(rows) - 1):
+        row = rows[r_idx]
+        row_text = _visible_text("".join(item.text for item in row))
+        if len(row_text) < 4:
+            continue
+        rx0 = min(item.box[0] for item in row)
+        ry0 = min(item.box[1] for item in row)
+        rx1 = max(item.box[2] for item in row)
+        ry1 = max(item.box[3] for item in row)
+        if ry1 < region[3] - .065:
+            continue
+        x0 = max(0, min(w, round(rx0 * w)))
+        y0 = max(0, min(h, round(ry0 * h)))
+        x1 = max(0, min(w, round(rx1 * w)))
+        y1 = max(0, min(h, round(ry1 * h)))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        cw = max(12, round((x1 - x0) / len(row_text)))
+        mid_y = (y0 + y1) // 2
+        if mid_y >= y1:
+            continue
+        if rx1 >= region[2] - .08 and x1 - cw > x0:
+            left_min = min(gray.crop((x0, y0, x1 - cw, y1)).tobytes())
+            r_bot_min = min(gray.crop((max(x0, x1 - cw), mid_y, x1, y1)).tobytes())
+            if left_min <= 35 and r_bot_min >= 95:
+                faded[r_idx] = "sub"
+                continue
+        if region[2] - .13 <= rx1 < region[2] - .07:
+            row_min = min(gray.crop((x0, y0, x1, y1)).tobytes())
+            cell_x1 = min(w, round(region[2] * w), x1 + cw + 6)
+            if row_min <= 35 and cell_x1 >= x1 + 8:
+                before_min = min(before_gray.crop((x1, y0, cell_x1, y1)).tobytes())
+                after_min = min(gray.crop((x1, y0, cell_x1, y1)).tobytes())
+                after_bot_min = min(gray.crop((x1, mid_y, cell_x1, y1)).tobytes())
+                if before_min >= 225 and after_min <= 215 and before_min - after_min >= 40 and after_bot_min >= 95:
+                    faded[r_idx] = "omit"
+    return faded
 
 
 def _located_suggestion_bar(before: bytes, after: bytes,
@@ -155,6 +283,7 @@ def _diff_has_unexpected_changes(
     screen_compare.mask_pointer_highlights(highlight_before, highlight_after, diff)
     screen_compare._mask_pointer_discs(before, after, diff, max_discs=2)
     screen_compare._mask_translucent_pointer_fade(highlight_before, highlight_after, diff)
+    screen_compare._mask_flat_background_pointer_disc(highlight_before, highlight_after, diff)
     values = diff.tobytes()
     # Ignore <=4/255 AirPlay/JPEG quantization noise after full-screen sheet dim/undim;
     # sharp small edits still trip _regions(diff, 24) >= 6 and broad low-contrast shifts exceed .8.
@@ -541,6 +670,7 @@ def _image(frame):
 
 
 _RETURN_KEYS = {"发送", "發送", "send", "return", "换行", "換行", "前往", "go", "搜索", "search", "完成", "done"}
+_CHAT_SEND_KEYS = frozenset({"发送", "發送", "send"})
 
 
 def _field_span(image, left, right, bottom):
@@ -611,11 +741,11 @@ def _grown_field(original_image, current_image, region, suggestion_bar, *, assis
     return current, (expand, (region[2], band[1], 1., band[3])), before[0] - after[0]
 
 
-def _return_key_box(original, current, suggestion_bar):
+def _return_key_box(original, current, suggestion_bar, *, keys=_RETURN_KEYS):
     """The keyboard's return/send key, whose tint changes once the field is non-empty."""
     def find(items):
         found = [item for item in items if item.conf >= _MIN_CONFIDENCE
-                 and ocr.normalize_text(item.text) in _RETURN_KEYS
+                 and ocr.normalize_text(item.text) in keys
                  and .72 <= item.box[0] < item.box[2] <= 1
                  and max(suggestion_bar[1] + .14, .82) <= item.box[1] < item.box[3] <= .94]
         return found[0] if len(found) == 1 else None
@@ -657,6 +787,22 @@ def _return_key_enabled(before: Image.Image, after: Image.Image, key_box) -> boo
 _PAIR_CACHE: tuple[object, tuple, bool] | None = None
 
 
+def _consume_wrapped_lines(added: tuple[str, ...], lines: tuple[str, ...]) -> int | None:
+    """Match logical `lines` against soft-wrapped visual OCR `added`, returning consumed index or None."""
+    idx = 0
+    for line in lines:
+        if idx >= len(added):
+            return None
+        joined = added[idx]
+        idx += 1
+        while len(joined) < len(line) and idx < len(added) and line.startswith(joined):
+            joined += added[idx]
+            idx += 1
+        if joined != line:
+            return None
+    return idx
+
+
 def _matches_wrapped_lines(added: tuple[str, ...], expected: tuple[str, ...]) -> bool:
     """Match visual OCR rows to logical lines, allowing display-level soft wrapping.
 
@@ -665,18 +811,159 @@ def _matches_wrapped_lines(added: tuple[str, ...], expected: tuple[str, ...]) ->
     newline) must still start on separate visual rows, and any missing, extra,
     altered, or duplicated text is rejected.
     """
-    idx = 0
-    for line in expected:
-        if idx >= len(added):
+    return _consume_wrapped_lines(added, expected) == len(added)
+
+
+_TERMINAL_CJK_PUNCT = frozenset("。！？…")
+_OCR_THIN_CJK_PUNCT = frozenset("「」『』《》〈〉“”‘’（）【】、，；：。！？…·")
+_WIDTH_EQUIV_PUNCT = {
+    "，": ",",
+    ",": "，",
+    "；": ";",
+    ";": "；",
+    "：": ":",
+    ":": "：",
+    "！": "!",
+    "!": "！",
+    "？": "?",
+    "?": "？",
+    "（": "(",
+    "(": "（",
+    "）": ")",
+    ")": "）",
+}
+_NEGATION_CJK = frozenset("不没无非勿别否未禁停")
+_MIN_TAIL_PUNCT_LEN = 15
+_MIN_TAIL_LAST_LINE = 6
+_MAX_OCR_PUNCT_OMISSIONS = 2
+_PROTECTED_PRECEDING = re.compile(r"[0-9A-Za-z@#%$¥￥/\\?=&+_~^|<>\[\]{}.-]")
+
+
+def _is_safe_fade_cjk(ch: str) -> bool:
+    return "\u4e00" <= ch <= "\u9fff" and ch not in _NEGATION_CJK
+
+
+def _adjacent_to_number_or_currency(line: str, pos: int) -> bool:
+    for adj in (pos - 1, pos + 1):
+        if 0 <= adj < len(line):
+            ch = line[adj]
+            if ch.isdigit() or ch in "¥￥$":
+                return True
+    return False
+
+
+def _chars_match_chat(obs_ch: str, exp_ch: str) -> bool:
+    return obs_ch == exp_ch or _WIDTH_EQUIV_PUNCT.get(obs_ch) == exp_ch
+
+
+def _matches_chat_composer_lines(
+    added: tuple[str, ...],
+    expected: tuple[str, ...],
+    *,
+    faded_rows: dict[int, str] | None = None,
+) -> tuple[str | None, str]:
+    """Match chat-composer OCR rows, allowing thin CJK punctuation gaps and proven corner fade.
+
+    Preserves logical newlines, digits, prices, URLs, negations, and exact word
+    characters; allows only bounded thin CJK punctuation omissions/width swaps
+    and physically-bleached bottom-right CJK character substitution/omission.
+    """
+    if _matches_wrapped_lines(added, expected):
+        return "full", ""
+    if not added or not expected or len(added) < len(expected):
+        return None, ""
+    total_added = sum(len(row) for row in added)
+    total_expected = sum(len(line) for line in expected)
+    if total_expected < _MIN_TAIL_PUNCT_LEN or total_added > total_expected:
+        return None, ""
+    max_missing = _MAX_OCR_PUNCT_OMISSIONS + (1 if faded_rows else 0)
+    if total_expected - total_added > max_missing:
+        return None, ""
+
+    row_idx = 0
+    omitted_punct: list[tuple[int, int, str]] = []
+    width_diffs = 0
+    fade_diffs: list[str] = []
+
+    def _can_omit_punct(l_idx: int, l_text: str, p: int) -> bool:
+        if l_text[p] not in _OCR_THIN_CJK_PUNCT or len(omitted_punct) >= _MAX_OCR_PUNCT_OMISSIONS:
             return False
-        joined = added[idx]
-        idx += 1
-        while len(joined) < len(line) and idx < len(added) and line.startswith(joined):
-            joined += added[idx]
-            idx += 1
-        if joined != line:
+        at_final_tail = l_idx == len(expected) - 1 and all(ch in _OCR_THIN_CJK_PUNCT for ch in l_text[p:])
+        at_line_terminal_tail = all(ch in _TERMINAL_CJK_PUNCT for ch in l_text[p:])
+        if at_final_tail and len(l_text) < _MIN_TAIL_LAST_LINE:
             return False
-    return idx == len(added)
+        if (at_final_tail or at_line_terminal_tail) and p > 0 and _PROTECTED_PRECEDING.search(l_text[p - 1]):
+            return False
+        return True
+
+    for line_idx, line in enumerate(expected):
+        pos = 0
+        consumed_rows = 0
+        while pos < len(line):
+            if row_idx >= len(added):
+                return None, ""
+            row = added[row_idx]
+            k = 0
+            while k < len(row):
+                if pos < len(line) and _chars_match_chat(row[k], line[pos]):
+                    if row[k] != line[pos]:
+                        width_diffs += 1
+                    k += 1
+                    pos += 1
+                elif pos < len(line) and _can_omit_punct(line_idx, line, pos):
+                    omitted_punct.append((line_idx, pos, line[pos]))
+                    pos += 1
+                elif (k == len(row) - 1 and len(row) >= 4 and pos < len(line) and not fade_diffs
+                      and (faded_rows or {}).get(row_idx) == "sub"
+                      and _is_safe_fade_cjk(line[pos]) and _is_safe_fade_cjk(row[k])
+                      and not _adjacent_to_number_or_currency(line, pos)):
+                    fade_diffs.append(f"{line[pos]}->{row[k]}")
+                    k += 1
+                    pos += 1
+                else:
+                    return None, ""
+
+            if (pos < len(line) and not fade_diffs and len(row) >= 4
+                    and (faded_rows or {}).get(row_idx) == "omit"
+                    and _is_safe_fade_cjk(line[pos])
+                    and not _adjacent_to_number_or_currency(line, pos)
+                    and ((row_idx + 1 >= len(added) and all(ch in _OCR_THIN_CJK_PUNCT for ch in line[pos + 1:]))
+                         or (row_idx + 1 < len(added) and not _chars_match_chat(added[row_idx + 1][0], line[pos])))):
+                fade_diffs.append(f"{line[pos]}->")
+                pos += 1
+
+            while pos < len(line) and _can_omit_punct(line_idx, line, pos):
+                if row_idx + 1 >= len(added):
+                    omitted_punct.append((line_idx, pos, line[pos]))
+                    pos += 1
+                elif not _chars_match_chat(added[row_idx + 1][0], line[pos]):
+                    omitted_punct.append((line_idx, pos, line[pos]))
+                    pos += 1
+                else:
+                    break
+
+            row_idx += 1
+            consumed_rows += 1
+        if consumed_rows == 0:
+            return None, ""
+
+    if row_idx != len(added):
+        return None, ""
+
+    punct_str = "".join(ch for _, _, ch in omitted_punct)
+    if fade_diffs:
+        detail = f"{fade_diffs[0]};punct={punct_str}" if punct_str else fade_diffs[0]
+        return "corner_fade", detail
+    if omitted_punct:
+        tail_start = len(expected[-1]) - len(omitted_punct)
+        if (width_diffs == 0
+                and all(l_idx == len(expected) - 1 and ch in _TERMINAL_CJK_PUNCT for l_idx, _, ch in omitted_punct)
+                and omitted_punct[0][1] == tail_start):
+            return "tail_punct", punct_str
+        return "ocr_punct", punct_str
+    if width_diffs:
+        return "ocr_punct", "width"
+    return "full", ""
 
 
 def _notes_enabled_share_box(before, after, original, current, region):
@@ -929,15 +1216,37 @@ def _verify_chat_structural_sync(
             grown = _grown_field(original_image, current_image, region, suggestion_bar, assistive_box=None)
             current_region = grown[0] if grown else region
     original_lines = _field_lines(original, region)
-    current_lines = _field_lines(current, current_region)
+    curr_field = (
+        _filter_stationary_field_icons(
+            current, original_image, current_image, current_region, expected=expected,
+        )
+        if original_lines == () else current
+    )
+    curr_rows = _field_rows(curr_field, current_region)
+    current_lines = (
+        None if curr_rows is None
+        else tuple(_visible_text("".join(item.text for item in row)) for row in curr_rows)
+    )
     if require_visual and original_lines != ():
         return None
-    appended = (original_lines is not None and current_lines is not None
-                and len(current_lines) >= len(original_lines)
-                and current_lines[:len(original_lines)] == original_lines
-                and _matches_wrapped_lines(current_lines[len(original_lines):], expected))
-    if not appended:
+    faded_rows = (
+        _corner_faded_rows(curr_rows, original_image, current_image, current_region)
+        if (curr_rows is not None and original_lines == ()) else {}
+    )
+    match_mode = None
+    if (original_lines is not None and current_lines is not None
+            and len(current_lines) >= len(original_lines)
+            and current_lines[:len(original_lines)] == original_lines):
+        match_mode, _ = _matches_chat_composer_lines(
+            current_lines[len(original_lines):], expected, faded_rows=faded_rows,
+        )
+    if match_mode is None:
         return None
+    if match_mode in {"tail_punct", "corner_fade", "ocr_punct"}:
+        send_box = _return_key_box(original, current, suggestion_bar, keys=_CHAT_SEND_KEYS)
+        if (original_lines != () or send_box is None
+                or not _return_key_enabled(original_image, current_image, send_box)):
+            return None
     if grown is None:
         if not _same_field_outline(original_image, current_image, region):
             return None
@@ -1025,6 +1334,7 @@ def chat_viewport_only_changed(before: bytes, after: bytes, viewport: tuple[floa
     screen_compare.mask_pointer_highlights(before, after, diff)
     screen_compare._mask_pointer_discs(before, after, diff, max_discs=2)
     screen_compare._mask_translucent_pointer_fade(before, after, diff)
+    screen_compare._mask_flat_background_pointer_disc(before, after, diff)
     values = diff.tobytes()
     return not (sum(value for value in values if value > 4) / len(values) > .8
                 or any(len(points) >= 6 for points in screen_compare._regions(diff, 24)))

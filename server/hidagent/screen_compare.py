@@ -280,6 +280,61 @@ def _mask_translucent_pointer_fade(before, after, diff):
             diff.putpixel(point, 0)
 
 
+def _flat_background_pointer_disc(visible: Image.Image, background: Image.Image, points, width: int) -> bool:
+    """Prove a pointer-sized neutral disc appeared or disappeared over a flat neutral surface."""
+    xs, ys = zip(*points, strict=True)
+    left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+    bw, bh = right - left + 1, bottom - top + 1
+    if not (.03 * width <= min(bw, bh) <= max(bw, bh) <= .067 * width
+            and .85 <= bw / bh <= 1.18 and .62 <= len(points) / (bw * bh) <= .90):
+        return False
+    cx, cy, radius = (left + right) / 2, (top + bottom) / 2, (bw + bh) / 4
+    footprint = set(points)
+    ideal = {(x, y) for y in range(top, bottom + 1) for x in range(left, right + 1)
+             if math.hypot(x - cx, y - cy) <= radius}
+    if (any(math.hypot(x - cx, y - cy) > radius + 1.2 for x, y in footprint)
+            or len(footprint ^ ideal) > .14 * len(ideal)):
+        return False
+    margin = 4
+    box = left - margin, top - margin, right + margin + 1, bottom + margin + 1
+    if min(box[:2]) < 0 or box[2] > visible.width or box[3] > visible.height:
+        return False
+    a, b = visible.crop(box), background.crop(box)
+    lcx, lcy = cx - box[0], cy - box[1]
+    pixels = [(x, y) for y in range(a.height) for x in range(a.width)]
+    around = [p for p in pixels if math.hypot(p[0] - lcx, p[1] - lcy) > radius + 2]
+    ring_diffs = [max(abs(u - v) for u, v in zip(a.getpixel(p), b.getpixel(p), strict=True)) for p in around]
+    if not ring_diffs or max(ring_diffs) > 18 or sum(ring_diffs) / len(ring_diffs) > 5:
+        return False
+    core = [p for p in pixels if math.hypot(p[0] - lcx, p[1] - lcy) <= .55 * radius]
+    disc_area = [p for p in pixels if math.hypot(p[0] - lcx, p[1] - lcy) <= radius + 1]
+    if not core or not disc_area:
+        return False
+    vis_core = [a.getpixel(p) for p in core]
+    bg_disc = [b.getpixel(p) for p in disc_area]
+    v_med = tuple(median(ch) for ch in zip(*vis_core, strict=True))
+    b_med = tuple(median(ch) for ch in zip(*bg_disc, strict=True))
+    v_luma, b_luma = sum(v_med) / 3, sum(b_med) / 3
+    return (100 <= v_luma <= 205 and max(v_med) - min(v_med) <= 20
+            and max(max(abs(p[c] - v_med[c]) for c in range(3)) for p in vis_core) <= 18
+            and max(b_med) - min(b_med) <= 20
+            and max(max(abs(p[c] - b_med[c]) for c in range(3)) for p in bg_disc) <= 16
+            and b_luma - v_luma >= 30)
+
+
+def _mask_flat_background_pointer_disc(before, after, diff) -> None:
+    """Mask an isolated pointer disc on a uniform background when both frames corroborate it."""
+    candidates = [points for points in _regions(diff, 24) if len(points) >= 6]
+    if len(candidates) != 1:
+        return
+    a, b = (_rgb_at_size(frame, diff.size) for frame in (before, after))
+    points = candidates[0]
+    if (_flat_background_pointer_disc(a, b, points, diff.width)
+            or _flat_background_pointer_disc(b, a, points, diff.width)):
+        for point in points:
+            diff.putpixel(point, 0)
+
+
 def _faded_pointer_disc(visible, background, points, width):
     """Prove a faded pointer disc over preserved glyphs, for pairing only.
 
@@ -841,7 +896,8 @@ def _mask_stationary_assistive_button(before: bytes | None, after: bytes | None,
 
 def observation_changed(before: bytes | None, after: bytes | None, *, input_region=None,
                         moved_pointer: tuple = (), caret_frames=(), context_regions=None,
-                        caret_scope=None, allow_assistive_opacity: bool = False) -> bool:
+                        caret_scope=None, allow_assistive_opacity: bool = False,
+                        residual_out: list | None = None) -> bool:
     """Reject content edits while tolerating clock and recognized pointer shapes.
 
     Recognized hover outlines and small compact discs may fade or move. Other larger
@@ -866,12 +922,26 @@ def observation_changed(before: bytes | None, after: bytes | None, *, input_regi
     mask_pointer_highlights(before, after, diff)
     _mask_pointer_discs(before, after, diff, max_discs=2)
     _mask_translucent_pointer_fade(before, after, diff)
+    _mask_flat_background_pointer_disc(before, after, diff)
     values = diff.tobytes()
     changed = sum(values) / len(values) > 0.8 or any(len(points) >= 6 for points in _regions(diff, 24))
     if changed and allow_assistive_opacity:
         _mask_stationary_assistive_button(before, after, diff, exclude=(input_region, caret_scope))
         values = diff.tobytes()
         changed = sum(values) / len(values) > 0.8 or any(len(points) >= 6 for points in _regions(diff, 24))
+    if changed and residual_out is not None:
+        w, h = diff.size
+        hot = sorted((r for r in _regions(diff, 24) if len(r) >= 6), key=len, reverse=True)
+        for r in hot[:4]:
+            xs = [p[0] for p in r]
+            ys = [p[1] for p in r]
+            residual_out.append({
+                "count": len(r),
+                "box": [round(min(xs) / w, 3), round(min(ys) / h, 3),
+                        round((max(xs) + 1) / w, 3), round((max(ys) + 1) / h, 3)],
+            })
+        if not residual_out:
+            residual_out.append({"mean_diff": round(sum(values) / len(values), 3)})
     return changed
 
 
