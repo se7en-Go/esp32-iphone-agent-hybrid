@@ -35,6 +35,10 @@ VERIFIED_CARET_SCOPE_TTL = 120.0
 log = logging.getLogger(__name__)
 
 
+class PreWriteRejection(ValueError):
+    """Action rejected before any physical HID/UART write occurred."""
+
+
 @dataclass(frozen=True)
 class _VerifiedCaretScope:
     region: tuple[float, float, float, float]
@@ -872,10 +876,15 @@ class Controls:
         # The same private observer covers wake motion, OCR and the action.
         # Only Device's actual write boundary admits the already-consumed ticket.
         with input_attempt() as admission:
-            plan, before, observed_at = await self._consume_action(request, admission)
-            if plan["name"] == "home":
-                plan["_reconcile_home"] = True
-            await self._resolve_text(plan, before, observed_at)
+            try:
+                plan, before, observed_at = await self._consume_action(request, admission)
+                if plan["name"] == "home":
+                    plan["_reconcile_home"] = True
+                await self._resolve_text(plan, before, observed_at)
+            except ValueError as exc:
+                if not admission.written:
+                    raise PreWriteRejection(str(exc)) from exc
+                raise
             ready = time.perf_counter()
             completed_at, acknowledged, error, home_unconfirmed = None, False, None, None
             try:
@@ -979,49 +988,52 @@ class Controls:
     async def _click_observed(self, request, qualified):
         began = time.perf_counter()
         response_session = self._response_session()
-        ticket, inputs = self.ticket, self._input_observation
-        observation = getattr(self, "_observation", None)
-        if qualified is None:
-            before, _, _ = self.consume(request.screen_id)
-        else:
-            self.invalidate()
-            self._check_ticket(ticket, request.screen_id)
-            before = ticket[2]
-        pointer = request.pointer_x, request.pointer_y
-        box = tuple(request.target_box)
-        if (len(box) != 4 or not all(math.isfinite(value) and 0 <= value <= 1 for value in (*pointer, *box))
-                or not (box[0] < pointer[0] < box[2] and box[1] < pointer[1] < box[3])):
-            raise ValueError("host-observed pointer must be strictly inside the normalized target_box")
-        if (inputs is None or inputs.device is None or inputs.links is None or inputs.epoch is None
-                or type(inputs.sequence) is not int or inputs.last_input_at is None
-                or not math.isfinite(inputs.last_input_at) or inputs.session_started_at is None
-                or not math.isfinite(inputs.session_started_at)):
-            raise ValueError("host-observed click requires device input history; observe again")
-        caret_scope = self._resolve_caret_scope(getattr(request, "caret_scope", None), inherit=True)
-
-        def validate_original():
-            device = self.phone.device
-            if (device is not inputs.device or device.links != inputs.links or device.abort_epoch != inputs.epoch
-                    or device.input_sequence != inputs.sequence or device.last_input_at != inputs.last_input_at
-                    or device.session_started_at != inputs.session_started_at):
-                raise ValueError("input or device session changed since observation; observe again")
-            boundary = max(inputs.last_input_at, inputs.session_started_at)
-            if observation.updated <= boundary + freshness.MIRROR_LAG_SECONDS:
-                raise ValueError(
-                    "observe a new frame after connection/last input and mirror pipeline before host-click")
+        try:
+            ticket, inputs = self.ticket, self._input_observation
+            observation = getattr(self, "_observation", None)
             if qualified is None:
-                self._validate_ticket(ticket, request.screen_id, caret_scope=caret_scope)
+                before, _, _ = self.consume(request.screen_id)
             else:
+                self.invalidate()
                 self._check_ticket(ticket, request.screen_id)
+                before = ticket[2]
+            pointer = request.pointer_x, request.pointer_y
+            box = tuple(request.target_box)
+            if (len(box) != 4 or not all(math.isfinite(value) and 0 <= value <= 1 for value in (*pointer, *box))
+                    or not (box[0] < pointer[0] < box[2] and box[1] < pointer[1] < box[3])):
+                raise ValueError("host-observed pointer must be strictly inside the normalized target_box")
+            if (inputs is None or inputs.device is None or inputs.links is None or inputs.epoch is None
+                    or type(inputs.sequence) is not int or inputs.last_input_at is None
+                    or not math.isfinite(inputs.last_input_at) or inputs.session_started_at is None
+                    or not math.isfinite(inputs.session_started_at)):
+                raise ValueError("host-observed click requires device input history; observe again")
+            caret_scope = self._resolve_caret_scope(getattr(request, "caret_scope", None), inherit=True)
 
-        validate_original()
-        ready = time.perf_counter()
-        completed_at, acknowledged, error = None, False, None
-        extra = {"evidence_source": "host_observed", "pointer_seen": False, "effect_verified": False}
-        duration = getattr(request, "duration", None)
-        label = getattr(request, "target_label", "")
-        if duration is not None and is_send_target(label, label):
-            raise ValueError("host-observed hold cannot target a Send control")
+            def validate_original():
+                device = self.phone.device
+                if (device is not inputs.device or device.links != inputs.links or device.abort_epoch != inputs.epoch
+                        or device.input_sequence != inputs.sequence or device.last_input_at != inputs.last_input_at
+                        or device.session_started_at != inputs.session_started_at):
+                    raise ValueError("input or device session changed since observation; observe again")
+                boundary = max(inputs.last_input_at, inputs.session_started_at)
+                if observation.updated <= boundary + freshness.MIRROR_LAG_SECONDS:
+                    raise ValueError(
+                        "observe a new frame after connection/last input and mirror pipeline before host-click")
+                if qualified is None:
+                    self._validate_ticket(ticket, request.screen_id, caret_scope=caret_scope)
+                else:
+                    self._check_ticket(ticket, request.screen_id)
+
+            validate_original()
+            ready = time.perf_counter()
+            completed_at, acknowledged, error = None, False, None
+            extra = {"evidence_source": "host_observed", "pointer_seen": False, "effect_verified": False}
+            duration = getattr(request, "duration", None)
+            label = getattr(request, "target_label", "")
+            if duration is not None and is_send_target(label, label):
+                raise ValueError("host-observed hold cannot target a Send control")
+        except ValueError as exc:
+            raise PreWriteRejection(str(exc)) from exc
         scope = send_target_scope(is_send_target(label, label)) if duration is None else nullcontext()
         try:
             with input_attempt(inherit=True) as contact, scope:

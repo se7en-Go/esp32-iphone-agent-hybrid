@@ -23,6 +23,15 @@ def _client_timeout() -> float:
         return 60.0
 
 
+class ClientHTTPError(RuntimeError):
+    """HTTP error raised by IPhoneClient while preserving status code and JSON body."""
+
+    def __init__(self, message: str, *, status_code: int, payload: dict | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.payload = payload if isinstance(payload, dict) else {}
+
+
 class IPhoneClient:
     def __init__(self, url: str | None = None, *, transport=None):
         url = url or os.environ.get("IPHONE_AGENT_URL", "http://127.0.0.1:8890")
@@ -42,10 +51,13 @@ class IPhoneClient:
         response = self.http.request(method, path, json=body)
         if response.is_error:
             try:
-                detail = response.json().get("detail", "request failed")
+                raw = response.json()
+                payload = raw if isinstance(raw, dict) else {}
             except ValueError:
-                detail = "request failed"
-            raise RuntimeError(f"HTTP {response.status_code}: {detail}")
+                payload = {}
+            detail = payload.get("detail", "request failed")
+            raise ClientHTTPError(f"HTTP {response.status_code}: {detail}",
+                                  status_code=response.status_code, payload=payload)
         response.raise_for_status()
         return response
 

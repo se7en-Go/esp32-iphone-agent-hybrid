@@ -51,6 +51,8 @@ python3 scripts/build_clipboard_shortcut.py \
    - 若另行验证过键盘组合键，也可按 [组合键绑定说明](#绑定服务端触发组合键) 配置为 `ctrl+alt+p` 等组合键（`Control+Option+P` 在已记录的 iPhone 11 Pro 真机环境中仍待验证）。
 5. 在空白测试输入框中运行分阶段流程，验证复制、浮层退出、原焦点恢复和准确文字。不得仅凭文件签名成功宣称手机粘贴已验收。
 
+> **⚠️ 同 Apple ID 通用剪贴板提醒**：若运行本服务的 Mac（或其他 Apple 设备）与挂机 iPhone 登录了同一 Apple ID，建议在挂机 iPhone 上关闭 **「设置 → 通用 → 隔空播放与接力（或隔空播放与连续互通）→ 接力（Handoff）」**。否则在 Mac 上按 `Cmd+C` 时，Apple 通用剪贴板会跨设备覆盖快捷指令刚写入 iPhone 的正文，造成 `Cmd+V` 贴入错误文本并触发粘贴核验失败与 `paste_sent_unconfirmed` 保护停机。
+
 模板动作只有：领取 staged-v1 待办 → 获取结构化正文 → 检查 `copy_allowed` → 按文本原样本地复制 → 发送复制 ACK → 结束。没有自定义提醒、没有发送动作，也不自动声称输入完成。没有待办、旧协议待办、下载错误或过期响应缺少 `copy_allowed` 时，不复制错误正文。
 
 依据：[Apple 命令行签名说明](https://support.apple.com/guide/shortcuts-mac/apd455c82f02/mac)、[导入设置问题](https://support.apple.com/guide/shortcuts/apdf330fd3a0/ios)、[首次权限与始终允许](https://support.apple.com/guide/shortcuts/apd961a4fc65/ios)。生成器参考系统自带 Gallery `.wflow` 的 plist 结构；签名、导入兼容性和真机输入效果是不同的验收阶段。

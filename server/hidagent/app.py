@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .agent import Agent
 from .clipboard import CompanionClipboard, create_router
 from .clipboard_control import create_control_router
-from .control import Controls
+from .control import Controls, PreWriteRejection
 from .debug import Trace
 from .device import Device, DeviceError, input_attempt, supervise_maintain
 from .enter_context import verify_enter_context
@@ -573,14 +573,23 @@ async def control_action(request: ControlAction, http_request: Request):
             scope = nullcontext()
             if request.enter_intent is not None:
                 if request.action != "key" or request.repeat != 1:
-                    raise ValueError("Enter 用途只适用于单独的一次 key 动作。")
-                observation = getattr(controls, "_observation", None)
-                before, _, _ = controls._validate_ticket(controls.ticket, request.screen_id)
-                validate = await verify_enter_context(screen, before, request.enter_intent, request.text,
-                                                      observation=observation)
-                scope = guard.verified_enter(request.enter_intent, validate)
+                    raise PreWriteRejection("Enter 用途只适用于单独的一次 key 动作。")
+                try:
+                    observation = getattr(controls, "_observation", None)
+                    before, _, _ = controls._validate_ticket(
+                        controls.ticket,
+                        request.screen_id,
+                        caret_scope=controls._resolve_caret_scope(request.caret_scope),
+                    )
+                    validate = await verify_enter_context(screen, before, request.enter_intent, request.text,
+                                                          observation=observation)
+                    scope = guard.verified_enter(request.enter_intent, validate)
+                except ValueError as e:
+                    raise PreWriteRejection(str(e)) from e
             with scope:
                 return await while_connected(http_request, controls.perform(request))
+        except PreWriteRejection as e:
+            return JSONResponse(status_code=409, content={"detail": str(e), "action_may_have_executed": False})
         except ValueError as e:
             raise HTTPException(409, str(e)) from e
         except OCRUnavailable as e:
@@ -603,6 +612,8 @@ async def control_host_click(request: HostClickBody, http_request: Request):
         controls.job = asyncio.current_task()
         try:
             return await while_connected(http_request, controls.click_observed(request))
+        except PreWriteRejection as exc:
+            return JSONResponse(status_code=409, content={"detail": str(exc), "action_may_have_executed": False})
         except (ValueError, RuntimeError, OSError) as exc:
             raise HTTPException(409, str(exc)) from exc
         except asyncio.CancelledError as exc:
