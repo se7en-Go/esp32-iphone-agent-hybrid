@@ -1030,3 +1030,271 @@ def test_paste_flow_exits_permission_check_early_once_direct_paste_verified(visi
     # One post-paste observe clears the header toast; one observe runs confirm
     # (vs 4 + 1 without early exit when ALLOW_CHECK_ATTEMPTS == 4).
     assert client.post_paste_observes == 2
+
+
+def _chat_flow_frame(*, pasted: bool, key_blue: bool = False, grown: bool = True):
+    image = Image.new("RGB", (500, 1080), (237, 237, 237))
+    draw = ImageDraw.Draw(image)
+    top = 480 if (pasted and grown) else 562
+    draw.rectangle((66, top, 382, 618), fill="white")
+    if pasted:
+        draw.rectangle((92, top + 16, 320, top + 24), fill=(35, 35, 35))
+        draw.rectangle((92, top + 56, 300, top + 64), fill=(35, 35, 35))
+    draw.rectangle((0, 626, 500, 700), fill=(214, 217, 222))
+    draw.rectangle((10, 646, 490, 676), fill=(214, 217, 222))
+    draw.rectangle((0, 700, 500, 1080), fill=(214, 217, 222))
+    send_fill = (10, 132, 255) if key_blue else (200, 204, 212)
+    draw.rounded_rectangle((380, 924, 494, 974), radius=8, fill=send_fill)
+    out = io.BytesIO()
+    image.save(out, "JPEG", quality=92)
+    return out.getvalue()
+
+
+def test_verify_confirm_frame_tail_punct_gates_and_field_span_fallback(monkeypatch):
+    from hidagent import paste_confirmation
+
+    field = (66 / 500, 562 / 1080, 382 / 500, 618 / 1080)
+    text = "这期具体保质期每款不一样，你点开对应链接看下后问群主确认。"
+    prep = _chat_flow_frame(pasted=False, key_blue=False, grown=False)
+    conf = _chat_flow_frame(pasted=True, key_blue=True, grown=True)
+    stale_prep = _chat_flow_frame(pasted=False, key_blue=True, grown=False)
+
+    header = ocr.TextBox("测试群(10)", (.35, .06, .55, .09), (.45, .075), .99)
+    kb = [
+        ocr.TextBox("发送", (.83, .86, .93, .90), (.88, .88), .99),
+        ocr.TextBox("123", (.03, .86, .12, .90), (.08, .88), .99),
+    ]
+    grown_items = [
+        ocr.TextBox("这期具体保质期每款不一样，", (.16, .46, .66, .49), (.41, .475), .99),
+        ocr.TextBox("你点开对应链接看下后问群主确认", (.16, .51, .70, .54), (.43, .525), .99),
+    ]
+    boxes = {
+        prep: [header, ocr.TextBox("候选A", (.15, .60, .25, .63), (.20, .615), .99), *kb],
+        stale_prep: [header, ocr.TextBox("候选A", (.15, .60, .25, .63), (.20, .615), .99), *kb],
+        conf: [header, *grown_items, ocr.TextBox("候选B", (.15, .60, .25, .63), (.20, .615), .99), *kb],
+    }
+    monkeypatch.setattr(ocr, "read_text", lambda raw: boxes[raw])
+
+    # Default allow_tail_punct=False rejects even valid tail_punct; allow_tail_punct=True accepts.
+    diag_f = {}
+    assert paste_flow._verify_confirm_frame(
+        prep, conf, field, text, expect_title="测试群(10)", allow_tail_punct=False, diagnostics=diag_f,
+    ) == (False, "pasted text was not observed in target field")
+    assert diag_f["expected_chars"] == len(text) and diag_f["observed_chars"] == len(text) - 1
+
+    diag_t = {}
+    assert paste_flow._verify_confirm_frame(
+        prep, conf, field, text, expect_title="测试群(10)", allow_tail_punct=True, diagnostics=diag_t,
+    ) == (True, "tail_punct")
+    assert diag_t["elided_tail"] == "。" and diag_t["chat_composer_verified"] is True
+
+    # Force _grown_field to return None (e.g. AssistiveTouch orb in side band): _field_span still recovers region.
+    monkeypatch.setattr(paste_confirmation, "_grown_field", lambda *_a, **_kw: None)
+    assert paste_flow._verify_confirm_frame(
+        prep, conf, field, text, expect_title="测试群(10)", allow_tail_punct=True,
+    ) == (True, "tail_punct")
+
+    # Stale already-blue send key in prepare_frame must block tail_punct.
+    assert paste_flow._verify_confirm_frame(
+        stale_prep, conf, field, text, expect_title="测试群(10)", allow_tail_punct=True,
+    ) == (False, "pasted text was not observed in target field")
+
+    # Extra line inside the grown region must block tail_punct even if a sub-region matches.
+    conf_extra_items = [header, *grown_items, ocr.TextBox("多余冲突行", (.16, .545, .45, .565), (.30, .555), .99), *kb]
+    monkeypatch.setattr(ocr, "read_text", lambda raw: conf_extra_items if raw == conf else boxes[raw])
+    assert paste_flow._verify_confirm_frame(
+        prep, conf, field, text, expect_title="测试群(10)", allow_tail_punct=True,
+    ) == (False, "pasted text was not observed in target field")
+
+
+def test_paste_flow_confirm_diagnostics_populated_and_exact_bytes_reused(monkeypatch):
+    frame = _chat_flow_frame(pasted=True, key_blue=True, grown=False)
+    frame_alt = _chat_flow_frame(pasted=True, key_blue=True, grown=False) + b"\x00"
+    confirm_verify_calls = 0
+    orig_verify = paste_flow._verify_confirm_frame
+
+    def spy_verify(*args, **kwargs):
+        nonlocal confirm_verify_calls
+        if kwargs.get("diagnostics") is not None:
+            confirm_verify_calls += 1
+        return orig_verify(*args, **kwargs)
+
+    monkeypatch.setattr(paste_flow, "_verify_confirm_frame", spy_verify)
+    monkeypatch.setattr(ocr, "read_text", lambda _raw: [])
+    monkeypatch.setattr(assistive_vision, "find_button_target", lambda _f: ((.75, .95), (.69, .92, .83, .98)))
+
+    class ConfirmClient(FakeClient):
+        def __init__(self, *, alternate_after_first: bool = False):
+            super().__init__(confirm_conflicts=0, sheet=False, trigger_configured=True, copied_on_prepare=True)
+            self._alt = alternate_after_first
+            self._confirm_obs = 0
+
+        def observe(self, for_click=False):
+            self.seen += 1
+            if "paste" in self.calls and confirm_verify_calls >= 1:
+                self._confirm_obs += 1
+            raw = frame_alt if (self._alt and self._confirm_obs >= 1) else frame
+            return {"screen_id": f"s-{self.seen}", "image_base64": base64.b64encode(raw).decode()}
+
+    # Identical frame bytes reuse the failed verify result across retries.
+    client = ConfirmClient(alternate_after_first=False)
+    with pytest.raises(paste_flow.FlowStopped) as stopped:
+        paste_flow.run(client, "第一行说明文字\n第二行补充说明。", FIELD, confirm_attempts=4)
+    assert confirm_verify_calls == 1
+    assert stopped.value.report.retries["confirm_text"] == 3
+    diag = stopped.value.report.facts["confirm_diagnostics"]
+    assert diag["expected_chars"] == 15 and diag["observed_chars"] == 0
+
+    # Visually similar but byte-distinct confirm frames must still re-run OCR rather than short-circuiting.
+    confirm_verify_calls = 0
+    distinct_client = ConfirmClient(alternate_after_first=True)
+    with pytest.raises(paste_flow.FlowStopped):
+        paste_flow.run(distinct_client, "第一行说明文字\n第二行补充说明。", FIELD, confirm_attempts=3)
+    assert confirm_verify_calls == 2
+
+
+def test_verify_confirm_frame_filters_stationary_icon_only(monkeypatch):
+    field = (66 / 500, 562 / 1080, 382 / 500, 618 / 1080)
+    text = "这个得看具体商品，拿不准直接问群主确认。"
+    icon_box = (.69, .545, .725, .562)
+    icon_px = (348, 591, 359, 604)
+
+    def make_frame(*, pasted: bool, draw_icon_before: bool, draw_icon_after: bool, with_keyboard: bool = True):
+        image = Image.new("RGB", (500, 1080), (237, 237, 237))
+        draw = ImageDraw.Draw(image)
+        top = 480 if pasted else 562
+        draw.rectangle((66, top, 382, 618), fill="white")
+        if pasted:
+            draw.rectangle((92, top + 16, 320, top + 24), fill=(35, 35, 35))
+        if (draw_icon_after if pasted else draw_icon_before):
+            draw.rectangle(icon_px, fill=(55, 55, 55))
+        if with_keyboard:
+            draw.rectangle((0, 626, 500, 700), fill=(214, 217, 222))
+            draw.rectangle((10, 646, 490, 676), fill=(214, 217, 222))
+            draw.rectangle((0, 700, 500, 1080), fill=(214, 217, 222))
+            draw.rounded_rectangle((380, 924, 494, 974), radius=8, fill=(10, 132, 255) if pasted else (200, 204, 212))
+        out = io.BytesIO()
+        image.save(out, "PNG")
+        return out.getvalue()
+
+    header = ocr.TextBox("测试群(10)", (.35, .06, .55, .09), (.45, .075), .99)
+    kb = [
+        ocr.TextBox("发送", (.83, .86, .93, .90), (.88, .88), .99),
+        ocr.TextBox("123", (.03, .86, .12, .90), (.08, .88), .99),
+    ]
+    grown_items = [
+        ocr.TextBox("这个得看具体商品，", (.16, .46, .66, .49), (.41, .475), .99),
+        ocr.TextBox("拿不准直接问群主确认。", (.16, .54, .68, .565), (.42, .552), .99),
+        ocr.TextBox("U", icon_box, (.707, .553), .97),
+    ]
+    prep_stationary = make_frame(pasted=False, draw_icon_before=True, draw_icon_after=True)
+    conf_stationary = make_frame(pasted=True, draw_icon_before=True, draw_icon_after=True)
+    prep_blank = make_frame(pasted=False, draw_icon_before=False, draw_icon_after=True)
+    conf_new_u = make_frame(pasted=True, draw_icon_before=False, draw_icon_after=True)
+    prep_nokb = make_frame(pasted=False, draw_icon_before=True, draw_icon_after=True, with_keyboard=False)
+    conf_nokb = make_frame(pasted=True, draw_icon_before=True, draw_icon_after=True, with_keyboard=False)
+
+    boxes = {
+        prep_stationary: [header, *kb],
+        conf_stationary: [header, *grown_items, *kb],
+        prep_blank: [header, *kb],
+        conf_new_u: [header, *grown_items, *kb],
+        prep_nokb: [header],
+        conf_nokb: [header, *grown_items],
+    }
+    monkeypatch.setattr(ocr, "read_text", lambda raw: boxes[raw])
+
+    diag = {}
+    assert paste_flow._verify_confirm_frame(
+        prep_stationary, conf_stationary, field, text, expect_title="测试群(10)",
+        allow_tail_punct=False, diagnostics=diag,
+    ) == (True, "full")
+    assert diag["filtered_icons"] == 1
+    assert paste_flow._verify_confirm_frame(
+        prep_blank, conf_new_u, field, text, expect_title="测试群(10)", allow_tail_punct=True,
+    ) == (False, "pasted text was not observed in target field")
+    # Non-chat layout (no keyboard strip) MUST NOT filter bottom-right UI items.
+    assert paste_flow._verify_confirm_frame(
+        prep_nokb, conf_nokb, field, text, expect_title="测试群(10)", allow_tail_punct=False,
+    ) == (False, "pasted text was not observed in target field")
+    # Non-empty prepare OCR MUST NOT filter stationary items.
+    monkeypatch.setattr(ocr, "read_text", lambda raw: (
+        [header, ocr.TextBox("U", icon_box, (.707, .553), .97), *kb] if raw == prep_stationary else boxes[raw]
+    ))
+    assert paste_flow._verify_confirm_frame(
+        prep_stationary, conf_stationary, field, text, expect_title="测试群(10)", allow_tail_punct=False,
+    ) == (False, "pasted text was not observed in target field")
+
+
+def test_verify_confirm_frame_corner_fade_requires_physical_bleach_and_gate(monkeypatch):
+    field = (66 / 500, 562 / 1080, 382 / 500, 618 / 1080)
+    text = "这个得赶紧找群主确认，没发货前一般还能协调改，具体看订单状态。"
+    icon_px = (348, 591, 359, 604)
+
+    def make_frame(*, pasted: bool, faded_corner: bool):
+        image = Image.new("RGB", (500, 1080), (237, 237, 237))
+        draw = ImageDraw.Draw(image)
+        top = 514 if pasted else 562
+        draw.rectangle((66, top, 382, 618), fill="white")
+        draw.rectangle(icon_px, fill=(45, 45, 45))
+        if pasted:
+            draw.rectangle((140, 558, 332, 582), fill=(15, 15, 15))
+            draw.rectangle((335, 558, 356, 568), fill=(70, 70, 70))
+            draw.rectangle((335, 570, 356, 582), fill=(155, 155, 155) if faded_corner else (10, 10, 10))
+        draw.rectangle((0, 626, 500, 700), fill=(214, 217, 222))
+        draw.rectangle((10, 646, 490, 676), fill=(214, 217, 222))
+        draw.rectangle((0, 700, 500, 1080), fill=(214, 217, 222))
+        draw.rounded_rectangle((380, 924, 494, 974), radius=8, fill=(10, 132, 255) if pasted else (200, 204, 212))
+        out = io.BytesIO()
+        image.save(out, "PNG")
+        return out.getvalue()
+
+    header = ocr.TextBox("测试群(10)", (.35, .06, .55, .09), (.45, .075), .99)
+    kb = [
+        ocr.TextBox("发送", (.83, .86, .93, .90), (.88, .88), .99),
+        ocr.TextBox("123", (.03, .86, .12, .90), (.08, .88), .99),
+    ]
+    grown_items = [
+        ocr.TextBox("这个得赶紧找群主确认，没", (.158, .492, .713, .515), (.435, .503), .99),
+        ocr.TextBox("发货前一般还能协调改，目", (.156, .514, .713, .542), (.434, .528), .98),
+        ocr.TextBox("体看订单状态。", (.158, .542, .459, .565), (.308, .553), .99),
+    ]
+    prep = make_frame(pasted=False, faded_corner=False)
+    conf_faded = make_frame(pasted=True, faded_corner=True)
+    conf_crisp = make_frame(pasted=True, faded_corner=False)
+    boxes = {prep: [header, *kb], conf_faded: [header, *grown_items, *kb], conf_crisp: [header, *grown_items, *kb]}
+    monkeypatch.setattr(ocr, "read_text", lambda raw: boxes[raw])
+
+    diag = {}
+    assert paste_flow._verify_confirm_frame(
+        prep, conf_faded, field, text, expect_title="测试群(10)", allow_tail_punct=True, diagnostics=diag,
+    ) == (True, "corner_fade")
+    assert diag["corner_fade_diff"] == "具->目" and diag["chat_composer_verified"] is True
+
+    assert paste_flow._verify_confirm_frame(
+        prep, conf_faded, field, text, expect_title="测试群(10)", allow_tail_punct=False,
+    ) == (False, "pasted text was not observed in target field")
+    assert paste_flow._verify_confirm_frame(
+        prep, conf_crisp, field, text, expect_title="测试群(10)", allow_tail_punct=True,
+    ) == (False, "pasted text was not observed in target field")
+
+    # Stacked missing thin CJK bracket '「' + corner_fade passes when faded & allowed, rejects otherwise.
+    stacked_text = "这个「得赶紧找群主确认，没发货前一般还能协调改，具体看订单状态。"
+    omitted_row1 = ocr.TextBox("这个得赶紧找群主确认，没", (.158, .492, .713, .515), (.435, .503), .99)
+    stacked_boxes = {
+        prep: [header, *kb],
+        conf_faded: [header, omitted_row1, grown_items[1], grown_items[2], *kb],
+        conf_crisp: [header, omitted_row1, grown_items[1], grown_items[2], *kb],
+    }
+    monkeypatch.setattr(ocr, "read_text", lambda raw: stacked_boxes[raw])
+    diag_s = {}
+    assert paste_flow._verify_confirm_frame(
+        prep, conf_faded, field, stacked_text, expect_title="测试群(10)", allow_tail_punct=True, diagnostics=diag_s,
+    ) == (True, "corner_fade")
+    assert diag_s["corner_fade_diff"] == "具->目;punct=「"
+    assert paste_flow._verify_confirm_frame(
+        prep, conf_faded, field, stacked_text, expect_title="测试群(10)", allow_tail_punct=False,
+    ) == (False, "pasted text was not observed in target field")
+    assert paste_flow._verify_confirm_frame(
+        prep, conf_crisp, field, stacked_text, expect_title="测试群(10)", allow_tail_punct=True,
+    ) == (False, "pasted text was not observed in target field")

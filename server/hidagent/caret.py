@@ -281,27 +281,34 @@ def _same_field(image, reference, caret, patch):
 
 
 def _green_scanout_matches(sample, off, on, width):
-    """Allow smooth sRGB/4:2:0 scanout fade along a proven green caret, never a mark or tick."""
+    """Allow smooth sRGB/4:2:0 scanout and chroma jitter along a proven green caret, never a mark or tick."""
     stride = width * 3
-    alphas, errors = [], []
+    alphas, errors, rg_errors = [], [], []
     for r0 in range(0, len(sample), stride):
         s_row, lo_row, hi_row = sample[r0:r0 + stride], off[r0:r0 + stride], on[r0:r0 + stride]
         delta = [h - lo for lo, h in zip(lo_row, hi_row, strict=True)]
         norm = sum(d * d for d in delta)
         if norm < 300:
-            row_errors = [max(abs(s_row[k + c] - lo_row[k + c]) for c in range(3)) for k in range(0, stride, 3)]
+            row_rg = [max(abs(s_row[k + c] - lo_row[k + c]) for c in (0, 1)) for k in range(0, stride, 3)]
+            row_errors = [max(row_rg[k // 3], abs(s_row[k + 2] - lo_row[k + 2])) for k in range(0, stride, 3)]
+            if any(err > 54 for err in row_errors):
+                return False
         else:
             alpha = sum((s - lo) * d for s, lo, d in zip(s_row, lo_row, delta, strict=True)) / norm
             if not -.10 <= alpha <= 1.10:
                 return False
             alpha = max(0., min(1., alpha))
             alphas.append(alpha)
-            row_errors = [max(abs(s_row[k + c] - (lo_row[k + c] + alpha * delta[k + c])) for c in range(3))
-                          for k in range(0, stride, 3)]
-        if any(err > 54 for err in row_errors):
-            return False
+            row_rg = [max(abs(s_row[k + c] - (lo_row[k + c] + alpha * delta[k + c])) for c in (0, 1))
+                      for k in range(0, stride, 3)]
+            row_b = [abs(s_row[k + 2] - (lo_row[k + 2] + alpha * delta[k + 2]))
+                     for k in range(0, stride, 3)]
+            if any(err > 54 for err in row_rg) or any(err > 68 for err in row_b):
+                return False
+            row_errors = [max(rg, b) for rg, b in zip(row_rg, row_b, strict=True)]
         errors.extend(row_errors)
-    if not errors or statistics.median(errors) > 12:
+        rg_errors.extend(row_rg)
+    if not errors or statistics.median(rg_errors) > 12 or statistics.median(errors) > 18:
         return False
     return not alphas or (max(alphas) - min(alphas) <= .65
                           and all(abs(b - a) <= .22 for a, b in zip(alphas, alphas[1:], strict=False)))
@@ -400,7 +407,7 @@ def _template_cycle(caret, images, frames, current, *, allow_white=True, amber=F
                     continue
                 tried.add(pair)
                 if _matching_cycle(caret, patch, images, frames, current, off_index, on_index, x, pair,
-                                   green=green):
+                                   green=green, on_indices=frozenset(on)):
                     return True
     return False
 
@@ -443,7 +450,8 @@ def _opposite_caret_pixels(low, high, caret, patch, core_x):
     return wrong
 
 
-def _matching_cycle(caret, patch, images, frames, current, off_index, on_index, core_x, pair, *, green=False):
+def _matching_cycle(caret, patch, images, frames, current, off_index, on_index, core_x, pair, *, green=False,
+                    on_indices=()):
     low, high = pair
     low_image = images[off_index]
     if (not _stable_underline(low_image, images[on_index], caret)
@@ -457,15 +465,19 @@ def _matching_cycle(caret, patch, images, frames, current, off_index, on_index, 
     if not norm:
         return False
     states = []
-    for image, frame in zip(images, frames, strict=True):
+    for idx, (image, frame) in enumerate(zip(images, frames, strict=True)):
         sample = image.crop(patch).tobytes()
         if not _same_field(image, low_image, caret, patch):
             states.clear()  # Never stitch a blink across a text/field edit.
             continue
-        if not _phase_matches(sample, low, high):
+        matched = _phase_matches(sample, low, high) or (
+            green and _green_scanout_matches(sample, low, high, patch[2] - patch[0])
+        )
+        if not matched:
             continue
         alpha = sum((v - a) * d for v, a, d in zip(sample, low, delta, strict=True)) / norm
-        state = 0 if alpha <= .1 else 1 if alpha >= .9 else None
+        state = (0 if alpha <= .1 else
+                 1 if alpha >= .9 or (green and idx in on_indices and alpha >= .65) else None)
         if state is not None and (not states or states[-1][0] != state):
             states.append((state, frame.arrived))
         if len(states) >= 3:
@@ -474,6 +486,80 @@ def _matching_cycle(caret, patch, images, frames, current, off_index, on_index, 
                     and .12 <= c[1] - b[1] <= 1.8):
                 return True
     return False
+
+
+def _solid_green_core(r, g, b):
+    # Full ON green caret core (distinct from semi-transparent fade mid-phases).
+    return r <= 40 and g >= 165 and g - r >= 140 and g - b >= 30
+
+
+def _steady_green_chroma_carets(first, second, regions, green_scope):
+    """Exempt stationary solid-ON green caret chroma jitter inside caller-verified `green_scope`."""
+    if green_scope is None:
+        return []
+    found = []
+    for bounds in regions:
+        channels = ImageChops.difference(first.crop(bounds), second.crop(bounds)).split()
+        dynamic = ImageChops.lighter(ImageChops.lighter(*channels[:2]), channels[2])
+        for points in _components(dynamic.point(lambda value: 255 if value > 24 else 0)):
+            xs, ys = zip(*points, strict=True)
+            x0, y0, x1, y1 = min(xs), min(ys), max(xs) + 1, max(ys) + 1
+            bw, bh = x1 - x0, y1 - y0
+            if not (0 < x0 < x1 < dynamic.width and 0 < y0 < y1 < dynamic.height
+                    and 1 <= bw <= max(3, .012 * first.width)
+                    and max(6, .008 * first.height) <= bh <= .05 * first.height and bh >= 3 * bw):
+                continue
+            if not (len(points) >= .65 * bw * bh or max(xs.count(x) for x in set(xs)) >= .95 * bh):
+                continue
+            bx0, by0, bx1, by1 = x0 + bounds[0], y0 + bounds[1], x1 + bounds[0], y1 + bounds[1]
+            box = (bx0, by0, bx1, by1)
+            scoped1 = _scoped_caret(first, box, green_scope)
+            scoped2 = _scoped_caret(second, box, green_scope)
+            if scoped1 is None or scoped2 is None:
+                continue
+            patch = (bx0 - 1, by0 - 1, bx1 + 2, by1 + 1)
+            if not _same_field(first, second, scoped1, patch):
+                continue
+            rows = range(by0 + 2, by1 - 2)
+            upper = range(by0 + 2, by0 + round(.75 * (by1 - by0)))
+            if len(rows) < 4 or not upper:
+                continue
+            has_core = False
+            for x in range(bx0, bx1):
+                c1 = [first.getpixel((x, y)) for y in rows]
+                c2 = [second.getpixel((x, y)) for y in rows]
+                if not (sum(_green_tone(*rgb) for rgb in c1) >= .80 * len(c1)
+                        and sum(_green_tone(*rgb) for rgb in c2) >= .80 * len(c2)
+                        and sum(_solid_green_core(*rgb) for rgb in c1) >= .75 * len(c1)
+                        and sum(_solid_green_core(*rgb) for rgb in c2) >= .75 * len(c2)):
+                    continue
+                k1 = [max(abs(a - b) for a, b in zip(first.getpixel((x, y)),
+                      first.getpixel((scoped1.background_x, y)), strict=True)) for y in upper]
+                k2 = [max(abs(a - b) for a, b in zip(second.getpixel((x, y)),
+                      second.getpixel((scoped2.background_x, y)), strict=True)) for y in upper]
+                if sum(v >= 120 for v in k1) >= .80 * len(upper) and sum(v >= 120 for v in k2) >= .80 * len(upper):
+                    has_core = True
+                    break
+            if not has_core:
+                continue
+            p1, p2 = first.crop(patch).tobytes(), second.crop(patch).tobytes()
+            r_diffs = [abs(p1[i] - p2[i]) for i in range(0, len(p1), 3)]
+            g_diffs = [abs(p1[i + 1] - p2[i + 1]) for i in range(0, len(p1), 3)]
+            if (max(r_diffs) > 45 or statistics.median(r_diffs) > 12
+                    or max(g_diffs) > 45 or statistics.median(g_diffs) > 16):
+                continue
+            valid_hot = True
+            for i in range(0, len(p1), 3):
+                r1, g1, b1 = p1[i], p1[i + 1], p1[i + 2]
+                r2, g2, b2 = p2[i], p2[i + 1], p2[i + 2]
+                if max(abs(r1 - r2), abs(g1 - g2), abs(b1 - b2)) > 24:
+                    if not (g1 >= 145 and g1 >= r1 and g1 >= b1 - 15
+                            and g2 >= 145 and g2 >= r2 and g2 >= b2 - 15):
+                        valid_hot = False
+                        break
+            if valid_hot:
+                found.append(scoped1)
+    return list(dict.fromkeys(found))
 
 
 def _temporal_carets(first, second, frames, regions, *, images=None, allow_white=True, allow_editor=False,
@@ -679,6 +765,13 @@ def mask_caret_blink(before, after, diff, frames=(), scope=None):
             w, h = first.size
             green_scope = (round(scope[0] * w), round(scope[1] * h), round(scope[2] * w), round(scope[3] * h))
         for caret in _temporal_carets(first, second, frames, regions, allow_editor=True, green_scope=green_scope):
+            x0, y0, x1, y1 = caret.box
+            candidates.append(tuple(round(v * diff.size[i % 2] / first.size[i % 2])
+                                    for i, v in enumerate((x0 - 1, y0 - 1, x1 + 1, y1))))
+    if not candidates and scope is not None:
+        w, h = first.size
+        green_scope = (round(scope[0] * w), round(scope[1] * h), round(scope[2] * w), round(scope[3] * h))
+        for caret in _steady_green_chroma_carets(first, second, regions, green_scope):
             x0, y0, x1, y1 = caret.box
             candidates.append(tuple(round(v * diff.size[i % 2] / first.size[i % 2])
                                     for i, v in enumerate((x0 - 1, y0 - 1, x1 + 1, y1))))

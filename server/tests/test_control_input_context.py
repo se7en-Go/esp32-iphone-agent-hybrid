@@ -1,8 +1,11 @@
 """Observed Controls input must retain its evidence while waiting for HID locks."""
 
 import asyncio
+import io
+from pathlib import Path
 
 import pytest
+from PIL import Image, ImageDraw
 from test_controls import jpeg
 
 from hidagent.app import ControlAction
@@ -268,5 +271,89 @@ def test_controls_recheck_a_later_chunk_after_an_identical_reconnect(tmp_path, m
         assert "changed" in result["error"]
         assert len(link.written) == 1
         device.close()
+
+    asyncio.run(scenario())
+
+
+def test_controls_allow_stationary_assistive_opacity_and_report_pre_write_false(tmp_path, monkeypatch):
+    fixtures = Path(__file__).parent / "fixtures" / "wechat_paste"
+    dim = (fixtures / "assistive_dim.jpg").read_bytes()
+    bright = (fixtures / "assistive_bright.jpg").read_bytes()
+    field = (0.132, 0.525, 0.768, 0.576)
+
+    async def scenario():
+        screen, device, link = Screen(), Device(), Link()
+        screen._on_jpeg(dim)
+        device.attach(link)
+        phone = Phone(device, tmp_path / "calibration.json", screen)
+        controls = Controls(phone, screen)
+        monkeypatch.setattr(controls, "_respond",
+                            lambda _b, _c, _g, _r, ack, err, extra, *_a: asyncio.sleep(
+                                0, result={"command_acknowledged": ack, "error": err, **extra}))
+
+        # 1. Ticket check tolerates stationary AssistiveTouch opacity shift outside field.
+        obs1 = controls.observation()
+        screen._on_jpeg(bright)
+        res_ok = await controls.perform(ControlAction(
+            action="key", text="enter", screen_id=obs1["screen_id"], caret_scope=field))
+        assert res_ok["command_acknowledged"] is True
+        assert link.written == [b"1 key enter\n"]
+
+        # 2. Pre-write _validate_context rejection sets action_may_have_executed=False while leaving
+        # stationary opacity shift allowed until real content changes.
+        screen._on_jpeg(dim)
+        obs2 = controls.observation()
+        lock = device._lock
+        await lock.acquire()
+        task = asyncio.create_task(controls.perform(ControlAction(
+            action="key", text="enter", screen_id=obs2["screen_id"], caret_scope=field)))
+        try:
+            while not lock._waiters:
+                await asyncio.sleep(0)
+            screen._on_jpeg(bright)  # harmless AssistiveTouch opacity shift dim -> bright still allowed
+            lock.release()
+            res_opacity = await task
+            assert res_opacity["command_acknowledged"] is True
+            assert len(link.written) == 2
+
+            obs3 = controls.observation()
+            await lock.acquire()
+            task2 = asyncio.create_task(controls.perform(ControlAction(
+                action="key", text="enter", screen_id=obs3["screen_id"], caret_scope=field)))
+            while not lock._waiters:
+                await asyncio.sleep(0)
+            screen._on_jpeg(jpeg("black"))
+            lock.release()
+            res_rejected = await task2
+            assert res_rejected["command_acknowledged"] is False
+            assert res_rejected["action_may_have_executed"] is False
+            assert "screen changed since the original observation" in res_rejected["error"]
+            assert len(link.written) == 2
+
+            # 3. Genuine content tamper on top of assistive_bright still rejects cleanly.
+            im_tampered = Image.open(io.BytesIO(bright)).convert("RGB")
+            ImageDraw.Draw(im_tampered).rectangle((180, 70, 320, 95), fill=(200, 200, 200))
+            tampered_buf = io.BytesIO()
+            im_tampered.save(tampered_buf, "JPEG", quality=92)
+            tampered_frame = tampered_buf.getvalue()
+
+            screen._on_jpeg(dim)
+            obs4 = controls.observation()
+            await lock.acquire()
+            task3 = asyncio.create_task(controls.perform(ControlAction(
+                action="key", text="enter", screen_id=obs4["screen_id"], caret_scope=field)))
+            while not lock._waiters:
+                await asyncio.sleep(0)
+            screen._on_jpeg(tampered_frame)
+            lock.release()
+            res_tamper = await task3
+            assert res_tamper["command_acknowledged"] is False
+            assert res_tamper["action_may_have_executed"] is False
+            assert "screen changed since the original observation" in res_tamper["error"]
+            assert len(link.written) == 2
+        finally:
+            if lock.locked():
+                lock.release()
+            device.close()
 
     asyncio.run(scenario())

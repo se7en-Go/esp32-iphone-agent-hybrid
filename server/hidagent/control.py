@@ -7,6 +7,7 @@
 import asyncio
 import base64
 import io
+import logging
 import math
 import time
 import uuid
@@ -31,6 +32,7 @@ from .text_input import clipboard_mode_options, select_type_mode
 from .text_target import TextTargetGuard
 
 VERIFIED_CARET_SCOPE_TTL = 120.0
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -221,11 +223,14 @@ class Controls:
             except RuntimeError as exc:
                 rejected("navigation_context", freshness.snapshot(self.screen))
                 raise ValueError(str(exc)) from exc
-        elif screen_compare.observation_changed(
-                ticket[2], frame, caret_frames=getattr(self.screen, "recent_frames", ()),
-                caret_scope=caret_scope):
-            rejected("layout_changed", current)
-            raise ValueError("screen changed since observation; observe again")
+        else:
+            residuals = []
+            if screen_compare.observation_changed(
+                    ticket[2], frame, caret_frames=getattr(self.screen, "recent_frames", ()),
+                    caret_scope=caret_scope, allow_assistive_opacity=True, residual_out=residuals):
+                log.info("control ticket rejected: residuals=%s", residuals)
+                rejected("layout_changed", current)
+                raise ValueError("screen changed since observation; observe again")
         return ticket[2], width, height
 
     @staticmethod
@@ -521,43 +526,55 @@ class Controls:
         return planned
 
     def _validate_context(self, planned, *, stage: str = "context", cursor=None, reference=None):
-        if "before_session" in planned:
-            planned["before_session"]()
-        original = planned["observation"]
-        current = require_fresh(self.screen)
-        if current.generation != original.generation:
-            raise RuntimeError("screen changed since the original observation; observe again before acting")
-        navigation = planned.get("navigation_context")
-        if navigation is not None:
-            if (not isinstance(navigation, NavigationContext) or planned["name"] not in {"home", "back"}
-                    or navigation.action != planned["name"] or navigation.observation != original):
-                raise RuntimeError("invalid system navigation context")
-            navigation.validate_current(self.screen, cursor=cursor, reference=reference)
-            return
-        if stage in {"accept", "chunk"}:
-            if "_input_guard" not in planned:
-                planned["_input_guard"] = InputContextGuard(self.screen, original)
-            planned["_input_guard"](stage=stage)
-            return
-        caret_scope = planned.get("caret_scope")
-        if cursor is not None:
-            # Gesture callers forward internally measured evidence, never a caller-supplied mask.
-            # Reuse the same crop checks as the final pointer guard at the device write boundary.
-            if "_gesture_context" not in planned:
-                planned["_gesture_context"] = TextTargetGuard(
-                    self.screen, original.frame, SimpleNamespace(center=cursor[0]), observation=original,
-                    **({"caret_scope": caret_scope} if caret_scope is not None else {}))
-            planned["_gesture_context"](cursor=cursor, reference=reference)
-            return
-        if screen_compare.observation_changed(
-            original.frame, current.frame,
-            caret_frames=getattr(self.screen, "recent_frames", ()),
-            caret_scope=caret_scope):
-            raise RuntimeError("screen changed since the original observation; observe again before acting")
+        planned["_pre_write_rejected"] = False
+        try:
+            if "before_session" in planned:
+                planned["before_session"]()
+            original = planned["observation"]
+            current = require_fresh(self.screen)
+            if current.generation != original.generation:
+                raise RuntimeError("screen changed since the original observation; observe again before acting")
+            navigation = planned.get("navigation_context")
+            if navigation is not None:
+                if (not isinstance(navigation, NavigationContext) or planned["name"] not in {"home", "back"}
+                        or navigation.action != planned["name"] or navigation.observation != original):
+                    raise RuntimeError("invalid system navigation context")
+                navigation.validate_current(self.screen, cursor=cursor, reference=reference)
+                return
+            if stage in {"accept", "chunk"}:
+                if "_input_guard" not in planned:
+                    planned["_input_guard"] = InputContextGuard(
+                        self.screen, original, allow_assistive_opacity=True)
+                planned["_input_guard"](stage=stage)
+                return
+            caret_scope = planned.get("caret_scope")
+            if cursor is not None:
+                # Gesture callers forward internally measured evidence, never a caller-supplied mask.
+                # Reuse the same crop checks as the final pointer guard at the device write boundary.
+                if "_gesture_context" not in planned:
+                    planned["_gesture_context"] = TextTargetGuard(
+                        self.screen, original.frame, SimpleNamespace(center=cursor[0]), observation=original,
+                        **({"caret_scope": caret_scope} if caret_scope is not None else {}))
+                planned["_gesture_context"](cursor=cursor, reference=reference)
+                return
+            residuals = []
+            if screen_compare.observation_changed(
+                    original.frame, current.frame,
+                    caret_frames=getattr(self.screen, "recent_frames", ()),
+                    caret_scope=caret_scope, allow_assistive_opacity=True, residual_out=residuals):
+                log.info("control context rejected (%s): residuals=%s", planned["name"], residuals)
+                raise RuntimeError("screen changed since the original observation; observe again before acting")
+        except RuntimeError:
+            planned["_pre_write_rejected"] = True
+            raise
 
     async def _execute(self, planned: dict) -> float | None:
         if "before_session" in planned:
-            planned["before_session"]()
+            try:
+                planned["before_session"]()
+            except RuntimeError:
+                planned["_pre_write_rejected"] = True
+                raise
         name = planned["name"]
         extra = planned["extra"]
         if name in ("tap", "tap_text", "long_press", "double_tap"):
@@ -876,6 +893,10 @@ class Controls:
                 completed_at = time.time()
             except (RuntimeError, OSError) as exc:
                 error = str(exc)
+                if (plan.pop("_pre_write_rejected", False)
+                        and not admission.written
+                        and plan["extra"].get("repeat_completed", 0) == 0):
+                    plan["extra"]["action_may_have_executed"] = False
         if acknowledged and plan["name"] != "point":
             self.clear_verified_caret_scope()
         options = {"home_unconfirmed": home_unconfirmed} if home_unconfirmed is not None else {}

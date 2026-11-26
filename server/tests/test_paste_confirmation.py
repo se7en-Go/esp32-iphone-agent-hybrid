@@ -504,3 +504,478 @@ def test_rigid_scroll_verifies_avatar_clipped_at_header_edge(edit, fractional_ed
     else:
         assert match is not None
         assert match == pytest.approx((split_y / height, scroll / height), abs=.002)
+
+
+def test_matches_chat_composer_lines_tail_punctuation_and_rejections():
+    from hidagent.paste_confirmation import _matches_chat_composer_lines
+
+    long_msg = ("这期具体保质期每款不一样，商品详情页一般会写，", "你点开对应链接看下；页面没标的我帮你问群主确认。")
+    assert _matches_chat_composer_lines(
+        ("这期具体保质期每款不一样，商品详情页一般会写，", "你点开对应链接看下；页面", "没标的我帮你问群主确认。"),
+        long_msg,
+    ) == ("full", "")
+    assert _matches_chat_composer_lines(
+        ("这期具体保质期每款不一样，商品详情页一般会写，", "你点开对应链接看下；页面", "没标的我帮你问群主确认"),
+        long_msg,
+    ) == ("tail_punct", "。")
+    assert _matches_chat_composer_lines(
+        ("请联系客服并在群内确认好发货时间后再拍……",),
+        ("请联系客服并在群内确认好发货时间后再拍……",),
+    ) == ("full", "")
+    assert _matches_chat_composer_lines(
+        ("请联系客服并在群内确认好发货时间后再拍",),
+        ("请联系客服并在群内确认好发货时间后再拍……",),
+    ) == ("tail_punct", "……")
+
+    # Strict rejections: short strings, protected digits/ASCII/URLs, CJK chars, interior edits, missing lines, dupes.
+    assert _matches_chat_composer_lines(("收到了，没问题",), ("收到了，没问题。",)) == (None, "")
+    assert _matches_chat_composer_lines(
+        ("本次团购活动统一到手价仅需89",), ("本次团购活动统一到手价仅需89。",),
+    ) == (None, "")
+    assert _matches_chat_composer_lines(("活动优惠直降金额合计是-10",), ("活动优惠直降金额合计是-10。",)) == (None, "")
+    assert _matches_chat_composer_lines(
+        ("点击活动链接https://a.com/x",), ("点击活动链接https://a.com/x。",),
+    ) == (None, "")
+    assert _matches_chat_composer_lines(
+        ("请联系客服并在群内确认好发货时间后再拍",),
+        ("请联系客服并在群内确认好发货时间后再拍了。",),
+    ) == (None, "")
+    assert _matches_chat_composer_lines(
+        ("这期具体保质期每款不一样，商品详情页一般会", "你点开对应链接看下；页面没标的我帮你问群主确认。"),
+        long_msg,
+    ) == (None, "")
+    assert _matches_chat_composer_lines(
+        ("这期具体保质期每款不一样，商品详情页一般会写", "你点开对应链接看下；页面没标的我帮你问群主确认"),
+        long_msg,
+    ) == ("ocr_punct", "，。")
+    assert _matches_chat_composer_lines(
+        ("这期具体保质期每款不一样商品详情页一般会写", "你点开对应链接看下；页面没标的我帮你问群主确认"),
+        long_msg,
+    ) == (None, "")
+    assert _matches_chat_composer_lines(
+        ("这期具体保质期每款不一样，商品详情页一般会写，", "你点开对应链接看下；页面没标的我帮你问群主确人"),
+        long_msg,
+    ) == (None, "")
+    assert _matches_chat_composer_lines(
+        ("第一行说明完整内容在这里",),
+        ("第一行说明完整内容在这里", "第二行说明完整内容。"),
+    ) == (None, "")
+    assert _matches_chat_composer_lines(
+        ("请直接点击小程序查看详情。", "多余一行"),
+        ("请直接点击小程序查看详情。",),
+    ) == (None, "")
+
+
+def _chat_tail_frame(*, pasted: bool, grown: bool = False, key_blue: bool = False):
+    image = Image.new("RGB", (500, 1080), (237, 237, 237))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, 500, 118), fill=(237, 237, 237))
+    top = 514 if (pasted and grown) else 562
+    draw.rectangle((66, top, 382, 618), fill="white")
+    if pasted:
+        draw.rectangle((92, top + 16, 320, top + 24), fill=(35, 35, 35))
+        if grown:
+            draw.rectangle((92, top + 56, 300, top + 64), fill=(35, 35, 35))
+    draw.rectangle((0, 626, 500, 700), fill=(214, 217, 222))
+    draw.rectangle((10, 646, 490, 676), fill=(214, 217, 222))
+    draw.rectangle((0, 700, 500, 1080), fill=(214, 217, 222))
+    send_fill = (10, 132, 255) if key_blue else (200, 204, 212)
+    draw.rounded_rectangle((380, 924, 494, 974), radius=8, fill=send_fill)
+    out = io.BytesIO()
+    image.save(out, "PNG")
+    return out.getvalue()
+
+
+@pytest.mark.parametrize("grown", [False, True])
+def test_chat_structural_sync_accepts_tail_punct_only_when_send_turns_blue(monkeypatch, grown):
+    from hidagent import paste_confirmation
+
+    field = (66 / 500, 562 / 1080, 382 / 500, 618 / 1080)
+    text = (
+        "第一行详细团购活动说明文字内容\n第二行请按链接提示核对并确认。"
+        if grown else "这期具体保质期看详情页链接确认。"
+    )
+    before = _chat_tail_frame(pasted=False, grown=False, key_blue=False)
+    after = _chat_tail_frame(pasted=True, grown=grown, key_blue=True)
+    stale_before = _chat_tail_frame(pasted=False, grown=False, key_blue=True)
+    grey_after = _chat_tail_frame(pasted=True, grown=grown, key_blue=False)
+
+    header = [label("测试群(10)", .45, .075)]
+    kb = [label("发送", .88, .88), label("123", .08, .88)]
+    if grown:
+        field_items = [
+            ocr.TextBox("第一行详细团购活动说明文字内容", (.18, .49, .70, .505), (.44, .497), .99),
+            ocr.TextBox("第二行请按链接提示核对并确认", (.18, .53, .68, .545), (.43, .537), .99),
+        ]
+    else:
+        field_items = [ocr.TextBox("这期具体保质期看详情页链接确认", (.18, .535, .68, .555), (.43, .545), .99)]
+
+    items = {
+        before: header + [label("候选A", .20, .615)] + kb,
+        stale_before: header + [label("候选A", .20, .615)] + kb,
+        after: header + field_items + [label("候选B", .20, .615)] + kb,
+        grey_after: header + field_items + [label("候选B", .20, .615)] + kb,
+    }
+    monkeypatch.setattr(ocr, "read_text_async", lambda frame: _async_val(items[frame]))
+    assert asyncio.run(paste_confirmation.verify_chat_structural_paste(before, after, field, text)) is not None
+    # Reject stale-blue send key, non-blue send key, and non-send keys in both grown and single-line branches.
+    assert asyncio.run(paste_confirmation.verify_chat_structural_paste(stale_before, after, field, text)) is None
+    assert asyncio.run(paste_confirmation.verify_chat_structural_paste(before, grey_after, field, text)) is None
+    search_kb = [label("搜索", .88, .88), label("123", .08, .88)]
+    monkeypatch.setattr(ocr, "read_text_async", lambda frame: _async_val({
+        before: header + [label("候选A", .20, .615)] + search_kb,
+        after: header + field_items + [label("候选B", .20, .615)] + search_kb,
+    }[frame]))
+    assert asyncio.run(paste_confirmation.verify_chat_structural_paste(before, after, field, text)) is None
+
+    # Permission-sheet path remains strictly exact on trailing punctuation using 3 distinct frames.
+    sheet = _chat_tail_frame(pasted=False, grown=False, key_blue=False) + b"\x00"
+    dialog = [
+        label("“微信”想从“快捷指令”粘贴", .5, .39),
+        label("你允许这样做吗？", .5, .44),
+        label("不允许粘贴", .27, .52),
+        label("允许粘贴", .7, .52),
+    ]
+    exact_items = (
+        [
+            ocr.TextBox("第一行详细团购活动说明文字内容", (.18, .49, .70, .505), (.44, .497), .99),
+            ocr.TextBox("第二行请按链接提示核对并确认。", (.18, .53, .70, .545), (.44, .537), .99),
+        ]
+        if grown else [ocr.TextBox("这期具体保质期看详情页链接确认。", (.18, .535, .70, .555), (.44, .545), .99)]
+    )
+    after_exact = _chat_tail_frame(pasted=True, grown=grown, key_blue=True) + b"\x01"
+    monkeypatch.setattr(ocr, "read_text_async", lambda frame: _async_val({
+        before: header + [label("候选A", .20, .615)] + kb,
+        sheet: dialog,
+        after: header + field_items + [label("候选A", .20, .615)] + kb,
+        after_exact: header + exact_items + [label("候选A", .20, .615)] + kb,
+    }[frame]))
+    assert asyncio.run(verify_after_paste_permission(before, sheet, after, field, text)) is False
+    assert asyncio.run(verify_after_paste_permission(before, sheet, after_exact, field, text)) is True
+
+
+def test_matches_chat_composer_lines_thin_punct_width_and_numeric_safety():
+    from hidagent.paste_confirmation import _matches_chat_composer_lines
+
+    # Intact digits and URLs allow thin CJK punctuation recovery elsewhere in the message.
+    assert _matches_chat_composer_lines(
+        ("一般48小时内发货，点进「订单详情就能看到物流单号。",),
+        ("一般48小时内发货，点进「订单详情」就能看到物流单号。",),
+    ) == ("ocr_punct", "」")
+    assert _matches_chat_composer_lines(
+        ("本次团购到手价89元，请先查看详情确认",), ("本次团购到手价89元，请先查看详情确认。",),
+    ) == ("tail_punct", "。")
+    assert _matches_chat_composer_lines(
+        ("活动链接https://a.com/x，请确认后下单",), ("活动链接https://a.com/x，请确认后下单。",),
+    ) == ("tail_punct", "。")
+
+    # Exact 144526 repro: missing thin bracket '」' + corner_fade '帮->都' + width-equiv ';'.
+    msg_144526 = ("在群里的官方团购小程序进「订单详情」就能看到物流单号；找不到的话联系群主帮你看下。",)
+    assert _matches_chat_composer_lines(
+        ("在群里的官方团购小程序进", "「订单详情就能看到物流单", "号；找不到的话联系群主帮", "你看下。"),
+        msg_144526,
+    ) == ("ocr_punct", "」")
+    assert _matches_chat_composer_lines(
+        ("在群里的官方团购小程序进", "「订单详情就能看到物流单", "号;找不到的话联系群主帮", "你看下。"),
+        msg_144526,
+    ) == ("ocr_punct", "」")
+    assert _matches_chat_composer_lines(
+        ("在群里的官方团购小程序进", "「订单详情就能看到物流单", "号；找不到的话联系群主都", "你看下。"),
+        msg_144526,
+        faded_rows={2: "sub"},
+    ) == ("corner_fade", "帮->都;punct=」")
+
+    # Safety boundaries: altered digits/price/URL/punctuation adjacent to digit or >2 puncts must reject.
+    assert _matches_chat_composer_lines(
+        ("一般4小时内发货，点进「订单详情」就能看到物流单号。",),
+        ("一般48小时内发货，点进「订单详情」就能看到物流单号。",),
+    ) == (None, "")
+    assert _matches_chat_composer_lines(
+        ("本次团购活动到手价89元，含税仅199元",),
+        ("本次团购活动到手价89元，含税仅19.9元",),
+    ) == (None, "")
+    assert _matches_chat_composer_lines(
+        ("请联系客服并在群内确认好发货时间，谢谢。",),
+        ("请联系客服并在群内确认好发货时间后再拍。",),
+    ) == (None, "")
+    assert _matches_chat_composer_lines(
+        ("在群里的官方团购小程序进「订单详情就能看到物流单号找不到的话联系群主帮你看下",),
+        msg_144526,
+    ) == (None, "")
+    assert _matches_chat_composer_lines(
+        ("本次团购到手价89天，请查看详情说明确认。",),
+        ("本次团购到手价89元，请查看详情说明确认。",),
+        faded_rows={0: "sub"},
+    ) == (None, "")
+    # Trailing punctuation immediately after a digit or URL or short last line (< 6 chars) must remain exact.
+    assert _matches_chat_composer_lines(
+        ("本次团购活动统一到手价仅需89",), ("本次团购活动统一到手价仅需89。",),
+    ) == (None, "")
+    assert _matches_chat_composer_lines(
+        ("点击活动链接https://a.com/x",), ("点击活动链接https://a.com/x。",),
+    ) == (None, "")
+    assert _matches_chat_composer_lines(
+        ("这里是一段足够长的第一行说明文字内容", "好"), ("这里是一段足够长的第一行说明文字内容", "好。"),
+    ) == (None, "")
+
+
+def test_chat_structural_sync_filters_stationary_icon_only(monkeypatch):
+    from hidagent import paste_confirmation
+
+    field = (66 / 500, 562 / 1080, 382 / 500, 618 / 1080)
+    short_text = "收到，这就处理。"
+    icon_box = (.69, .545, .725, .562)
+    icon_px = (348, 591, 359, 604)
+
+    def make_frame(*, pasted: bool, key_blue: bool, draw_icon: bool = True,
+                   draw_new_glyph: bool = False, icon_color=(55, 55, 55), field_bg="white"):
+        image = Image.new("RGB", (500, 1080), (237, 237, 237))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, 500, 118), fill=(237, 237, 237))
+        draw.rectangle((66, 562, 382, 618), fill=field_bg)
+        if draw_icon:
+            draw.rectangle(icon_px, fill=icon_color)
+        if draw_new_glyph:
+            draw.rectangle(icon_px, fill=(20, 20, 20))
+        if pasted:
+            draw.rectangle((92, 578, 220, 586), fill=(35, 35, 35))
+        draw.rectangle((0, 626, 500, 700), fill=(214, 217, 222))
+        draw.rectangle((10, 646, 490, 676), fill=(214, 217, 222))
+        draw.rectangle((0, 700, 500, 1080), fill=(214, 217, 222))
+        send_fill = (10, 132, 255) if key_blue else (200, 204, 212)
+        draw.rounded_rectangle((380, 924, 494, 974), radius=8, fill=send_fill)
+        out = io.BytesIO()
+        image.save(out, "PNG")
+        return out.getvalue()
+
+    header = [label("测试群(10)", .45, .075)]
+    kb = [label("发送", .88, .88), label("123", .08, .88)]
+    pasted_item = ocr.TextBox(short_text, (.18, .535, .44, .555), (.31, .545), .99)
+    hallucinated_u = ocr.TextBox("U", icon_box, (.707, .553), .97)
+    hallucinated_second = ocr.TextBox("0", (.65, .545, .685, .562), (.667, .553), .97)
+    overlapping_u = ocr.TextBox("U", (.42, .545, .455, .562), (.437, .553), .97)
+    stationary_period = ocr.TextBox("。", icon_box, (.707, .553), .97)
+    left_draft = ocr.TextBox("旧", (.16, .545, .19, .562), (.175, .553), .98)
+
+    before_icon = make_frame(pasted=False, key_blue=False, draw_icon=True)
+    after_icon = make_frame(pasted=True, key_blue=True, draw_icon=True)
+    before_blank = make_frame(pasted=False, key_blue=False, draw_icon=False)
+    after_new_u = make_frame(pasted=True, key_blue=True, draw_icon=False, draw_new_glyph=True)
+    # Spatially flat colored patch (200, 200, 240): RGB channel spread 40 but grayscale luma contrast 0.
+    before_flat_tint = make_frame(pasted=False, key_blue=False, draw_icon=False, field_bg=(200, 200, 240))
+    after_flat_tint = make_frame(pasted=True, key_blue=True, draw_icon=False, field_bg=(200, 200, 240))
+
+    # 1. Stationary drawn bottom-right icon misread as 'U' only in after is filtered.
+    monkeypatch.setattr(ocr, "read_text_async", lambda frame: _async_val({
+        before_icon: header + [label("候选A", .20, .615)] + kb,
+        after_icon: header + [pasted_item, hallucinated_u, label("候选B", .20, .615)] + kb,
+    }[frame]))
+    assert asyncio.run(paste_confirmation.verify_chat_structural_paste(
+        before_icon, after_icon, field, short_text)) is not None
+
+    # 2. If 'U' was already read in before OCR, before is non-empty -> strictly rejected.
+    monkeypatch.setattr(ocr, "read_text_async", lambda frame: _async_val({
+        before_icon: header + [hallucinated_u, label("候选A", .20, .615)] + kb,
+        after_icon: header + [pasted_item, hallucinated_u, label("候选B", .20, .615)] + kb,
+    }[frame]))
+    assert asyncio.run(paste_confirmation.verify_chat_structural_paste(
+        before_icon, after_icon, field, short_text)) is None
+
+    # 3. Newly pasted 'U' drawn only in after (white -> dark ink) MUST NOT be filtered.
+    monkeypatch.setattr(ocr, "read_text_async", lambda frame: _async_val({
+        before_blank: header + [label("候选A", .20, .615)] + kb,
+        after_new_u: header + [pasted_item, hallucinated_u, label("候选B", .20, .615)] + kb,
+    }[frame]))
+    assert asyncio.run(paste_confirmation.verify_chat_structural_paste(
+        before_blank, after_new_u, field, short_text)) is None
+
+    # 4. Flat white pixels AND flat tinted patch (200, 200, 240) MUST NOT be filtered.
+    monkeypatch.setattr(ocr, "read_text_async", lambda frame: _async_val({
+        before_blank: header + [label("候选A", .20, .615)] + kb,
+        after_icon: header + [pasted_item, hallucinated_u, label("候选B", .20, .615)] + kb,
+    }[frame]))
+    assert asyncio.run(paste_confirmation.verify_chat_structural_paste(
+        before_blank, after_icon, field, short_text)) is None
+    monkeypatch.setattr(ocr, "read_text_async", lambda frame: _async_val({
+        before_flat_tint: header + [label("候选A", .20, .615)] + kb,
+        after_flat_tint: header + [pasted_item, hallucinated_u, label("候选B", .20, .615)] + kb,
+    }[frame]))
+    assert asyncio.run(paste_confirmation.verify_chat_structural_paste(
+        before_flat_tint, after_flat_tint, field, short_text)) is None
+
+    # 5. Two stationary candidates, overlapping candidate, expected suffix "。", and left draft MUST NOT be filtered.
+    for bad_after in (
+        header + [pasted_item, hallucinated_second, hallucinated_u, label("候选B", .20, .615)] + kb,
+        header + [pasted_item, overlapping_u, label("候选B", .20, .615)] + kb,
+        header + [ocr.TextBox(short_text[:-1], (.18, .535, .64, .555), (.41, .545), .99),
+                  stationary_period, label("候选B", .20, .615)] + kb,
+    ):
+        monkeypatch.setattr(ocr, "read_text_async", lambda frame, a=bad_after: _async_val({
+            before_icon: header + [label("候选A", .20, .615)] + kb,
+            after_icon: a,
+        }[frame]))
+        target_msg = short_text[:-1] if stationary_period in bad_after else short_text
+        assert asyncio.run(paste_confirmation.verify_chat_structural_paste(
+            before_icon, after_icon, field, target_msg)) is None
+
+    # Directly verify _filter_stationary_field_icons never drops "。" even when drawn pixels are stationary.
+    with Image.open(io.BytesIO(before_icon)) as b_img, Image.open(io.BytesIO(after_icon)) as a_img:
+        kept = paste_confirmation._filter_stationary_field_icons(
+            [stationary_period], b_img.convert("RGB"), a_img.convert("RGB"), field,
+            expected=("这里有足够长的普通聊天消息先发。",),
+        )
+        assert kept == [stationary_period]
+
+    monkeypatch.setattr(ocr, "read_text_async", lambda frame: _async_val({
+        before_icon: header + [left_draft, label("候选A", .20, .615)] + kb,
+        after_icon: header + [left_draft, pasted_item, label("候选B", .20, .615)] + kb,
+    }[frame]))
+    assert asyncio.run(paste_confirmation.verify_chat_structural_paste(
+        before_icon, after_icon, field, short_text)) is None
+
+
+def test_chat_structural_sync_corner_fade_physical_proof_and_rejections(monkeypatch):
+    from hidagent import paste_confirmation
+
+    field = (66 / 500, 562 / 1080, 382 / 500, 618 / 1080)
+    icon_px = (348, 591, 359, 604)
+    text = "这个得赶紧找群主确认，没发货前一般还能协调改，具体看订单状态。"
+
+    def make_frame(*, pasted: bool, key_blue: bool, draw_icon: bool = True,
+                   faded_corner: bool = True, kb_label_blue: bool = True,
+                   draw_right_glyph: bool = True):
+        image = Image.new("RGB", (500, 1080), (237, 237, 237))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, 500, 118), fill=(237, 237, 237))
+        top = 514 if pasted else 562
+        draw.rectangle((66, top, 382, 618), fill="white")
+        if draw_icon:
+            draw.rectangle(icon_px, fill=(45, 45, 45))
+        if pasted:
+            draw.rectangle((92, top + 16, 260, top + 24), fill=(35, 35, 35))
+            # Row 2 left text crisp black (luma 15, wide enough white margin for _field_span)
+            draw.rectangle((140, 558, 326, 582), fill=(15, 15, 15))
+            if draw_right_glyph:
+                draw.rectangle((335, 558, 356, 568), fill=(70, 70, 70))
+                lower_fill = (155, 155, 155) if faded_corner else (10, 10, 10)
+                draw.rectangle((335, 570, 356, 582), fill=lower_fill)
+            draw.rectangle((78, 588, 228, 606), fill=(15, 15, 15))
+        draw.rectangle((0, 626, 500, 700), fill=(214, 217, 222))
+        draw.rectangle((10, 646, 490, 676), fill=(214, 217, 222))
+        draw.rectangle((0, 700, 500, 1080), fill=(214, 217, 222))
+        send_fill = (10, 132, 255) if (key_blue and kb_label_blue) else (200, 204, 212)
+        draw.rounded_rectangle((380, 924, 494, 974), radius=8, fill=send_fill)
+        out = io.BytesIO()
+        image.save(out, "PNG")
+        return out.getvalue()
+
+    header = [label("测试群(10)", .45, .075)]
+    kb = [label("发送", .88, .88), label("123", .08, .88)]
+    search_kb = [label("搜索", .88, .88), label("123", .08, .88)]
+    row1 = ocr.TextBox("这个得赶紧找群主确认，没", (.158, .492, .713, .515), (.435, .503), .99)
+    row2_mu = ocr.TextBox("发货前一般还能协调改，目", (.156, .514, .713, .542), (.434, .528), .98)
+    row2_interior_bad = ocr.TextBox("发货前一般还能协凋改，目", (.156, .514, .713, .542), (.434, .528), .98)
+    row3 = ocr.TextBox("体看订单状态。", (.158, .542, .459, .565), (.308, .553), .99)
+    row3_no_punct = ocr.TextBox("体看订单状态", (.158, .542, .440, .565), (.299, .553), .99)
+
+    prep_icon = make_frame(pasted=False, key_blue=False, draw_icon=True)
+    after_faded = make_frame(pasted=True, key_blue=True, draw_icon=True, faded_corner=True)
+    after_crisp = make_frame(pasted=True, key_blue=True, draw_icon=True, faded_corner=False)
+    after_omit_blank = make_frame(
+        pasted=True, key_blue=True, draw_icon=True, faded_corner=True, draw_right_glyph=False,
+    )
+    prep_no_icon = make_frame(pasted=False, key_blue=False, draw_icon=False)
+    after_no_icon = make_frame(pasted=True, key_blue=True, draw_icon=False, faded_corner=True)
+    row2_omitted = ocr.TextBox("发货前一般还能协调改，", (.158, .517, .659, .540), (.408, .528), .99)
+
+    # Positive: stationary corner icon + bleached right glyph accepts "sub" (具->目) and "omit" (具->).
+    monkeypatch.setattr(ocr, "read_text_async", lambda frame: _async_val({
+        prep_icon: header + [label("候选A", .20, .615)] + kb,
+        after_faded: header + [row1, row2_mu, row3, label("候选B", .20, .615)] + kb,
+    }[frame]))
+    assert asyncio.run(paste_confirmation.verify_chat_structural_paste(prep_icon, after_faded, field, text)) is not None
+
+    monkeypatch.setattr(ocr, "read_text_async", lambda frame: _async_val({
+        prep_icon: header + [label("候选A", .20, .615)] + kb,
+        after_faded: header + [row1, row2_omitted, row3, label("候选B", .20, .615)] + kb,
+    }[frame]))
+    assert asyncio.run(paste_confirmation.verify_chat_structural_paste(prep_icon, after_faded, field, text)) is not None
+
+    # Omission with blank white pixels (no glyph rendered right of x1) or crisp glyph MUST fail.
+    for bad_frame in (after_omit_blank, after_crisp):
+        monkeypatch.setattr(ocr, "read_text_async", lambda frame, bf=bad_frame: _async_val({
+            prep_icon: header + [label("候选A", .20, .615)] + kb,
+            bf: header + [row1, row2_omitted, row3, label("候选B", .20, .615)] + kb,
+        }[frame]))
+        assert asyncio.run(paste_confirmation.verify_chat_structural_paste(prep_icon, bad_frame, field, text)) is None
+
+    # Negative 1: crisp black right glyph (no physical bleach) MUST NOT use corner_fade.
+    monkeypatch.setattr(ocr, "read_text_async", lambda frame: _async_val({
+        prep_icon: header + [label("候选A", .20, .615)] + kb,
+        after_crisp: header + [row1, row2_mu, row3, label("候选B", .20, .615)] + kb,
+    }[frame]))
+    assert asyncio.run(paste_confirmation.verify_chat_structural_paste(prep_icon, after_crisp, field, text)) is None
+
+    # Negative 2: no stationary corner icon in before MUST reject even if faded.
+    monkeypatch.setattr(ocr, "read_text_async", lambda frame: _async_val({
+        prep_no_icon: header + [label("候选A", .20, .615)] + kb,
+        after_no_icon: header + [row1, row2_mu, row3, label("候选B", .20, .615)] + kb,
+    }[frame]))
+    assert asyncio.run(
+        paste_confirmation.verify_chat_structural_paste(prep_no_icon, after_no_icon, field, text),
+    ) is None
+
+    # Intact digits + corner_fade, and stacked corner_fade + thin CJK punct now pass ONLY when faded & blue send.
+    row1_with_price = ocr.TextBox("这个89元请找群主确认，没", row1.box, row1.center, .99)
+    text_with_price = "这个89元请找群主确认，没发货前一般还能协调改，具体看订单状态。"
+    for after_boxes, target_text in (
+        ([row1_with_price, row2_mu, row3], text_with_price),
+        ([row1, row2_mu, row3_no_punct], text),
+    ):
+        cand_label = label("候选B", .20, .615)
+        monkeypatch.setattr(
+            ocr,
+            "read_text_async",
+            lambda frame, a=after_boxes, cl=cand_label: _async_val({
+                prep_icon: header + [label("候选A", .20, .615)] + kb,
+                after_faded: header + a + [cl] + kb,
+            }[frame]),
+        )
+        assert asyncio.run(paste_confirmation.verify_chat_structural_paste(
+            prep_icon, after_faded, field, target_text)) is not None
+        monkeypatch.setattr(
+            ocr,
+            "read_text_async",
+            lambda frame, a=after_boxes, cl=cand_label: _async_val({
+                prep_icon: header + [label("候选A", .20, .615)] + kb,
+                after_crisp: header + a + [cl] + kb,
+            }[frame]),
+        )
+        assert asyncio.run(paste_confirmation.verify_chat_structural_paste(
+            prep_icon, after_crisp, field, target_text)) is None
+
+    # Negative 3..6: negation char, digit-adjacent fade, interior edit, non-send key.
+    row2_bu = ocr.TextBox("发货前一般还能协调改，不", (.156, .514, .713, .542), (.434, .528), .98)
+    row2_digit_adj = ocr.TextBox("发货前核对订单一共89件", (.156, .514, .713, .542), (.434, .528), .98)
+    for after_boxes, target_text, used_kb in (
+        ([row1, row2_mu, row3], text.replace("具体", "不体"), kb),
+        ([row1, row2_bu, row3], text, kb),
+        ([row1, row2_digit_adj, row3], "这个得赶紧找群主确认，没发货前核对订单一共89元体看订单状态。", kb),
+        ([row1, row2_interior_bad, row3], text, kb),
+        ([row1, row2_mu, row3], text, search_kb),
+    ):
+        cand_label = label("候选B", .20, .615)
+        monkeypatch.setattr(
+            ocr,
+            "read_text_async",
+            lambda frame, a=after_boxes, u_kb=used_kb, cl=cand_label: _async_val({
+                prep_icon: header + [label("候选A", .20, .615)] + u_kb,
+                after_faded: header + a + [cl] + u_kb,
+            }[frame]),
+        )
+        assert asyncio.run(paste_confirmation.verify_chat_structural_paste(
+            prep_icon, after_faded, field, target_text)) is None
+
+
+async def _async_val(val):
+    return val

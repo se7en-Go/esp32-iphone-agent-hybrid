@@ -362,3 +362,76 @@ def test_api_models_cli_and_client_caret_scope_contract():
     assert res["command_acknowledged"] is True
     assert captured["path"] == "/api/control/host-click"
     assert captured["json"]["caret_scope"] == list(FIELD)
+
+
+def _with_green_caret(base_name: str, color: tuple[int, int, int], *, x0: int = 250, width: int = 2) -> bytes:
+    def paint(draw: ImageDraw.ImageDraw) -> None:
+        draw.rectangle((246, 578, 262, 614), fill=(255, 255, 255))
+        draw.rectangle((x0, 581, x0 + width - 1, 610), fill=color)
+
+    return edited(base_name, paint)
+
+
+def test_green_caret_h264_blue_chroma_jitter_passes_in_blink_and_steady_on_modes():
+    off = _with_green_caret("pointer_outward_off", (255, 255, 255))
+    deep_a = _with_green_caret("pointer_outward_off", (0, 195, 58))
+    jitter_b = _with_green_caret("pointer_outward_off", (8, 216, 138))
+    deep_c = _with_green_caret("pointer_outward_off", (0, 194, 57))
+
+    for seq in (
+        (jitter_b, off, deep_c),
+        (off, jitter_b, off, deep_c),
+        (deep_c, off, jitter_b),
+        (deep_a, jitter_b, deep_c),
+    ):
+        hist = tuple(
+            SimpleNamespace(frame=frame, arrived=i * 0.45, generation=1)
+            for i, frame in enumerate(seq)
+        )
+        assert not screen_compare.observation_changed(jitter_b, deep_c, caret_frames=hist, caret_scope=FIELD)
+        assert screen_compare.observation_changed(jitter_b, deep_c, caret_frames=hist)
+        assert screen_compare.observation_changed(jitter_b, deep_c, caret_frames=hist, caret_scope=OUTSIDE_FIELD)
+
+
+@pytest.mark.parametrize("tamper", [
+    "dark_on_caret",
+    "dark_beside_caret",
+    "red_stroke",
+    "blue_stroke",
+    "shifted_column",
+    "mid_to_on_without_off",
+])
+def test_green_caret_chroma_jitter_never_hides_non_green_or_position_tamper(tamper):
+    deep_a = _with_green_caret("pointer_outward_off", (0, 195, 58))
+    jitter_b = _with_green_caret("pointer_outward_off", (8, 216, 138))
+    before = jitter_b
+
+    if tamper == "dark_on_caret":
+        after = edited("pointer_outward_off", lambda d: (
+            d.rectangle((246, 578, 262, 614), fill=(255, 255, 255)),
+            d.rectangle((250, 581, 251, 610), fill=(0, 195, 58)),
+            d.line((250, 586, 250, 598), fill=(30, 30, 30), width=1),
+        ))
+    elif tamper == "dark_beside_caret":
+        after = edited("pointer_outward_off", lambda d: (
+            d.rectangle((246, 578, 262, 614), fill=(255, 255, 255)),
+            d.rectangle((250, 581, 251, 610), fill=(0, 195, 58)),
+            d.line((257, 586, 257, 600), fill=(30, 30, 30), width=2),
+        ))
+    elif tamper == "red_stroke":
+        after = _with_green_caret("pointer_outward_off", (215, 40, 40))
+    elif tamper == "blue_stroke":
+        after = _with_green_caret("pointer_outward_off", (15, 110, 240))
+    elif tamper == "shifted_column":
+        after = _with_green_caret("pointer_outward_off", (0, 195, 58), x0=258)
+    else:
+        # Fading mid-phase without an off phase in history must still fail.
+        before = _with_green_caret("pointer_outward_off", (155, 222, 187))
+        after = _with_green_caret("pointer_outward_off", (8, 216, 138))
+        deep_a = _with_green_caret("pointer_outward_off", (160, 224, 190))
+
+    hist = tuple(
+        SimpleNamespace(frame=frame, arrived=i * 0.45, generation=1)
+        for i, frame in enumerate((deep_a, before, after))
+    )
+    assert screen_compare.observation_changed(before, after, caret_frames=hist, caret_scope=FIELD)

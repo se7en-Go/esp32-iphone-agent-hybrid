@@ -148,7 +148,7 @@ def _verify_target_context(frame, target_box, *, expect_title=None, report=None)
         raise RuntimeError("input field already has a draft; it was kept and nothing was pasted")
 
 
-def _center_field_lines(boxes, region):
+def _center_field_rows(boxes, region):
     from . import paste_confirmation
 
     left, top, right, bottom = region
@@ -173,10 +173,16 @@ def _center_field_lines(boxes, region):
         if not rows or abs(rows[-1][0].center[1] - item.center[1]) > height / 2:
             rows.append([])
         rows[-1].append(item)
-    return tuple(
-        paste_confirmation._visible_text("".join(item.text for item in sorted(row, key=lambda item: item.center[0])))
-        for row in rows
-    )
+    return [sorted(row, key=lambda item: item.center[0]) for row in rows]
+
+
+def _center_field_lines(boxes, region):
+    from . import paste_confirmation
+
+    rows = _center_field_rows(boxes, region)
+    if rows is None:
+        return None
+    return tuple(paste_confirmation._visible_text("".join(item.text for item in row)) for row in rows)
 
 
 def _matches_scrolled_suffix(observed: tuple[str, ...], expected: tuple[str, ...]) -> bool:
@@ -205,8 +211,95 @@ def _matches_scrolled_suffix(observed: tuple[str, ...], expected: tuple[str, ...
     return False
 
 
-def _verify_confirm_frame(prepare_frame, confirm_frame, target_box, text, *, expect_title=None):
-    from . import ocr, paste_confirmation, screen_compare
+def _confirm_candidate_regions(prepare_frame, confirm_frame, target_box):
+    from . import paste_confirmation, screen_compare
+
+    region = tuple(target_box)
+    regions: list[tuple[float, float, float, float]] = []
+
+    def add_region(cand):
+        if cand is None:
+            return
+        if not any(all(abs(a - b) <= 1e-4 for a, b in zip(cand, prev, strict=True)) for prev in regions):
+            regions.append(cand)
+
+    try:
+        confirm_rgb = _rgb(confirm_frame)
+    except (OSError, ValueError):
+        confirm_rgb = None
+
+    grown_found = False
+    if prepare_frame and confirm_rgb is not None:
+        try:
+            prep_rgb = _rgb(prepare_frame)
+            suggestion_bar = paste_confirmation._located_suggestion_bar(prepare_frame, confirm_frame, region)
+            if suggestion_bar is not None:
+                assistive_box = screen_compare.stationary_assistive_button_box(
+                    prepare_frame, confirm_frame, exclude=(region,))
+                grown = paste_confirmation._grown_field(
+                    prep_rgb, confirm_rgb, region, suggestion_bar, assistive_box=assistive_box)
+                if grown is not None:
+                    add_region(grown[0])
+                    grown_found = True
+        except (OSError, ValueError):
+            pass
+    if not grown_found and confirm_rgb is not None:
+        try:
+            # Self-measured span keeps multi-line region discovery intact only when
+            # _grown_field could not lock a pair.
+            span = paste_confirmation._field_span(confirm_rgb, region[0], region[2], region[3])
+            if span is not None and span[0] < region[1] - .005:
+                add_region((region[0], span[0], region[2], span[1]))
+        except (OSError, ValueError):
+            pass
+    add_region(region)
+    return regions
+
+
+def _chat_composer_tail_eligible(
+    prepare_frame,
+    confirm_frame,
+    confirm_boxes,
+    target_box,
+    *,
+    orig_boxes=None,
+) -> bool:
+    from . import ocr, paste_confirmation
+
+    region = tuple(target_box)
+    if not prepare_frame or region[1] < .35:
+        return False
+    suggestion_bar = paste_confirmation._chat_composer_layout(prepare_frame, confirm_frame, region)
+    if suggestion_bar is None:
+        return False
+    try:
+        prep_rgb = _rgb(prepare_frame)
+        conf_rgb = _rgb(confirm_frame)
+    except (OSError, ValueError):
+        return False
+    if orig_boxes is None:
+        orig_boxes = ocr.read_text(prepare_frame)
+    if paste_confirmation._field_lines(orig_boxes, region) != ():
+        return False
+    key_box = paste_confirmation._return_key_box(
+        orig_boxes, confirm_boxes, suggestion_bar, keys=paste_confirmation._CHAT_SEND_KEYS,
+    )
+    if key_box is None:
+        return False
+    return paste_confirmation._return_key_enabled(prep_rgb, conf_rgb, key_box)
+
+
+def _verify_confirm_frame(
+    prepare_frame,
+    confirm_frame,
+    target_box,
+    text,
+    *,
+    expect_title=None,
+    allow_tail_punct=False,
+    diagnostics=None,
+):
+    from . import ocr, paste_confirmation
 
     boxes = ocr.read_text(confirm_frame)
     if expect_title:
@@ -217,36 +310,102 @@ def _verify_confirm_frame(prepare_frame, confirm_frame, target_box, text, *, exp
     expected = paste_confirmation._expected_lines(text)
     if not expected:
         return False, "pasted text has no visible characters to visually verify"
-    regions = []
+    expected_chars = sum(len(line) for line in expected)
+    target_region = tuple(target_box)
+    prep_rgb = conf_rgb = None
+    orig_boxes = None
+    filter_eligible = False
     if prepare_frame:
         try:
-            region = tuple(target_box)
-            suggestion_bar = paste_confirmation._located_suggestion_bar(prepare_frame, confirm_frame, region)
-            if suggestion_bar is not None:
-                assistive_box = screen_compare.stationary_assistive_button_box(
-                    prepare_frame, confirm_frame, exclude=(region,))
-                grown = paste_confirmation._grown_field(
-                    _rgb(prepare_frame), _rgb(confirm_frame), region, suggestion_bar,
-                    assistive_box=assistive_box)
-                if grown is not None:
-                    regions.append(grown[0])
+            prep_rgb = _rgb(prepare_frame)
+            conf_rgb = _rgb(confirm_frame)
         except (OSError, ValueError):
-            pass
-    regions.append(tuple(target_box))
-    for region in regions:
-        strict_lines = paste_confirmation._field_lines(boxes, region)
-        if strict_lines is not None and paste_confirmation._matches_wrapped_lines(strict_lines, expected):
+            prep_rgb = conf_rgb = None
+        if (prep_rgb is not None and conf_rgb is not None
+                and paste_confirmation._chat_composer_layout(prepare_frame, confirm_frame, target_region) is not None):
+            orig_boxes = ocr.read_text(prepare_frame)
+            filter_eligible = paste_confirmation._field_lines(orig_boxes, target_region) == ()
+    regions = _confirm_candidate_regions(prepare_frame, confirm_frame, target_box)
+    extracted: list[tuple[int, tuple[str, ...], dict[int, str]]] = []
+    filtered_icons = 0
+    for r_idx, region in enumerate(regions):
+        if filter_eligible:
+            region_boxes = paste_confirmation._filter_stationary_field_icons(
+                boxes, prep_rgb, conf_rgb, region, expected=expected,
+            )
+            filtered_icons = max(filtered_icons, len(boxes) - len(region_boxes))
+        else:
+            region_boxes = boxes
+        for rows in (
+            paste_confirmation._field_rows(region_boxes, region),
+            _center_field_rows(region_boxes, region),
+        ):
+            if rows is not None:
+                lines = tuple(paste_confirmation._visible_text("".join(item.text for item in row)) for row in rows)
+                faded = (
+                    paste_confirmation._corner_faded_rows(rows, prep_rgb, conf_rgb, region)
+                    if filter_eligible else {}
+                )
+                extracted.append((r_idx, lines, faded))
+
+    for r_idx, lines, _ in extracted:
+        if paste_confirmation._matches_wrapped_lines(lines, expected):
+            if diagnostics is not None:
+                diagnostics.update(
+                    match_mode="full", expected_chars=expected_chars,
+                    observed_chars=sum(len(r) for r in lines), elided_tail="",
+                    matched_region_idx=r_idx, filtered_icons=filtered_icons,
+                )
             return True, "full"
-        relaxed_lines = _center_field_lines(boxes, region)
-        if relaxed_lines is not None and paste_confirmation._matches_wrapped_lines(relaxed_lines, expected):
-            return True, "full"
-    for region in regions:
-        strict_lines = paste_confirmation._field_lines(boxes, region)
-        if strict_lines is not None and _matches_scrolled_suffix(strict_lines, expected):
+
+    chat_verified = False
+    has_extra_text = any(sum(len(r) for r in rows) > expected_chars for _, rows, _ in extracted)
+    if allow_tail_punct and prepare_frame and not has_extra_text:
+        chat_verified = _chat_composer_tail_eligible(
+            prepare_frame, confirm_frame, boxes, target_box, orig_boxes=orig_boxes,
+        )
+        if chat_verified:
+            for r_idx, lines, faded in extracted:
+                mode, detail = paste_confirmation._matches_chat_composer_lines(
+                    lines, expected, faded_rows=faded,
+                )
+                if mode in {"tail_punct", "corner_fade", "ocr_punct"}:
+                    if diagnostics is not None:
+                        diagnostics.update(
+                            match_mode=mode,
+                            expected_chars=expected_chars,
+                            observed_chars=sum(len(r) for r in lines),
+                            elided_tail=detail if mode in {"tail_punct", "ocr_punct"} else "",
+                            corner_fade_diff=detail if mode == "corner_fade" else "",
+                            matched_region_idx=r_idx,
+                            filtered_icons=filtered_icons,
+                            chat_composer_verified=True,
+                        )
+                    return True, mode
+
+    for r_idx, lines, _ in extracted:
+        if _matches_scrolled_suffix(lines, expected):
+            if diagnostics is not None:
+                diagnostics.update(
+                    match_mode="suffix", expected_chars=expected_chars,
+                    observed_chars=sum(len(r) for r in lines), elided_tail="",
+                    matched_region_idx=r_idx, filtered_icons=filtered_icons,
+                )
             return True, "suffix"
-        relaxed_lines = _center_field_lines(boxes, region)
-        if relaxed_lines is not None and _matches_scrolled_suffix(relaxed_lines, expected):
-            return True, "suffix"
+
+    if diagnostics is not None:
+        best = max((rows for _, rows, _ in extracted), key=lambda rows: sum(len(r) for r in rows), default=())
+        diagnostics.update(
+            match_mode=None,
+            expected_chars=expected_chars,
+            observed_chars=sum(len(r) for r in best),
+            observed_row_count=len(best),
+            last_row_tail=best[-1][-30:] if best else "",
+            filtered_icons=filtered_icons,
+            regions_tried=len(regions),
+            allow_tail_punct=allow_tail_punct,
+            chat_composer_verified=chat_verified,
+        )
     return False, "pasted text was not observed in target field"
 
 
@@ -799,7 +958,11 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
                 if found is not None:
                     # The pasted text can itself contain permission labels. When
                     # it is already visible in the original field, only confirm.
-                    if _verify_confirm_frame(prepare_frame, candidate, target_box, text, expect_title=expect_title)[0]:
+                    # Requiring send-key grey->blue keeps tail_punct safe here.
+                    if _verify_confirm_frame(
+                        prepare_frame, candidate, target_box, text,
+                        expect_title=expect_title, allow_tail_punct=True,
+                    )[0]:
                         break
                     from . import ocr
                     if not _on_prepared_page(_page_header(ocr.read_text(prepare_frame)), found.header, expect_title):
@@ -818,7 +981,9 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
                         if remaining is not None and not found.same_sheet(remaining):
                             raise RuntimeError("paste permission prompt changed after clicking")
                         if remaining is None and _verify_confirm_frame(
-                                prepare_frame, raw, target_box, text, expect_title=expect_title)[0]:
+                                prepare_frame, raw, target_box, text,
+                                expect_title=expect_title, allow_tail_punct=True,
+                        )[0]:
                             report.facts["permission_sheet_dismissed"] = True
                             break
                         if check + 1 < ALLOW_CHECK_ATTEMPTS:
@@ -826,7 +991,8 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
                     else:
                         raise RuntimeError("Allow Paste permission sheet did not dismiss with the expected text")
                     break
-                if _verify_confirm_frame(prepare_frame, candidate, target_box, text, expect_title=expect_title)[0]:
+                if _verify_confirm_frame(prepare_frame, candidate, target_box, text,
+                                         expect_title=expect_title, allow_tail_punct=True)[0]:
                     break
                 if attempt + 1 < ALLOW_CHECK_ATTEMPTS:
                     time.sleep(.3)
@@ -839,15 +1005,28 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
                 # start confirm on a steady on-plateau.
                 with _Stage(report, "caret_sync"):
                     wait_caret_plateau(client, target_box, timeout=1.5)
+            last_failed_frame = None
+            last_failed_detail = None
+            last_failed_diag: dict | None = None
             for attempt in range(confirm_attempts):
                 observed = client.observe()
                 keep(f"4-confirm-{attempt}", observed)
                 confirm_frame = base64.b64decode(observed["image_base64"]) if observed.get("image_base64") else None
                 if confirm_frame:
-                    ok_text, detail = _verify_confirm_frame(
-                        prepare_frame, confirm_frame, target_box, text, expect_title=expect_title)
+                    diag: dict = {}
+                    unchanged = last_failed_frame is not None and last_failed_frame == confirm_frame
+                    if unchanged and last_failed_detail is not None and last_failed_diag is not None:
+                        ok_text, detail, diag = False, last_failed_detail, dict(last_failed_diag)
+                    else:
+                        ok_text, detail = _verify_confirm_frame(
+                            prepare_frame, confirm_frame, target_box, text,
+                            expect_title=expect_title, allow_tail_punct=True, diagnostics=diag)
                     if not ok_text:
+                        last_failed_frame, last_failed_detail, last_failed_diag = (
+                            confirm_frame, detail, dict(diag))
                         report.facts.setdefault("confirm_rejections", []).append(detail)
+                        if diag:
+                            report.facts["confirm_diagnostics"] = diag
                         if attempt == confirm_attempts - 1:
                             report.facts["confirm_error"] = detail
                             raise RuntimeError(detail)
@@ -856,6 +1035,8 @@ def run(client, text, target_box, *, expect_title=None, caret_box=None, prewarm=
                         continue
                     report.facts["client_text_verified"] = True
                     report.facts["client_text_match"] = detail
+                    if diag.get("elided_tail") or diag.get("corner_fade_diff"):
+                        report.facts["confirm_diagnostics"] = diag
                 else:
                     reason = "confirmation observation omitted image_base64"
                     report.facts.setdefault("confirm_rejections", []).append(reason)
