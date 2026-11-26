@@ -8,7 +8,7 @@ from pathlib import Path
 
 import httpx
 
-from .client import IPhoneClient
+from .client import ClientHTTPError, IPhoneClient
 
 try:
     from .mcp import serve as serve_mcp
@@ -324,7 +324,12 @@ def main(argv=None) -> int:
         text = str(e)
         if "Connection refused" in text or "10061" in text or "积极拒绝" in text:
             text = "连不上本机 8890。请先运行 run-local.sh 或 run-server.ps1，并确认端口没被别的程序占用。"
-        print(json.dumps({"error": text}, ensure_ascii=False), file=sys.stderr)
+        error_body: dict = {"error": text}
+        if isinstance(e, ClientHTTPError):
+            error_body["status_code"] = e.status_code
+            if isinstance(e.payload.get("action_may_have_executed"), bool):
+                error_body["action_may_have_executed"] = e.payload["action_may_have_executed"]
+        print(json.dumps(error_body, ensure_ascii=False), file=sys.stderr)
         return 2
 
 

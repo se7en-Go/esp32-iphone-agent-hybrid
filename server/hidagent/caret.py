@@ -335,6 +335,20 @@ def _green_tone(r, g, b):
     return g >= 145 and g - r >= 45 and g - b >= 30
 
 
+def _green_residual_off(image, x, upper, background_x, contrasts):
+    """Accept an H.264/4:2:0 pale residual off-phase inside verified `green_scope`."""
+    upper_colors = [image.getpixel((x, y)) for y in upper]
+    if (sum(min(rgb) >= 195 for rgb in upper_colors) < .90 * len(upper_colors)
+            or sum(g >= r - 6 and g >= b - 6 for r, g, b in upper_colors) < .90 * len(upper_colors)):
+        return False
+    if statistics.median(contrasts) > 50 or sum(value <= 60 for value in contrasts) < .85 * len(contrasts):
+        return False
+    g_contrasts = [abs(color[1] - image.getpixel((background_x, y))[1])
+                   for color, y in zip(upper_colors, upper, strict=True)]
+    return (statistics.median(g_contrasts) <= 24
+            and sum(value <= 30 for value in g_contrasts) >= .85 * len(g_contrasts))
+
+
 def _scoped_caret(image, box, scope):
     """A thin line inside a caller-verified input field, on that field's light background.
 
@@ -373,7 +387,7 @@ def _template_cycle(caret, images, frames, current, *, allow_white=True, amber=F
     upper = range(y0 + 2, y0 + round(.75 * (y1 - y0)))
     tried = set()
     for x in range(x0, x1):
-        on, off = [], []
+        pure_off, residual_off, on, on_medians = [], [], [], {}
         for i, image in enumerate(images):
             colors = [image.getpixel((x, y)) for y in rows]
             if tone is not None:
@@ -386,29 +400,43 @@ def _template_cycle(caret, images, frames, current, *, allow_white=True, amber=F
                          image.getpixel((caret.background_x, y)), strict=True)) for y in upper]
             if on_pixels >= .85 * len(colors) and sum(v >= 60 for v in contrasts) >= .85 * len(contrasts):
                 on.append(i)
-            if statistics.median(contrasts) <= 12 and sum(v <= 20 for v in contrasts) >= .85 * len(contrasts):
+                on_medians[i] = statistics.median(contrasts)
+            is_pure_off = (statistics.median(contrasts) <= 12
+                           and sum(v <= 20 for v in contrasts) >= .85 * len(contrasts))
+            is_residual_off = (green and not is_pure_off
+                               and _green_residual_off(image, x, upper, caret.background_x, contrasts))
+            if is_pure_off or is_residual_off:
                 # An amber or green line on a light field must disappear completely.
                 # Its endpoints cannot become part of a new learned off phase.
                 if tone is not None:
                     clearance = max(3, round(.006 * image.height))
                     pixels = image.crop((x0 - 1, y0 - clearance, x1 + 1, y1 + clearance)).tobytes()
-                    colors = zip(pixels[::3], pixels[1::3], pixels[2::3], strict=True)
-                    if any(tone(*color) for color in colors):
+                    c_colors = zip(pixels[::3], pixels[1::3], pixels[2::3], strict=True)
+                    if any(tone(*color) for color in c_colors):
                         continue
-                off.append(i)
-        if not on or not off:
+                (pure_off if is_pure_off else residual_off).append(i)
+        if not on or not (pure_off or residual_off):
             continue
-        # Use actual complete phase pairs, not extrema merged across different
-        # JPEGs. A compression outlier cannot veto another fully proved cycle.
-        for off_index in off:
-            for on_index in on:
-                pair = images[off_index].crop(patch).tobytes(), images[on_index].crop(patch).tobytes()
-                if pair in tried:
-                    continue
-                tried.add(pair)
-                if _matching_cycle(caret, patch, images, frames, current, off_index, on_index, x, pair,
-                                   green=green, on_indices=frozenset(on)):
-                    return True
+        # Use pure off-phases first; fall back to H.264 pale residual off-phases
+        # only paired with strong solid-green on-phases (median contrast >= 120).
+        candidate_pairs = [
+            (off_index, on_index)
+            for off_index in pure_off
+            for on_index in on
+        ] + [
+            (off_index, on_index)
+            for off_index in residual_off
+            for on_index in on
+            if on_medians[on_index] >= 120
+        ]
+        for off_index, on_index in candidate_pairs:
+            pair = images[off_index].crop(patch).tobytes(), images[on_index].crop(patch).tobytes()
+            if pair in tried:
+                continue
+            tried.add(pair)
+            if _matching_cycle(caret, patch, images, frames, current, off_index, on_index, x, pair,
+                               green=green, on_indices=frozenset(on)):
+                return True
     return False
 
 

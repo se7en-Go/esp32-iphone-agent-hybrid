@@ -65,15 +65,27 @@ class RecentFrameHistory:
     """Bounded, session-local pixel history shared by board and Mac receivers."""
 
     def _remember_snapshot(self, frame: FrameSnapshot) -> None:
-        """Retain only a few recent immutable frames for caret animation evidence."""
+        """Retain bounded recent immutable frames across the full 4 s caret window."""
         with self._frame_lock:
             if self._recent_frames and self._recent_frames[-1].generation != frame.generation:
                 self._recent_frames.clear()
+            while self._recent_frames and frame.arrived - self._recent_frames[0].arrived > 4:
+                self._recent_frames.popleft()
             if frame.frame and frame.observed_live:
                 prev = self._recent_frames[-1] if self._recent_frames else None
                 if prev is None or frame.arrived > prev.arrived or (
                         frame.arrived == prev.arrived
                         and (frame.updated > prev.updated or frame.frame != prev.frame)):
+                    limit = self._recent_frames.maxlen
+                    if limit is not None and len(self._recent_frames) >= limit and len(self._recent_frames) > 8:
+                        frames = list(self._recent_frames)
+                        drop_index = min(
+                            range(1, len(frames) - 6),
+                            key=lambda idx: frames[idx + 1].arrived - frames[idx - 1].arrived,
+                        )
+                        del frames[drop_index]
+                        self._recent_frames.clear()
+                        self._recent_frames.extend(frames)
                     self._recent_frames.append(frame)
             while self._recent_frames and frame.arrived - self._recent_frames[0].arrived > 4:
                 self._recent_frames.popleft()
