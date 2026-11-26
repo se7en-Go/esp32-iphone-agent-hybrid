@@ -7,7 +7,7 @@ from statistics import median
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
-from .caret import mask_caret_blink
+from .caret import _components, mask_caret_blink
 from .vision import _discs
 
 STATUS_HEIGHT = 0.06
@@ -58,9 +58,85 @@ def retain_context_regions(diff: Image.Image, regions) -> None:
     diff.paste(retained)
 
 
-def _regions(diff: Image.Image, threshold: int):
-    w, _ = diff.size
-    return _point_regions({(i % w, i // w) for i, value in enumerate(diff.tobytes()) if value > threshold})
+def _regions(diff: Image.Image, threshold: int, *, max_points: int | None = None):
+    if not sum(diff.histogram()[threshold + 1:]):
+        return iter(())
+    mask = diff.point(lambda value: 255 if value > threshold else 0)
+    return _components(mask, max_points=max_points)
+
+
+def _single_small_region(diff: Image.Image, threshold: int, max_points: int) -> list[tuple[int, int]] | None:
+    """Return the sole 8-connected component with >= 6 pixels only if no component exceeds `max_points`."""
+    if sum(diff.histogram()[threshold + 1:]) < 6:
+        return None
+    width, height = diff.size
+    mask = diff.point(lambda value: 255 if value > threshold else 0)
+    data = bytearray(mask.tobytes())
+    pos = 0
+    found = None
+    while (start := data.find(255, pos)) >= 0:
+        pos = start + 1
+        data[start] = 0
+        stack = [start]
+        points = []
+        while stack:
+            idx = stack.pop()
+            x, y = idx % width, idx // width
+            points.append((x, y))
+            if len(points) > max_points:
+                return None
+            x0 = x - 1 if x > 0 else 0
+            x1 = x + 1 if x + 1 < width else width - 1
+            y0 = y - 1 if y > 0 else 0
+            y1 = y + 1 if y + 1 < height else height - 1
+            for ny in range(y0, y1 + 1):
+                row = ny * width
+                for nx in range(x0, x1 + 1):
+                    nidx = row + nx
+                    if data[nidx]:
+                        data[nidx] = 0
+                        stack.append(nidx)
+        if len(points) >= 6:
+            if found is not None:
+                return None
+            found = points
+    return found
+
+
+def _has_hot_region(diff: Image.Image, threshold: int = 24, min_points: int = 6) -> bool:
+    if sum(diff.histogram()[threshold + 1:]) < min_points:
+        return False
+    return any(len(points) >= min_points for points in _regions(diff, threshold))
+
+
+def _assistive_opacity_plausible(diff: Image.Image, exclude=()) -> bool:
+    """Fast bound check: stationary AssistiveTouch opacity cannot explain wide or excluded edits."""
+    w, h = diff.size
+    if sum(diff.histogram()[25:]) > .08 * w * h:
+        return False
+    hot_regions = [pts for pts in _regions(diff, 24) if len(pts) >= 6]
+    if not hot_regions:
+        return True
+    ux0 = uy0 = w + h
+    ux1 = uy1 = -1
+    region_boxes = []
+    for pts in hot_regions:
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        rx0, ry0, rx1, ry1 = min(xs), min(ys), max(xs), max(ys)
+        ux0, uy0 = min(ux0, rx0), min(uy0, ry0)
+        ux1, uy1 = max(ux1, rx1), max(uy1, ry1)
+        region_boxes.append((rx0, ry0, rx1, ry1))
+    if ux1 - ux0 + 1 > .35 * w or uy1 - uy0 + 1 > .25 * h:
+        return False
+    for ex in exclude:
+        if ex is None:
+            continue
+        ex0, ey0, ex2, ey2 = ex[0] * w + 1, ex[1] * h + 1, ex[2] * w - 1, ex[3] * h - 1
+        if any(ex0 <= rx0 and rx1 + 1 <= ex2 and ey0 <= ry0 and ry1 + 1 <= ey2
+               for rx0, ry0, rx1, ry1 in region_boxes):
+            return False
+    return True
 
 
 def _point_regions(hot):
@@ -269,11 +345,10 @@ def _translucent_pointer_fade(visible, background, points, width):
 
 
 def _mask_translucent_pointer_fade(before, after, diff):
-    candidates = [points for points in _regions(diff, 24) if len(points) >= 6]
-    if len(candidates) != 1:
+    points = _single_small_region(diff, 24, math.ceil((.067 * diff.width + 2) ** 2))
+    if points is None:
         return
     a, b = (_rgb_at_size(frame, diff.size) for frame in (before, after))
-    points = candidates[0]
     if (_translucent_pointer_fade(a, b, points, diff.width)
             or _translucent_pointer_fade(b, a, points, diff.width)):
         for point in points:
@@ -324,11 +399,10 @@ def _flat_background_pointer_disc(visible: Image.Image, background: Image.Image,
 
 def _mask_flat_background_pointer_disc(before, after, diff) -> None:
     """Mask an isolated pointer disc on a uniform background when both frames corroborate it."""
-    candidates = [points for points in _regions(diff, 24) if len(points) >= 6]
-    if len(candidates) != 1:
+    points = _single_small_region(diff, 24, math.ceil((.067 * diff.width + 2) ** 2))
+    if points is None:
         return
     a, b = (_rgb_at_size(frame, diff.size) for frame in (before, after))
-    points = candidates[0]
     if (_flat_background_pointer_disc(a, b, points, diff.width)
             or _flat_background_pointer_disc(b, a, points, diff.width)):
         for point in points:
@@ -740,7 +814,7 @@ def _mask_pointer_discs(before: bytes, after: bytes, diff: Image.Image, max_disc
     """Mask visible gray discs in delayed move frames, without hiding other small edits."""
     w, h = diff.size
     boxes = []
-    for points in _regions(diff, 25):
+    for points in _regions(diff, 25, max_points=math.ceil((0.1 * w + 1) ** 2)):
         if len(points) < 6:
             continue
         xs, ys = zip(*points, strict=True)
@@ -780,7 +854,8 @@ def mask_pointer_highlights(before: bytes | Image.Image, after: bytes | Image.Im
     """
     w, _ = diff.size
     candidates = []
-    for points in _regions(unmasked if unmasked is not None else diff, 24):
+    max_points = math.ceil(0.36 * (0.26 * w + 1) ** 2) + 16
+    for points in _regions(unmasked if unmasked is not None else diff, 24, max_points=max_points):
         xs, ys = zip(*points, strict=True)
         x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
         bw, bh = x1 - x0 + 1, y1 - y0 + 1
@@ -924,22 +999,33 @@ def observation_changed(before: bytes | None, after: bytes | None, *, input_regi
     _mask_translucent_pointer_fade(before, after, diff)
     _mask_flat_background_pointer_disc(before, after, diff)
     values = diff.tobytes()
-    changed = sum(values) / len(values) > 0.8 or any(len(points) >= 6 for points in _regions(diff, 24))
-    if changed and allow_assistive_opacity:
+    changed = sum(values) / len(values) > 0.8 or _has_hot_region(diff)
+    if (changed and allow_assistive_opacity
+            and _assistive_opacity_plausible(diff, exclude=(input_region, caret_scope))):
         _mask_stationary_assistive_button(before, after, diff, exclude=(input_region, caret_scope))
         values = diff.tobytes()
-        changed = sum(values) / len(values) > 0.8 or any(len(points) >= 6 for points in _regions(diff, 24))
+        changed = sum(values) / len(values) > 0.8 or _has_hot_region(diff)
     if changed and residual_out is not None:
         w, h = diff.size
-        hot = sorted((r for r in _regions(diff, 24) if len(r) >= 6), key=len, reverse=True)
-        for r in hot[:4]:
-            xs = [p[0] for p in r]
-            ys = [p[1] for p in r]
-            residual_out.append({
-                "count": len(r),
-                "box": [round(min(xs) / w, 3), round(min(ys) / h, 3),
-                        round((max(xs) + 1) / w, 3), round((max(ys) + 1) / h, 3)],
-            })
+        hot_count = sum(diff.histogram()[25:])
+        if hot_count > 4000:
+            bbox = diff.point(lambda value: 255 if value > 24 else 0).getbbox()
+            if bbox is not None:
+                residual_out.append({
+                    "count": hot_count,
+                    "box": [round(bbox[0] / w, 3), round(bbox[1] / h, 3),
+                            round(bbox[2] / w, 3), round(bbox[3] / h, 3)],
+                })
+        else:
+            hot = sorted((r for r in _regions(diff, 24) if len(r) >= 6), key=len, reverse=True)
+            for r in hot[:4]:
+                xs = [p[0] for p in r]
+                ys = [p[1] for p in r]
+                residual_out.append({
+                    "count": len(r),
+                    "box": [round(min(xs) / w, 3), round(min(ys) / h, 3),
+                            round((max(xs) + 1) / w, 3), round((max(ys) + 1) / h, 3)],
+                })
         if not residual_out:
             residual_out.append({"mean_diff": round(sum(values) / len(values), 3)})
     return changed
