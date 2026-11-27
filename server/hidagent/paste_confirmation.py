@@ -300,7 +300,7 @@ def _outside_visual_changed(before: bytes, after: bytes, region: tuple[float, fl
     return _diff_has_unexpected_changes(before, after, diff, region, suggestion_bar, extra)
 
 
-def _context_anchors(items, region, *, suggestion_bar=None, ignored_boxes=()):
+def _context_anchors(items, region, *, suggestion_bar=None, ignored_boxes=(), min_y: float = .06):
     selected = []
     for item in items:
         left, top, right, bottom = item.box
@@ -310,7 +310,7 @@ def _context_anchors(items, region, *, suggestion_bar=None, ignored_boxes=()):
         if any(_overlaps_box(item, box) for box in ignored_boxes):
             continue
         label = _visible_text(item.text)
-        if item.center[1] > .06 and item.conf >= _MIN_CONFIDENCE and len(label) >= 2:
+        if item.center[1] > min_y and item.conf >= _MIN_CONFIDENCE and len(label) >= 2:
             selected.append(item)
     return selected
 
@@ -335,9 +335,11 @@ def _stationary_anchors_match(before_items, after_items):
     return [points[0] for points in original.values() if len(points) == 1]
 
 
-def _same_context(before, after, region, *, suggestion_bar=None, ignored_boxes=()):
-    original = _context_anchors(before, region, suggestion_bar=suggestion_bar, ignored_boxes=ignored_boxes)
-    current = _context_anchors(after, region, suggestion_bar=suggestion_bar, ignored_boxes=ignored_boxes)
+def _same_context(before, after, region, *, suggestion_bar=None, ignored_boxes=(), min_y: float = .06):
+    original = _context_anchors(
+        before, region, suggestion_bar=suggestion_bar, ignored_boxes=ignored_boxes, min_y=min_y)
+    current = _context_anchors(
+        after, region, suggestion_bar=suggestion_bar, ignored_boxes=ignored_boxes, min_y=min_y)
     unique = _stationary_anchors_match(original, current)
     return (unique is not None and len(unique) >= 3
             and any(y < region[1] for _, y in unique) and any(y > region[3] for _, y in unique))
@@ -371,14 +373,14 @@ def _match_shifted_anchors(before_items, after_items, *, dy=0., tol_x=.008, tol_
 
 
 def _header_viewport_bounds(before, after, region, current_region,
-                            *, ignored_boxes=()) -> tuple[float, float] | None:
+                            *, ignored_boxes=(), min_y: float = .06) -> tuple[float, float] | None:
     """Locate the vertical split band between a fixed top header and the scrolled viewport."""
     header_cap = min(.20, current_region[1] - .12)
     if header_cap <= .07:
         return None
-    top_before = [item for item in _context_anchors(before, region, ignored_boxes=ignored_boxes)
+    top_before = [item for item in _context_anchors(before, region, ignored_boxes=ignored_boxes, min_y=min_y)
                   if item.center[1] < header_cap]
-    top_after = [item for item in _context_anchors(after, current_region, ignored_boxes=ignored_boxes)
+    top_after = [item for item in _context_anchors(after, current_region, ignored_boxes=ignored_boxes, min_y=min_y)
                  if item.center[1] < header_cap]
     matched, unmatched_before, unmatched_after = _match_shifted_anchors(top_before, top_after)
     first_moved = min((item.center[1] for item in (*unmatched_before, *unmatched_after)), default=header_cap)
@@ -532,7 +534,8 @@ def _scrolled_viewport_match(
     # split. Compare those rows against a reference clipped before resizing so
     # the same split is visible in both images. Skip extra smoothing here to
     # preserve evidence of edits on either side of the boundary.
-    seam_top = max(int(screen_compare.STATUS_HEIGHT * h) + 1, best_y - 2)
+    status_h = screen_compare.status_height_for_size((w, h))
+    seam_top = max(int(status_h * h) + 1, best_y - 2)
     seam_bottom = min(y_bot_px, best_y + 2)
     seam = (0, seam_top, w, seam_bottom)
     seam_diff = _rgb_difference(comp_before_360, after_360)
@@ -552,10 +555,10 @@ def _ignored_across_scroll(item, ignored_boxes, dy: float) -> bool:
 
 
 def _same_context_scrolled(before, after, region, current_region, *, split_y: float, scroll_delta: float,
-                           suggestion_bar=None, ignored_boxes=()) -> bool:
+                           suggestion_bar=None, ignored_boxes=(), min_y: float = .06) -> bool:
     """Verify stationary header/lower anchors and rigidly scrolled chat-viewport anchors."""
-    orig_anchors = _context_anchors(before, region, suggestion_bar=suggestion_bar)
-    curr_anchors = _context_anchors(after, current_region, suggestion_bar=suggestion_bar)
+    orig_anchors = _context_anchors(before, region, suggestion_bar=suggestion_bar, min_y=min_y)
+    curr_anchors = _context_anchors(after, current_region, suggestion_bar=suggestion_bar, min_y=min_y)
 
     orig_header = [i for i in orig_anchors if i.center[1] < split_y
                    and not any(_overlaps_box(i, box) for box in ignored_boxes)]
@@ -741,13 +744,13 @@ def _grown_field(original_image, current_image, region, suggestion_bar, *, assis
     return current, (expand, (region[2], band[1], 1., band[3])), before[0] - after[0]
 
 
-def _return_key_box(original, current, suggestion_bar, *, keys=_RETURN_KEYS):
+def _return_key_box(original, current, suggestion_bar, *, keys=_RETURN_KEYS, max_bottom: float = .94):
     """The keyboard's return/send key, whose tint changes once the field is non-empty."""
     def find(items):
         found = [item for item in items if item.conf >= _MIN_CONFIDENCE
                  and ocr.normalize_text(item.text) in keys
                  and .72 <= item.box[0] < item.box[2] <= 1
-                 and max(suggestion_bar[1] + .14, .82) <= item.box[1] < item.box[3] <= .94]
+                 and max(suggestion_bar[1] + .14, .82) <= item.box[1] < item.box[3] <= max_bottom]
         return found[0] if len(found) == 1 else None
 
     first, second = find(original), find(current)
@@ -756,7 +759,179 @@ def _return_key_box(original, current, suggestion_bar, *, keys=_RETURN_KEYS):
             or abs(first.center[0] - second.center[0]) > .008 or abs(first.center[1] - second.center[1]) > .005):
         return None
     x, y = (first.center[0] + second.center[0]) / 2, (first.center[1] + second.center[1]) / 2
-    return (max(.74, x - .13), max(suggestion_bar[1] + .12, y - .034), min(1., x + .12), min(.94, y + .032))
+    return (max(.74, x - .13), max(suggestion_bar[1] + .12, y - .034), min(1., x + .12), min(max_bottom, y + .032))
+
+
+def _white_keycap_bands(raw: bytes, width: int, height: int, y_min: int, y_max: int) -> list[tuple[int, int]]:
+    """Locate the three horizontal QWERTY keycap rows inside `[y_min, y_max)`."""
+    stride = width * 3
+    samples = len(range(0, width, 2))
+    min_row_h = max(10, round(.025 * height))
+    bands: list[tuple[int, int]] = []
+    cur: list[int] | None = None
+    for y in range(y_min, y_max):
+        row_off = y * stride
+        white = 0
+        for x in range(0, width, 2):
+            off = row_off + x * 3
+            r, g, b = raw[off], raw[off + 1], raw[off + 2]
+            if min(r, g, b) >= 240 and max(r, g, b) - min(r, g, b) <= 15:
+                white += 1
+        if white / samples >= .36:
+            if cur is None:
+                cur = [y, y]
+            else:
+                cur[1] = y
+        elif cur is not None:
+            if cur[1] - cur[0] >= min_row_h:
+                bands.append((cur[0], cur[1] + 1))
+            cur = None
+    if cur is not None and cur[1] - cur[0] >= min_row_h:
+        bands.append((cur[0], cur[1] + 1))
+    return bands
+
+
+def _row_keycap_spans(raw: bytes, width: int, y0: int, y1: int) -> list[tuple[int, int]]:
+    """Locate white keycap horizontal spans across `(y0, y1)` using top/bottom borders."""
+    stride = width * 3
+    sample_ys = (y0 + 1, y0 + 2, y1 - 3, y1 - 2)
+    min_w = round(.055 * width)
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    for x in range(width):
+        bright = 0
+        for yy in sample_ys:
+            off = yy * stride + x * 3
+            r, g, b = raw[off], raw[off + 1], raw[off + 2]
+            if min(r, g, b) >= 230 and max(r, g, b) - min(r, g, b) <= 20:
+                bright += 1
+        if bright >= 3:
+            if start is None:
+                start = x
+        elif start is not None:
+            if x - start >= min_w:
+                spans.append((start, x))
+            start = None
+    if start is not None and width - start >= min_w:
+        spans.append((start, width))
+    return spans
+
+
+def _crop_pixel_stats(img: Image.Image, box: tuple[int, int, int, int]) -> tuple[int, float, float, float] | None:
+    """Return `(max_chroma, white_frac, black_frac, grey_frac)` over integer pixel crop `box`."""
+    crop_bytes = img.crop(box).tobytes()
+    total = len(crop_bytes) // 3
+    if total <= 0:
+        return None
+    max_chroma = white = black = grey = 0
+    for idx in range(0, len(crop_bytes), 3):
+        r, g, b = crop_bytes[idx], crop_bytes[idx + 1], crop_bytes[idx + 2]
+        hi, lo = max(r, g, b), min(r, g, b)
+        chroma = hi - lo
+        if chroma > max_chroma:
+            max_chroma = chroma
+        if lo >= 225:
+            white += 1
+        elif hi <= 45:
+            black += 1
+        elif 450 <= r + g + b <= 615:
+            grey += 1
+    return max_chroma, white / total, black / total, grey / total
+
+
+def _keyboard_shift_off_boxes(
+    before_image: Image.Image,
+    after_image: Image.Image,
+    original,
+    current,
+    suggestion_bar: tuple[float, float] | None,
+    key_box: tuple[float, float, float, float] | None,
+) -> tuple[tuple[float, float, float, float], ...] | None:
+    """Return tight Shift + 26-letter keycap boxes iff English Shift transitioned ON -> OFF."""
+    if suggestion_bar is None or key_box is None or before_image.size != after_image.size:
+        return None
+    w, h = before_image.size
+    y_min = round(suggestion_bar[1] * h)
+    y_max = round(key_box[1] * h)
+    if y_max - y_min < round(.14 * h):
+        return None
+
+    b_raw, a_raw = before_image.tobytes(), after_image.tobytes()
+    b_bands = _white_keycap_bands(b_raw, w, h, y_min, y_max)
+    a_bands = _white_keycap_bands(a_raw, w, h, y_min, y_max)
+    if len(b_bands) != 3 or len(a_bands) != 3:
+        return None
+
+    rows: list[tuple[int, int]] = []
+    for (by0, by1), (ay0, ay1) in zip(b_bands, a_bands, strict=True):
+        if abs(by0 - ay0) > 4 or abs(by1 - ay1) > 4:
+            return None
+        row_h = (by1 - by0) / h
+        if not (.032 <= row_h <= .075):
+            return None
+        rows.append((min(by0, ay0), max(by1, ay1)))
+    p1, p2 = (rows[1][0] - rows[0][0]) / h, (rows[2][0] - rows[1][0]) / h
+    if abs(p1 - p2) > .012 or not (.045 <= p1 <= .095):
+        return None
+
+    r0_b, r0_a = _row_keycap_spans(b_raw, w, *rows[0]), _row_keycap_spans(a_raw, w, *rows[0])
+    r1_b, r1_a = _row_keycap_spans(b_raw, w, *rows[1]), _row_keycap_spans(a_raw, w, *rows[1])
+    r2_b, r2_a = _row_keycap_spans(b_raw, w, *rows[2]), _row_keycap_spans(a_raw, w, *rows[2])
+    if (len(r0_b), len(r0_a), len(r1_b), len(r1_a)) != (10, 10, 9, 9):
+        return None
+    if len(r2_b) != 8 or len(r2_a) != 7:
+        return None
+    shift_x0, shift_x1 = r2_b[0]
+    if shift_x0 > round(.03 * w) or shift_x1 > round(.15 * w):
+        return None
+
+    letter_boxes_px: list[tuple[int, int, int, int]] = []
+    for row_idx, (bs, as_) in enumerate(((r0_b, r0_a), (r1_b, r1_a), (r2_b[1:], r2_a))):
+        y0, y1 = rows[row_idx]
+        for (bx0, bx1), (ax0, ax1) in zip(bs, as_, strict=True):
+            if abs(bx0 - ax0) > 4 or abs(bx1 - ax1) > 4:
+                return None
+            letter_boxes_px.append((min(bx0, ax0), y0, max(bx1, ax1), y1))
+
+    sy0, sy1 = rows[2]
+    sb = _crop_pixel_stats(before_image, (shift_x0 + 2, sy0 + 2, shift_x1 - 2, sy1 - 2))
+    sa = _crop_pixel_stats(after_image, (shift_x0 + 2, sy0 + 2, shift_x1 - 2, sy1 - 2))
+    if sb is None or sa is None or sb[0] > 30 or sa[0] > 30:
+        return None
+    if not (sb[1] >= .45 and sb[2] >= .08 and sa[3] >= .60 and sa[1] <= .05):
+        return None
+
+    for x0, y0, x1, y1 in letter_boxes_px:
+        for img in (before_image, after_image):
+            stats = _crop_pixel_stats(img, (x0 + 1, y0 + 1, x1 - 1, y1 - 1))
+            if stats is None or stats[0] > 32 or stats[1] < .45:
+                return None
+
+    kb_top_norm, kb_bot_norm = rows[0][0] / h, rows[2][1] / h
+    flips = 0
+    for b_item in original:
+        bt = b_item.text.strip()
+        if len(bt) != 1 or not ("A" <= bt <= "Z") or b_item.conf < .70:
+            continue
+        if not (kb_top_norm <= b_item.center[1] <= kb_bot_norm):
+            continue
+        if any(a_item.text.strip() == bt.lower() and a_item.conf >= .65
+               and abs(a_item.center[0] - b_item.center[0]) <= .02
+               and abs(a_item.center[1] - b_item.center[1]) <= .015
+               for a_item in current):
+            flips += 1
+    if flips < 3:
+        return None
+
+    pad_x, pad_y = 2 / w, 2 / h
+    boxes = [
+        (max(0., shift_x0 / w - pad_x), max(0., sy0 / h - pad_y),
+         min(1., shift_x1 / w + pad_x), min(1., sy1 / h + pad_y))
+    ]
+    for x0, y0, x1, y1 in letter_boxes_px:
+        boxes.append((max(0., x0 / w - pad_x), max(0., y0 / h - pad_y),
+                      min(1., x1 / w + pad_x), min(1., y1 / h + pad_y)))
+    return tuple(boxes)
 
 
 def _return_key_enabled(before: Image.Image, after: Image.Image, key_box) -> bool:
@@ -832,6 +1007,10 @@ _WIDTH_EQUIV_PUNCT = {
     "）": ")",
     ")": "）",
 }
+_CORNER_BRACKET_OCR_EQUIV = {
+    "[": frozenset("「『"),
+    "]": frozenset("」』"),
+}
 _NEGATION_CJK = frozenset("不没无非勿别否未禁停")
 _MIN_TAIL_PUNCT_LEN = 15
 _MIN_TAIL_LAST_LINE = 6
@@ -853,7 +1032,11 @@ def _adjacent_to_number_or_currency(line: str, pos: int) -> bool:
 
 
 def _chars_match_chat(obs_ch: str, exp_ch: str) -> bool:
-    return obs_ch == exp_ch or _WIDTH_EQUIV_PUNCT.get(obs_ch) == exp_ch
+    return (
+        obs_ch == exp_ch
+        or _WIDTH_EQUIV_PUNCT.get(obs_ch) == exp_ch
+        or exp_ch in _CORNER_BRACKET_OCR_EQUIV.get(obs_ch, ())
+    )
 
 
 def _matches_chat_composer_lines(
@@ -1122,16 +1305,24 @@ def _verify_paste_transition(before, after, original, current, region, expected,
         return None
     if require_visual and grown is not None and suggestion_bar is None:
         return None
+    compact = screen_compare.is_compact_portrait_size(original_image.size)
+    anchor_min_y = .038 if compact else .06
+    return_max_bottom = .995 if compact else .94
     extra = []
     if grown is not None:
         extra.extend(grown[1])
     key_box = None
     if original_lines == () and suggestion_bar is not None:
-        key_box = _return_key_box(original, current, suggestion_bar)
+        key_box = _return_key_box(original, current, suggestion_bar, max_bottom=return_max_bottom)
         if key_box is not None:
             extra.append(key_box)
+            shift_boxes = _keyboard_shift_off_boxes(
+                original_image, current_image, original, current, suggestion_bar, key_box)
+            if shift_boxes is not None:
+                extra.extend(shift_boxes)
     ignored = (assistive_box,) if assistive_box is not None else ()
-    if _same_context(original, current, current_region, suggestion_bar=suggestion_bar, ignored_boxes=ignored):
+    if _same_context(original, current, current_region,
+                     suggestion_bar=suggestion_bar, ignored_boxes=ignored, min_y=anchor_min_y):
         if not notes_only and not _outside_visual_changed(before, after, current_region, suggestion_bar, extra):
             if (not require_visual or grown is not None
                     or (key_box is not None and _return_key_enabled(original_image, current_image, key_box))):
@@ -1143,7 +1334,8 @@ def _verify_paste_transition(before, after, original, current, region, expected,
                 return "notes_share_enabled"
     if grown is None:
         return None
-    split_bounds = _header_viewport_bounds(original, current, region, current_region, ignored_boxes=ignored)
+    split_bounds = _header_viewport_bounds(
+        original, current, region, current_region, ignored_boxes=ignored, min_y=anchor_min_y)
     if split_bounds is None:
         return None
     scrolled = _scrolled_viewport_match(
@@ -1155,7 +1347,8 @@ def _verify_paste_transition(before, after, original, current, region, expected,
     split_y, scroll_delta = scrolled
     if _same_context_scrolled(
         original, current, region, current_region,
-        split_y=split_y, scroll_delta=scroll_delta, suggestion_bar=suggestion_bar, ignored_boxes=ignored,
+        split_y=split_y, scroll_delta=scroll_delta, suggestion_bar=suggestion_bar,
+        ignored_boxes=ignored, min_y=anchor_min_y,
     ):
         return "direct_paste_verified"
     return None
@@ -1201,10 +1394,13 @@ def _verify_chat_structural_sync(
         return None
     if assistive_vision.find_panel(before) is not None or assistive_vision.find_panel(after) is not None:
         return None
+    compact = screen_compare.is_compact_portrait_size(original_image.size)
+    anchor_min_y = .038 if compact else .06
+    return_max_bottom = .995 if compact else .94
     suggestion_bar = _chat_composer_layout(before, after, region)
     if suggestion_bar is None:
         return None
-    key_box = _return_key_box(original, current, suggestion_bar)
+    key_box = _return_key_box(original, current, suggestion_bar, max_bottom=return_max_bottom)
     if key_box is None:
         return None
     assistive_box = screen_compare.stationary_assistive_button_box(before, after, exclude=(region,))
@@ -1255,8 +1451,10 @@ def _verify_chat_structural_sync(
     elif len(current_lines) < 2:
         return None
     ignored = (assistive_box,) if assistive_box is not None else ()
-    orig_anchors = _context_anchors(original, region, suggestion_bar=suggestion_bar, ignored_boxes=ignored)
-    curr_anchors = _context_anchors(current, current_region, suggestion_bar=suggestion_bar, ignored_boxes=ignored)
+    orig_anchors = _context_anchors(
+        original, region, suggestion_bar=suggestion_bar, ignored_boxes=ignored, min_y=anchor_min_y)
+    curr_anchors = _context_anchors(
+        current, current_region, suggestion_bar=suggestion_bar, ignored_boxes=ignored, min_y=anchor_min_y)
     orig_header = [i for i in orig_anchors if i.center[1] <= .105]
     curr_header = [i for i in curr_anchors if i.center[1] <= .105]
     header_unique = _stationary_anchors_match(orig_header, curr_header)
@@ -1274,8 +1472,17 @@ def _verify_chat_structural_sync(
     diff = screen_compare._difference(before, after, 360)
     if diff is None:
         return None
+    shift_boxes = (
+        _keyboard_shift_off_boxes(original_image, current_image, original, current, suggestion_bar, key_box)
+        if original_lines == () else None
+    )
     viewport = (header_bottom, composer_top)
-    extra = [*(grown[1] if grown is not None else ()), key_box, (0., viewport[0], 1., viewport[1])]
+    extra = [
+        *(grown[1] if grown is not None else ()),
+        key_box,
+        *(shift_boxes or ()),
+        (0., viewport[0], 1., viewport[1]),
+    ]
     if _diff_has_unexpected_changes(before, after, diff, current_region, suggestion_bar, extra,
                                     assistive_box=assistive_box):
         return None
