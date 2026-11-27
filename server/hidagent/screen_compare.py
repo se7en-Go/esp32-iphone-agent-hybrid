@@ -11,7 +11,19 @@ from .caret import _components, mask_caret_blink
 from .vision import _discs
 
 STATUS_HEIGHT = 0.06
+COMPACT_STATUS_HEIGHT = 0.036
 POINTER_RADIUS = 0.045  # fraction of width; includes JPEG edges and a small highlight
+
+
+def is_compact_portrait_size(size: tuple[int, int]) -> bool:
+    """True for classic 9:16 Touch ID portrait iPhones (aspect ~0.563, thin top status bar, no Home Indicator)."""
+    w, h = size
+    return h > 0 and 0.52 <= (w / h) <= 0.62
+
+
+def status_height_for_size(size: tuple[int, int]) -> float:
+    """Return the normalized top status-bar mask height for `size`."""
+    return COMPACT_STATUS_HEIGHT if is_compact_portrait_size(size) else STATUS_HEIGHT
 
 
 def _difference(before: bytes | None, after: bytes | None, width: int, *, ignore_status=True):
@@ -27,7 +39,8 @@ def _difference(before: bytes | None, after: bytes | None, width: int, *, ignore
     red, green, blue = ImageChops.difference(a, b).split()
     diff = ImageChops.lighter(ImageChops.lighter(red, green), blue)
     if ignore_status:
-        ImageDraw.Draw(diff).rectangle((0, 0, w, int(STATUS_HEIGHT * h)), fill=0)
+        status_h = status_height_for_size((w, h))
+        ImageDraw.Draw(diff).rectangle((0, 0, w, int(status_h * h)), fill=0)
     return diff
 
 
